@@ -1,0 +1,63 @@
+[package]
+name = "lattice"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+description = "A markdown predicate linter and backlink reconciler, shipped as an LSP server."
+repository = "https://github.com/TwoWells/Lattice"
+keywords = ["markdown", "lsp", "linter", "backlinks", "commonmark"]
+categories = ["development-tools", "command-line-utilities"]
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[lints.clippy]
+# Lint groups
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+cargo = { level = "warn", priority = -1 }
+
+# Hard denials — no agent should produce these
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+wildcard_imports = "deny"
+missing_assert_message = "deny"
+
+# Force agents to justify exceptions
+allow_attributes_without_reason = "deny"
+
+# Dependencies
+multiple_crate_versions = "allow"
+
+# Documentation
+missing_errors_doc = "warn"
+missing_panics_doc = "warn"
+missing_safety_doc = "warn"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+pulldown-cmark = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_yaml_ng = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+toml = "0.8"
+tower-lsp = "0.20"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+
+[profile.release]
+panic = "abort"
+lto = true
+codegen-units = 1
+opt-level = 3
+strip = "symbols"
