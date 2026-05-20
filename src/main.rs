@@ -3,4 +3,11 @@
 
 //! Lattice: a markdown predicate linter and backlink reconciler.
 
+#[allow(
+    dead_code,
+    reason = "foundation module — consumers land in upcoming tickets"
+)]
+mod config;
+
+#[allow(clippy::missing_const_for_fn, reason = "main cannot be const")]
 fn main() {}
