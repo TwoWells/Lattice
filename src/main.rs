@@ -18,5 +18,10 @@ mod frontmatter;
     reason = "foundation modules — consumers land in upcoming tickets"
 )]
 mod markdown;
+#[allow(
+    dead_code,
+    reason = "foundation modules — consumers land in upcoming tickets"
+)]
+mod workspace;
 
 fn main() {}
