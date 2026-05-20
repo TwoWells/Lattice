@@ -212,7 +212,7 @@ fn is_markdown_ext(path: &Path) -> bool {
 
 /// Normalize a path by resolving `.` and `..` components without
 /// touching the filesystem.
-fn normalize_path(path: &Path) -> PathBuf {
+pub fn normalize_path(path: &Path) -> PathBuf {
     let mut parts: Vec<Component<'_>> = Vec::new();
     for c in path.components() {
         match c {

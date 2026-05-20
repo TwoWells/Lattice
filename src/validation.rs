@@ -3,13 +3,15 @@
 
 //! Link graph validation.
 //!
-//! Checks forward links across the workspace: target existence, predicate
-//! vocabulary, and predicate policy compliance.
+//! Checks forward links and backlink consistency across the workspace:
+//! target existence, predicate vocabulary, predicate policy compliance,
+//! and frontmatter backlink reconciliation.
 
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use crate::config::{Config, PredicatePolicy};
-use crate::markdown::LinkKind;
+use crate::markdown::{self, LinkKind};
 use crate::workspace::Workspace;
 
 /// Diagnostic severity level.
@@ -146,6 +148,142 @@ fn check_predicate(
                     severity: Severity::Error,
                     message: format!("link missing predicate: choose from [{}]", known.join(", ")),
                 });
+            }
+        }
+    }
+}
+
+/// Validate backlink consistency across the workspace.
+///
+/// Computes expected backlinks from forward links, diffs against actual
+/// frontmatter, and emits warnings for missing or stale backlinks.
+/// Returns an empty list when `backlinks = false` in the policy.
+pub fn validate_backlinks(workspace: &Workspace) -> Vec<Diagnostic> {
+    if !workspace.config().policy.backlinks {
+        return Vec::new();
+    }
+
+    let expected = build_expected_backlinks(workspace);
+    let mut diagnostics = Vec::new();
+
+    check_missing_backlinks(workspace, &expected, &mut diagnostics);
+    check_stale_backlinks(workspace, &expected, &mut diagnostics);
+
+    diagnostics.sort_by(|a, b| a.file.cmp(&b.file).then(a.line.cmp(&b.line)));
+    diagnostics
+}
+
+/// Build expected backlinks from all forward links in the workspace.
+///
+/// Returns a map: target file → { inverse predicate → set of source files }.
+/// All paths are workspace-relative.
+fn build_expected_backlinks(
+    workspace: &Workspace,
+) -> HashMap<PathBuf, HashMap<String, BTreeSet<PathBuf>>> {
+    let config = workspace.config();
+    let mut expected: HashMap<PathBuf, HashMap<String, BTreeSet<PathBuf>>> = HashMap::new();
+
+    for (source_path, file_data) in workspace.files() {
+        for link in &file_data.links {
+            if let LinkKind::IntraProject {
+                target, predicate, ..
+            } = &link.kind
+            {
+                // Skip broken targets and unknown predicates — forward validation handles those.
+                if workspace.file(target).is_none() {
+                    continue;
+                }
+                let Some(inverse) = config.inverse_of(predicate) else {
+                    continue;
+                };
+
+                expected
+                    .entry(target.clone())
+                    .or_default()
+                    .entry(inverse.to_string())
+                    .or_default()
+                    .insert(source_path.clone());
+            }
+        }
+    }
+
+    expected
+}
+
+/// Emit warnings for expected backlinks missing from frontmatter.
+fn check_missing_backlinks(
+    workspace: &Workspace,
+    expected: &HashMap<PathBuf, HashMap<String, BTreeSet<PathBuf>>>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    for (target_path, expected_backlinks) in expected {
+        let file_data = workspace.file(target_path);
+        let actual = file_data
+            .and_then(|f| f.frontmatter.as_ref())
+            .map(|fm| &fm.backlinks);
+
+        let line = file_data
+            .and_then(|f| f.frontmatter.as_ref())
+            .map_or(1, |fm| fm.start_line);
+
+        for (inverse_pred, expected_sources) in expected_backlinks {
+            let actual_sources: BTreeSet<PathBuf> = actual
+                .and_then(|a| a.get(inverse_pred.as_str()))
+                .map(|paths| {
+                    paths
+                        .iter()
+                        .map(|p| markdown::normalize_path(Path::new(p)))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            for source in expected_sources {
+                if !actual_sources.contains(source) {
+                    diagnostics.push(Diagnostic {
+                        file: target_path.clone(),
+                        line,
+                        severity: Severity::Warning,
+                        message: format!(
+                            "expected backlink `{inverse_pred}` from `{}`",
+                            source.display()
+                        ),
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// Emit warnings for frontmatter backlinks with no corresponding forward link.
+fn check_stale_backlinks(
+    workspace: &Workspace,
+    expected: &HashMap<PathBuf, HashMap<String, BTreeSet<PathBuf>>>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    for (file_path, file_data) in workspace.files() {
+        let Some(fm) = &file_data.frontmatter else {
+            continue;
+        };
+
+        for (inverse_pred, sources) in &fm.backlinks {
+            let expected_sources = expected
+                .get(file_path)
+                .and_then(|e| e.get(inverse_pred.as_str()));
+
+            for source_str in sources {
+                let source_path = markdown::normalize_path(Path::new(source_str));
+                let is_expected = expected_sources.is_some_and(|set| set.contains(&source_path));
+
+                if !is_expected {
+                    diagnostics.push(Diagnostic {
+                        file: file_path.clone(),
+                        line: fm.start_line,
+                        severity: Severity::Warning,
+                        message: format!(
+                            "backlink `{inverse_pred}` from `{source_str}` has no corresponding forward link"
+                        ),
+                    });
+                }
             }
         }
     }
@@ -385,6 +523,216 @@ predicates = \"required\"
         assert!(
             diags.iter().all(|d| d.severity != Severity::Error),
             "no errors for valid cross-directory link: {diags:?}"
+        );
+    }
+
+    // --- Backlink validation ---
+
+    #[test]
+    fn backlink_present_no_warning() {
+        let target = "\
+---
+backlinks:
+  referenced_by:
+    - index.md
+---
+# Target
+";
+        let (_dir, ws) = setup_workspace(&[
+            ("index.md", r#"[target](target.md "references")"#),
+            ("target.md", target),
+        ]);
+
+        let diags = validate_backlinks(&ws);
+        assert!(
+            diags.is_empty(),
+            "no warnings when backlink is present: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn missing_backlink_warning() {
+        let (_dir, ws) = setup_workspace(&[
+            ("index.md", r#"[target](target.md "supersedes")"#),
+            ("target.md", "# Target\n"),
+        ]);
+
+        let diags = validate_backlinks(&ws);
+        let warnings: Vec<_> = diags
+            .iter()
+            .filter(|d| d.severity == Severity::Warning)
+            .collect();
+
+        assert_eq!(warnings.len(), 1, "one warning for missing backlink");
+        assert!(
+            warnings[0].message.contains("superseded_by"),
+            "message names the inverse predicate: {}",
+            warnings[0].message
+        );
+        assert!(
+            warnings[0].message.contains("index.md"),
+            "message names the source file: {}",
+            warnings[0].message
+        );
+        assert_eq!(
+            warnings[0].file,
+            Path::new("target.md"),
+            "diagnostic is on the target file"
+        );
+    }
+
+    #[test]
+    fn stale_backlink_warning() {
+        let target = "\
+---
+backlinks:
+  superseded_by:
+    - ghost.md
+---
+# Target
+";
+        let (_dir, ws) = setup_workspace(&[("target.md", target)]);
+
+        let diags = validate_backlinks(&ws);
+        let warnings: Vec<_> = diags
+            .iter()
+            .filter(|d| d.severity == Severity::Warning)
+            .collect();
+
+        assert_eq!(warnings.len(), 1, "one warning for stale backlink");
+        assert!(
+            warnings[0]
+                .message
+                .contains("no corresponding forward link"),
+            "message describes staleness: {}",
+            warnings[0].message
+        );
+        assert!(
+            warnings[0].message.contains("ghost.md"),
+            "message names the stale source: {}",
+            warnings[0].message
+        );
+    }
+
+    #[test]
+    fn default_predicate_generates_referenced_by_backlink() {
+        let (_dir, ws) = setup_workspace(&[
+            ("index.md", "[target](target.md)"),
+            ("target.md", "# Target\n"),
+        ]);
+
+        let diags = validate_backlinks(&ws);
+        let warnings: Vec<_> = diags
+            .iter()
+            .filter(|d| d.severity == Severity::Warning)
+            .collect();
+
+        assert_eq!(warnings.len(), 1, "one warning for missing backlink");
+        assert!(
+            warnings[0].message.contains("referenced_by"),
+            "implicit references produces referenced_by backlink: {}",
+            warnings[0].message
+        );
+    }
+
+    #[test]
+    fn backlinks_disabled_skips_checking() {
+        let config_toml = "\
+[policy]
+backlinks = false
+";
+        let (_dir, ws) = setup_workspace(&[
+            (".lattice.toml", config_toml),
+            ("index.md", r#"[target](target.md "supersedes")"#),
+            ("target.md", "# Target\n"),
+        ]);
+
+        let diags = validate_backlinks(&ws);
+        assert!(
+            diags.is_empty(),
+            "no diagnostics when backlinks disabled: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn multiple_backlinks_from_different_files() {
+        let target = "\
+---
+backlinks:
+  superseded_by:
+    - a.md
+---
+# Target
+";
+        let (_dir, ws) = setup_workspace(&[
+            ("a.md", r#"[target](target.md "supersedes")"#),
+            ("b.md", r#"[target](target.md "supersedes")"#),
+            ("target.md", target),
+        ]);
+
+        let diags = validate_backlinks(&ws);
+        let warnings: Vec<_> = diags
+            .iter()
+            .filter(|d| d.severity == Severity::Warning)
+            .collect();
+
+        assert_eq!(
+            warnings.len(),
+            1,
+            "one missing backlink (a.md present, b.md missing): {warnings:?}"
+        );
+        assert!(
+            warnings[0].message.contains("b.md"),
+            "warning is about the missing source: {}",
+            warnings[0].message
+        );
+    }
+
+    #[test]
+    fn cross_directory_backlinks() {
+        let target = "\
+---
+backlinks:
+  referenced_by:
+    - docs/guide.md
+---
+# README
+";
+        let (_dir, ws) = setup_workspace(&[
+            ("docs/guide.md", r#"[readme](../README.md "references")"#),
+            ("README.md", target),
+        ]);
+
+        let diags = validate_backlinks(&ws);
+        assert!(
+            diags.is_empty(),
+            "no warnings for correct cross-directory backlink: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn broken_forward_link_does_not_expect_backlink() {
+        let (_dir, ws) =
+            setup_workspace(&[("index.md", r#"[missing](nonexistent.md "supersedes")"#)]);
+
+        let diags = validate_backlinks(&ws);
+        assert!(
+            diags.is_empty(),
+            "no backlink warnings for broken forward links: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn unknown_predicate_does_not_expect_backlink() {
+        let (_dir, ws) = setup_workspace(&[
+            ("index.md", r#"[target](target.md "invented")"#),
+            ("target.md", "# Target\n"),
+        ]);
+
+        let diags = validate_backlinks(&ws);
+        assert!(
+            diags.is_empty(),
+            "no backlink warnings for unknown predicates: {diags:?}"
         );
     }
 }
