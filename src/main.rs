@@ -5,9 +5,13 @@
 
 #[allow(
     dead_code,
-    reason = "foundation module — consumers land in upcoming tickets"
+    reason = "foundation modules — consumers land in upcoming tickets"
 )]
 mod config;
+#[allow(
+    dead_code,
+    reason = "foundation modules — consumers land in upcoming tickets"
+)]
+mod markdown;
 
-#[allow(clippy::missing_const_for_fn, reason = "main cannot be const")]
 fn main() {}

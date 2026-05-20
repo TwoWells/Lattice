@@ -36,12 +36,16 @@ allow_attributes_without_reason = "deny"
 # Dependencies
 multiple_crate_versions = "allow"
 
+# Nursery false positives
+missing_const_for_fn = "allow"
+
 # Documentation
 missing_errors_doc = "warn"
 missing_panics_doc = "warn"
 missing_safety_doc = "warn"
 
 [dependencies]
+pulldown-cmark = "0.12"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 toml = "0.8"
