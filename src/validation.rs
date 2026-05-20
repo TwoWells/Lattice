@@ -210,6 +210,42 @@ fn build_expected_backlinks(
     expected
 }
 
+/// Resolve a backlink path (file-relative) to a workspace-relative path.
+///
+/// Backlink paths in frontmatter are relative to the file containing them,
+/// just like forward link targets. This joins the containing file's parent
+/// directory with the backlink path and normalizes the result.
+fn resolve_backlink_path(containing_file: &Path, backlink_path: &str) -> PathBuf {
+    let dir = containing_file.parent().unwrap_or_else(|| Path::new(""));
+    markdown::normalize_path(&dir.join(backlink_path))
+}
+
+/// Compute the relative path from one file to another.
+///
+/// Both paths must be workspace-relative. Returns the path you would write
+/// in `from`'s frontmatter to reference `to` — relative to `from`'s
+/// parent directory.
+fn file_relative(from: &Path, to: &Path) -> PathBuf {
+    let from_dir = from.parent().unwrap_or_else(|| Path::new(""));
+    let from_parts: Vec<_> = from_dir.components().collect();
+    let to_parts: Vec<_> = to.components().collect();
+
+    let common = from_parts
+        .iter()
+        .zip(&to_parts)
+        .take_while(|(a, b)| a == b)
+        .count();
+
+    let mut result = PathBuf::new();
+    for _ in common..from_parts.len() {
+        result.push("..");
+    }
+    for part in &to_parts[common..] {
+        result.push(part);
+    }
+    result
+}
+
 /// Emit warnings for expected backlinks missing from frontmatter.
 fn check_missing_backlinks(
     workspace: &Workspace,
@@ -232,20 +268,21 @@ fn check_missing_backlinks(
                 .map(|paths| {
                     paths
                         .iter()
-                        .map(|p| markdown::normalize_path(Path::new(p)))
+                        .map(|p| resolve_backlink_path(target_path, p))
                         .collect()
                 })
                 .unwrap_or_default();
 
             for source in expected_sources {
                 if !actual_sources.contains(source) {
+                    let rel = file_relative(target_path, source);
                     diagnostics.push(Diagnostic {
                         file: target_path.clone(),
                         line,
                         severity: Severity::Warning,
                         message: format!(
                             "expected backlink `{inverse_pred}` from `{}`",
-                            source.display()
+                            rel.display()
                         ),
                     });
                 }
@@ -271,8 +308,8 @@ fn check_stale_backlinks(
                 .and_then(|e| e.get(inverse_pred.as_str()));
 
             for source_str in sources {
-                let source_path = markdown::normalize_path(Path::new(source_str));
-                let is_expected = expected_sources.is_some_and(|set| set.contains(&source_path));
+                let resolved = resolve_backlink_path(file_path, source_str);
+                let is_expected = expected_sources.is_some_and(|set| set.contains(&resolved));
 
                 if !is_expected {
                     diagnostics.push(Diagnostic {
@@ -689,7 +726,7 @@ backlinks:
     }
 
     #[test]
-    fn cross_directory_backlinks() {
+    fn cross_directory_backlink_to_root() {
         let target = "\
 ---
 backlinks:
@@ -707,6 +744,71 @@ backlinks:
         assert!(
             diags.is_empty(),
             "no warnings for correct cross-directory backlink: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn cross_directory_backlink_to_subdir() {
+        let target = "\
+---
+backlinks:
+  referenced_by:
+    - ../index.md
+---
+# API
+";
+        let (_dir, ws) = setup_workspace(&[
+            ("index.md", r#"[api](docs/api.md "references")"#),
+            ("docs/api.md", target),
+        ]);
+
+        let diags = validate_backlinks(&ws);
+        assert!(
+            diags.is_empty(),
+            "no warnings when backlink uses file-relative path: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn same_directory_backlink() {
+        let target = "\
+---
+backlinks:
+  superseded_by:
+    - guide.md
+---
+# API
+";
+        let (_dir, ws) = setup_workspace(&[
+            ("docs/guide.md", r#"[api](api.md "supersedes")"#),
+            ("docs/api.md", target),
+        ]);
+
+        let diags = validate_backlinks(&ws);
+        assert!(
+            diags.is_empty(),
+            "no warnings when same-directory backlink uses bare filename: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn missing_backlink_message_shows_file_relative_path() {
+        let (_dir, ws) = setup_workspace(&[
+            ("index.md", r#"[api](docs/api.md "supersedes")"#),
+            ("docs/api.md", "# API\n"),
+        ]);
+
+        let diags = validate_backlinks(&ws);
+        let warnings: Vec<_> = diags
+            .iter()
+            .filter(|d| d.severity == Severity::Warning)
+            .collect();
+
+        assert_eq!(warnings.len(), 1, "one warning for missing backlink");
+        assert!(
+            warnings[0].message.contains("../index.md"),
+            "message shows file-relative path, not workspace-relative: {}",
+            warnings[0].message
         );
     }
 
