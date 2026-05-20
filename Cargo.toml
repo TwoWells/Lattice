@@ -47,6 +47,7 @@ missing_safety_doc = "warn"
 [dependencies]
 pulldown-cmark = "0.12"
 serde = { version = "1", features = ["derive"] }
+serde_yaml_ng = "0.10"
 thiserror = "2"
 toml = "0.8"
 

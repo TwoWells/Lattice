@@ -12,6 +12,11 @@ mod config;
     dead_code,
     reason = "foundation modules — consumers land in upcoming tickets"
 )]
+mod frontmatter;
+#[allow(
+    dead_code,
+    reason = "foundation modules — consumers land in upcoming tickets"
+)]
 mod markdown;
 
 fn main() {}
