@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Commit-msg hook: enforce conventional commits format.
+# See https://www.conventionalcommits.org/
+set -euo pipefail
+
+msg=$(head -1 "$1")
+
+# Pattern: type(scope): description  OR  type: description
+# Types: feat, fix, docs, style, refactor, perf, test, build, ci, chore, revert
+pattern='^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\(.+\))?(!)?: .+'
+
+if ! echo "$msg" | grep -qE "$pattern"; then
+    echo "error: commit message does not follow conventional commits format"
+    echo ""
+    echo "  Expected: type(scope): description"
+    echo "  Example:  feat(backlinks): add frontmatter consistency check"
+    echo "  Example:  fix: correct title text extraction"
+    echo ""
+    echo "  Types: feat, fix, docs, style, refactor, perf, test, build, ci, chore, revert"
+    echo ""
+    echo "  Got: $msg"
+    exit 1
+fi
