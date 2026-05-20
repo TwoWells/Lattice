@@ -55,6 +55,8 @@ pub enum LinkKind {
         fragment: Option<String>,
         /// Predicate from title text, or `"references"` if absent.
         predicate: String,
+        /// Whether the predicate was explicitly set via title text.
+        explicit_predicate: bool,
     },
 }
 
@@ -173,15 +175,17 @@ fn build_link(url: &str, title: &str, file_path: &Path, line: usize) -> Option<L
         let target = normalize_path(&parent.join(path_str));
 
         if is_markdown_ext(&target) {
-            let predicate = if title.is_empty() {
-                "references".to_string()
-            } else {
+            let explicit_predicate = !title.is_empty();
+            let predicate = if explicit_predicate {
                 title.to_string()
+            } else {
+                "references".to_string()
             };
             LinkKind::IntraProject {
                 target,
                 fragment,
                 predicate,
+                explicit_predicate,
             }
         } else {
             LinkKind::NonMarkdown { target }
@@ -424,10 +428,12 @@ mod tests {
                 target,
                 predicate,
                 fragment,
+                explicit_predicate,
             } => {
                 assert_eq!(target, Path::new("decisions/26.md"), "target path");
                 assert_eq!(predicate, "supersedes", "predicate");
                 assert!(fragment.is_none(), "no fragment");
+                assert!(explicit_predicate, "predicate was explicit");
             }
             other => panic!("expected IntraProject, got {other:?}"),
         }
@@ -443,10 +449,14 @@ mod tests {
         assert_eq!(doc.links.len(), 1, "should find one link");
         match &doc.links[0].kind {
             LinkKind::IntraProject {
-                target, predicate, ..
+                target,
+                predicate,
+                explicit_predicate,
+                ..
             } => {
                 assert_eq!(target, Path::new("decisions/26.md"), "target");
                 assert_eq!(predicate, "supersedes", "predicate from definition");
+                assert!(explicit_predicate, "predicate was explicit");
             }
             other => panic!("expected IntraProject, got {other:?}"),
         }
@@ -458,8 +468,13 @@ mod tests {
 
         assert_eq!(doc.links.len(), 1, "should find one link");
         match &doc.links[0].kind {
-            LinkKind::IntraProject { predicate, .. } => {
+            LinkKind::IntraProject {
+                predicate,
+                explicit_predicate,
+                ..
+            } => {
                 assert_eq!(predicate, "references", "default predicate");
+                assert!(!explicit_predicate, "predicate was implicit");
             }
             other => panic!("expected IntraProject, got {other:?}"),
         }
@@ -478,10 +493,12 @@ mod tests {
                 target,
                 fragment,
                 predicate,
+                explicit_predicate,
             } => {
                 assert_eq!(target, Path::new("other.md"), "target");
                 assert_eq!(fragment.as_deref(), Some("context"), "fragment");
                 assert_eq!(predicate, "supersedes", "predicate");
+                assert!(explicit_predicate, "predicate was explicit");
             }
             other => panic!("expected IntraProject, got {other:?}"),
         }

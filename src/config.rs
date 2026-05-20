@@ -6,7 +6,7 @@
 //! Loads `.lattice.toml` if present, merging with built-in defaults.
 //! Produces a resolved [`Config`] consumed by the rest of the system.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -104,7 +104,7 @@ impl Default for Policy {
 #[derive(Debug, Clone)]
 pub struct Config {
     /// Predicate vocabulary: forward predicate → inverse predicate.
-    pub predicates: HashMap<String, String>,
+    pub predicates: BTreeMap<String, String>,
     /// Policy settings.
     pub policy: Policy,
     /// Path to the `.lattice.toml` that was loaded, if any.
@@ -251,14 +251,14 @@ struct RawPolicy {
 // --- Helpers ---
 
 /// Built-in predicate vocabulary.
-fn default_predicates() -> HashMap<String, String> {
-    HashMap::from([
-        ("supersedes".into(), "superseded_by".into()),
-        ("implements".into(), "implemented_by".into()),
-        ("depends_on".into(), "dependency_of".into()),
+fn default_predicates() -> BTreeMap<String, String> {
+    BTreeMap::from([
         ("amends".into(), "amended_by".into()),
         ("blocks".into(), "blocked_by".into()),
+        ("depends_on".into(), "dependency_of".into()),
+        ("implements".into(), "implemented_by".into()),
         ("references".into(), "referenced_by".into()),
+        ("supersedes".into(), "superseded_by".into()),
     ])
 }
 

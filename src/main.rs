@@ -3,25 +3,15 @@
 
 //! Lattice: a markdown predicate linter and backlink reconciler.
 
-#[allow(
-    dead_code,
-    reason = "foundation modules — consumers land in upcoming tickets"
-)]
+#[allow(dead_code, reason = "consumers land in upcoming server/CLI tickets")]
 mod config;
-#[allow(
-    dead_code,
-    reason = "foundation modules — consumers land in upcoming tickets"
-)]
+#[allow(dead_code, reason = "consumers land in upcoming server/CLI tickets")]
 mod frontmatter;
-#[allow(
-    dead_code,
-    reason = "foundation modules — consumers land in upcoming tickets"
-)]
+#[allow(dead_code, reason = "consumers land in upcoming server/CLI tickets")]
 mod markdown;
-#[allow(
-    dead_code,
-    reason = "foundation modules — consumers land in upcoming tickets"
-)]
+#[allow(dead_code, reason = "consumers land in upcoming server/CLI tickets")]
+mod validation;
+#[allow(dead_code, reason = "consumers land in upcoming server/CLI tickets")]
 mod workspace;
 
 fn main() {}
