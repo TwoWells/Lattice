@@ -18,6 +18,8 @@ pub struct ParsedDocument {
     pub links: Vec<Link>,
     /// All headings found in the document.
     pub headings: Vec<Heading>,
+    /// Bare file paths found in prose text.
+    pub bare_paths: Vec<BarePath>,
 }
 
 /// A link extracted from a markdown document.
@@ -60,6 +62,16 @@ pub enum LinkKind {
     },
 }
 
+/// A bare file path found in document text (not inside a link, code block, or
+/// inline code).
+#[derive(Debug)]
+pub struct BarePath {
+    /// 1-based line number in the source.
+    pub line: usize,
+    /// The detected path text.
+    pub path: String,
+}
+
 /// A heading extracted from a markdown document.
 #[derive(Debug)]
 pub struct Heading {
@@ -99,9 +111,12 @@ pub fn parse_document(content: &str, file_path: &Path) -> ParsedDocument {
 
     let mut links = Vec::new();
     let mut headings = Vec::new();
+    let mut bare_paths = Vec::new();
     let mut slugs = SlugCounts::new();
 
     let mut in_heading = false;
+    let mut in_code_block = false;
+    let mut in_link = false;
     let mut heading_text = String::new();
     let mut heading_start: Option<(u8, Option<String>, usize)> = None;
 
@@ -110,18 +125,32 @@ pub fn parse_document(content: &str, file_path: &Path) -> ParsedDocument {
             Event::Start(Tag::Link {
                 dest_url, title, ..
             }) => {
+                in_link = true;
                 let line = byte_offset_to_line(content, range.start);
                 if let Some(link) = build_link(&dest_url, &title, file_path, line) {
                     links.push(link);
                 }
+            }
+            Event::End(TagEnd::Link) => {
+                in_link = false;
+            }
+            Event::Start(Tag::CodeBlock(_)) => {
+                in_code_block = true;
+            }
+            Event::End(TagEnd::CodeBlock) => {
+                in_code_block = false;
             }
             Event::Start(Tag::Heading { level, id, .. }) => {
                 in_heading = true;
                 heading_text.clear();
                 heading_start = Some((level_to_u8(level), id.map(|s| s.to_string()), range.start));
             }
-            Event::Text(text) | Event::Code(text) if in_heading => {
-                heading_text.push_str(&text);
+            Event::Text(ref text) | Event::Code(ref text) if in_heading => {
+                heading_text.push_str(text);
+            }
+            Event::Text(ref text) if !in_code_block && !in_link => {
+                let base_line = byte_offset_to_line(content, range.start);
+                scan_bare_paths(text, base_line, &mut bare_paths);
             }
             Event::SoftBreak | Event::HardBreak if in_heading => {
                 heading_text.push(' ');
@@ -151,7 +180,11 @@ pub fn parse_document(content: &str, file_path: &Path) -> ParsedDocument {
         }
     }
 
-    ParsedDocument { links, headings }
+    ParsedDocument {
+        links,
+        headings,
+        bare_paths,
+    }
 }
 
 // --- Link helpers ---
@@ -402,6 +435,35 @@ fn deduplicate(base: String, slugs: &mut HashMap<String, usize>) -> String {
     }
     slugs.insert(slug.clone(), 0);
     slug
+}
+
+// --- Bare path detection ---
+
+const BARE_PATH_EXTENSIONS: &[&str] = &[".md", ".png", ".jpg", ".svg", ".pdf"];
+
+/// Scan a text fragment for bare file paths and append them to `out`.
+fn scan_bare_paths(text: &str, base_line: usize, out: &mut Vec<BarePath>) {
+    for (line_idx, line_text) in text.split('\n').enumerate() {
+        for word in line_text.split_whitespace() {
+            let cleaned = word
+                .trim_start_matches(['(', '[', '"', '\''])
+                .trim_end_matches([',', '.', ';', ':', '!', '?', ')', ']', '"', '\'']);
+
+            if is_bare_path(cleaned) {
+                out.push(BarePath {
+                    line: base_line + line_idx,
+                    path: cleaned.to_string(),
+                });
+            }
+        }
+    }
+}
+
+/// Check whether a string looks like a bare file path.
+///
+/// Must contain at least one `/` and end with a known file extension.
+fn is_bare_path(s: &str) -> bool {
+    s.contains('/') && BARE_PATH_EXTENSIONS.iter().any(|ext| s.ends_with(ext))
 }
 
 #[cfg(test)]

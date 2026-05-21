@@ -14,7 +14,7 @@ use thiserror::Error;
 
 use crate::config::{Config, ConfigError};
 use crate::frontmatter::{self, BacklinkDiagnostic, Frontmatter, FrontmatterError};
-use crate::markdown::{self, Heading, Link, ParsedDocument};
+use crate::markdown::{self, BarePath, Heading, Link, ParsedDocument};
 
 /// Errors that can occur during workspace operations.
 #[derive(Debug, Error)]
@@ -43,6 +43,8 @@ pub struct FileData {
     pub links: Vec<Link>,
     /// Headings extracted from the document body.
     pub headings: Vec<Heading>,
+    /// Bare file paths found in prose text.
+    pub bare_paths: Vec<BarePath>,
     /// Parsed frontmatter, if present.
     pub frontmatter: Option<Frontmatter>,
     /// Diagnostics from frontmatter parsing (unknown inverse predicates).
@@ -213,13 +215,18 @@ fn parse_file(
 ) -> Result<FileData, ParseFileError> {
     let content = std::fs::read_to_string(abs_path).map_err(ParseFileError::Read)?;
 
-    let ParsedDocument { links, headings } = markdown::parse_document(&content, rel_path);
+    let ParsedDocument {
+        links,
+        headings,
+        bare_paths,
+    } = markdown::parse_document(&content, rel_path);
     let fm_result =
         frontmatter::parse_frontmatter(&content, config).map_err(ParseFileError::Frontmatter)?;
 
     Ok(FileData {
         links,
         headings,
+        bare_paths,
         frontmatter: fm_result.frontmatter,
         backlink_diagnostics: fm_result.diagnostics,
     })
