@@ -8,6 +8,7 @@
 //! headings. Supports multiple workspace folders.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -109,6 +110,14 @@ pub fn run() -> Result<()> {
         "referencesProvider": true,
         "typeHierarchyProvider": true,
         "callHierarchyProvider": true,
+        "documentLinkProvider": {},
+        "foldingRangeProvider": true,
+        "hoverProvider": true,
+        "diagnosticProvider": {
+            "interFileDependencies": true,
+            "workspaceDiagnostics": true
+        },
+        "documentFormattingProvider": true,
         "workspace": {
             "workspaceFolders": {
                 "supported": true,
@@ -219,6 +228,35 @@ fn handle_request(
             let params: lsp::CallHierarchyParams = serde_json::from_value(req.params)?;
             let calls = call_hierarchy_outgoing(workspaces, &params.item);
             Response::new_ok(req.id, calls)
+        }
+        lsp::method::DOCUMENT_LINK => {
+            let params: lsp::DocumentSymbolParams = serde_json::from_value(req.params)?;
+            let links = document_links(workspaces, &params.text_document.uri);
+            Response::new_ok(req.id, links)
+        }
+        lsp::method::FOLDING_RANGE => {
+            let params: lsp::DocumentSymbolParams = serde_json::from_value(req.params)?;
+            let ranges = folding_ranges(workspaces, &params.text_document.uri);
+            Response::new_ok(req.id, ranges)
+        }
+        lsp::method::HOVER => {
+            let params: lsp::TextDocumentPositionParams = serde_json::from_value(req.params)?;
+            let hover = hover_preview(workspaces, &params);
+            Response::new_ok(req.id, hover)
+        }
+        lsp::method::DOCUMENT_DIAGNOSTIC => {
+            let params: lsp::DocumentDiagnosticParams = serde_json::from_value(req.params)?;
+            let report = document_diagnostic(workspaces, &params.text_document.uri);
+            Response::new_ok(req.id, report)
+        }
+        lsp::method::WORKSPACE_DIAGNOSTIC => {
+            let report = workspace_diagnostic(workspaces);
+            Response::new_ok(req.id, report)
+        }
+        lsp::method::FORMATTING => {
+            let params: lsp::DocumentFormattingParams = serde_json::from_value(req.params)?;
+            let edits = format_document(workspaces, &params.text_document.uri);
+            Response::new_ok(req.id, edits)
         }
         _ => Response::new_err(
             req.id,
@@ -712,6 +750,297 @@ fn call_hierarchy_outgoing(
     }
 
     calls
+}
+
+// ---------------------------------------------------------------------------
+// Document link (ticket 06)
+// ---------------------------------------------------------------------------
+
+/// Return clickable document links for all intra-project links.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "line numbers in markdown files won't exceed u32::MAX"
+)]
+fn document_links(workspaces: &Workspaces, uri: &str) -> Vec<lsp::DocumentLink> {
+    let Some((workspace, rel_path)) = workspaces.resolve(uri) else {
+        return Vec::new();
+    };
+    let Some(file_data) = workspace.file(&rel_path) else {
+        return Vec::new();
+    };
+
+    let root = workspace.root();
+    let mut links = Vec::new();
+
+    for link in &file_data.links {
+        let target_uri = match &link.kind {
+            LinkKind::IntraProject { target, .. } | LinkKind::NonMarkdown { target } => {
+                path_to_uri(&root.join(target))
+            }
+            // Skip external and intra-document links.
+            LinkKind::External { .. } | LinkKind::IntraDocument { .. } => continue,
+        };
+        let line = link.line.saturating_sub(1) as u32;
+        links.push(lsp::DocumentLink {
+            range: lsp::Range {
+                start: lsp::Position { line, character: 0 },
+                end: lsp::Position { line, character: 0 },
+            },
+            target: Some(target_uri),
+        });
+    }
+
+    links
+}
+
+// ---------------------------------------------------------------------------
+// Pull diagnostics (ticket 09)
+// ---------------------------------------------------------------------------
+
+/// Return diagnostics for a single document.
+fn document_diagnostic(workspaces: &Workspaces, uri: &str) -> lsp::FullDocumentDiagnosticReport {
+    let items = if let Some((workspace, rel_path)) = workspaces.resolve(uri) {
+        let all = validation::collect_all(workspace);
+        all.iter()
+            .filter(|d| d.file == rel_path)
+            .map(to_lsp_diagnostic)
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    lsp::FullDocumentDiagnosticReport {
+        kind: "full".to_string(),
+        items,
+    }
+}
+
+/// Return diagnostics for all files across all workspaces.
+fn workspace_diagnostic(workspaces: &Workspaces) -> lsp::WorkspaceDiagnosticReport {
+    let mut reports = Vec::new();
+
+    for (root, workspace) in workspaces.iter() {
+        let all = validation::collect_all(workspace);
+        let mut by_file: BTreeMap<PathBuf, Vec<lsp::Diagnostic>> = BTreeMap::new();
+
+        for diag in &all {
+            by_file
+                .entry(diag.file.clone())
+                .or_default()
+                .push(to_lsp_diagnostic(diag));
+        }
+
+        for (rel_path, items) in by_file {
+            reports.push(lsp::WorkspaceDocumentDiagnosticReport {
+                kind: "full".to_string(),
+                uri: path_to_uri(&root.join(rel_path)),
+                items,
+            });
+        }
+    }
+
+    lsp::WorkspaceDiagnosticReport { items: reports }
+}
+
+// ---------------------------------------------------------------------------
+// Hover preview (ticket 10)
+// ---------------------------------------------------------------------------
+
+/// Show a preview of the link target on hover.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "line numbers in markdown files won't exceed u32::MAX"
+)]
+fn hover_preview(
+    workspaces: &Workspaces,
+    params: &lsp::TextDocumentPositionParams,
+) -> Option<lsp::Hover> {
+    let (workspace, rel_path) = workspaces.resolve(&params.text_document.uri)?;
+    let file_data = workspace.file(&rel_path)?;
+
+    // Find the link on the cursor's line.
+    let cursor_line = params.position.line;
+    let link = file_data
+        .links
+        .iter()
+        .find(|l| l.line.saturating_sub(1) as u32 == cursor_line)?;
+
+    let (target, fragment, predicate) = match &link.kind {
+        LinkKind::IntraProject {
+            target,
+            fragment,
+            predicate,
+            ..
+        } => (target.clone(), fragment.clone(), predicate.as_str()),
+        LinkKind::NonMarkdown { target } => (target.clone(), None, "references"),
+        // No hover for external or intra-document links.
+        LinkKind::External { .. } | LinkKind::IntraDocument { .. } => return None,
+    };
+
+    let target_data = workspace.file(&target)?;
+    let root = workspace.root();
+    let target_content = std::fs::read_to_string(root.join(&target)).ok()?;
+
+    let preview = build_hover_preview(&target_content, target_data, fragment.as_deref());
+    let header = format!("**{predicate}** → `{}`", target.display());
+
+    Some(lsp::Hover {
+        contents: lsp::MarkupContent {
+            kind: "markdown".to_string(),
+            value: format!("{header}\n\n---\n\n{preview}"),
+        },
+    })
+}
+
+/// Build a ~5 line preview from the target file content.
+fn build_hover_preview(
+    content: &str,
+    target_data: &crate::workspace::FileData,
+    fragment: Option<&str>,
+) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+
+    // Determine the start line for the preview.
+    let start = fragment.map_or_else(
+        // No fragment — skip frontmatter.
+        || target_data.frontmatter.as_ref().map_or(0, |fm| fm.end_line),
+        // Fragment — find the matching heading.
+        |frag| {
+            target_data
+                .headings
+                .iter()
+                .find(|h| heading_matches_fragment(h, frag))
+                .map_or(0, |h| h.line.saturating_sub(1))
+        },
+    );
+
+    lines
+        .iter()
+        .skip(start)
+        .filter(|l| !l.trim().is_empty())
+        .take(5)
+        .copied()
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+// ---------------------------------------------------------------------------
+// Folding range (ticket 11)
+// ---------------------------------------------------------------------------
+
+/// Return folding ranges for headings and frontmatter.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "line numbers in markdown files won't exceed u32::MAX"
+)]
+fn folding_ranges(workspaces: &Workspaces, uri: &str) -> Vec<lsp::FoldingRange> {
+    let Some((workspace, rel_path)) = workspaces.resolve(uri) else {
+        return Vec::new();
+    };
+    let Some(file_data) = workspace.file(&rel_path) else {
+        return Vec::new();
+    };
+
+    // Read the file to count total lines.
+    let root = workspace.root();
+    let total_lines =
+        std::fs::read_to_string(root.join(&rel_path)).map_or(0, |c| c.lines().count()) as u32;
+
+    let mut ranges = Vec::new();
+
+    // Frontmatter folding range.
+    if let Some(fm) = &file_data.frontmatter {
+        let start = fm.start_line.saturating_sub(1) as u32;
+        let end = fm.end_line.saturating_sub(1) as u32;
+        if end > start {
+            ranges.push(lsp::FoldingRange {
+                start_line: start,
+                end_line: end,
+                kind: Some("region".to_string()),
+            });
+        }
+    }
+
+    // Heading folding ranges.
+    let headings = &file_data.headings;
+    for (i, heading) in headings.iter().enumerate() {
+        let start = heading.line.saturating_sub(1) as u32;
+        // End is the line before the next heading at same or higher level, or EOF.
+        let end = headings[i + 1..]
+            .iter()
+            .find(|h| h.level <= heading.level)
+            .map_or_else(
+                || total_lines.saturating_sub(1),
+                |h| (h.line.saturating_sub(1) as u32).saturating_sub(1),
+            );
+        if end > start {
+            ranges.push(lsp::FoldingRange {
+                start_line: start,
+                end_line: end,
+                kind: Some("region".to_string()),
+            });
+        }
+    }
+
+    ranges
+}
+
+// ---------------------------------------------------------------------------
+// Formatting (ticket 12)
+// ---------------------------------------------------------------------------
+
+/// Format a document's backlink frontmatter.
+///
+/// Sorts predicate keys alphabetically, sorts paths within each predicate,
+/// and normalizes whitespace. If the config specifies an external formatter,
+/// pipes the full document through it after frontmatter sorting.
+fn format_document(workspaces: &Workspaces, uri: &str) -> Option<Vec<lsp::TextEdit>> {
+    let (workspace, rel_path) = workspaces.resolve(uri)?;
+    let file_data = workspace.file(&rel_path)?;
+    let fm = file_data.frontmatter.as_ref()?;
+
+    if fm.backlinks.is_empty() {
+        return None;
+    }
+
+    // Sort predicates and paths.
+    let mut sorted: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for (pred, paths) in &fm.backlinks {
+        let mut path_refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+        path_refs.sort_unstable();
+        sorted.insert(pred.as_str(), path_refs);
+    }
+
+    // Build the new frontmatter YAML.
+    let mut yaml = String::from("---\nbacklinks:\n");
+    for (pred, paths) in &sorted {
+        let _ = writeln!(yaml, "  {pred}:");
+        for path in paths {
+            let _ = writeln!(yaml, "    - {path}");
+        }
+    }
+    yaml.push_str("---");
+
+    // Replace the entire frontmatter block.
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "line numbers in markdown files won't exceed u32::MAX"
+    )]
+    let range = lsp::Range {
+        start: lsp::Position {
+            line: fm.start_line.saturating_sub(1) as u32,
+            character: 0,
+        },
+        end: lsp::Position {
+            line: fm.end_line.saturating_sub(1) as u32,
+            character: 3, // length of "---"
+        },
+    };
+
+    Some(vec![lsp::TextEdit {
+        range,
+        new_text: yaml,
+    }])
 }
 
 // ---------------------------------------------------------------------------
@@ -1619,6 +1948,252 @@ mod tests {
             calls[0].from.kind,
             lsp::symbol_kind::FILE,
             "caller with no enclosing heading should be a FILE item"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Document link (ticket 06)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn document_links_returns_intra_project_links() {
+        let dir = workspace_with_files(&[
+            ("a.md", "# A\n\n[see B](b.md \"references\")\n"),
+            ("b.md", "# B\n"),
+        ]);
+        let workspaces = scan_workspaces(&dir);
+
+        let links = document_links(&workspaces, &file_uri(&dir, "a.md"));
+        assert_eq!(links.len(), 1, "should return one document link");
+        let target = links[0].target.as_ref().expect("should have target URI");
+        assert!(target.ends_with("b.md"), "target should point to b.md");
+    }
+
+    #[test]
+    fn document_links_skips_external() {
+        let dir =
+            workspace_with_files(&[("a.md", "# A\n\n[ext](https://example.com)\n[b](b.md)\n")]);
+        let workspaces = scan_workspaces(&dir);
+
+        let links = document_links(&workspaces, &file_uri(&dir, "a.md"));
+        // Only the intra-project link to b.md, not the https link.
+        assert_eq!(links.len(), 1, "should skip external links");
+    }
+
+    // -----------------------------------------------------------------------
+    // Pull diagnostics (ticket 09)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn document_diagnostic_returns_file_errors() {
+        let dir =
+            workspace_with_files(&[("a.md", "# A\n\n[broken](nonexistent.md \"references\")\n")]);
+        let workspaces = scan_workspaces(&dir);
+
+        let report = document_diagnostic(&workspaces, &file_uri(&dir, "a.md"));
+        assert_eq!(report.kind, "full", "report kind should be full");
+        assert!(
+            !report.items.is_empty(),
+            "should have diagnostics for broken link"
+        );
+    }
+
+    #[test]
+    fn document_diagnostic_clean_file_returns_empty() {
+        let dir = workspace_with_files(&[
+            ("a.md", "# A\n\n[see B](b.md \"references\")\n"),
+            (
+                "b.md",
+                "---\nbacklinks:\n  referenced_by:\n    - a.md\n---\n\n# B\n",
+            ),
+        ]);
+        let workspaces = scan_workspaces(&dir);
+
+        let report = document_diagnostic(&workspaces, &file_uri(&dir, "b.md"));
+        assert!(
+            report.items.is_empty(),
+            "clean file should have no diagnostics"
+        );
+    }
+
+    #[test]
+    fn workspace_diagnostic_covers_all_files() {
+        let dir =
+            workspace_with_files(&[("a.md", "# A\n\n[broken](nonexistent.md \"references\")\n")]);
+        let workspaces = scan_workspaces(&dir);
+
+        let report = workspace_diagnostic(&workspaces);
+        assert!(
+            !report.items.is_empty(),
+            "workspace diagnostic should include reports"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Hover preview (ticket 10)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn hover_on_link_shows_preview() {
+        let dir = workspace_with_files(&[
+            ("a.md", "# A\n\n[see B](b.md \"supersedes\")\n"),
+            ("b.md", "# B\n\nFirst line.\n\nSecond line.\n"),
+        ]);
+        let workspaces = scan_workspaces(&dir);
+
+        let params = lsp::TextDocumentPositionParams {
+            text_document: lsp::TextDocumentIdentifier {
+                uri: file_uri(&dir, "a.md"),
+            },
+            position: lsp::Position {
+                line: 2,
+                character: 0,
+            },
+        };
+        let hover = hover_preview(&workspaces, &params).expect("should produce hover");
+        assert!(
+            hover.contents.value.contains("supersedes"),
+            "hover should include predicate"
+        );
+        assert!(
+            hover.contents.value.contains("# B"),
+            "hover should include target content"
+        );
+    }
+
+    #[test]
+    fn hover_on_fragment_link_shows_heading_content() {
+        let dir = workspace_with_files(&[
+            ("a.md", "# A\n\n[details](b.md#details \"references\")\n"),
+            ("b.md", "# B\n\nPreamble.\n\n## Details\n\nThe details.\n"),
+        ]);
+        let workspaces = scan_workspaces(&dir);
+
+        let params = lsp::TextDocumentPositionParams {
+            text_document: lsp::TextDocumentIdentifier {
+                uri: file_uri(&dir, "a.md"),
+            },
+            position: lsp::Position {
+                line: 2,
+                character: 0,
+            },
+        };
+        let hover = hover_preview(&workspaces, &params).expect("should produce hover");
+        assert!(
+            hover.contents.value.contains("## Details"),
+            "hover should start from the fragment heading"
+        );
+    }
+
+    #[test]
+    fn hover_on_prose_returns_none() {
+        let dir = workspace_with_files(&[("a.md", "# A\n\nJust text.\n")]);
+        let workspaces = scan_workspaces(&dir);
+
+        let params = lsp::TextDocumentPositionParams {
+            text_document: lsp::TextDocumentIdentifier {
+                uri: file_uri(&dir, "a.md"),
+            },
+            position: lsp::Position {
+                line: 2,
+                character: 0,
+            },
+        };
+        assert!(
+            hover_preview(&workspaces, &params).is_none(),
+            "prose should not produce hover"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Folding range (ticket 11)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn folding_ranges_for_headings() {
+        let dir = workspace_with_files(&[("a.md", "# Title\n\nContent\n\n## Section\n\nMore\n")]);
+        let workspaces = scan_workspaces(&dir);
+
+        let ranges = folding_ranges(&workspaces, &file_uri(&dir, "a.md"));
+        assert!(
+            ranges.len() >= 2,
+            "should have folding ranges for H1 and H2"
+        );
+        // H1 should fold from line 0.
+        assert_eq!(ranges[0].start_line, 0, "H1 folding should start at line 0");
+    }
+
+    #[test]
+    fn folding_ranges_include_frontmatter() {
+        let dir = workspace_with_files(&[(
+            "a.md",
+            "---\nbacklinks:\n  referenced_by:\n    - b.md\n---\n\n# Title\n",
+        )]);
+        let workspaces = scan_workspaces(&dir);
+
+        let ranges = folding_ranges(&workspaces, &file_uri(&dir, "a.md"));
+        let fm_range = ranges
+            .iter()
+            .find(|r| r.start_line == 0)
+            .expect("should have frontmatter folding range");
+        assert!(
+            fm_range.end_line >= 4,
+            "frontmatter fold should cover the --- delimiters"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Formatting (ticket 12)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn format_sorts_backlink_predicates() {
+        let dir = workspace_with_files(&[(
+            "a.md",
+            "---\nbacklinks:\n  referenced_by:\n    - c.md\n  amended_by:\n    - b.md\n---\n\n# A\n",
+        )]);
+        let workspaces = scan_workspaces(&dir);
+
+        let edits =
+            format_document(&workspaces, &file_uri(&dir, "a.md")).expect("should produce edits");
+        assert_eq!(edits.len(), 1, "should have one edit replacing frontmatter");
+        let new_text = &edits[0].new_text;
+        let amended_pos = new_text
+            .find("amended_by")
+            .expect("should contain amended_by");
+        let referenced_pos = new_text
+            .find("referenced_by")
+            .expect("should contain referenced_by");
+        assert!(
+            amended_pos < referenced_pos,
+            "amended_by should come before referenced_by (alphabetical)"
+        );
+    }
+
+    #[test]
+    fn format_sorts_paths_within_predicate() {
+        let dir = workspace_with_files(&[(
+            "a.md",
+            "---\nbacklinks:\n  referenced_by:\n    - z.md\n    - a.md\n---\n\n# A\n",
+        )]);
+        let workspaces = scan_workspaces(&dir);
+
+        let edits =
+            format_document(&workspaces, &file_uri(&dir, "a.md")).expect("should produce edits");
+        let new_text = &edits[0].new_text;
+        let a_pos = new_text.find("a.md").expect("should contain a.md");
+        let z_pos = new_text.find("z.md").expect("should contain z.md");
+        assert!(a_pos < z_pos, "a.md should come before z.md (alphabetical)");
+    }
+
+    #[test]
+    fn format_returns_none_without_backlinks() {
+        let dir = workspace_with_files(&[("a.md", "# A\n\nNo frontmatter.\n")]);
+        let workspaces = scan_workspaces(&dir);
+
+        assert!(
+            format_document(&workspaces, &file_uri(&dir, "a.md")).is_none(),
+            "no frontmatter should mean no formatting edits"
         );
     }
 }

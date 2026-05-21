@@ -311,6 +311,88 @@ pub struct HierarchyItem {
     pub data: Option<serde_json::Value>,
 }
 
+/// A document link (ctrl-clickable).
+#[derive(Debug, Clone, Serialize)]
+pub struct DocumentLink {
+    /// Range of the link in the source document.
+    pub range: Range,
+    /// Target URI.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+}
+
+/// A folding range.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FoldingRange {
+    /// 0-based start line.
+    pub start_line: u32,
+    /// 0-based end line.
+    pub end_line: u32,
+    /// Folding range kind.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+}
+
+/// A hover result.
+#[derive(Debug, Clone, Serialize)]
+pub struct Hover {
+    /// Hover content.
+    pub contents: MarkupContent,
+}
+
+/// Markup content for hover.
+#[derive(Debug, Clone, Serialize)]
+pub struct MarkupContent {
+    /// Content kind ("markdown" or "plaintext").
+    pub kind: String,
+    /// The actual content.
+    pub value: String,
+}
+
+/// Full document diagnostic report.
+#[derive(Debug, Clone, Serialize)]
+pub struct FullDocumentDiagnosticReport {
+    /// Report kind — always "full".
+    pub kind: String,
+    /// Diagnostics.
+    pub items: Vec<Diagnostic>,
+}
+
+/// A single workspace document diagnostic report.
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkspaceDocumentDiagnosticReport {
+    /// Report kind — always "full".
+    pub kind: String,
+    /// Document URI.
+    pub uri: String,
+    /// Diagnostics.
+    pub items: Vec<Diagnostic>,
+}
+
+/// Workspace diagnostic report.
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkspaceDiagnosticReport {
+    /// Per-document reports.
+    pub items: Vec<WorkspaceDocumentDiagnosticReport>,
+}
+
+/// `textDocument/formatting` params.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DocumentFormattingParams {
+    /// The document to format.
+    pub text_document: TextDocumentIdentifier,
+}
+
+/// `textDocument/diagnostic` params.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DocumentDiagnosticParams {
+    /// The document to get diagnostics for.
+    pub text_document: TextDocumentIdentifier,
+}
+
 /// An incoming call.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -390,4 +472,16 @@ pub mod method {
     pub const CALL_HIERARCHY_INCOMING: &str = "callHierarchy/incomingCalls";
     /// `callHierarchy/outgoingCalls`.
     pub const CALL_HIERARCHY_OUTGOING: &str = "callHierarchy/outgoingCalls";
+    /// `textDocument/documentLink`.
+    pub const DOCUMENT_LINK: &str = "textDocument/documentLink";
+    /// `textDocument/foldingRange`.
+    pub const FOLDING_RANGE: &str = "textDocument/foldingRange";
+    /// `textDocument/hover`.
+    pub const HOVER: &str = "textDocument/hover";
+    /// `textDocument/diagnostic`.
+    pub const DOCUMENT_DIAGNOSTIC: &str = "textDocument/diagnostic";
+    /// `workspace/diagnostic`.
+    pub const WORKSPACE_DIAGNOSTIC: &str = "workspace/diagnostic";
+    /// `textDocument/formatting`.
+    pub const FORMATTING: &str = "textDocument/formatting";
 }
