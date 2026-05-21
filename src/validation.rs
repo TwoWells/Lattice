@@ -10,8 +10,8 @@
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
-use crate::config::{Config, PredicatePolicy};
-use crate::markdown::{self, LinkKind};
+use crate::config::{Config, FragmentAlgorithm, PredicatePolicy};
+use crate::markdown::{self, HeadingId, LinkKind};
 use crate::workspace::Workspace;
 
 /// Diagnostic severity level.
@@ -44,6 +44,7 @@ pub struct Diagnostic {
 /// - Target file existence.
 /// - Predicate membership in the configured vocabulary.
 /// - Predicate policy compliance (optional vs required).
+/// - Fragment resolution against headings in the target document.
 pub fn validate_forward_links(workspace: &Workspace) -> Vec<Diagnostic> {
     let config = workspace.config();
     let mut diagnostics = Vec::new();
@@ -59,9 +60,9 @@ pub fn validate_forward_links(workspace: &Workspace) -> Vec<Diagnostic> {
 
                 LinkKind::IntraProject {
                     target,
+                    fragment,
                     predicate,
                     explicit_predicate,
-                    ..
                 } => {
                     check_target_exists(workspace, file_path, link.line, target, &mut diagnostics);
                     check_predicate(
@@ -72,6 +73,17 @@ pub fn validate_forward_links(workspace: &Workspace) -> Vec<Diagnostic> {
                         *explicit_predicate,
                         &mut diagnostics,
                     );
+                    if let Some(frag) = fragment {
+                        check_fragment(
+                            workspace,
+                            config,
+                            file_path,
+                            link.line,
+                            target,
+                            frag,
+                            &mut diagnostics,
+                        );
+                    }
                 }
             }
         }
@@ -323,6 +335,58 @@ fn check_stale_backlinks(
                 }
             }
         }
+    }
+}
+
+/// Check that a fragment resolves to a heading in the target document.
+///
+/// Explicit `{#id}` anchors are checked first (exact match). For computed
+/// slugs, the algorithm policy determines which slugs are considered.
+/// Skips the check when the target file does not exist (forward link
+/// validation handles that case).
+fn check_fragment(
+    workspace: &Workspace,
+    config: &Config,
+    source: &Path,
+    line: usize,
+    target: &Path,
+    fragment: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let Some(target_data) = workspace.file(target) else {
+        return;
+    };
+
+    let algorithm = config.policy.fragments;
+
+    let found = target_data
+        .headings
+        .iter()
+        .any(|heading| match &heading.id {
+            HeadingId::Explicit(id) => id == fragment,
+            HeadingId::Computed {
+                github,
+                gitlab,
+                vscode,
+            } => match algorithm {
+                Some(FragmentAlgorithm::Github) => github == fragment,
+                Some(FragmentAlgorithm::Gitlab) => gitlab == fragment,
+                Some(FragmentAlgorithm::Vscode) => vscode == fragment,
+                None => github == fragment || gitlab == fragment || vscode == fragment,
+            },
+        });
+
+    if !found {
+        diagnostics.push(Diagnostic {
+            file: source.to_path_buf(),
+            line,
+            severity: Severity::Error,
+            message: format!(
+                "fragment `#{}` not found in `{}`",
+                fragment,
+                target.display()
+            ),
+        });
     }
 }
 
@@ -836,5 +900,201 @@ backlinks:
             diags.is_empty(),
             "no backlink warnings for unknown predicates: {diags:?}"
         );
+    }
+
+    // --- Fragment validation ---
+
+    #[test]
+    fn fragment_matches_explicit_anchor() {
+        let (_dir, ws) = setup_workspace(&[
+            ("index.md", r#"[context](target.md#my-anchor "references")"#),
+            ("target.md", "## Context {#my-anchor}\n"),
+        ]);
+
+        let diags = validate_forward_links(&ws);
+        assert!(
+            diags.is_empty(),
+            "no errors when fragment matches explicit anchor: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn fragment_matches_computed_slug() {
+        let (_dir, ws) = setup_workspace(&[
+            (
+                "index.md",
+                r#"[gs](target.md#getting-started "references")"#,
+            ),
+            ("target.md", "## Getting Started\n"),
+        ]);
+
+        let diags = validate_forward_links(&ws);
+        assert!(
+            diags.is_empty(),
+            "no errors when fragment matches computed slug: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn fragment_not_found_produces_error() {
+        let (_dir, ws) = setup_workspace(&[
+            ("index.md", r#"[ref](target.md#nonexistent "references")"#),
+            ("target.md", "## Introduction\n"),
+        ]);
+
+        let diags = validate_forward_links(&ws);
+        let errors: Vec<_> = diags
+            .iter()
+            .filter(|d| d.severity == Severity::Error)
+            .collect();
+
+        assert_eq!(errors.len(), 1, "one error for unresolved fragment");
+        assert!(
+            errors[0].message.contains("#nonexistent"),
+            "message includes the fragment: {}",
+            errors[0].message
+        );
+        assert!(
+            errors[0].message.contains("target.md"),
+            "message includes the target file: {}",
+            errors[0].message
+        );
+    }
+
+    #[test]
+    fn fragment_pinned_to_github_rejects_gitlab_only_slug() {
+        // "Héllo" → github slug "héllo", gitlab slug "hllo"
+        let config_toml = "\
+[policy]
+fragments = \"github\"
+";
+        let (_dir, ws) = setup_workspace(&[
+            (".lattice.toml", config_toml),
+            ("index.md", r#"[ref](target.md#hllo "references")"#),
+            ("target.md", "## Héllo\n"),
+        ]);
+
+        let diags = validate_forward_links(&ws);
+        let errors: Vec<_> = diags
+            .iter()
+            .filter(|d| d.severity == Severity::Error)
+            .collect();
+
+        assert_eq!(
+            errors.len(),
+            1,
+            "gitlab-only slug rejected when pinned to github"
+        );
+        assert!(
+            errors[0].message.contains("#hllo"),
+            "message includes the fragment: {}",
+            errors[0].message
+        );
+    }
+
+    #[test]
+    fn fragment_pinned_to_github_accepts_github_slug() {
+        // "Héllo" → github slug "héllo"
+        let config_toml = "\
+[policy]
+fragments = \"github\"
+";
+        let (_dir, ws) = setup_workspace(&[
+            (".lattice.toml", config_toml),
+            ("index.md", r#"[ref](target.md#héllo "references")"#),
+            ("target.md", "## Héllo\n"),
+        ]);
+
+        let diags = validate_forward_links(&ws);
+        assert!(
+            diags.is_empty(),
+            "github slug accepted when pinned to github: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn fragment_pinned_to_gitlab_accepts_gitlab_slug() {
+        // "Héllo" → gitlab slug "hllo"
+        let config_toml = "\
+[policy]
+fragments = \"gitlab\"
+";
+        let (_dir, ws) = setup_workspace(&[
+            (".lattice.toml", config_toml),
+            ("index.md", r#"[ref](target.md#hllo "references")"#),
+            ("target.md", "## Héllo\n"),
+        ]);
+
+        let diags = validate_forward_links(&ws);
+        assert!(
+            diags.is_empty(),
+            "gitlab slug accepted when pinned to gitlab: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn fragment_unpinned_accepts_any_algorithm() {
+        // "Héllo" → github "héllo", gitlab "hllo", vscode "héllo"
+        // With no pinned algorithm, "hllo" (gitlab-only) should still pass.
+        let (_dir, ws) = setup_workspace(&[
+            ("index.md", r#"[ref](target.md#hllo "references")"#),
+            ("target.md", "## Héllo\n"),
+        ]);
+
+        let diags = validate_forward_links(&ws);
+        assert!(
+            diags.is_empty(),
+            "gitlab-only slug accepted when no algorithm pinned: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn fragment_on_broken_target_skipped() {
+        let (_dir, ws) =
+            setup_workspace(&[("index.md", r#"[ref](missing.md#heading "references")"#)]);
+
+        let diags = validate_forward_links(&ws);
+        let fragment_errors: Vec<_> = diags
+            .iter()
+            .filter(|d| d.severity == Severity::Error && d.message.contains("fragment"))
+            .collect();
+
+        assert!(
+            fragment_errors.is_empty(),
+            "no fragment errors for broken targets: {fragment_errors:?}"
+        );
+    }
+
+    #[test]
+    fn fragment_on_file_with_no_headings() {
+        let (_dir, ws) = setup_workspace(&[
+            ("index.md", r#"[ref](target.md#something "references")"#),
+            ("target.md", "No headings here.\n"),
+        ]);
+
+        let diags = validate_forward_links(&ws);
+        let errors: Vec<_> = diags
+            .iter()
+            .filter(|d| d.severity == Severity::Error)
+            .collect();
+
+        assert_eq!(errors.len(), 1, "error when target has no headings at all");
+        assert!(
+            errors[0].message.contains("#something"),
+            "message includes the fragment: {}",
+            errors[0].message
+        );
+    }
+
+    #[test]
+    fn explicit_anchor_takes_priority_over_slug() {
+        // Heading has explicit anchor that differs from the computed slug.
+        let (_dir, ws) = setup_workspace(&[
+            ("index.md", r#"[ref](target.md#custom-id "references")"#),
+            ("target.md", "## Getting Started {#custom-id}\n"),
+        ]);
+
+        let diags = validate_forward_links(&ws);
+        assert!(diags.is_empty(), "explicit anchor matched: {diags:?}");
     }
 }
