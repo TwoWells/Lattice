@@ -76,10 +76,6 @@ pub struct BarePath {
 
 /// A heading extracted from a markdown document.
 #[derive(Debug)]
-#[allow(
-    dead_code,
-    reason = "line/level/text stored for LSP server diagnostics"
-)]
 pub struct Heading {
     /// 1-based line number in the source.
     pub line: usize,
