@@ -27,37 +27,12 @@ pub fn run(start: &Path, out: &mut impl Write) -> Result<bool> {
     let workspace = Workspace::scan(start).context("failed to scan workspace")?;
 
     // Config errors are hard failures in CLI mode.
-    #[allow(clippy::useless_let_if_seq, reason = "has_errors is mutated later")]
-    let mut has_errors = false;
-    if let Some(config_err) = workspace.config_error() {
-        writeln!(out, ".lattice.toml: error: {config_err}")?;
-        has_errors = true;
-    }
+    let mut has_errors = workspace.config_error().is_some_and(|config_err| {
+        let _ = writeln!(out, ".lattice.toml: error: {config_err}");
+        true
+    });
 
-    // Frontmatter parse errors.
-    for (path, err) in workspace.errors() {
-        writeln!(out, "{}: error: {err}", path.display())?;
-        has_errors = true;
-    }
-
-    let mut diagnostics = Vec::new();
-    diagnostics.extend(validation::validate_forward_links(&workspace));
-    diagnostics.extend(validation::validate_backlinks(&workspace));
-    diagnostics.extend(validation::validate_bare_paths(&workspace));
-
-    // Unknown inverse predicates in frontmatter backlink sections.
-    for (path, file_data) in workspace.files() {
-        for bd in &file_data.backlink_diagnostics {
-            diagnostics.push(Diagnostic {
-                file: path.clone(),
-                line: bd.line,
-                severity: Severity::Error,
-                message: format!("unknown inverse predicate `{}`", bd.predicate),
-            });
-        }
-    }
-
-    diagnostics.sort_by(|a, b| a.file.cmp(&b.file).then(a.line.cmp(&b.line)));
+    let diagnostics = validation::collect_all(&workspace);
 
     for diag in &diagnostics {
         if diag.severity == Severity::Error {

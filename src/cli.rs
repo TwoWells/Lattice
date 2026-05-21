@@ -32,4 +32,9 @@ pub enum Command {
         #[arg(default_value = ".")]
         path: PathBuf,
     },
+    /// Start the LSP server on stdio.
+    ///
+    /// Publishes diagnostics on file open, save, and change.
+    /// Diagnostic-only — no completions, hover, or other interactive features.
+    Serve,
 }

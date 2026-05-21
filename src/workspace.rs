@@ -21,10 +21,6 @@ use crate::markdown::{self, BarePath, Heading, Link, ParsedDocument};
 pub enum WorkspaceError {
     /// Failed to read a markdown file.
     #[error("failed to read {path}: {source}")]
-    #[allow(
-        dead_code,
-        reason = "constructed in Workspace::update, used by LSP server"
-    )]
     Read {
         /// Path that could not be read.
         path: PathBuf,
@@ -137,7 +133,6 @@ impl Workspace {
     /// # Errors
     ///
     /// Returns [`WorkspaceError::Read`] if the file exists but cannot be read.
-    #[allow(dead_code, reason = "used by LSP server for incremental re-indexing")]
     pub fn update(&mut self, rel_path: &Path) -> Result<(), WorkspaceError> {
         let abs_path = self.root.join(rel_path);
 
@@ -167,6 +162,25 @@ impl Workspace {
         }
 
         Ok(())
+    }
+
+    /// Update the index for a file using in-memory content.
+    ///
+    /// `rel_path` must be relative to the workspace root. The content is
+    /// parsed directly without reading from disk, which is used by the LSP
+    /// server for unsaved editor buffers.
+    pub fn update_content(&mut self, rel_path: &Path, content: &str) {
+        self.errors.remove(rel_path);
+
+        match parse_content(content, rel_path, &self.config) {
+            Ok(data) => {
+                self.files.insert(rel_path.to_path_buf(), data);
+            }
+            Err(e) => {
+                self.files.remove(rel_path);
+                self.errors.insert(rel_path.to_path_buf(), e);
+            }
+        }
     }
 
     /// The absolute path to the workspace root.
@@ -212,21 +226,28 @@ enum ParseFileError {
     Frontmatter(FrontmatterError),
 }
 
-/// Parse a single markdown file into [`FileData`].
+/// Parse a single markdown file from disk into [`FileData`].
 fn parse_file(
     abs_path: &Path,
     rel_path: &Path,
     config: &Config,
 ) -> Result<FileData, ParseFileError> {
     let content = std::fs::read_to_string(abs_path).map_err(ParseFileError::Read)?;
+    parse_content(&content, rel_path, config).map_err(ParseFileError::Frontmatter)
+}
 
+/// Parse markdown content into [`FileData`].
+fn parse_content(
+    content: &str,
+    rel_path: &Path,
+    config: &Config,
+) -> Result<FileData, FrontmatterError> {
     let ParsedDocument {
         links,
         headings,
         bare_paths,
-    } = markdown::parse_document(&content, rel_path);
-    let fm_result =
-        frontmatter::parse_frontmatter(&content, config).map_err(ParseFileError::Frontmatter)?;
+    } = markdown::parse_document(content, rel_path);
+    let fm_result = frontmatter::parse_frontmatter(content, config)?;
 
     Ok(FileData {
         links,
@@ -533,6 +554,38 @@ mod tests {
 
         let ws = Workspace::scan(dir.path()).expect("scan should succeed");
         assert_eq!(ws.files().len(), 2, "should find both .md and .MD files");
+    }
+
+    #[test]
+    fn update_content_replaces_file_data() {
+        let dir = workspace_with_files(&[("doc.md", "[link](other.md)\n")]);
+        let mut ws = Workspace::scan(dir.path()).expect("scan should succeed");
+
+        let data = ws.file(Path::new("doc.md")).expect("file should exist");
+        assert_eq!(data.links.len(), 1, "initial parse should find one link");
+
+        ws.update_content(Path::new("doc.md"), "# No links here\n");
+        let data = ws
+            .file(Path::new("doc.md"))
+            .expect("file should still exist");
+        assert!(
+            data.links.is_empty(),
+            "updated content should have no links"
+        );
+    }
+
+    #[test]
+    fn update_content_adds_new_file() {
+        let dir = workspace_with_files(&[("a.md", "# A\n")]);
+        let mut ws = Workspace::scan(dir.path()).expect("scan should succeed");
+        assert_eq!(ws.files().len(), 1, "should start with one file");
+
+        ws.update_content(Path::new("b.md"), "# B\n");
+        assert_eq!(ws.files().len(), 2, "should have two files after adding");
+        assert!(
+            ws.file(Path::new("b.md")).is_some(),
+            "new file should be indexed"
+        );
     }
 
     #[test]

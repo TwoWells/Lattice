@@ -419,6 +419,42 @@ pub fn validate_bare_paths(workspace: &Workspace) -> Vec<Diagnostic> {
     diagnostics
 }
 
+/// Collect all diagnostics for the workspace.
+///
+/// Runs every validation check (forward links, backlinks, bare paths),
+/// collects unknown inverse predicate errors from frontmatter, and
+/// includes frontmatter parse errors. Returns diagnostics sorted by
+/// file then line number.
+pub fn collect_all(workspace: &Workspace) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+    diagnostics.extend(validate_forward_links(workspace));
+    diagnostics.extend(validate_backlinks(workspace));
+    diagnostics.extend(validate_bare_paths(workspace));
+
+    for (path, file_data) in workspace.files() {
+        for bd in &file_data.backlink_diagnostics {
+            diagnostics.push(Diagnostic {
+                file: path.clone(),
+                line: bd.line,
+                severity: Severity::Error,
+                message: format!("unknown inverse predicate `{}`", bd.predicate),
+            });
+        }
+    }
+
+    for (path, err) in workspace.errors() {
+        diagnostics.push(Diagnostic {
+            file: path.clone(),
+            line: 1,
+            severity: Severity::Error,
+            message: format!("frontmatter error: {err}"),
+        });
+    }
+
+    diagnostics.sort_by(|a, b| a.file.cmp(&b.file).then(a.line.cmp(&b.line)));
+    diagnostics
+}
+
 #[cfg(test)]
 #[allow(
     clippy::expect_used,

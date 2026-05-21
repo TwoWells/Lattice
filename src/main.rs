@@ -13,6 +13,7 @@ mod config;
 mod frontmatter;
 mod lint;
 mod markdown;
+mod server;
 mod validation;
 mod workspace;
 
@@ -36,5 +37,12 @@ fn main() -> ExitCode {
                 }
             }
         }
+        cli::Command::Serve => match server::run() {
+            Ok(()) => ExitCode::from(0),
+            Err(e) => {
+                let _ = writeln!(io::stderr().lock(), "error: {e:#}");
+                ExitCode::from(1)
+            }
+        },
     }
 }
