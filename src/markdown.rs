@@ -37,11 +37,13 @@ pub enum LinkKind {
     /// External URL (`http://`, `https://`, `mailto:`).
     External {
         /// The raw URL.
+        #[allow(dead_code, reason = "stored for LSP server diagnostics")]
         url: String,
     },
     /// Intra-document fragment-only link (`#section`).
     IntraDocument {
         /// Fragment without the leading `#`.
+        #[allow(dead_code, reason = "stored for LSP server diagnostics")]
         fragment: String,
     },
     /// Link to a non-markdown file in the project.
@@ -74,6 +76,10 @@ pub struct BarePath {
 
 /// A heading extracted from a markdown document.
 #[derive(Debug)]
+#[allow(
+    dead_code,
+    reason = "line/level/text stored for LSP server diagnostics"
+)]
 pub struct Heading {
     /// 1-based line number in the source.
     pub line: usize,

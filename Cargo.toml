@@ -45,6 +45,8 @@ missing_panics_doc = "warn"
 missing_safety_doc = "warn"
 
 [dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
 ignore = "0.4"
 pulldown-cmark = "0.12"
 serde = { version = "1", features = ["derive"] }

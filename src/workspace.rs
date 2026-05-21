@@ -7,7 +7,7 @@
 //! an in-memory index of links, headings, and backlinks, and supports
 //! incremental updates when individual files change.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use thiserror::Error;
@@ -21,6 +21,10 @@ use crate::markdown::{self, BarePath, Heading, Link, ParsedDocument};
 pub enum WorkspaceError {
     /// Failed to read a markdown file.
     #[error("failed to read {path}: {source}")]
+    #[allow(
+        dead_code,
+        reason = "constructed in Workspace::update, used by LSP server"
+    )]
     Read {
         /// Path that could not be read.
         path: PathBuf,
@@ -61,9 +65,9 @@ pub struct Workspace {
     /// Error from loading `.lattice.toml`, if any. When set, defaults were used.
     config_error: Option<ConfigError>,
     /// Parsed file data, keyed by workspace-relative path.
-    files: HashMap<PathBuf, FileData>,
+    files: BTreeMap<PathBuf, FileData>,
     /// Files that had parse errors (frontmatter), keyed by relative path.
-    errors: HashMap<PathBuf, FrontmatterError>,
+    errors: BTreeMap<PathBuf, FrontmatterError>,
 }
 
 impl Workspace {
@@ -94,8 +98,8 @@ impl Workspace {
 
         let md_paths = discover_markdown_files(&root);
 
-        let mut files = HashMap::new();
-        let mut errors = HashMap::new();
+        let mut files = BTreeMap::new();
+        let mut errors = BTreeMap::new();
 
         for abs_path in md_paths {
             let rel_path = abs_path
@@ -133,6 +137,7 @@ impl Workspace {
     /// # Errors
     ///
     /// Returns [`WorkspaceError::Read`] if the file exists but cannot be read.
+    #[allow(dead_code, reason = "used by LSP server for incremental re-indexing")]
     pub fn update(&mut self, rel_path: &Path) -> Result<(), WorkspaceError> {
         let abs_path = self.root.join(rel_path);
 
@@ -184,7 +189,7 @@ impl Workspace {
     }
 
     /// Parsed file data for all successfully parsed files.
-    pub fn files(&self) -> &HashMap<PathBuf, FileData> {
+    pub fn files(&self) -> &BTreeMap<PathBuf, FileData> {
         &self.files
     }
 
@@ -194,7 +199,7 @@ impl Workspace {
     }
 
     /// Frontmatter parse errors, keyed by workspace-relative path.
-    pub fn errors(&self) -> &HashMap<PathBuf, FrontmatterError> {
+    pub fn errors(&self) -> &BTreeMap<PathBuf, FrontmatterError> {
         &self.errors
     }
 }
