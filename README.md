@@ -13,7 +13,7 @@ no database, everything in git.
 lattice lint
 
 # Run as an LSP server (used by editors)
-lattice
+lattice serve
 ```
 
 ## Git hook
