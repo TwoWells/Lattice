@@ -1062,15 +1062,15 @@ fn format_document(workspaces: &Workspaces, uri: &str) -> Option<Vec<lsp::TextEd
 }
 
 /// Run an external formatter command, piping content through stdin/stdout.
+///
+/// The command is passed to `sh -c` so shell features (pipes, quoted args,
+/// environment variables) work as expected.
 fn run_formatter(command: &str, content: &str) -> Option<String> {
     use std::io::Write as _;
     use std::process::{Command, Stdio};
 
-    let parts: Vec<&str> = command.split_whitespace().collect();
-    let (program, args) = parts.split_first()?;
-
-    let mut child = Command::new(program)
-        .args(args)
+    let mut child = Command::new("sh")
+        .args(["-c", command])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
