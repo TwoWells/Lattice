@@ -878,10 +878,8 @@ fn hover_preview(
     };
 
     let target_data = workspace.file(&target)?;
-    let root = workspace.root();
-    let target_content = std::fs::read_to_string(root.join(&target)).ok()?;
 
-    let preview = build_hover_preview(&target_content, target_data, fragment.as_deref());
+    let preview = build_hover_preview(&target_data.content, target_data, fragment.as_deref());
     let header = format!("**{predicate}** → `{}`", target.display());
 
     Some(lsp::Hover {
@@ -941,10 +939,7 @@ fn folding_ranges(workspaces: &Workspaces, uri: &str) -> Vec<lsp::FoldingRange> 
         return Vec::new();
     };
 
-    // Read the file to count total lines.
-    let root = workspace.root();
-    let total_lines =
-        std::fs::read_to_string(root.join(&rel_path)).map_or(0, |c| c.lines().count()) as u32;
+    let total_lines = file_data.content.lines().count() as u32;
 
     let mut ranges = Vec::new();
 
@@ -994,53 +989,109 @@ fn folding_ranges(workspaces: &Workspaces, uri: &str) -> Vec<lsp::FoldingRange> 
 /// Sorts predicate keys alphabetically, sorts paths within each predicate,
 /// and normalizes whitespace. If the config specifies an external formatter,
 /// pipes the full document through it after frontmatter sorting.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "line numbers in markdown files won't exceed u32::MAX"
+)]
 fn format_document(workspaces: &Workspaces, uri: &str) -> Option<Vec<lsp::TextEdit>> {
     let (workspace, rel_path) = workspaces.resolve(uri)?;
     let file_data = workspace.file(&rel_path)?;
-    let fm = file_data.frontmatter.as_ref()?;
 
-    if fm.backlinks.is_empty() {
+    let has_backlinks = file_data
+        .frontmatter
+        .as_ref()
+        .is_some_and(|fm| !fm.backlinks.is_empty());
+
+    let format_command = workspace.config().format_command.as_deref();
+
+    // Nothing to do if there are no backlinks to sort and no external formatter.
+    if !has_backlinks && format_command.is_none() {
         return None;
     }
 
-    // Sort predicates and paths.
-    let mut sorted: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
-    for (pred, paths) in &fm.backlinks {
-        let mut path_refs: Vec<&str> = paths.iter().map(String::as_str).collect();
-        path_refs.sort_unstable();
-        sorted.insert(pred.as_str(), path_refs);
-    }
-
-    // Build the new frontmatter YAML.
-    let mut yaml = String::from("---\nbacklinks:\n");
-    for (pred, paths) in &sorted {
-        let _ = writeln!(yaml, "  {pred}:");
-        for path in paths {
-            let _ = writeln!(yaml, "    - {path}");
+    // Step 1: Sort frontmatter backlinks.
+    let mut document = file_data.content.clone();
+    if let Some(fm) = &file_data.frontmatter
+        && !fm.backlinks.is_empty()
+    {
+        let mut sorted: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+        for (pred, paths) in &fm.backlinks {
+            let mut path_refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+            path_refs.sort_unstable();
+            sorted.insert(pred.as_str(), path_refs);
         }
-    }
-    yaml.push_str("---");
 
-    // Replace the entire frontmatter block.
-    #[allow(
-        clippy::cast_possible_truncation,
-        reason = "line numbers in markdown files won't exceed u32::MAX"
-    )]
+        let mut yaml = String::from("---\nbacklinks:\n");
+        for (pred, paths) in &sorted {
+            let _ = writeln!(yaml, "  {pred}:");
+            for path in paths {
+                let _ = writeln!(yaml, "    - {path}");
+            }
+        }
+        yaml.push_str("---");
+
+        document.replace_range(fm.byte_range.clone(), &yaml);
+    }
+
+    // Step 2: Pipe through external formatter if configured.
+    if let Some(cmd) = format_command
+        && let Some(formatted) = run_formatter(cmd, &document)
+    {
+        document = formatted;
+    }
+
+    // Replace the entire document.
+    let total_lines = file_data.content.lines().count() as u32;
+    let last_line_len = file_data.content.lines().last().map_or(0, str::len) as u32;
+
     let range = lsp::Range {
         start: lsp::Position {
-            line: fm.start_line.saturating_sub(1) as u32,
+            line: 0,
             character: 0,
         },
         end: lsp::Position {
-            line: fm.end_line.saturating_sub(1) as u32,
-            character: 3, // length of "---"
+            line: total_lines.saturating_sub(1),
+            character: last_line_len,
         },
     };
 
     Some(vec![lsp::TextEdit {
         range,
-        new_text: yaml,
+        new_text: document,
     }])
+}
+
+/// Run an external formatter command, piping content through stdin/stdout.
+fn run_formatter(command: &str, content: &str) -> Option<String> {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+
+    let parts: Vec<&str> = command.split_whitespace().collect();
+    let (program, args) = parts.split_first()?;
+
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(content.as_bytes());
+    }
+
+    let output = child.wait_with_output().ok()?;
+    if output.status.success() {
+        String::from_utf8(output.stdout).ok()
+    } else {
+        tracing::warn!(
+            "formatter exited with status {}: {}",
+            output.status,
+            command
+        );
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------

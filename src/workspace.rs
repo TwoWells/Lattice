@@ -39,6 +39,8 @@ pub enum WorkspaceError {
 /// Parsed data for a single markdown file.
 #[derive(Debug)]
 pub struct FileData {
+    /// Raw document content (from disk or editor buffer).
+    pub content: String,
     /// Links extracted from the document body.
     pub links: Vec<Link>,
     /// Headings extracted from the document body.
@@ -250,6 +252,7 @@ fn parse_content(
     let fm_result = frontmatter::parse_frontmatter(content, config)?;
 
     Ok(FileData {
+        content: content.to_string(),
         links,
         headings,
         bare_paths,

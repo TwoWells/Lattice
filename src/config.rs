@@ -107,6 +107,8 @@ pub struct Config {
     pub predicates: BTreeMap<String, String>,
     /// Policy settings.
     pub policy: Policy,
+    /// External formatter command for `textDocument/formatting`.
+    pub format_command: Option<String>,
 }
 
 impl Default for Config {
@@ -114,6 +116,7 @@ impl Default for Config {
         Self {
             predicates: default_predicates(),
             policy: Policy::default(),
+            format_command: None,
         }
     }
 }
@@ -199,6 +202,10 @@ impl Config {
             }
         }
 
+        if let Some(format) = raw.format {
+            config.format_command = format.command;
+        }
+
         Ok(config)
     }
 
@@ -224,6 +231,12 @@ impl Config {
 struct RawConfig {
     predicates: Option<HashMap<String, String>>,
     policy: Option<RawPolicy>,
+    format: Option<RawFormat>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawFormat {
+    command: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
