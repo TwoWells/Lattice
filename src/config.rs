@@ -107,8 +107,6 @@ pub struct Config {
     pub predicates: BTreeMap<String, String>,
     /// Policy settings.
     pub policy: Policy,
-    /// Path to the `.lattice.toml` that was loaded, if any.
-    pub file_path: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -116,7 +114,6 @@ impl Default for Config {
         Self {
             predicates: default_predicates(),
             policy: Policy::default(),
-            file_path: None,
         }
     }
 }
@@ -151,10 +148,7 @@ impl Config {
 
     /// Build a resolved config from raw TOML values, merging with defaults.
     fn from_raw(raw: RawConfig, path: PathBuf) -> Result<Self, ConfigError> {
-        let mut config = Self {
-            file_path: Some(path.clone()),
-            ..Self::default()
-        };
+        let mut config = Self::default();
 
         if let Some(predicates) = raw.predicates {
             for (forward, inverse) in &predicates {
@@ -221,14 +215,6 @@ impl Config {
     /// Returns the inverse for a forward predicate.
     pub fn inverse_of(&self, forward: &str) -> Option<&str> {
         self.predicates.get(forward).map(String::as_str)
-    }
-
-    /// Returns the forward predicate for an inverse predicate.
-    pub fn forward_of(&self, inverse: &str) -> Option<&str> {
-        self.predicates
-            .iter()
-            .find(|(_, v)| v.as_str() == inverse)
-            .map(|(k, _)| k.as_str())
     }
 }
 
@@ -334,7 +320,6 @@ mod tests {
 
         let config = Config::load(dir.path()).expect("load should succeed");
 
-        assert!(config.file_path.is_none(), "no config file should be found");
         assert_eq!(
             config.predicates.len(),
             6,
@@ -484,12 +469,11 @@ fragments = "gitlab"
     }
 
     #[test]
-    fn empty_config_returns_defaults_with_path() {
+    fn empty_config_returns_defaults() {
         let dir = temp_dir_with(Some(""));
 
         let config = Config::load(dir.path()).expect("load should succeed");
 
-        assert!(config.file_path.is_some(), "file_path should be set");
         assert_eq!(config.predicates.len(), 6, "defaults preserved");
         assert_eq!(
             config.policy.predicates,
@@ -511,7 +495,6 @@ fragments = "gitlab"
             PredicatePolicy::Required,
             "found config from parent"
         );
-        assert!(config.file_path.is_some(), "file_path set");
     }
 
     #[test]
@@ -529,10 +512,6 @@ fragments = "gitlab"
 
         let config = Config::load(&project).expect("load should succeed");
 
-        assert!(
-            config.file_path.is_none(),
-            "should not find config above git root"
-        );
         assert_eq!(
             config.policy.predicates,
             PredicatePolicy::Optional,
@@ -651,19 +630,9 @@ fragments = "gitlab"
             "inverse lookup"
         );
         assert_eq!(
-            config.forward_of("superseded_by"),
-            Some("supersedes"),
-            "forward lookup"
-        );
-        assert_eq!(
             config.inverse_of("unknown"),
             None,
             "unknown forward returns None"
-        );
-        assert_eq!(
-            config.forward_of("unknown"),
-            None,
-            "unknown inverse returns None"
         );
     }
 }

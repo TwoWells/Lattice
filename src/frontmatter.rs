@@ -40,10 +40,15 @@ pub struct BacklinkDiagnostic {
 #[derive(Debug)]
 pub struct Frontmatter {
     /// Byte range of the entire frontmatter block (including `---` delimiters).
+    #[allow(dead_code, reason = "used by formatting (ticket 12)")]
     pub byte_range: Range<usize>,
     /// 1-based line of the opening `---`.
     pub start_line: usize,
     /// 1-based line of the closing `---`.
+    #[allow(
+        dead_code,
+        reason = "used by folding range (ticket 11) and hover (ticket 10)"
+    )]
     pub end_line: usize,
     /// Parsed backlinks: inverse predicate → list of relative file paths.
     pub backlinks: HashMap<String, Vec<String>>,
