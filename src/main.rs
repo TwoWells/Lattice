@@ -12,6 +12,7 @@ mod cli;
 mod config;
 mod frontmatter;
 mod lint;
+mod lsp;
 mod markdown;
 mod server;
 mod validation;

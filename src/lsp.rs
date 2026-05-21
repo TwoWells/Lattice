@@ -1,0 +1,393 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Two Wells <contact@twowells.dev>
+
+//! Minimal LSP protocol types.
+//!
+//! Only the subset Lattice actually uses. Serialized/deserialized with serde
+//! to match the LSP JSON wire format.
+
+use serde::{Deserialize, Serialize};
+
+// ---------------------------------------------------------------------------
+// Primitives
+// ---------------------------------------------------------------------------
+
+/// 0-based line and character offset.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Position {
+    /// 0-based line number.
+    pub line: u32,
+    /// 0-based UTF-16 character offset.
+    pub character: u32,
+}
+
+/// A range in a text document.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Range {
+    /// Start position (inclusive).
+    pub start: Position,
+    /// End position (exclusive).
+    pub end: Position,
+}
+
+/// A location in a document.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Location {
+    /// Document URI.
+    pub uri: String,
+    /// Range within the document.
+    pub range: Range,
+}
+
+/// A text edit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TextEdit {
+    /// Range to replace.
+    pub range: Range,
+    /// Replacement text.
+    pub new_text: String,
+}
+
+// ---------------------------------------------------------------------------
+// Initialization
+// ---------------------------------------------------------------------------
+
+/// Subset of `InitializeParams` we read.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InitializeParams {
+    /// Workspace folders.
+    pub workspace_folders: Option<Vec<WorkspaceFolder>>,
+    /// Deprecated root URI fallback.
+    pub root_uri: Option<String>,
+}
+
+/// A workspace folder.
+#[derive(Debug, Deserialize)]
+pub struct WorkspaceFolder {
+    /// Folder URI.
+    pub uri: String,
+}
+
+// ---------------------------------------------------------------------------
+// Text document identification
+// ---------------------------------------------------------------------------
+
+/// Identifies a text document.
+#[derive(Debug, Deserialize)]
+pub struct TextDocumentIdentifier {
+    /// Document URI.
+    pub uri: String,
+}
+
+/// Identifies a versioned text document.
+#[derive(Debug, Deserialize)]
+pub struct VersionedTextDocumentIdentifier {
+    /// Document URI.
+    pub uri: String,
+}
+
+/// A text document item (full content).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TextDocumentItem {
+    /// Document URI.
+    pub uri: String,
+    /// Document content.
+    pub text: String,
+}
+
+/// Position in a text document.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TextDocumentPositionParams {
+    /// The document.
+    pub text_document: TextDocumentIdentifier,
+    /// The position.
+    pub position: Position,
+}
+
+// ---------------------------------------------------------------------------
+// Notifications
+// ---------------------------------------------------------------------------
+
+/// `textDocument/didOpen` params.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DidOpenTextDocumentParams {
+    /// The opened document.
+    pub text_document: TextDocumentItem,
+}
+
+/// `textDocument/didSave` params.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DidSaveTextDocumentParams {
+    /// The saved document.
+    pub text_document: TextDocumentIdentifier,
+    /// Full content if `includeText` was requested.
+    pub text: Option<String>,
+}
+
+/// `textDocument/didChange` params.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DidChangeTextDocumentParams {
+    /// The changed document.
+    pub text_document: VersionedTextDocumentIdentifier,
+    /// Content changes (we request FULL sync, so last entry has full text).
+    pub content_changes: Vec<TextDocumentContentChangeEvent>,
+}
+
+/// A content change event.
+#[derive(Debug, Deserialize)]
+pub struct TextDocumentContentChangeEvent {
+    /// The new text of the document (for FULL sync).
+    pub text: String,
+}
+
+/// `workspace/didChangeWorkspaceFolders` params.
+#[derive(Debug, Deserialize)]
+pub struct DidChangeWorkspaceFoldersParams {
+    /// The change event.
+    pub event: WorkspaceFoldersChangeEvent,
+}
+
+/// Workspace folder change event.
+#[derive(Debug, Deserialize)]
+pub struct WorkspaceFoldersChangeEvent {
+    /// Added folders.
+    pub added: Vec<WorkspaceFolder>,
+    /// Removed folders.
+    pub removed: Vec<WorkspaceFolder>,
+}
+
+// ---------------------------------------------------------------------------
+// Requests — params
+// ---------------------------------------------------------------------------
+
+/// `textDocument/documentSymbol` params.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DocumentSymbolParams {
+    /// The document.
+    pub text_document: TextDocumentIdentifier,
+}
+
+/// `workspace/symbol` params.
+#[derive(Debug, Deserialize)]
+pub struct WorkspaceSymbolParams {
+    /// Search query.
+    pub query: String,
+}
+
+/// `textDocument/rename` params.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RenameParams {
+    /// The document and position.
+    pub text_document: TextDocumentIdentifier,
+    /// The position.
+    pub position: Position,
+    /// The new name.
+    pub new_name: String,
+}
+
+/// `textDocument/references` params.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReferenceParams {
+    /// The document.
+    pub text_document: TextDocumentIdentifier,
+    /// The position.
+    pub position: Position,
+}
+
+/// `typeHierarchy/supertypes` or `typeHierarchy/subtypes` params.
+#[derive(Debug, Deserialize)]
+pub struct TypeHierarchyParams {
+    /// The item to resolve.
+    pub item: HierarchyItem,
+}
+
+/// `callHierarchy/incomingCalls` or `callHierarchy/outgoingCalls` params.
+#[derive(Debug, Deserialize)]
+pub struct CallHierarchyParams {
+    /// The item to resolve.
+    pub item: HierarchyItem,
+}
+
+// ---------------------------------------------------------------------------
+// Requests — responses
+// ---------------------------------------------------------------------------
+
+/// A document symbol with nested children.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DocumentSymbol {
+    /// Symbol name.
+    pub name: String,
+    /// Symbol kind (numeric LSP `SymbolKind`).
+    pub kind: u32,
+    /// Full range of the symbol.
+    pub range: Range,
+    /// Range of the symbol name for selection.
+    pub selection_range: Range,
+    /// Child symbols.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub children: Option<Vec<Self>>,
+}
+
+/// A flat symbol (workspace symbol results).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SymbolInformation {
+    /// Symbol name.
+    pub name: String,
+    /// Symbol kind.
+    pub kind: u32,
+    /// Location.
+    pub location: Location,
+    /// Container name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container_name: Option<String>,
+}
+
+/// A workspace edit.
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkspaceEdit {
+    /// URI → edits mapping.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub changes: Option<std::collections::HashMap<String, Vec<TextEdit>>>,
+}
+
+/// An LSP diagnostic.
+#[derive(Debug, Clone, Serialize)]
+pub struct Diagnostic {
+    /// Range.
+    pub range: Range,
+    /// Severity (1=Error, 2=Warning, 3=Information, 4=Hint).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub severity: Option<u32>,
+    /// Source identifier.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// Message.
+    pub message: String,
+}
+
+/// `textDocument/publishDiagnostics` params.
+#[derive(Debug, Serialize)]
+pub struct PublishDiagnosticsParams {
+    /// Document URI.
+    pub uri: String,
+    /// Diagnostics.
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+/// A hierarchy item used for both type hierarchy and call hierarchy.
+///
+/// Serialized/deserialized identically for both protocols — the LSP wire
+/// format is the same.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HierarchyItem {
+    /// Symbol name.
+    pub name: String,
+    /// Symbol kind.
+    pub kind: u32,
+    /// Document URI.
+    pub uri: String,
+    /// Full range.
+    pub range: Range,
+    /// Selection range.
+    pub selection_range: Range,
+    /// Optional detail string.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// Opaque data preserved between prepare and resolve.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<serde_json::Value>,
+}
+
+/// An incoming call.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CallHierarchyIncomingCall {
+    /// The calling item.
+    pub from: HierarchyItem,
+    /// Ranges in the caller where the call appears.
+    pub from_ranges: Vec<Range>,
+}
+
+/// An outgoing call.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CallHierarchyOutgoingCall {
+    /// The called item.
+    pub to: HierarchyItem,
+    /// Ranges in the current item where the call appears.
+    pub from_ranges: Vec<Range>,
+}
+
+// ---------------------------------------------------------------------------
+// LSP constants
+// ---------------------------------------------------------------------------
+
+/// LSP `SymbolKind` constants (subset).
+pub mod symbol_kind {
+    /// File.
+    pub const FILE: u32 = 1;
+    /// String (used for headings).
+    pub const STRING: u32 = 15;
+}
+
+/// LSP `DiagnosticSeverity` constants.
+pub mod diagnostic_severity {
+    /// Error.
+    pub const ERROR: u32 = 1;
+    /// Warning.
+    pub const WARNING: u32 = 2;
+    /// Information.
+    pub const INFORMATION: u32 = 3;
+}
+
+/// LSP method name constants.
+pub mod method {
+    // Notifications
+    /// `textDocument/didOpen`.
+    pub const DID_OPEN: &str = "textDocument/didOpen";
+    /// `textDocument/didSave`.
+    pub const DID_SAVE: &str = "textDocument/didSave";
+    /// `textDocument/didChange`.
+    pub const DID_CHANGE: &str = "textDocument/didChange";
+    /// `workspace/didChangeWorkspaceFolders`.
+    pub const DID_CHANGE_WORKSPACE_FOLDERS: &str = "workspace/didChangeWorkspaceFolders";
+    /// `textDocument/publishDiagnostics`.
+    pub const PUBLISH_DIAGNOSTICS: &str = "textDocument/publishDiagnostics";
+
+    // Requests
+    /// `textDocument/documentSymbol`.
+    pub const DOCUMENT_SYMBOL: &str = "textDocument/documentSymbol";
+    /// `workspace/symbol`.
+    pub const WORKSPACE_SYMBOL: &str = "workspace/symbol";
+    /// `textDocument/prepareRename`.
+    pub const PREPARE_RENAME: &str = "textDocument/prepareRename";
+    /// `textDocument/rename`.
+    pub const RENAME: &str = "textDocument/rename";
+    /// `textDocument/references`.
+    pub const REFERENCES: &str = "textDocument/references";
+    /// `textDocument/prepareTypeHierarchy`.
+    pub const PREPARE_TYPE_HIERARCHY: &str = "textDocument/prepareTypeHierarchy";
+    /// `typeHierarchy/supertypes`.
+    pub const TYPE_HIERARCHY_SUPERTYPES: &str = "typeHierarchy/supertypes";
+    /// `typeHierarchy/subtypes`.
+    pub const TYPE_HIERARCHY_SUBTYPES: &str = "typeHierarchy/subtypes";
+    /// `textDocument/prepareCallHierarchy`.
+    pub const PREPARE_CALL_HIERARCHY: &str = "textDocument/prepareCallHierarchy";
+    /// `callHierarchy/incomingCalls`.
+    pub const CALL_HIERARCHY_INCOMING: &str = "callHierarchy/incomingCalls";
+    /// `callHierarchy/outgoingCalls`.
+    pub const CALL_HIERARCHY_OUTGOING: &str = "callHierarchy/outgoingCalls";
+}
