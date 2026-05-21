@@ -16,6 +16,18 @@ lattice lint
 lattice
 ```
 
+## Git hook
+
+Add to `.githooks/pre-commit` or `.git/hooks/pre-commit`:
+
+```sh
+#!/bin/sh
+lattice lint
+```
+
+Commits with broken links, unknown predicates, or missing backlinks
+will be rejected.
+
 ## Configuration
 
 An optional `.lattice.toml` at the project root overrides defaults:
