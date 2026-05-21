@@ -36,6 +36,16 @@ bare_paths = "warn"        # or "deny", "disabled"
 # fragments = "github"    # or "gitlab", "vscode"; omit to try all
 ```
 
+## Agent instructions
+
+Add this to your project's `AGENTS.md` or `CLAUDE.md`:
+
+> Markdown links follow [Lattice](https://github.com/TwoWells/Lattice)
+> conventions: predicates are encoded in title text, e.g.
+> `[Doc](doc.md "supersedes")`. The predicate vocabulary is: supersedes,
+> implements, depends_on, amends, blocks, references. Backlinks are
+> maintained in YAML frontmatter.
+
 ## License
 
 AGPL-3.0-or-later. Commercial license available — contact [Two Wells](mailto:contact@twowells.dev).
