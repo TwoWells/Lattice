@@ -181,12 +181,18 @@ fn handle_request(
     workspaces: &Workspaces,
     req: lsp_server::Request,
 ) -> Result<()> {
-    if req.method == <DocumentSymbolRequest as lsp_types::request::Request>::METHOD {
+    let resp = if req.method == <DocumentSymbolRequest as lsp_types::request::Request>::METHOD {
         let params: lsp_types::DocumentSymbolParams = serde_json::from_value(req.params)?;
         let symbols = document_symbols(workspaces, &params.text_document.uri);
-        let resp = Response::new_ok(req.id, symbols);
-        connection.sender.send(Message::Response(resp))?;
-    }
+        Response::new_ok(req.id, symbols)
+    } else {
+        Response::new_err(
+            req.id,
+            lsp_server::ErrorCode::MethodNotFound as i32,
+            format!("method not found: {}", req.method),
+        )
+    };
+    connection.sender.send(Message::Response(resp))?;
     Ok(())
 }
 
