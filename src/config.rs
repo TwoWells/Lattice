@@ -256,6 +256,7 @@ fn default_predicates() -> BTreeMap<String, String> {
         ("blocks".into(), "blocked_by".into()),
         ("depends_on".into(), "dependency_of".into()),
         ("implements".into(), "implemented_by".into()),
+        ("imports".into(), "imported_by".into()),
         ("references".into(), "referenced_by".into()),
         ("supersedes".into(), "superseded_by".into()),
     ])
@@ -335,8 +336,8 @@ mod tests {
 
         assert_eq!(
             config.predicates.len(),
-            6,
-            "should have 6 default predicates"
+            7,
+            "should have 7 default predicates"
         );
         assert_eq!(
             config.inverse_of("supersedes"),
@@ -398,8 +399,8 @@ tracks = "tracked_by"
             "default references preserved"
         );
         assert!(
-            config.predicates.len() >= 7,
-            "at least 7 predicates (6 defaults + 1 new)"
+            config.predicates.len() >= 8,
+            "at least 8 predicates (7 defaults + 1 new)"
         );
     }
 
@@ -487,7 +488,7 @@ fragments = "gitlab"
 
         let config = Config::load(dir.path()).expect("load should succeed");
 
-        assert_eq!(config.predicates.len(), 6, "defaults preserved");
+        assert_eq!(config.predicates.len(), 7, "defaults preserved");
         assert_eq!(
             config.policy.predicates,
             PredicatePolicy::Optional,

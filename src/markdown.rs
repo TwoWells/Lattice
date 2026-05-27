@@ -152,6 +152,7 @@ pub fn parse_document(content: &str, file_path: &Path) -> ParsedDocument {
             }
             Event::Text(ref text) if !in_code_block && !in_link => {
                 let base_line = byte_offset_to_line(content, range.start);
+                scan_import_directives(text, base_line, file_path, &mut links);
                 scan_bare_paths(text, base_line, &mut bare_paths);
             }
             Event::SoftBreak | Event::HardBreak if in_heading => {
@@ -464,8 +465,72 @@ fn scan_bare_paths(text: &str, base_line: usize, out: &mut Vec<BarePath>) {
 /// Check whether a string looks like a bare file path.
 ///
 /// Must contain at least one `/` and end with a known file extension.
+/// Import directives (`@./path`) are excluded — they are recognized as links.
 fn is_bare_path(s: &str) -> bool {
-    s.contains('/') && BARE_PATH_EXTENSIONS.iter().any(|ext| s.ends_with(ext))
+    !is_import_directive(s)
+        && s.contains('/')
+        && BARE_PATH_EXTENSIONS.iter().any(|ext| s.ends_with(ext))
+}
+
+/// File extensions recognized in `@path` import directives.
+const IMPORT_EXTENSIONS: &[&str] = &[".json", ".md", ".toml", ".txt", ".xml", ".yaml", ".yml"];
+
+/// Check whether a string is an `@path` import directive.
+///
+/// Matches `@./path`, `@../path`, `@path/to/file.ext`, and `@file.ext`
+/// where the extension is in [`IMPORT_EXTENSIONS`]. Absolute paths
+/// (`@/...`, `@~/...`) are rejected.
+fn is_import_directive(s: &str) -> bool {
+    let Some(path) = s.strip_prefix('@') else {
+        return false;
+    };
+    is_import_path(path)
+}
+
+/// Check whether a path (after stripping `@`) looks like a relative import.
+///
+/// All forms require a known file extension from [`IMPORT_EXTENSIONS`].
+fn is_import_path(path: &str) -> bool {
+    if path.starts_with('/') || path.starts_with('~') {
+        return false;
+    }
+    if path.is_empty() {
+        return false;
+    }
+    IMPORT_EXTENSIONS.iter().any(|ext| path.ends_with(ext))
+}
+
+/// Scan a text fragment for `@path` import directives and append links.
+fn scan_import_directives(text: &str, base_line: usize, file_path: &Path, out: &mut Vec<Link>) {
+    let parent = file_path.parent().unwrap_or_else(|| Path::new(""));
+    for (line_idx, line_text) in text.split('\n').enumerate() {
+        for word in line_text.split_whitespace() {
+            let cleaned = word
+                .trim_start_matches(['(', '[', '"', '\''])
+                .trim_end_matches([',', '.', ';', ':', '!', '?', ')', ']', '"', '\'']);
+
+            let Some(path_str) = cleaned.strip_prefix('@') else {
+                continue;
+            };
+            if !is_import_path(path_str) {
+                continue;
+            }
+
+            let line = base_line + line_idx;
+            let target = normalize_path(&parent.join(path_str));
+            let kind = if is_markdown_ext(&target) {
+                LinkKind::IntraProject {
+                    target,
+                    fragment: None,
+                    predicate: "imports".to_string(),
+                    explicit_predicate: true,
+                }
+            } else {
+                LinkKind::NonMarkdown { target }
+            };
+            out.push(Link { line, kind });
+        }
+    }
 }
 
 #[cfg(test)]
@@ -798,5 +863,201 @@ mod tests {
         let second = deduplicate("foo".to_string(), &mut slugs);
         // "foo-1" is taken by the natural slug, so should skip to "foo-2"
         assert_eq!(second, "foo-2", "dedup skips taken foo-1");
+    }
+
+    // --- Import directive recognition ---
+
+    #[test]
+    fn import_directive_produces_imports_link() {
+        let doc = parse_document("@./AGENTS.md\n", Path::new("CLAUDE.md"));
+
+        assert_eq!(doc.links.len(), 1, "should find one link");
+        match &doc.links[0].kind {
+            LinkKind::IntraProject {
+                target,
+                predicate,
+                explicit_predicate,
+                fragment,
+            } => {
+                assert_eq!(target, Path::new("AGENTS.md"), "target path");
+                assert_eq!(predicate, "imports", "predicate");
+                assert!(explicit_predicate, "predicate is explicit");
+                assert!(fragment.is_none(), "no fragment");
+            }
+            other => panic!("expected IntraProject, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn import_directive_parent_path() {
+        let doc = parse_document("@../shared/AGENTS.md\n", Path::new("docs/CLAUDE.md"));
+
+        assert_eq!(doc.links.len(), 1, "should find one link");
+        match &doc.links[0].kind {
+            LinkKind::IntraProject { target, .. } => {
+                assert_eq!(target, Path::new("shared/AGENTS.md"), "resolved target");
+            }
+            other => panic!("expected IntraProject, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn import_directive_not_flagged_as_bare_path() {
+        let doc = parse_document("@./AGENTS.md\n", Path::new("CLAUDE.md"));
+
+        assert!(
+            doc.bare_paths.is_empty(),
+            "import directive should not be a bare path: {:?}",
+            doc.bare_paths
+        );
+    }
+
+    #[test]
+    fn import_directive_requires_whitespace_boundary() {
+        let doc = parse_document("user@./path.md\n", Path::new("index.md"));
+
+        assert!(
+            doc.links.is_empty(),
+            "user@./path should not be an import: {:?}",
+            doc.links
+        );
+    }
+
+    #[test]
+    fn import_directive_unknown_extension_ignored() {
+        let doc = parse_document("@./diagram.png\n", Path::new("index.md"));
+
+        assert!(
+            doc.links.is_empty(),
+            "unknown extension should not be an import: {:?}",
+            doc.links
+        );
+    }
+
+    #[test]
+    fn import_directive_in_code_block_skipped() {
+        let doc = parse_document("```\n@./AGENTS.md\n```\n", Path::new("index.md"));
+
+        assert!(
+            doc.links.is_empty(),
+            "import in code block should be skipped: {:?}",
+            doc.links
+        );
+    }
+
+    #[test]
+    fn import_directive_bare_at_dot_slash_ignored() {
+        let doc = parse_document("@./\n", Path::new("index.md"));
+
+        assert!(
+            doc.links.is_empty(),
+            "bare @./ with no filename should be skipped: {:?}",
+            doc.links
+        );
+    }
+
+    #[test]
+    fn import_directive_bare_relative_path() {
+        let doc = parse_document("@docs/guidelines.md\n", Path::new("CLAUDE.md"));
+
+        assert_eq!(doc.links.len(), 1, "should find one link");
+        match &doc.links[0].kind {
+            LinkKind::IntraProject {
+                target, predicate, ..
+            } => {
+                assert_eq!(target, Path::new("docs/guidelines.md"), "target path");
+                assert_eq!(predicate, "imports", "predicate");
+            }
+            other => panic!("expected IntraProject, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn import_directive_bare_relative_json() {
+        let doc = parse_document("@config/package.json\n", Path::new("CLAUDE.md"));
+
+        assert_eq!(doc.links.len(), 1, "should find one link");
+        match &doc.links[0].kind {
+            LinkKind::NonMarkdown { target } => {
+                assert_eq!(target, Path::new("config/package.json"), "target path");
+            }
+            other => panic!("expected NonMarkdown, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn import_directive_bare_relative_not_flagged_as_bare_path() {
+        let doc = parse_document("@docs/guidelines.md\n", Path::new("CLAUDE.md"));
+
+        assert!(
+            doc.bare_paths.is_empty(),
+            "import directive should not be a bare path: {:?}",
+            doc.bare_paths
+        );
+    }
+
+    #[test]
+    fn import_directive_bare_at_word_ignored() {
+        let doc = parse_document("Contact @username for help.\n", Path::new("index.md"));
+
+        assert!(
+            doc.links.is_empty(),
+            "@username should not be an import: {:?}",
+            doc.links
+        );
+    }
+
+    #[test]
+    fn import_directive_bare_at_org_repo_ignored() {
+        let doc = parse_document(
+            "See @anthropics/claude-code for details.\n",
+            Path::new("index.md"),
+        );
+
+        assert!(
+            doc.links.is_empty(),
+            "@org/repo without known extension should not be an import: {:?}",
+            doc.links
+        );
+    }
+
+    #[test]
+    fn import_directive_no_slash() {
+        let doc = parse_document("@README.md\n", Path::new("CLAUDE.md"));
+
+        assert_eq!(doc.links.len(), 1, "should find one link");
+        match &doc.links[0].kind {
+            LinkKind::IntraProject {
+                target, predicate, ..
+            } => {
+                assert_eq!(target, Path::new("README.md"), "target path");
+                assert_eq!(predicate, "imports", "predicate");
+            }
+            other => panic!("expected IntraProject, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn import_directive_no_slash_non_markdown() {
+        let doc = parse_document("@package.json\n", Path::new("CLAUDE.md"));
+
+        assert_eq!(doc.links.len(), 1, "should find one link");
+        match &doc.links[0].kind {
+            LinkKind::NonMarkdown { target } => {
+                assert_eq!(target, Path::new("package.json"), "target path");
+            }
+            other => panic!("expected NonMarkdown, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn import_directive_absolute_path_ignored() {
+        let doc = parse_document("@/home/user/file.md\n", Path::new("index.md"));
+
+        assert!(
+            doc.links.is_empty(),
+            "absolute path should not be an import: {:?}",
+            doc.links
+        );
     }
 }
