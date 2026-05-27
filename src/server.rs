@@ -2037,8 +2037,10 @@ mod tests {
 
     #[test]
     fn document_diagnostic_returns_file_errors() {
-        let dir =
-            workspace_with_files(&[("a.md", "# A\n\n[broken](nonexistent.md \"references\")\n")]);
+        let dir = workspace_with_files(&[
+            (".lattice.toml", ""),
+            ("a.md", "# A\n\n[broken](nonexistent.md \"references\")\n"),
+        ]);
         let workspaces = scan_workspaces(&dir);
 
         let report = document_diagnostic(&workspaces, &file_uri(&dir, "a.md"));
@@ -2052,6 +2054,7 @@ mod tests {
     #[test]
     fn document_diagnostic_clean_file_returns_empty() {
         let dir = workspace_with_files(&[
+            (".lattice.toml", ""),
             ("a.md", "# A\n\n[see B](b.md \"references\")\n"),
             (
                 "b.md",
@@ -2069,8 +2072,10 @@ mod tests {
 
     #[test]
     fn workspace_diagnostic_covers_all_files() {
-        let dir =
-            workspace_with_files(&[("a.md", "# A\n\n[broken](nonexistent.md \"references\")\n")]);
+        let dir = workspace_with_files(&[
+            (".lattice.toml", ""),
+            ("a.md", "# A\n\n[broken](nonexistent.md \"references\")\n"),
+        ]);
         let workspaces = scan_workspaces(&dir);
 
         let report = workspace_diagnostic(&workspaces);

@@ -62,6 +62,8 @@ pub struct Workspace {
     config: Config,
     /// Error from loading `.lattice.toml`, if any. When set, defaults were used.
     config_error: Option<ConfigError>,
+    /// Whether a `.lattice.toml` file was found in the workspace root.
+    has_config: bool,
     /// Parsed file data, keyed by workspace-relative path.
     files: BTreeMap<PathBuf, FileData>,
     /// Files that had parse errors (frontmatter), keyed by relative path.
@@ -85,6 +87,8 @@ impl Workspace {
         let root = find_workspace_root(start).ok_or_else(|| WorkspaceError::NoRoot {
             start: start.to_path_buf(),
         })?;
+
+        let has_config = root.join(".lattice.toml").is_file();
 
         let (config, config_error) = match Config::load(&root) {
             Ok(c) => (c, None),
@@ -122,6 +126,7 @@ impl Workspace {
             root,
             config,
             config_error,
+            has_config,
             files,
             errors,
         })
@@ -202,6 +207,14 @@ impl Workspace {
     /// the CLI should treat it as a hard error.
     pub fn config_error(&self) -> Option<&ConfigError> {
         self.config_error.as_ref()
+    }
+
+    /// Whether a `.lattice.toml` file was found in the workspace root.
+    ///
+    /// When `true`, graph validation (predicates, backlinks, bare paths) is
+    /// active. When `false`, Lattice acts as a code intelligence server only.
+    pub fn has_config(&self) -> bool {
+        self.has_config
     }
 
     /// Parsed file data for all successfully parsed files.
@@ -607,5 +620,32 @@ mod tests {
             ws.file(Path::new("README.md")).is_some(),
             "files should still be parsed with defaults"
         );
+    }
+
+    #[test]
+    fn has_config_true_when_lattice_toml_present() {
+        let dir = workspace_with_files(&[(".lattice.toml", ""), ("README.md", "# Root")]);
+
+        let ws = Workspace::scan(dir.path()).expect("scan should succeed");
+        assert!(ws.has_config(), "should detect .lattice.toml");
+    }
+
+    #[test]
+    fn has_config_false_when_no_lattice_toml() {
+        let dir = workspace_with_files(&[("README.md", "# Root")]);
+
+        let ws = Workspace::scan(dir.path()).expect("scan should succeed");
+        assert!(!ws.has_config(), "should detect absence of .lattice.toml");
+    }
+
+    #[test]
+    fn has_config_true_when_config_is_broken() {
+        let dir = workspace_with_files(&[
+            (".lattice.toml", "not valid toml {{{}}}"),
+            ("README.md", "# Root"),
+        ]);
+
+        let ws = Workspace::scan(dir.path()).expect("scan should succeed");
+        assert!(ws.has_config(), "broken config still means user opted in");
     }
 }

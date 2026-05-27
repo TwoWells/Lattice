@@ -26,6 +26,14 @@ use crate::workspace::Workspace;
 pub fn run(start: &Path, out: &mut impl Write) -> Result<bool> {
     let workspace = Workspace::scan(start).context("failed to scan workspace")?;
 
+    if !workspace.has_config() {
+        writeln!(
+            out,
+            "note: no .lattice.toml found, graph validation disabled"
+        )?;
+        return Ok(false);
+    }
+
     // Config errors are hard failures in CLI mode.
     let mut has_errors = workspace.config_error().is_some_and(|config_err| {
         let _ = writeln!(out, ".lattice.toml: error: {config_err}");
@@ -144,6 +152,7 @@ mod tests {
     #[test]
     fn clean_workspace_no_output() {
         let dir = setup(&[
+            (".lattice.toml", ""),
             (
                 "index.md",
                 "---\nbacklinks:\n  referenced_by:\n    - other.md\n---\n\n[other](other.md \"references\")\n",
@@ -163,7 +172,10 @@ mod tests {
 
     #[test]
     fn broken_link_reports_error() {
-        let dir = setup(&[("index.md", "[missing](gone.md \"references\")\n")]);
+        let dir = setup(&[
+            (".lattice.toml", ""),
+            ("index.md", "[missing](gone.md \"references\")\n"),
+        ]);
         let (has_errors, output) = run_lint(&dir);
         assert!(has_errors, "broken link should produce errors");
         assert!(
@@ -178,7 +190,11 @@ mod tests {
 
     #[test]
     fn unknown_predicate_reports_error() {
-        let dir = setup(&[("a.md", "[b](b.md \"invented\")\n"), ("b.md", "# B\n")]);
+        let dir = setup(&[
+            (".lattice.toml", ""),
+            ("a.md", "[b](b.md \"invented\")\n"),
+            ("b.md", "# B\n"),
+        ]);
         let (has_errors, output) = run_lint(&dir);
         assert!(has_errors, "unknown predicate should produce errors");
         assert!(
@@ -190,7 +206,11 @@ mod tests {
     #[test]
     fn warnings_only_exit_zero() {
         // Missing backlink produces a warning, not an error.
-        let dir = setup(&[("a.md", "[b](b.md \"references\")\n"), ("b.md", "# B\n")]);
+        let dir = setup(&[
+            (".lattice.toml", ""),
+            ("a.md", "[b](b.md \"references\")\n"),
+            ("b.md", "# B\n"),
+        ]);
         let (has_errors, output) = run_lint(&dir);
         assert!(
             !has_errors,
@@ -222,10 +242,13 @@ mod tests {
 
     #[test]
     fn unknown_inverse_predicate_reports_error() {
-        let dir = setup(&[(
-            "a.md",
-            "---\nbacklinks:\n  invented_by:\n    - b.md\n---\n\n# A\n",
-        )]);
+        let dir = setup(&[
+            (".lattice.toml", ""),
+            (
+                "a.md",
+                "---\nbacklinks:\n  invented_by:\n    - b.md\n---\n\n# A\n",
+            ),
+        ]);
         let (has_errors, output) = run_lint(&dir);
         assert!(
             has_errors,
@@ -234,6 +257,17 @@ mod tests {
         assert!(
             output.contains("unknown inverse predicate"),
             "output should mention the unknown predicate: {output}"
+        );
+    }
+
+    #[test]
+    fn no_config_prints_note() {
+        let dir = setup(&[("a.md", "[b](b.md \"references\")\n"), ("b.md", "# B\n")]);
+        let (has_errors, output) = run_lint(&dir);
+        assert!(!has_errors, "no config should not produce errors");
+        assert!(
+            output.contains("no .lattice.toml found"),
+            "output should note that graph validation is disabled: {output}"
         );
     }
 }

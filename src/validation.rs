@@ -426,6 +426,10 @@ pub fn validate_bare_paths(workspace: &Workspace) -> Vec<Diagnostic> {
 /// includes frontmatter parse errors. Returns diagnostics sorted by
 /// file then line number.
 pub fn collect_all(workspace: &Workspace) -> Vec<Diagnostic> {
+    if !workspace.has_config() {
+        return Vec::new();
+    }
+
     let mut diagnostics = Vec::new();
     diagnostics.extend(validate_forward_links(workspace));
     diagnostics.extend(validate_backlinks(workspace));
@@ -1291,5 +1295,32 @@ bare_paths = \"disabled\"
 
         let diags = validate_bare_paths(&ws);
         assert_eq!(diags.len(), 3, "three bare paths detected: {diags:?}");
+    }
+
+    // --- collect_all opt-in gate ---
+
+    #[test]
+    fn collect_all_empty_without_config() {
+        let (_dir, ws) = setup_workspace(&[("index.md", r#"[missing](gone.md "references")"#)]);
+
+        let diags = collect_all(&ws);
+        assert!(
+            diags.is_empty(),
+            "collect_all should return empty without .lattice.toml: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn collect_all_runs_with_config() {
+        let (_dir, ws) = setup_workspace(&[
+            (".lattice.toml", ""),
+            ("index.md", r#"[missing](gone.md "references")"#),
+        ]);
+
+        let diags = collect_all(&ws);
+        assert!(
+            !diags.is_empty(),
+            "collect_all should produce diagnostics with .lattice.toml"
+        );
     }
 }
