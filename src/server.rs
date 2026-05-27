@@ -133,6 +133,7 @@ pub fn run() -> Result<()> {
     let workspaces = Workspaces::from_params(&params);
 
     main_loop(&connection, workspaces)?;
+    drop(connection); // Close channels so IO threads can exit.
     io_threads.join()?;
 
     Ok(())
@@ -156,10 +157,21 @@ fn main_loop(connection: &Connection, mut workspaces: Workspaces) -> Result<()> 
                 if connection.handle_shutdown(&req)? {
                     return Ok(());
                 }
-                handle_request(connection, &workspaces, req)?;
+                let id = req.id.clone();
+                if let Err(err) = handle_request(connection, &workspaces, req) {
+                    tracing::error!("request {id} failed: {err:#}");
+                    let resp = Response::new_err(
+                        id,
+                        lsp_server::ErrorCode::InternalError as i32,
+                        format!("{err:#}"),
+                    );
+                    connection.sender.send(Message::Response(resp))?;
+                }
             }
             Message::Notification(notif) => {
-                handle_notification(connection, &mut workspaces, notif)?;
+                if let Err(err) = handle_notification(connection, &mut workspaces, notif) {
+                    tracing::error!("notification failed: {err:#}");
+                }
             }
             Message::Response(_) => {}
         }
