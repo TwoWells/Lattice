@@ -5,14 +5,14 @@
 //!
 //! Detects `---` delimited frontmatter at the start of a markdown file,
 //! parses the `backlinks` section, and validates inverse predicates against
-//! the configured vocabulary.
+//! the configured vocabulary. Uses the span-aware YAML parser from
+//! [`crate::yaml`] instead of `serde_yaml_ng`.
 
 use std::collections::HashMap;
 use std::ops::Range;
 
-use serde::Deserialize;
-
 use crate::config::Config;
+use crate::yaml;
 
 /// Errors that can occur when parsing frontmatter.
 #[derive(Debug, thiserror::Error)]
@@ -58,15 +58,6 @@ pub struct FrontmatterResult {
     pub diagnostics: Vec<BacklinkDiagnostic>,
 }
 
-/// Raw YAML structure for the frontmatter block.
-#[derive(Debug, Deserialize)]
-struct RawFrontmatter {
-    backlinks: Option<HashMap<String, Vec<String>>>,
-    /// Capture remaining fields so we don't reject unknown keys.
-    #[serde(flatten)]
-    _rest: HashMap<String, serde_yaml_ng::Value>,
-}
-
 /// Parse frontmatter from a markdown document and validate backlinks.
 ///
 /// Returns a [`FrontmatterResult`] containing the parsed frontmatter (if any)
@@ -74,44 +65,47 @@ struct RawFrontmatter {
 ///
 /// # Errors
 ///
-/// Returns [`FrontmatterError`] if the frontmatter block contains invalid YAML.
+/// Returns [`FrontmatterError`] if the frontmatter block contains fatal YAML
+/// errors (currently the new parser recovers from all errors via diagnostics,
+/// so this only fires for internal consistency issues).
 pub fn parse_frontmatter(
     source: &str,
     config: &Config,
 ) -> Result<FrontmatterResult, FrontmatterError> {
-    let Some((yaml_content, byte_range, start_line, end_line)) = extract_raw_frontmatter(source)
-    else {
+    let Some(block) = yaml::parse_frontmatter_block(source) else {
         return Ok(FrontmatterResult {
             frontmatter: None,
             diagnostics: Vec::new(),
         });
     };
 
-    if yaml_content.trim().is_empty() {
-        return Ok(FrontmatterResult {
-            frontmatter: Some(Frontmatter {
-                byte_range,
-                start_line,
-                end_line,
-                backlinks: HashMap::new(),
-            }),
-            diagnostics: Vec::new(),
-        });
+    // Check for hard parse errors that should be surfaced as FrontmatterError.
+    for diag in &block.diagnostics {
+        if diag.severity == yaml::YamlSeverity::Error {
+            let line = byte_offset_to_line(source, diag.span.start);
+            return Err(FrontmatterError::InvalidYaml {
+                line,
+                message: diag.message.clone(),
+            });
+        }
     }
 
-    let raw: RawFrontmatter =
-        serde_yaml_ng::from_str(yaml_content).map_err(|e| FrontmatterError::InvalidYaml {
-            line: start_line,
-            message: e.to_string(),
-        })?;
+    let byte_range: Range<usize> = block.span.into();
+    let start_line = 1;
+    let end_byte = byte_range.end;
+    let newline_count = source[..end_byte.min(source.len())]
+        .bytes()
+        .filter(|&b| b == b'\n')
+        .count();
+    let end_line =
+        newline_count + usize::from(!source[..end_byte.min(source.len())].ends_with('\n'));
 
-    let backlinks = raw.backlinks.unwrap_or_default();
+    let backlinks = yaml::extract_backlinks(&block, source);
 
     let mut diagnostics = Vec::new();
     for predicate in backlinks.keys() {
         if !config.is_known_inverse(predicate) {
-            let line = find_key_line(yaml_content, predicate)
-                .map_or(start_line, |offset| start_line + offset);
+            let line = yaml::find_predicate_line(&block, predicate, source);
             diagnostics.push(BacklinkDiagnostic {
                 line,
                 predicate: predicate.clone(),
@@ -130,87 +124,13 @@ pub fn parse_frontmatter(
     })
 }
 
-/// Extract the raw YAML content between `---` delimiters.
-///
-/// Returns `(yaml_content, byte_range, start_line, end_line)` or `None`
-/// if the file does not start with frontmatter.
-fn extract_raw_frontmatter(source: &str) -> Option<(&str, Range<usize>, usize, usize)> {
-    // Frontmatter must start at the very beginning of the file.
-    if !source.starts_with("---\n") && !source.starts_with("---\r\n") {
-        return None;
-    }
-
-    let opener_len = if source.starts_with("---\r\n") { 5 } else { 4 };
-
-    let rest = &source[opener_len..];
-    let closing_pos = find_closing_delimiter(rest)?;
-
-    let yaml_content = &rest[..closing_pos];
-    let closing_line_len = if rest[closing_pos..].starts_with("---\r\n") {
-        5
-    } else if rest[closing_pos..].starts_with("---\n") {
-        4
-    } else {
-        // Closing `---` at end of file without trailing newline.
-        3
-    };
-
-    let byte_end = opener_len + closing_pos + closing_line_len;
-    let byte_range = 0..byte_end;
-
-    let start_line = 1;
-    let newline_count = source[..byte_end].bytes().filter(|&b| b == b'\n').count();
-    let end_line = newline_count + usize::from(!source[..byte_end].ends_with('\n'));
-
-    Some((yaml_content, byte_range, start_line, end_line))
-}
-
-/// Find the 0-based line offset of a YAML key within the frontmatter content.
-///
-/// Looks for `key:` as a YAML mapping key (with leading whitespace only).
-/// Returns the line offset from the start of the YAML content, or `None`
-/// if the key is not found.
-fn find_key_line(yaml_content: &str, key: &str) -> Option<usize> {
-    for (line_offset, line) in yaml_content.lines().enumerate() {
-        let trimmed = line.trim_start();
-        if let Some(after_key) = trimmed.strip_prefix(key)
-            && after_key.starts_with(':')
-        {
-            // +1 because the YAML content starts on the line after `---`.
-            return Some(line_offset + 1);
-        }
-    }
-    None
-}
-
-/// Find the byte offset of the closing `---` delimiter in the remaining text.
-///
-/// The closing delimiter must appear at the start of a line.
-fn find_closing_delimiter(rest: &str) -> Option<usize> {
-    let mut search_from = 0;
-    loop {
-        let candidate = rest[search_from..].find("---")?;
-        let abs_pos = search_from + candidate;
-
-        // Must be at start of a line (position 0 or preceded by newline).
-        let at_line_start = abs_pos == 0 || rest.as_bytes().get(abs_pos - 1) == Some(&b'\n');
-        if !at_line_start {
-            search_from = abs_pos + 3;
-            continue;
-        }
-
-        // Must be followed by newline, CRLF, or EOF.
-        let after = abs_pos + 3;
-        let valid_end = after >= rest.len()
-            || rest.as_bytes().get(after) == Some(&b'\n')
-            || rest.as_bytes().get(after) == Some(&b'\r');
-        if !valid_end {
-            search_from = after;
-            continue;
-        }
-
-        return Some(abs_pos);
-    }
+/// Convert a byte offset to a 1-based line number.
+fn byte_offset_to_line(source: &str, offset: usize) -> usize {
+    source[..offset.min(source.len())]
+        .bytes()
+        .filter(|&b| b == b'\n')
+        .count()
+        + 1
 }
 
 #[cfg(test)]
@@ -292,8 +212,8 @@ mod tests {
         assert!(result.is_err(), "malformed YAML should produce an error");
         let err = result.expect_err("should be an error");
         assert!(
-            matches!(err, FrontmatterError::InvalidYaml { line: 1, .. }),
-            "error should report line 1, got: {err:?}"
+            matches!(err, FrontmatterError::InvalidYaml { line: 2, .. }),
+            "error should report line 2 (the malformed line), got: {err:?}"
         );
     }
 

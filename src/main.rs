@@ -15,8 +15,10 @@ mod lint;
 mod lsp;
 mod markdown;
 mod server;
+mod span;
 mod validation;
 mod workspace;
+mod yaml;
 
 fn main() -> ExitCode {
     let args = cli::Cli::parse();
