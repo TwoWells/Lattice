@@ -8,6 +8,7 @@ use std::process::ExitCode;
 
 use clap::Parser;
 
+mod block;
 mod cli;
 mod config;
 mod frontmatter;
