@@ -168,6 +168,22 @@ fn count_indent(line: &str) -> usize {
     line.bytes().take_while(|&b| b == b' ').count()
 }
 
+/// Strip a trailing `\n` or `\r\n` from a byte offset into source.
+///
+/// Returns the adjusted end offset with the line ending excluded.
+fn strip_trailing_newline(source: &str, end: usize) -> usize {
+    let bytes = source.as_bytes();
+    if end > 0 && bytes.get(end - 1) == Some(&b'\n') {
+        if end > 1 && bytes.get(end - 2) == Some(&b'\r') {
+            end - 2
+        } else {
+            end - 1
+        }
+    } else {
+        end
+    }
+}
+
 /// Check if a line is an ATX heading opener. Returns `Some(level)` if so.
 fn atx_heading_level(line: &str) -> Option<u8> {
     let trimmed = line.trim_start_matches(' ');
@@ -1036,10 +1052,14 @@ impl BlockParser<'_> {
                 *pos += next_line.len();
                 *line_idx += 1;
 
+                // Strip trailing line ending from text span so it contains
+                // only the heading text, not syntax artifacts.
+                let text_end = strip_trailing_newline(self.source, para_text_end);
+
                 self.blocks.push(Block {
                     kind: BlockKind::SetextHeading {
                         level,
-                        text_span: Span::new(para_start, para_text_end),
+                        text_span: Span::new(para_start, text_end),
                     },
                     span: Span::new(para_start, self.body_offset + *pos),
                 });
@@ -1286,8 +1306,8 @@ mod tests {
                 assert_eq!(*level, 1, "setext level 1");
                 assert_eq!(
                     span_text(source, text_span),
-                    "Heading\n",
-                    "text span includes paragraph text"
+                    "Heading",
+                    "text span is heading text without trailing newline"
                 );
             }
             other => panic!("expected SetextHeading, got {other:?}"),
@@ -1303,7 +1323,11 @@ mod tests {
         match &result.blocks[0].kind {
             BlockKind::SetextHeading { level, text_span } => {
                 assert_eq!(*level, 2, "setext level 2");
-                assert_eq!(span_text(source, text_span), "Heading\n", "text span");
+                assert_eq!(
+                    span_text(source, text_span),
+                    "Heading",
+                    "text span without trailing newline"
+                );
             }
             other => panic!("expected SetextHeading, got {other:?}"),
         }
@@ -1320,8 +1344,8 @@ mod tests {
                 assert_eq!(*level, 1, "setext level 1");
                 assert_eq!(
                     span_text(source, text_span),
-                    "Line one\nLine two\n",
-                    "multiline text span"
+                    "Line one\nLine two",
+                    "multiline: internal newlines preserved, trailing stripped"
                 );
             }
             other => panic!("expected SetextHeading, got {other:?}"),
