@@ -403,6 +403,31 @@ fn parse_reference_def(line: &str) -> Option<(String, String, String)> {
     Some((normalize_label(label_text), url, title))
 }
 
+/// Try to parse a standalone title line (for multi-line reference definitions).
+///
+/// Matches `"title"`, `'title'`, or `(title)` optionally surrounded by
+/// whitespace, with nothing else on the line.
+fn parse_standalone_title(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if let Some(s) = trimmed.strip_prefix('"') {
+        let end = s.find('"')?;
+        if s[end + 1..].trim().is_empty() {
+            return Some(s[..end].to_string());
+        }
+    } else if let Some(s) = trimmed.strip_prefix('\'') {
+        let end = s.find('\'')?;
+        if s[end + 1..].trim().is_empty() {
+            return Some(s[..end].to_string());
+        }
+    } else if let Some(s) = trimmed.strip_prefix('(') {
+        let end = s.find(')')?;
+        if s[end + 1..].trim().is_empty() {
+            return Some(s[..end].to_string());
+        }
+    }
+    None
+}
+
 /// Try to parse the start of a footnote definition.
 ///
 /// Returns `Some(label)` if the line starts with `[^label]:`.
@@ -1099,13 +1124,17 @@ impl<'a> TreeBuilder<'a> {
                 pos += raw_len;
                 line_idx += 1;
             } else if let Some((label, url, title)) = parse_reference_def(content) {
-                self.add_leaf(
-                    ElementKind::ReferenceDef { label, url, title },
-                    Syntax::Markdown,
-                    Span::new(content_start, raw_start + raw_len),
+                self.parse_reference_def_block(
+                    &lines,
+                    &mut pos,
+                    &mut line_idx,
+                    body_offset,
+                    content_start,
+                    raw_len,
+                    label,
+                    url,
+                    title,
                 );
-                pos += raw_len;
-                line_idx += 1;
             } else if let Some(label) = parse_footnote_def_start(content) {
                 self.parse_footnote_def(
                     &lines,
@@ -1394,6 +1423,51 @@ impl<'a> TreeBuilder<'a> {
             ElementKind::HtmlBlock,
             Syntax::Markdown,
             Span::new(block_start, body_offset + *pos),
+        );
+    }
+
+    /// Parse a link reference definition, consuming a continuation title
+    /// line if the first line has a URL but no title.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "ref def parameters are distinct concerns"
+    )]
+    fn parse_reference_def_block(
+        &mut self,
+        lines: &[&str],
+        pos: &mut usize,
+        line_idx: &mut usize,
+        body_offset: usize,
+        def_start: usize,
+        first_raw_len: usize,
+        label: String,
+        url: String,
+        mut title: String,
+    ) {
+        *pos += first_raw_len;
+        *line_idx += 1;
+        let mut span_end = body_offset + *pos;
+
+        // If no title on first line, check next line for continuation title
+        if title.is_empty() && *line_idx < lines.len() {
+            let next_line = lines[*line_idx];
+            let next_start = body_offset + *pos;
+            let next_len = next_line.len();
+
+            if let Some((next_content, _)) = self.strip_continuation(next_line, next_start)
+                && let Some(t) = parse_standalone_title(next_content)
+            {
+                title = t;
+                *pos += next_len;
+                *line_idx += 1;
+                span_end = body_offset + *pos;
+            }
+        }
+
+        self.add_leaf(
+            ElementKind::ReferenceDef { label, url, title },
+            Syntax::Markdown,
+            Span::new(def_start, span_end),
         );
     }
 

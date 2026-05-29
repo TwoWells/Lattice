@@ -236,7 +236,7 @@ fn scan_inlines(
                 if let Some((end, path)) = try_parse_import(text, i) {
                     tree.add_child(
                         parent,
-                        ElementKind::Import { path: path.clone() },
+                        ElementKind::Import { path },
                         Syntax::Markdown,
                         Span::new(base + i, base + end),
                     );
@@ -1044,6 +1044,62 @@ mod tests {
         );
         let paras = find_nodes(&tree, |k| matches!(k, ElementKind::Paragraph));
         assert_eq!(paras.len(), 1, "should be one paragraph");
+    }
+
+    #[test]
+    fn reference_def_multiline_title() {
+        let tree = parse("[ref]: url\n\"title on next line\"\n");
+        let defs = find_nodes(&tree, |k| matches!(k, ElementKind::ReferenceDef { .. }));
+        assert_eq!(defs.len(), 1, "should find one ref def");
+        match &tree.node(defs[0]).kind {
+            ElementKind::ReferenceDef { url, title, .. } => {
+                assert_eq!(url, "url", "url");
+                assert_eq!(title, "title on next line", "multi-line title");
+            }
+            other => panic!("expected ReferenceDef, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reference_def_multiline_title_single_quoted() {
+        let tree = parse("[ref]: url\n'single quoted'\n");
+        let defs = find_nodes(&tree, |k| matches!(k, ElementKind::ReferenceDef { .. }));
+        assert_eq!(defs.len(), 1, "should find one ref def");
+        match &tree.node(defs[0]).kind {
+            ElementKind::ReferenceDef { title, .. } => {
+                assert_eq!(title, "single quoted", "single-quoted multi-line title");
+            }
+            other => panic!("expected ReferenceDef, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reference_def_multiline_title_resolves() {
+        let tree = parse("[text][ref]\n\n[ref]: url\n\"pred\"\n");
+        let links = find_nodes(&tree, |k| matches!(k, ElementKind::Link { .. }));
+        assert_eq!(links.len(), 1, "should find one link");
+        match &tree.node(links[0]).kind {
+            ElementKind::Link { url, title } => {
+                assert_eq!(url, "url", "resolved url");
+                assert_eq!(title, "pred", "resolved multi-line title");
+            }
+            other => panic!("expected Link, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reference_def_multiline_non_title_stays_separate() {
+        let tree = parse("[ref]: url\nNot a title\n");
+        let defs = find_nodes(&tree, |k| matches!(k, ElementKind::ReferenceDef { .. }));
+        assert_eq!(defs.len(), 1, "should find one ref def");
+        match &tree.node(defs[0]).kind {
+            ElementKind::ReferenceDef { title, .. } => {
+                assert!(title.is_empty(), "non-title line should not be consumed");
+            }
+            other => panic!("expected ReferenceDef, got {other:?}"),
+        }
+        let paras = find_nodes(&tree, |k| matches!(k, ElementKind::Paragraph));
+        assert_eq!(paras.len(), 1, "non-title line should be a paragraph");
     }
 
     // --- Nested brackets ---
