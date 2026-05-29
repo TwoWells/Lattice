@@ -303,6 +303,38 @@ struct TabMapping {
     num_spaces: usize,
 }
 
+/// Map an offset in a tab-expanded string back to the corresponding byte
+/// offset in the original (pre-expansion) string.
+///
+/// Uses the tab mappings produced by [`expand_leading_tabs`]. If there are
+/// no tabs, the expanded and raw offsets are identical.
+fn expanded_to_raw(expanded_offset: usize, raw_line: &str, mappings: &[TabMapping]) -> usize {
+    if mappings.is_empty() {
+        return expanded_offset.min(raw_line.len());
+    }
+
+    // Walk through the mapping to compute the cumulative offset delta.
+    let mut delta: usize = 0; // expanded_offset - raw_offset so far
+    for m in mappings {
+        // In the expanded string, this tab occupies columns
+        // [m.expanded_col .. m.expanded_col + m.num_spaces).
+        // In the raw string, it's a single byte at m.original_byte.
+        let tab_expanded_end = m.expanded_col + m.num_spaces;
+        if expanded_offset <= m.expanded_col + delta {
+            // Before this tab — delta is from prior tabs only.
+            break;
+        }
+        if expanded_offset < tab_expanded_end + delta {
+            // Inside the expansion of this tab — map to just past the tab byte.
+            return m.original_byte + 1;
+        }
+        // Past this tab: each tab added (num_spaces - 1) extra bytes.
+        delta += m.num_spaces - 1;
+    }
+
+    expanded_offset.saturating_sub(delta).min(raw_line.len())
+}
+
 // ---------------------------------------------------------------------------
 // Line classification helpers
 // ---------------------------------------------------------------------------
@@ -1227,7 +1259,11 @@ impl<'a> TreeBuilder<'a> {
     // -- List scope management ------------------------------------------------
 
     /// Open a new list and its first item.
-    fn open_list(&mut self, marker: &ListMarkerInfo, span_start: usize) {
+    ///
+    /// `task` is the pre-computed checkbox state for the first item
+    /// (caller resolves this from the raw content to avoid tab
+    /// expansion offset mismatches).
+    fn open_list(&mut self, marker: &ListMarkerInfo, span_start: usize, task: Option<bool>) {
         let list_node = self.push_scope(
             ElementKind::List {
                 ordered: marker.ordered,
@@ -1237,17 +1273,6 @@ impl<'a> TreeBuilder<'a> {
             Syntax::Markdown,
             Span::new(span_start, span_start),
         );
-        let content = if marker.content_offset < usize::MAX {
-            // Check for task item
-            &self.source[span_start + marker.content_offset..]
-        } else {
-            ""
-        };
-        let task = if marker.ordered {
-            None
-        } else {
-            recognize_task(content)
-        };
         let item_node = self.push_scope(
             ElementKind::ListItem { task },
             Syntax::Markdown,
@@ -1310,7 +1335,7 @@ impl<'a> TreeBuilder<'a> {
             return (line, line_start);
         }
 
-        let (expanded, _) = expand_leading_tabs(line);
+        let (expanded, tab_mappings) = expand_leading_tabs(line);
         let indent = count_indent(&expanded);
 
         while let Some(ctx) = self.list_stack.last() {
@@ -1345,7 +1370,8 @@ impl<'a> TreeBuilder<'a> {
                 }
 
                 // Open new item.
-                let content_after = &line[marker.content_offset..];
+                let raw_offset = expanded_to_raw(marker.content_offset, line, &tab_mappings);
+                let content_after = &line[raw_offset..];
                 let task = if marker.ordered {
                     None
                 } else {
@@ -1361,10 +1387,7 @@ impl<'a> TreeBuilder<'a> {
                     ctx.content_column = marker.content_column;
                 }
 
-                return (
-                    &line[marker.content_offset..],
-                    line_start + marker.content_offset,
-                );
+                return (&line[raw_offset..], line_start + raw_offset);
             }
 
             // Case 3: line breaks this list level.
@@ -1418,7 +1441,7 @@ impl<'a> TreeBuilder<'a> {
             let (content, content_start) = self.handle_list_continuation(content, content_start);
 
             // Classify the content.
-            let (expanded, _) = expand_leading_tabs(content);
+            let (expanded, tab_mappings) = expand_leading_tabs(content);
             let indent = count_indent(&expanded);
 
             if let Some((fence_char, fence_len, info)) = fenced_code_open(&expanded) {
@@ -1497,20 +1520,66 @@ impl<'a> TreeBuilder<'a> {
                 pos += raw_len;
                 line_idx += 1;
             } else if let Some(marker) = recognize_list_marker(&expanded) {
-                self.open_list(&marker, content_start);
-                let after = &content[marker.content_offset..];
+                let raw_offset = expanded_to_raw(marker.content_offset, content, &tab_mappings);
+                let after = &content[raw_offset..];
+                let task = if marker.ordered {
+                    None
+                } else {
+                    recognize_task(after)
+                };
+                self.open_list(&marker, content_start, task);
+                let item_start = content_start + raw_offset;
                 if after.trim().is_empty() {
                     pos += raw_len;
                     line_idx += 1;
                 } else {
-                    self.parse_paragraph(
-                        &lines,
-                        &mut pos,
-                        &mut line_idx,
-                        body_offset,
-                        content_start + marker.content_offset,
-                        raw_len,
-                    );
+                    // Classify content after the marker through the
+                    // block-level chain (it could be a fenced code
+                    // opener, heading, etc. — not always a paragraph).
+                    let (after_expanded, _) = expand_leading_tabs(after);
+                    if let Some((fc, fl, fi)) = fenced_code_open(&after_expanded) {
+                        pos += raw_len;
+                        line_idx += 1;
+                        self.parse_fenced_code(
+                            &lines,
+                            &mut pos,
+                            &mut line_idx,
+                            body_offset,
+                            item_start,
+                            raw_start + raw_len,
+                            fc,
+                            fl,
+                            fi.as_ref(),
+                        );
+                    } else if block_math_open(&after_expanded) {
+                        pos += raw_len;
+                        line_idx += 1;
+                        self.parse_block_math(
+                            &lines,
+                            &mut pos,
+                            &mut line_idx,
+                            body_offset,
+                            item_start,
+                            raw_start + raw_len,
+                        );
+                    } else if let Some(level) = atx_heading_level(&after_expanded) {
+                        self.add_leaf(
+                            ElementKind::Heading { level },
+                            Syntax::Markdown,
+                            Span::new(item_start, raw_start + raw_len),
+                        );
+                        pos += raw_len;
+                        line_idx += 1;
+                    } else {
+                        self.parse_paragraph(
+                            &lines,
+                            &mut pos,
+                            &mut line_idx,
+                            body_offset,
+                            item_start,
+                            raw_len,
+                        );
+                    }
                 }
             } else if indent >= 4 && !self.last_child_is_paragraph() {
                 self.parse_indented_code(
@@ -1648,19 +1717,29 @@ impl<'a> TreeBuilder<'a> {
             let inner_start = body_offset + *pos;
             let inner_len = inner_line.len();
 
-            // Strip quote continuation markers.
-            let Some((content, _)) = self.strip_continuation(inner_line, inner_start) else {
-                // Quote ended — code block is unclosed.
-                self.add_leaf(
-                    ElementKind::CodeBlock,
-                    Syntax::Markdown,
-                    Span::new(open_start, body_offset + *pos),
-                );
-                self.diagnostics.push(Diagnostic {
-                    span: Span::new(open_start, open_raw_end),
-                    message: "unclosed fenced code block".to_string(),
-                });
-                break;
+            // Strip continuation markers (quotes + list indent).
+            let content = if let Some((c, _)) = self.strip_continuation(inner_line, inner_start) {
+                c
+            } else {
+                // Context ended (quote or list). Check if the raw
+                // line is a closing fence before giving up — a
+                // fence at lower indentation closes the code block
+                // and the enclosing container simultaneously.
+                let (raw_expanded, _) = expand_leading_tabs(inner_line);
+                if fenced_code_close(&raw_expanded, fence_char, fence_len) {
+                    inner_line
+                } else {
+                    self.add_leaf(
+                        ElementKind::CodeBlock,
+                        Syntax::Markdown,
+                        Span::new(open_start, body_offset + *pos),
+                    );
+                    self.diagnostics.push(Diagnostic {
+                        span: Span::new(open_start, open_raw_end),
+                        message: "unclosed fenced code block".to_string(),
+                    });
+                    break;
+                }
             };
 
             let (inner_expanded, _) = expand_leading_tabs(content);
@@ -1699,8 +1778,13 @@ impl<'a> TreeBuilder<'a> {
             let inner_start = body_offset + *pos;
             let inner_len = inner_line.len();
 
-            let Some((content, _)) = self.strip_continuation(inner_line, inner_start) else {
-                break; // Quote ended.
+            let content = if let Some((c, _)) = self.strip_continuation(inner_line, inner_start) {
+                c
+            } else if block_math_close(inner_line) {
+                // Context ended but raw line has closing delimiter.
+                inner_line
+            } else {
+                break;
             };
 
             if block_math_close(content) {
@@ -2001,22 +2085,24 @@ impl<'a> TreeBuilder<'a> {
             let next_len = next_line.len();
 
             // Strip continuation markers, with lazy fallback.
-            let content = match self.strip_continuation(next_line, next_start) {
-                Some((c, _)) => c,
-                None => {
-                    // Lazy continuation: line without markers that is not a
-                    // block-starting construct can continue a paragraph.
-                    if self.quote_depth > 0
-                        && strip_blockquote_marker(next_line).is_none()
-                        && !is_thematic_break(next_line)
-                        && atx_heading_level(next_line).is_none()
-                        && fenced_code_open(next_line).is_none()
-                        && html_block_start(next_line).is_none()
-                    {
-                        next_line
-                    } else {
-                        break;
-                    }
+            let content = if let Some((c, _)) = self.strip_continuation(next_line, next_start) {
+                c
+            } else {
+                // Lazy continuation: line without proper markers/indent
+                // that is not a block-starting construct can continue a
+                // paragraph inside a block quote or list item.
+                let (lazy_expanded, _) = expand_leading_tabs(next_line);
+                if (self.quote_depth > 0 || !self.list_stack.is_empty())
+                    && strip_blockquote_marker(next_line).is_none()
+                    && !is_thematic_break(next_line)
+                    && atx_heading_level(next_line).is_none()
+                    && fenced_code_open(next_line).is_none()
+                    && html_block_start(next_line).is_none()
+                    && recognize_list_marker(&lazy_expanded).is_none()
+                {
+                    next_line
+                } else {
+                    break;
                 }
             };
 
@@ -3395,6 +3481,45 @@ mod tests {
         assert_kind(&tree, item_children[0], &ElementKind::Paragraph);
     }
 
+    #[test]
+    fn lazy_continuation_no_indent() {
+        let source = "- first\nlazy line\n";
+        let tree = parse(source);
+        let children = root_children(&tree);
+
+        assert_eq!(children.len(), 1, "one list");
+        let items = tree.children(children[0]);
+        assert_eq!(items.len(), 1, "one item");
+        let item_children = tree.children(items[0]);
+        assert_eq!(item_children.len(), 1, "item has one paragraph");
+        assert_kind(&tree, item_children[0], &ElementKind::Paragraph);
+    }
+
+    #[test]
+    fn lazy_continuation_broken_by_blank() {
+        let source = "- first\n\nnot in list\n";
+        let tree = parse(source);
+        let children = root_children(&tree);
+
+        // Blank line + unindented line closes the list.
+        assert!(children.len() >= 2, "list + paragraph");
+        assert!(
+            matches!(tree.node(children[0]).kind, ElementKind::List { .. }),
+            "first child is list"
+        );
+        assert_kind(&tree, children[children.len() - 1], &ElementKind::Paragraph);
+    }
+
+    #[test]
+    fn lazy_continuation_broken_by_list_marker() {
+        let source = "- first\n+ second\n";
+        let tree = parse(source);
+        let children = root_children(&tree);
+
+        // `+ second` is a different marker → new list, not lazy continuation.
+        assert_eq!(children.len(), 2, "two lists");
+    }
+
     // --- Lists: marker changes ---
 
     #[test]
@@ -3447,6 +3572,31 @@ mod tests {
             .iter()
             .any(|&id| matches!(tree.node(id).kind, ElementKind::QuoteBlock));
         assert!(has_quote, "item should contain a block quote");
+    }
+
+    #[test]
+    fn fence_at_list_boundary_closes_code_block() {
+        // Closing fence at indent 0 while code block is inside a list
+        // item (content_column=2). The fence should close the code block,
+        // not produce an unclosed diagnostic.
+        let source = "- ```\n  code\n```\n";
+        let tree = parse(source);
+
+        assert!(
+            tree.diagnostics().is_empty(),
+            "no unclosed diagnostic: {:?}",
+            tree.diagnostics()
+        );
+
+        let children = root_children(&tree);
+        assert_eq!(children.len(), 1, "one list");
+        let items = tree.children(children[0]);
+        let item_children = tree.children(items[0]);
+
+        let has_code = item_children
+            .iter()
+            .any(|&id| matches!(tree.node(id).kind, ElementKind::CodeBlock));
+        assert!(has_code, "item should contain a code block");
     }
 
     // --- Lists: interactions ---
