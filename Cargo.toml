@@ -46,6 +46,7 @@ missing_safety_doc = "warn"
 
 [dependencies]
 anyhow = "1"
+phf = { version = "0.11", features = ["macros"] }
 clap = { version = "4", features = ["derive"] }
 ignore = "0.4"
 lsp-server = "0.7"

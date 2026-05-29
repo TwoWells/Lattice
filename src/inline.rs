@@ -12,6 +12,7 @@
 use std::collections::HashMap;
 
 use crate::block::{Diagnostic, ElementKind, NodeId, Syntax, Tree, normalize_label};
+use crate::html::{self, HtmlTag};
 use crate::span::Span;
 
 // ---------------------------------------------------------------------------
@@ -228,6 +229,66 @@ fn scan_inlines(
                         Span::new(base + i, base + end),
                     );
                     i = end;
+                } else {
+                    i += 1;
+                }
+            }
+            b'<' => {
+                let remaining = &text[i..];
+                // Try autolink first (short-circuit before tag parsing).
+                if let Some((url, len)) = html::try_autolink(remaining) {
+                    tree.add_child(
+                        parent,
+                        ElementKind::Link {
+                            url,
+                            title: String::new(),
+                        },
+                        Syntax::Html,
+                        Span::new(base + i, base + i + len),
+                    );
+                    i += len;
+                } else if let Some(tag) = html::tokenize_tag(remaining, base + i) {
+                    match tag {
+                        HtmlTag::Open {
+                            ref name,
+                            ref attrs,
+                            len,
+                            ..
+                        } if name == "a" => {
+                            let (href, title) = html::extract_link_attrs(attrs);
+                            // Find closing </a> to determine full span.
+                            let tag_end = i + len;
+                            let close_end = find_inline_close_tag(&text[tag_end..], "a")
+                                .map_or(tag_end, |cl| tag_end + cl);
+                            tree.add_child(
+                                parent,
+                                ElementKind::Link { url: href, title },
+                                Syntax::Html,
+                                Span::new(base + i, base + close_end),
+                            );
+                            i = close_end;
+                        }
+                        HtmlTag::Open {
+                            ref name,
+                            ref attrs,
+                            len,
+                            ..
+                        } if name == "img" => {
+                            let (url, title) = html::extract_image_attrs(attrs);
+                            tree.add_child(
+                                parent,
+                                ElementKind::Image { url, title },
+                                Syntax::Html,
+                                Span::new(base + i, base + i + len),
+                            );
+                            i += len;
+                        }
+                        HtmlTag::Open { len, .. }
+                        | HtmlTag::Close { len, .. }
+                        | HtmlTag::Comment { len, .. } => {
+                            i += len;
+                        }
+                    }
                 } else {
                     i += 1;
                 }
@@ -580,6 +641,28 @@ fn skip_spaces(bytes: &[u8], i: &mut usize) {
 }
 
 // ---------------------------------------------------------------------------
+// Inline HTML close tag search
+// ---------------------------------------------------------------------------
+
+/// Find the end of a closing tag `</name>` within inline text.
+///
+/// Returns the byte offset past the `>` relative to `text`, or `None`
+/// if no matching close tag is found.
+fn find_inline_close_tag(text: &str, tag: &str) -> Option<usize> {
+    let mut search = 0;
+    while let Some(lt) = text[search..].find("</") {
+        let abs = search + lt;
+        if let Some(HtmlTag::Close { ref name, len, .. }) = html::tokenize_tag(&text[abs..], 0)
+            && name == tag
+        {
+            return Some(abs + len);
+        }
+        search = abs + 2;
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
 // Import directives
 // ---------------------------------------------------------------------------
 
@@ -622,16 +705,27 @@ fn try_parse_import(text: &str, pos: usize) -> Option<(usize, String)> {
     reason = "tests use expect and panic for clarity"
 )]
 mod tests {
-    use crate::block::{ElementKind, NodeId, Tree, parse_tree};
+    use crate::block::{ElementKind, Node, NodeId, Syntax, Tree, parse_tree};
 
     /// Parse source with no frontmatter.
     fn parse(source: &str) -> Tree {
         parse_tree(source, None)
     }
 
-    /// Collect children of the root.
+    /// Helper: collect children of the root.
     fn root_children(tree: &Tree) -> Vec<NodeId> {
         tree.children(tree.root()).to_vec()
+    }
+
+    /// Helper: assert a node is a specific kind and return it.
+    fn assert_kind<'a>(tree: &'a Tree, id: NodeId, expected: &ElementKind) -> &'a Node {
+        let node = tree.node(id);
+        assert_eq!(
+            &node.kind, expected,
+            "node {id} should be {expected:?}, got {:?}",
+            node.kind
+        );
+        node
     }
 
     /// Find all nodes of a given kind.
@@ -1186,5 +1280,124 @@ mod tests {
             tree.diagnostics().is_empty(),
             "no diagnostic for unmatched shortcut ref"
         );
+    }
+
+    // ===================================================================
+    // Inline HTML
+    // ===================================================================
+
+    // --- Autolinks ---
+
+    #[test]
+    fn inline_autolink_uri() {
+        let tree = parse("See <https://example.com> for info.\n");
+        let links = find_nodes(&tree, |k| matches!(k, ElementKind::Link { .. }));
+        assert_eq!(links.len(), 1, "should find one autolink");
+        match &tree.node(links[0]).kind {
+            ElementKind::Link { url, title } => {
+                assert_eq!(url, "https://example.com", "autolink URL");
+                assert!(title.is_empty(), "autolink has no title");
+            }
+            other => panic!("expected Link, got {other:?}"),
+        }
+        assert_eq!(
+            tree.node(links[0]).syntax,
+            Syntax::Html,
+            "autolink has Html syntax"
+        );
+    }
+
+    #[test]
+    fn inline_autolink_email() {
+        let tree = parse("Mail <user@example.com> now.\n");
+        let links = find_nodes(&tree, |k| matches!(k, ElementKind::Link { .. }));
+        assert_eq!(links.len(), 1, "should find one email autolink");
+        match &tree.node(links[0]).kind {
+            ElementKind::Link { url, .. } => {
+                assert_eq!(url, "mailto:user@example.com", "email autolink URL");
+            }
+            other => panic!("expected Link, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn autolink_not_confused_with_tags() {
+        let tree = parse("See <http://example.com> here.\n");
+        let links = find_nodes(&tree, |k| matches!(k, ElementKind::Link { .. }));
+        assert_eq!(links.len(), 1, "URI autolink parsed as link, not tag");
+    }
+
+    // --- Inline <a> tags ---
+
+    #[test]
+    fn inline_a_tag_as_link() {
+        let tree = parse(r#"Click <a href="path.md" title="references">here</a>."#);
+        let links = find_nodes(&tree, |k| matches!(k, ElementKind::Link { .. }));
+        assert_eq!(links.len(), 1, "should find one link from <a>");
+        match &tree.node(links[0]).kind {
+            ElementKind::Link { url, title } => {
+                assert_eq!(url, "path.md", "<a> href");
+                assert_eq!(title, "references", "<a> title");
+            }
+            other => panic!("expected Link, got {other:?}"),
+        }
+        assert_eq!(
+            tree.node(links[0]).syntax,
+            Syntax::Html,
+            "<a> link has Html syntax"
+        );
+    }
+
+    #[test]
+    fn inline_a_tag_same_as_markdown_link() {
+        let md_tree = parse("[text](path.md \"references\")\n");
+        let html_tree = parse(r#"<a href="path.md" title="references">text</a>"#);
+
+        let md_links = find_nodes(&md_tree, |k| matches!(k, ElementKind::Link { .. }));
+        let html_links = find_nodes(&html_tree, |k| matches!(k, ElementKind::Link { .. }));
+
+        assert_eq!(md_links.len(), 1, "one markdown link");
+        assert_eq!(html_links.len(), 1, "one HTML link");
+
+        // Same kind (same url and title).
+        assert_eq!(
+            md_tree.node(md_links[0]).kind,
+            html_tree.node(html_links[0]).kind,
+            "same Link kind"
+        );
+    }
+
+    // --- Inline <img> tags ---
+
+    #[test]
+    fn inline_img_tag_as_image() {
+        let tree = parse(r#"<img src="photo.jpg" title="caption" />"#);
+        let images = find_nodes(&tree, |k| matches!(k, ElementKind::Image { .. }));
+        assert_eq!(images.len(), 1, "should find one image from <img>");
+        match &tree.node(images[0]).kind {
+            ElementKind::Image { url, title } => {
+                assert_eq!(url, "photo.jpg", "<img> src");
+                assert_eq!(title, "caption", "<img> title");
+            }
+            other => panic!("expected Image, got {other:?}"),
+        }
+    }
+
+    // --- Inline HTML tags are skipped ---
+
+    #[test]
+    fn inline_html_comment_skipped() {
+        let tree = parse("text <!-- comment --> more\n");
+        let links = find_nodes(&tree, |k| matches!(k, ElementKind::Link { .. }));
+        assert!(links.is_empty(), "comments produce no links");
+    }
+
+    #[test]
+    fn inline_formatting_tags_skipped() {
+        let tree = parse("Some <em>emphasized</em> text.\n");
+        // em has no structural mapping, so it's skipped.
+        let children = root_children(&tree);
+        assert_eq!(children.len(), 1, "one paragraph");
+        assert_kind(&tree, children[0], &ElementKind::Paragraph);
     }
 }

@@ -13,6 +13,7 @@
 //! images). Inline parsing happens in a later ticket over completed
 //! leaf nodes.
 
+use crate::html::{self, HtmlTag};
 use crate::span::Span;
 
 // ---------------------------------------------------------------------------
@@ -115,6 +116,12 @@ pub enum ElementKind {
     },
     /// A cell in a GFM pipe table row.
     TableCell,
+    /// Generic HTML container (`<div>`, `<section>`, `<article>`, etc.).
+    Container,
+    /// `<details>` disclosure container.
+    Details,
+    /// `<summary>` inside a `<details>`.
+    DetailsSummary,
 }
 
 /// Column alignment for a GFM pipe table.
@@ -136,7 +143,6 @@ pub enum Syntax {
     /// Markdown structural syntax.
     Markdown,
     /// Raw HTML.
-    #[allow(dead_code, reason = "used by HTML tag parser ticket 04")]
     Html,
 }
 
@@ -957,6 +963,17 @@ fn html_block_end(line: &str, html_type: u8) -> bool {
     }
 }
 
+/// Check if a line opens a `<pre><code>` block (case-insensitive).
+fn is_pre_code_open(line: &str) -> bool {
+    let lower = line.trim().to_lowercase();
+    if let Some(after) = lower.strip_prefix("<pre>") {
+        return after.trim_start().starts_with("<code");
+    }
+    // <pre followed by whitespace then > (e.g. <pre >) is also type 1,
+    // but the <code> must follow the closing >.
+    false
+}
+
 // ---------------------------------------------------------------------------
 // List helpers
 // ---------------------------------------------------------------------------
@@ -1338,6 +1355,9 @@ pub fn parse_tree(source: &str, frontmatter_span: Option<Span>) -> Tree {
     // Close any remaining open lists (finalizes tight/loose).
     builder.close_all_lists(source.len());
 
+    // Close any remaining open HTML scopes (emits unclosed diagnostics).
+    builder.close_all_html_scopes(source.len());
+
     // Close any remaining open scopes (finalizes spans).
     while builder.scope_stack.len() > 1 {
         builder.pop_scope(source.len());
@@ -1359,6 +1379,14 @@ pub fn parse_tree(source: &str, frontmatter_span: Option<Span>) -> Tree {
     tree
 }
 
+/// An open HTML container on the html stack.
+struct HtmlScope {
+    /// Lowercased tag name (for matching close tags).
+    tag: String,
+    /// Node ID of the container in the tree.
+    node_id: NodeId,
+}
+
 /// Internal tree builder with scope stack.
 struct TreeBuilder<'a> {
     /// The full source text.
@@ -1373,6 +1401,8 @@ struct TreeBuilder<'a> {
     quote_depth: usize,
     /// Stack of open list contexts.
     list_stack: Vec<ListContext>,
+    /// Stack of open HTML container tags (for close-tag matching).
+    html_stack: Vec<HtmlScope>,
 }
 
 impl<'a> TreeBuilder<'a> {
@@ -1384,6 +1414,7 @@ impl<'a> TreeBuilder<'a> {
             diagnostics: Vec::new(),
             quote_depth: 0,
             list_stack: Vec::new(),
+            html_stack: Vec::new(),
         }
     }
 
@@ -1509,6 +1540,258 @@ impl<'a> TreeBuilder<'a> {
     fn mark_list_blank(&mut self) {
         if let Some(ctx) = self.list_stack.last_mut() {
             ctx.saw_blank = true;
+        }
+    }
+
+    // -- HTML scope management -----------------------------------------------
+
+    /// Push an HTML container scope onto both the scope stack and html stack.
+    fn push_html_scope(&mut self, tag: &str, kind: ElementKind, span: Span) -> NodeId {
+        let id = self.push_scope(kind, Syntax::Html, span);
+        self.html_stack.push(HtmlScope {
+            tag: tag.to_string(),
+            node_id: id,
+        });
+        id
+    }
+
+    /// Handle an HTML closing tag. Returns `true` if the tag matched an
+    /// open scope (including error recovery for mismatched nesting).
+    fn handle_html_close_tag(&mut self, tag: &str, span_end: usize) -> bool {
+        // Find the matching open tag in the html stack.
+        let pos = self.html_stack.iter().rposition(|s| s.tag == tag);
+
+        let Some(idx) = pos else {
+            // No match — unexpected close tag.
+            self.diagnostics.push(Diagnostic {
+                span: Span::new(span_end.saturating_sub(tag.len() + 3), span_end),
+                message: format!("unexpected closing tag `</{tag}>`"),
+            });
+            return false;
+        };
+
+        // Close everything above the match (implicit close, flagged).
+        let above = self.html_stack.split_off(idx + 1);
+        for scope in above.iter().rev() {
+            self.diagnostics.push(Diagnostic {
+                span: self.nodes[scope.node_id].span,
+                message: format!("unclosed `<{}>` tag", scope.tag),
+            });
+            self.pop_scope(span_end);
+        }
+
+        // Pop the matched scope.
+        self.html_stack.pop();
+        self.pop_scope(span_end);
+        true
+    }
+
+    /// Close all remaining HTML scopes (at end of document).
+    fn close_all_html_scopes(&mut self, pos: usize) {
+        while let Some(scope) = self.html_stack.pop() {
+            self.diagnostics.push(Diagnostic {
+                span: self.nodes[scope.node_id].span,
+                message: format!("unclosed `<{}>` tag", scope.tag),
+            });
+            self.pop_scope(pos);
+        }
+    }
+
+    /// Try to handle a line as an HTML closing tag. Returns `true` if
+    /// the line was consumed (matched or emitted a diagnostic).
+    fn try_html_close_tag(&mut self, content: &str, content_start: usize, line_end: usize) -> bool {
+        let trimmed = content.trim();
+        if let Some(HtmlTag::Close { ref name, .. }) = html::tokenize_tag(trimmed, content_start) {
+            // handle_html_close_tag returns true on match, false on
+            // unexpected close (but still emits a diagnostic).
+            if self.html_stack.is_empty() {
+                self.diagnostics.push(Diagnostic {
+                    span: Span::new(content_start, line_end),
+                    message: format!("unexpected closing tag `</{name}>`"),
+                });
+                return true;
+            }
+            self.handle_html_close_tag(name, line_end);
+            return true;
+        }
+        false
+    }
+
+    /// Handle an HTML opening tag on a type 6/7 block line.
+    ///
+    /// Returns `true` if the tag was handled as a mapped HTML element
+    /// (container scope pushed or leaf added). Returns `false` if the
+    /// tag has no structural mapping and should fall through to the
+    /// opaque `HtmlBlock` path.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "line context parameters are distinct concerns"
+    )]
+    fn handle_html_open(
+        &mut self,
+        lines: &[&str],
+        pos: &mut usize,
+        line_idx: &mut usize,
+        body_offset: usize,
+        content: &str,
+        content_start: usize,
+        first_raw_len: usize,
+    ) -> bool {
+        let trimmed = content.trim();
+
+        // Try autolink first — not a structural tag.
+        if html::try_autolink(trimmed).is_some() {
+            return false;
+        }
+
+        let Some(tag) = html::tokenize_tag(trimmed, content_start) else {
+            return false;
+        };
+
+        match tag {
+            HtmlTag::Open {
+                ref name,
+                ref attrs,
+                self_closing,
+                ..
+            } => {
+                let line_end = body_offset + *pos + first_raw_len;
+                let span = Span::new(content_start, line_end);
+
+                // <a> tags produce Link nodes (not structural containers).
+                if name == "a" {
+                    let (href, title) = html::extract_link_attrs(attrs);
+                    *pos += first_raw_len;
+                    *line_idx += 1;
+                    self.consume_html_leaf(lines, pos, line_idx, name);
+                    let full_span = Span::new(content_start, body_offset + *pos);
+                    self.add_leaf(
+                        ElementKind::Link { url: href, title },
+                        Syntax::Html,
+                        full_span,
+                    );
+                    return true;
+                }
+
+                let Some(kind) = html::tag_to_element_kind(name) else {
+                    return false;
+                };
+
+                // Void elements and self-closing: always leaf.
+                if self_closing || html::VOID_ELEMENTS.contains(name.as_str()) {
+                    // Special handling for <img> to extract src/title.
+                    let leaf_kind = if name == "img" {
+                        let (url, title) = html::extract_image_attrs(attrs);
+                        ElementKind::Image { url, title }
+                    } else {
+                        kind
+                    };
+                    self.add_leaf(leaf_kind, Syntax::Html, span);
+                    *pos += first_raw_len;
+                    *line_idx += 1;
+                    return true;
+                }
+
+                // Non-container leaf elements: <p>, <h1>-<h6>.
+                if !html::is_html_container(name) {
+                    *pos += first_raw_len;
+                    *line_idx += 1;
+                    self.consume_html_leaf(lines, pos, line_idx, name);
+                    let full_span = Span::new(content_start, body_offset + *pos);
+                    self.add_leaf(kind, Syntax::Html, full_span);
+                    return true;
+                }
+
+                // Container element: push scope.
+                *pos += first_raw_len;
+                *line_idx += 1;
+
+                self.push_html_scope(name, kind, span);
+
+                // Check if next line (after stripping continuation markers)
+                // is non-blank. If blank, content is parsed as markdown
+                // (scope stays on stack, main loop continues). If non-blank,
+                // consume raw content until blank or close.
+                let next_is_nonblank = *line_idx < lines.len() && {
+                    let next = lines[*line_idx];
+                    let content = self
+                        .strip_continuation(next, body_offset + *pos)
+                        .map_or(next, |(c, _)| c);
+                    !content.trim().is_empty()
+                };
+                if next_is_nonblank {
+                    self.consume_html_raw(lines, pos, line_idx, body_offset, name);
+                }
+
+                true
+            }
+            HtmlTag::Close { .. } | HtmlTag::Comment { .. } => false,
+        }
+    }
+
+    /// Consume lines until matching close tag or blank line (raw HTML content mode).
+    fn consume_html_raw(
+        &mut self,
+        lines: &[&str],
+        pos: &mut usize,
+        line_idx: &mut usize,
+        body_offset: usize,
+        tag: &str,
+    ) {
+        while *line_idx < lines.len() {
+            let line = lines[*line_idx];
+            let inner_start = body_offset + *pos;
+
+            // Strip continuation markers (quotes + list indent).
+            let content = self
+                .strip_continuation(line, inner_start)
+                .map_or(line, |(c, _)| c);
+
+            if content.trim().is_empty() {
+                // Blank line: switch to markdown mode (stop consuming raw).
+                break;
+            }
+
+            let trimmed = content.trim();
+            if let Some(HtmlTag::Close { ref name, .. }) = html::tokenize_tag(trimmed, 0)
+                && name == tag
+            {
+                // Matching close: pop scope.
+                *pos += line.len();
+                *line_idx += 1;
+                self.handle_html_close_tag(tag, body_offset + *pos);
+                return;
+            }
+
+            *pos += line.len();
+            *line_idx += 1;
+        }
+    }
+
+    /// Consume lines until matching close tag for a leaf-level HTML element.
+    fn consume_html_leaf(&self, lines: &[&str], pos: &mut usize, line_idx: &mut usize, tag: &str) {
+        while *line_idx < lines.len() {
+            let line = lines[*line_idx];
+            let inner_start = *pos; // offset doesn't matter, only content
+
+            // Strip continuation markers (quotes + list indent).
+            let content = self
+                .strip_continuation(line, inner_start)
+                .map_or(line, |(c, _)| c);
+            let trimmed = content.trim();
+
+            *pos += line.len();
+            *line_idx += 1;
+
+            if let Some(HtmlTag::Close { ref name, .. }) = html::tokenize_tag(trimmed, 0)
+                && name == tag
+            {
+                return;
+            }
+
+            if trimmed.is_empty() {
+                return;
+            }
         }
     }
 
@@ -1691,17 +1974,44 @@ impl<'a> TreeBuilder<'a> {
                     &label,
                     content,
                 );
+            } else if self.try_html_close_tag(content, content_start, raw_start + raw_len) {
+                pos += raw_len;
+                line_idx += 1;
             } else if let Some(html_type) = html_block_start(&expanded) {
-                self.parse_html_block(
-                    &lines,
-                    &mut pos,
-                    &mut line_idx,
-                    body_offset,
-                    content_start,
-                    raw_len,
-                    content,
-                    html_type,
-                );
+                if matches!(html_type, 6 | 7)
+                    && self.handle_html_open(
+                        &lines,
+                        &mut pos,
+                        &mut line_idx,
+                        body_offset,
+                        content,
+                        content_start,
+                        raw_len,
+                    )
+                {
+                    // Handled by HTML tag integration.
+                } else if html_type == 1 && is_pre_code_open(content) {
+                    self.parse_pre_code_block(
+                        &lines,
+                        &mut pos,
+                        &mut line_idx,
+                        body_offset,
+                        content_start,
+                        raw_len,
+                        content,
+                    );
+                } else {
+                    self.parse_html_block(
+                        &lines,
+                        &mut pos,
+                        &mut line_idx,
+                        body_offset,
+                        content_start,
+                        raw_len,
+                        content,
+                        html_type,
+                    );
+                }
             } else if is_thematic_break(expanded.trim_end()) {
                 self.add_leaf(
                     ElementKind::Rules,
@@ -2070,6 +2380,52 @@ impl<'a> TreeBuilder<'a> {
         self.add_leaf(
             ElementKind::HtmlBlock,
             Syntax::Markdown,
+            Span::new(block_start, body_offset + *pos),
+        );
+    }
+
+    /// Parse a `<pre><code>` block as a `CodeBlock` with `Syntax::Html`.
+    ///
+    /// Consumes lines until `</pre>` (same end condition as type 1).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "line context parameters are distinct concerns"
+    )]
+    fn parse_pre_code_block(
+        &mut self,
+        lines: &[&str],
+        pos: &mut usize,
+        line_idx: &mut usize,
+        body_offset: usize,
+        block_start: usize,
+        first_line_raw_len: usize,
+        first_content: &str,
+    ) {
+        let end_on_first = html_block_end(first_content, 1);
+        *pos += first_line_raw_len;
+        *line_idx += 1;
+
+        if !end_on_first {
+            while *line_idx < lines.len() {
+                let inner_line = lines[*line_idx];
+                let inner_start = body_offset + *pos;
+
+                let Some((content, _)) = self.strip_continuation(inner_line, inner_start) else {
+                    break;
+                };
+
+                *pos += inner_line.len();
+                *line_idx += 1;
+
+                if html_block_end(content, 1) {
+                    break;
+                }
+            }
+        }
+
+        self.add_leaf(
+            ElementKind::CodeBlock,
+            Syntax::Html,
             Span::new(block_start, body_offset + *pos),
         );
     }
@@ -3090,12 +3446,13 @@ mod tests {
 
     #[test]
     fn html_block_type6_div() {
-        let source = "<div>\ncontent\n</div>\n\n";
+        let source = "<div>\ncontent\n</div>\n";
         let tree = parse(source);
         let children = root_children(&tree);
 
-        assert_eq!(children.len(), 1, "should find one non-blank block");
-        assert_kind(&tree, children[0], &ElementKind::HtmlBlock);
+        assert_eq!(children.len(), 1, "should find one container");
+        let node = assert_kind(&tree, children[0], &ElementKind::Container);
+        assert_eq!(node.syntax, Syntax::Html, "syntax is Html");
     }
 
     #[test]
@@ -4118,6 +4475,77 @@ mod tests {
         );
     }
 
+    // =======================================================================
+    // HTML tag integration
+    // =======================================================================
+
+    // --- Equivalence: same ElementKind for markdown and HTML syntax ---
+
+    #[test]
+    fn html_blockquote_same_kind_as_markdown() {
+        let md = parse("> quoted\n");
+        let html = parse("<blockquote>\n\nquoted\n\n</blockquote>\n");
+
+        let md_kind = &md.node(root_children(&md)[0]).kind;
+        let html_kind = &html.node(root_children(&html)[0]).kind;
+        assert_eq!(md_kind, html_kind, "both produce QuoteBlock");
+    }
+
+    #[test]
+    fn html_heading_same_kind_as_markdown() {
+        let md = parse("# Heading\n");
+        let html = parse("<h1>Heading</h1>\n");
+
+        let md_kind = &md.node(root_children(&md)[0]).kind;
+        let html_kind = &html.node(root_children(&html)[0]).kind;
+        assert_eq!(md_kind, html_kind, "both produce Heading level 1");
+    }
+
+    #[test]
+    fn html_hr_same_kind_as_markdown() {
+        let md = parse("---\n");
+        let html = parse("<hr>\n");
+
+        let md_kind = &md.node(root_children(&md)[0]).kind;
+        let html_kind = &html.node(root_children(&html)[0]).kind;
+        assert_eq!(md_kind, html_kind, "both produce Rules");
+    }
+
+    // --- HTML syntax produces Syntax::Html ---
+
+    #[test]
+    fn html_blockquote_has_html_syntax() {
+        let tree = parse("<blockquote>\n\nquoted\n\n</blockquote>\n");
+        let children = root_children(&tree);
+        let node = tree.node(children[0]);
+        assert_eq!(node.syntax, Syntax::Html, "HTML blockquote has Html syntax");
+        assert_eq!(node.kind, ElementKind::QuoteBlock, "kind is QuoteBlock");
+    }
+
+    #[test]
+    fn html_heading_has_html_syntax() {
+        let tree = parse("<h1>Heading</h1>\n");
+        let children = root_children(&tree);
+        let node = tree.node(children[0]);
+        assert_eq!(node.syntax, Syntax::Html, "HTML heading has Html syntax");
+        assert_eq!(
+            node.kind,
+            ElementKind::Heading { level: 1 },
+            "kind is Heading level 1"
+        );
+    }
+
+    #[test]
+    fn html_h2_through_h6() {
+        for level in 2..=6u8 {
+            let source = format!("<h{level}>text</h{level}>\n");
+            let tree = parse(&source);
+            let children = root_children(&tree);
+            assert_eq!(children.len(), 1, "h{level} produces one node");
+            assert_kind(&tree, children[0], &ElementKind::Heading { level });
+        }
+    }
+
     #[test]
     fn table_multiple_body_rows() {
         let source = "| H |\n| --- |\n| a |\n| b |\n| c |\n";
@@ -4470,6 +4898,291 @@ mod tests {
             "block quote contains table"
         );
     }
+
+    #[test]
+    fn html_heading_multiline_span() {
+        let source = "<h2>\nHeading Text\n</h2>\n";
+        let tree = parse(source);
+        let children = root_children(&tree);
+        assert_eq!(children.len(), 1, "one heading");
+        let node = assert_kind(&tree, children[0], &ElementKind::Heading { level: 2 });
+        assert_eq!(
+            node.span,
+            Span::new(0, source.len()),
+            "span covers opening through closing tag"
+        );
+    }
+
+    #[test]
+    fn html_hr_has_html_syntax() {
+        let tree = parse("<hr>\n");
+        let children = root_children(&tree);
+        let node = tree.node(children[0]);
+        assert_eq!(node.syntax, Syntax::Html, "HTML hr has Html syntax");
+        assert_eq!(node.kind, ElementKind::Rules, "kind is Rules");
+    }
+
+    #[test]
+    fn html_hr_self_closing() {
+        let tree = parse("<hr/>\n");
+        let children = root_children(&tree);
+        assert_eq!(children.len(), 1, "one node");
+        assert_kind(&tree, children[0], &ElementKind::Rules);
+    }
+
+    // --- Void elements ---
+
+    #[test]
+    fn void_element_never_pushed_to_scope() {
+        let tree = parse("<hr>\n<br>\n");
+        let children = root_children(&tree);
+        // Void elements are leaves, not containers.
+        assert_eq!(children.len(), 2, "two void element leaves");
+        assert_kind(&tree, children[0], &ElementKind::Rules);
+        // <br> has no structural mapping so falls through to HtmlBlock.
+    }
+
+    #[test]
+    fn img_void_element() {
+        let tree = parse("<img src=\"photo.jpg\" />\n");
+        let children = root_children(&tree);
+        assert_eq!(children.len(), 1, "one image node");
+        let node = tree.node(children[0]);
+        assert_eq!(node.syntax, Syntax::Html, "Html syntax");
+        assert!(
+            matches!(node.kind, ElementKind::Image { .. }),
+            "kind is Image"
+        );
+    }
+
+    // --- Container scoping ---
+
+    #[test]
+    fn details_container_scope() {
+        let tree = parse("<details>\n\ncontent\n\n</details>\n");
+        let children = root_children(&tree);
+        assert_eq!(children.len(), 1, "one details container");
+        assert_kind(&tree, children[0], &ElementKind::Details);
+        let inner = tree.children(children[0]);
+        assert!(
+            !inner.is_empty(),
+            "details has children (content parsed as markdown)"
+        );
+    }
+
+    #[test]
+    fn nested_html_containers() {
+        let source = "<div>\n\n<blockquote>\n\ntext\n\n</blockquote>\n\n</div>\n";
+        let tree = parse(source);
+        let children = root_children(&tree);
+        assert_eq!(children.len(), 1, "one div container");
+        assert_kind(&tree, children[0], &ElementKind::Container);
+    }
+
+    // --- HTML inside block quotes ---
+
+    #[test]
+    fn html_container_inside_blockquote() {
+        let source = "> <div>\n> content\n> </div>\n";
+        let tree = parse(source);
+        let children = root_children(&tree);
+        assert_eq!(children.len(), 1, "one block quote");
+        assert_kind(&tree, children[0], &ElementKind::QuoteBlock);
+        // The div container should be a child of the block quote.
+        let quote_children = tree.children(children[0]);
+        assert!(
+            quote_children
+                .iter()
+                .any(|&id| tree.node(id).kind == ElementKind::Container),
+            "div container inside block quote: {quote_children:?}"
+        );
+        // The container should be properly closed (no unclosed diagnostic).
+        assert!(
+            !tree
+                .diagnostics()
+                .iter()
+                .any(|d| d.message.contains("unclosed")),
+            "no unclosed tag diagnostic: {:?}",
+            tree.diagnostics()
+        );
+    }
+
+    #[test]
+    fn html_heading_inside_blockquote() {
+        let source = "> <h2>Title</h2>\n";
+        let tree = parse(source);
+        let children = root_children(&tree);
+        assert_eq!(children.len(), 1, "one block quote");
+        let quote_children = tree.children(children[0]);
+        assert!(
+            quote_children
+                .iter()
+                .any(|&id| matches!(tree.node(id).kind, ElementKind::Heading { level: 2 })),
+            "heading inside block quote: {quote_children:?}"
+        );
+    }
+
+    // --- Error recovery ---
+
+    #[test]
+    fn unclosed_html_tag_diagnostic() {
+        let tree = parse("<div>\n\ncontent\n");
+        let diags = tree.diagnostics();
+        assert!(
+            diags.iter().any(|d| d.message.contains("unclosed")),
+            "should have unclosed tag diagnostic: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn unexpected_close_tag_diagnostic() {
+        let tree = parse("</div>\n");
+        let diags = tree.diagnostics();
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("unexpected closing tag")),
+            "should have unexpected close tag diagnostic: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn mismatched_nesting_recovery() {
+        // <div><section></div> should close section implicitly
+        let tree = parse("<div>\n\n<section>\n\ntext\n\n</div>\n");
+        let diags = tree.diagnostics();
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("unclosed `<section>`")),
+            "should flag unclosed section: {diags:?}"
+        );
+        // The div should still be properly closed.
+        let children = root_children(&tree);
+        assert_eq!(children.len(), 1, "one root container");
+    }
+
+    // --- Markdown inside HTML blocks ---
+
+    #[test]
+    fn markdown_in_html_with_blank_lines() {
+        let source = "<div>\n\n## Heading\n\n</div>\n";
+        let tree = parse(source);
+        let children = root_children(&tree);
+        assert_eq!(children.len(), 1, "one container");
+        assert_kind(&tree, children[0], &ElementKind::Container);
+        // The heading should be a child of the container.
+        let inner = tree.children(children[0]);
+        assert!(
+            inner
+                .iter()
+                .any(|&id| matches!(tree.node(id).kind, ElementKind::Heading { level: 2 })),
+            "heading parsed inside container"
+        );
+    }
+
+    #[test]
+    fn raw_html_without_blank_lines() {
+        let source = "<div>\n## Not a heading\n</div>\n";
+        let tree = parse(source);
+        let children = root_children(&tree);
+        assert_eq!(children.len(), 1, "one container");
+        // Content without blank lines is raw: no heading child.
+        let inner = tree.children(children[0]);
+        assert!(
+            !inner
+                .iter()
+                .any(|&id| matches!(tree.node(id).kind, ElementKind::Heading { .. })),
+            "no heading in raw mode"
+        );
+    }
+
+    // --- <pre><code> → CodeBlock ---
+
+    #[test]
+    fn pre_code_produces_code_block() {
+        let tree = parse("<pre><code>\nfn main() {}\n</code></pre>\n");
+        let children = root_children(&tree);
+        assert_eq!(children.len(), 1, "one block");
+        let node = assert_kind(&tree, children[0], &ElementKind::CodeBlock);
+        assert_eq!(node.syntax, Syntax::Html, "Html syntax");
+    }
+
+    #[test]
+    fn pre_code_with_language() {
+        let tree = parse("<pre><code class=\"language-rust\">\nfn main() {}\n</code></pre>\n");
+        let children = root_children(&tree);
+        assert_eq!(children.len(), 1, "one block");
+        assert_kind(&tree, children[0], &ElementKind::CodeBlock);
+    }
+
+    #[test]
+    fn pre_code_same_kind_as_fenced() {
+        let md = parse("```\ncode\n```\n");
+        let html = parse("<pre><code>\ncode\n</code></pre>\n");
+
+        let md_kind = &md.node(root_children(&md)[0]).kind;
+        let html_kind = &html.node(root_children(&html)[0]).kind;
+        assert_eq!(md_kind, html_kind, "both produce CodeBlock");
+    }
+
+    #[test]
+    fn pre_code_span_covers_full_block() {
+        let source = "<pre><code>\nline1\nline2\n</code></pre>\n";
+        let tree = parse(source);
+        let children = root_children(&tree);
+        let node = tree.node(children[0]);
+        assert_eq!(
+            node.span,
+            Span::new(0, source.len()),
+            "span covers opening through closing tag"
+        );
+    }
+
+    // --- Standalone <pre> stays opaque ---
+
+    #[test]
+    fn html_block_type1_pre_stays_opaque() {
+        let tree = parse("<pre>\ncode\n</pre>\n");
+        let children = root_children(&tree);
+        // Standalone <pre> (without <code>) stays as HtmlBlock.
+        assert_eq!(children.len(), 1, "one block");
+        assert_kind(&tree, children[0], &ElementKind::HtmlBlock);
+    }
+
+    #[test]
+    fn html_block_type2_comment_stays_opaque() {
+        let tree = parse("<!-- comment -->\n");
+        let children = root_children(&tree);
+        assert_eq!(children.len(), 1, "one block");
+        assert_kind(&tree, children[0], &ElementKind::HtmlBlock);
+    }
+
+    // --- Table (HTML) elements ---
+
+    #[test]
+    fn html_table_container() {
+        let tree = parse("<table>\n\n<tr><td>cell</td></tr>\n\n</table>\n");
+        let children = root_children(&tree);
+        assert_eq!(children.len(), 1, "one table container");
+        assert!(
+            matches!(&tree.node(children[0]).kind, ElementKind::Table { .. }),
+            "kind is Table"
+        );
+        assert_eq!(tree.node(children[0]).syntax, Syntax::Html, "Html syntax");
+    }
+
+    // --- Section/article/aside all map to Container ---
+
+    #[test]
+    fn section_maps_to_container() {
+        let tree = parse("<section>\n\ncontent\n\n</section>\n");
+        let children = root_children(&tree);
+        assert_eq!(children.len(), 1, "one container");
+        assert_kind(&tree, children[0], &ElementKind::Container);
+    }
+
+    // --- Table structure (main's table tests) ---
 
     #[test]
     fn table_tree_structure() {
