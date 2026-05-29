@@ -3498,7 +3498,7 @@ impl Tree {
     }
 
     /// Extract heading display text, optional explicit ID, and text byte span.
-    fn heading_content(&self, node_id: NodeId) -> (String, Option<String>, Span) {
+    pub fn heading_content(&self, node_id: NodeId) -> (String, Option<String>, Span) {
         let node = &self.nodes[node_id];
         let raw = &self.source[node.span.start..node.span.end];
 

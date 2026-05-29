@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use lsp_server::{Connection, Message, Notification, Response};
 
-use crate::block::{ElementKind, Heading, HeadingId, LinkKind, normalize_label};
+use crate::block::{ElementKind, Heading, HeadingId, LinkKind, NodeId, Tree, normalize_label};
 use crate::lsp;
 use crate::span::Span;
 use crate::validation::{self, Diagnostic, Severity};
@@ -313,40 +313,544 @@ fn handle_request(
 // Document symbols
 // ---------------------------------------------------------------------------
 
-/// Build document symbols (headings) for a file.
+/// Maximum length for truncated symbol names.
+const SYMBOL_NAME_MAX: usize = 60;
+
+/// Truncate a string to `SYMBOL_NAME_MAX` characters, appending `…` if cut.
+fn truncate_name(s: &str) -> String {
+    if s.len() <= SYMBOL_NAME_MAX {
+        return s.to_string();
+    }
+    let mut end = SYMBOL_NAME_MAX;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &s[..end])
+}
+
+/// Map an `ElementKind` to its LSP `SymbolKind`, or `None` if the node
+/// should not be emitted as a symbol.
+fn element_symbol_kind(kind: &ElementKind) -> Option<u32> {
+    match kind {
+        ElementKind::Heading { .. } => Some(lsp::symbol_kind::STRING),
+        ElementKind::Link { .. } | ElementKind::Import { .. } => Some(lsp::symbol_kind::FUNCTION),
+        ElementKind::Image { .. } => Some(lsp::symbol_kind::FILE),
+        ElementKind::List { ordered: true, .. } => Some(lsp::symbol_kind::ARRAY),
+        ElementKind::List { ordered: false, .. } => Some(lsp::symbol_kind::ENUM),
+        ElementKind::ListItem { task: Some(_), .. } => Some(lsp::symbol_kind::BOOLEAN),
+        ElementKind::ListItem { task: None, .. } => Some(lsp::symbol_kind::ENUM_MEMBER),
+        ElementKind::Table { .. } => Some(lsp::symbol_kind::STRUCT),
+        ElementKind::TableRow { .. } => Some(lsp::symbol_kind::KEY),
+        ElementKind::TableCell => Some(lsp::symbol_kind::FIELD),
+        ElementKind::CodeBlock | ElementKind::Math => Some(lsp::symbol_kind::OBJECT),
+        ElementKind::QuoteBlock | ElementKind::Details => Some(lsp::symbol_kind::MODULE),
+        ElementKind::Rules => Some(lsp::symbol_kind::OPERATOR),
+        ElementKind::FootnoteDef { .. } => Some(lsp::symbol_kind::CONSTANT),
+        ElementKind::Container => Some(lsp::symbol_kind::NAMESPACE),
+        // Not emitted: paragraphs, inline code, inline math, footnote refs,
+        // document root, frontmatter, HTML blocks, details summary, ref defs.
+        ElementKind::Document
+        | ElementKind::Frontmatter
+        | ElementKind::Paragraph
+        | ElementKind::HtmlBlock
+        | ElementKind::InlineCode
+        | ElementKind::InlineMath
+        | ElementKind::FootnoteRef { .. }
+        | ElementKind::ReferenceDef { .. }
+        | ElementKind::DetailsSummary => None,
+    }
+}
+
+/// Whether an element is a scope boundary (headings inside it do not
+/// participate in the document's heading hierarchy).
+fn is_scope_boundary(kind: &ElementKind) -> bool {
+    matches!(kind, ElementKind::QuoteBlock | ElementKind::Details)
+}
+
+/// Generate the symbol name and optional detail for a tree node.
+fn symbol_name(tree: &Tree, node_id: NodeId) -> (String, Option<String>) {
+    let node = tree.node(node_id);
+    let source = tree.source();
+    let raw = &source[node.span.start..node.span.end];
+
+    match &node.kind {
+        ElementKind::Heading { .. } => {
+            let (text, _, _) = tree.heading_content(node_id);
+            (text, None)
+        }
+        ElementKind::Link { .. } | ElementKind::Import { .. } => link_symbol_name(&node.kind, raw),
+        ElementKind::Image { url, .. } => image_symbol_name(url, raw),
+        ElementKind::CodeBlock | ElementKind::Math => {
+            let name = code_block_language(raw)
+                .map_or_else(|| "code".to_string(), |l| format!("code: {l}"));
+            (name, None)
+        }
+        ElementKind::Table { alignments } => table_symbol_name(tree, node_id, node, alignments),
+        ElementKind::TableRow { header } => {
+            let text = table_row_text(tree, node_id);
+            let name = if text.is_empty() {
+                if *header { "header" } else { "row" }.to_string()
+            } else {
+                truncate_name(&text)
+            };
+            (name, None)
+        }
+        ElementKind::TableCell => {
+            let clean = raw.trim().trim_matches('|').trim();
+            (truncate_name(clean), None)
+        }
+        ElementKind::ListItem { task } => {
+            let text = list_item_text(tree, node_id);
+            let detail = task.map(|c| if c { "checked" } else { "unchecked" }.to_string());
+            (truncate_name(&text), detail)
+        }
+        ElementKind::List { .. } => ("list".to_string(), None),
+        ElementKind::QuoteBlock => {
+            let text = blockquote_first_line(raw);
+            let name = if text.is_empty() {
+                "blockquote".to_string()
+            } else {
+                truncate_name(&text)
+            };
+            (name, None)
+        }
+        ElementKind::Details => {
+            let text = details_summary_text(tree, node_id);
+            let name = if text.is_empty() {
+                "details".to_string()
+            } else {
+                truncate_name(&text)
+            };
+            (name, None)
+        }
+        ElementKind::FootnoteDef { label } => (format!("[^{label}]"), None),
+        ElementKind::Rules => ("---".to_string(), None),
+        ElementKind::Container => (container_tag_name(raw), None),
+        _ => (String::new(), None),
+    }
+}
+
+/// Build symbol name for a link or import node.
+fn link_symbol_name(kind: &ElementKind, raw: &str) -> (String, Option<String>) {
+    let (url, title) = match kind {
+        ElementKind::Import { path } => (path.as_str(), "import"),
+        ElementKind::Link { url, title } => (url.as_str(), title.as_str()),
+        _ => ("", ""),
+    };
+    let predicate = if title.is_empty() {
+        "references"
+    } else {
+        title
+    };
+    let name = format!("{predicate}({url})");
+    let display = link_display_text(raw);
+    let detail = if display.is_empty() {
+        None
+    } else {
+        Some(display)
+    };
+    (truncate_name(&name), detail)
+}
+
+/// Build symbol name for an image node.
+fn image_symbol_name(url: &str, raw: &str) -> (String, Option<String>) {
+    let alt = image_alt_text(raw);
+    let name = if alt.is_empty() {
+        "image".to_string()
+    } else {
+        truncate_name(&alt)
+    };
+    let detail = if url.is_empty() {
+        None
+    } else {
+        Some(url.to_string())
+    };
+    (name, detail)
+}
+
+/// Build symbol name for a table node.
+fn table_symbol_name(
+    tree: &Tree,
+    node_id: NodeId,
+    node: &crate::block::Node,
+    alignments: &[crate::block::TableAlignment],
+) -> (String, Option<String>) {
+    let header = table_header_text(tree, node_id);
+    let name = if header.is_empty() {
+        "table".to_string()
+    } else {
+        truncate_name(&header)
+    };
+    let rows = node
+        .children
+        .iter()
+        .filter(|&&c| matches!(tree.node(c).kind, ElementKind::TableRow { .. }))
+        .count();
+    let cols = alignments.len();
+    (name, Some(format!("{rows}×{cols}")))
+}
+
+/// Extract the display text from a markdown link like `[text](url)`.
+fn link_display_text(raw: &str) -> String {
+    if raw.starts_with('[') {
+        if let Some(end) = raw.find("](") {
+            return raw[1..end].trim().to_string();
+        }
+        if let Some(end) = raw.find("][") {
+            return raw[1..end].trim().to_string();
+        }
+        if raw.ends_with(']') && !raw.contains("](") {
+            return raw[1..raw.len() - 1].trim().to_string();
+        }
+    }
+    // HTML <a> tag: extract inner text
+    if let Some(text) = raw
+        .find('>')
+        .and_then(|start| {
+            raw.rfind("</")
+                .filter(|&end| end > start)
+                .map(|end| (start, end))
+        })
+        .map(|(s, e)| raw[s + 1..e].trim())
+    {
+        return text.to_string();
+    }
+    String::new()
+}
+
+/// Extract alt text from a markdown image `![alt](src)`.
+fn image_alt_text(raw: &str) -> String {
+    if let Some(end) = raw.strip_prefix("![").and_then(|r| r.find("](")) {
+        return raw[2..end + 2].trim().to_string();
+    }
+    // HTML <img>: extract alt attribute
+    if let Some(alt) = raw
+        .find("alt=\"")
+        .map(|i| &raw[i + 4..])
+        .and_then(|rest| rest.find('"').map(|end| &rest[..end]))
+    {
+        return alt.to_string();
+    }
+    String::new()
+}
+
+/// Extract the language tag from a fenced code block.
+fn code_block_language(raw: &str) -> Option<String> {
+    let first_line = raw.lines().next().unwrap_or("");
+    let trimmed = first_line.trim();
+    // Fenced: ```lang or ~~~lang
+    if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+        let fence_char = &trimmed[..1];
+        let after_fence = trimmed.trim_start_matches(fence_char.chars().next().unwrap_or('`'));
+        let lang = after_fence.trim();
+        if lang.is_empty() {
+            return None;
+        }
+        // Strip info string after first space
+        let lang = lang.split_whitespace().next().unwrap_or(lang);
+        return Some(lang.to_string());
+    }
+    // Block math
+    if trimmed.starts_with("$$") {
+        return Some("math".to_string());
+    }
+    None
+}
+
+/// Extract the first header row text from a table.
+fn table_header_text(tree: &Tree, table_id: NodeId) -> String {
+    let table = tree.node(table_id);
+    for &child_id in &table.children {
+        let child = tree.node(child_id);
+        if matches!(child.kind, ElementKind::TableRow { header: true }) {
+            return table_row_text(tree, child_id);
+        }
+    }
+    String::new()
+}
+
+/// Extract cell texts from a table row, joined by ` | `.
+fn table_row_text(tree: &Tree, row_id: NodeId) -> String {
+    let row = tree.node(row_id);
+    let source = tree.source();
+    let cells: Vec<&str> = row
+        .children
+        .iter()
+        .map(|&c| {
+            let cell = tree.node(c);
+            source[cell.span.start..cell.span.end]
+                .trim()
+                .trim_matches('|')
+                .trim()
+        })
+        .collect();
+    cells.join(" | ")
+}
+
+/// Extract the first line of a blockquote, preserving the `>` marker.
+fn blockquote_first_line(raw: &str) -> String {
+    let first = raw.lines().next().unwrap_or("");
+    let trimmed = first.trim();
+    // Check for GFM admonition: > [!TYPE]
+    if let Some(admonition) = trimmed
+        .strip_prefix('>')
+        .map(str::trim)
+        .and_then(|inner| inner.strip_prefix("[!"))
+        .and_then(|r| r.find(']').map(|e| &r[..e]))
+    {
+        return admonition.to_string();
+    }
+    truncate_name(trimmed)
+}
+
+/// Extract the `<summary>` text from a `<details>` node.
+fn details_summary_text(tree: &Tree, details_id: NodeId) -> String {
+    let details = tree.node(details_id);
+    let source = tree.source();
+    for &child_id in &details.children {
+        let child = tree.node(child_id);
+        if matches!(child.kind, ElementKind::DetailsSummary) {
+            let text = &source[child.span.start..child.span.end];
+            // Strip <summary> tags
+            let inner = text.trim().strip_prefix("<summary>").unwrap_or(text).trim();
+            let inner = inner.strip_suffix("</summary>").unwrap_or(inner).trim();
+            return inner.to_string();
+        }
+    }
+    String::new()
+}
+
+/// Extract the tag name from a generic container's opening tag.
+fn container_tag_name(raw: &str) -> String {
+    let first_line = raw.lines().next().unwrap_or("");
+    let trimmed = first_line.trim();
+    if let Some(after) = trimmed.strip_prefix('<') {
+        let end = after
+            .find(|c: char| c.is_whitespace() || c == '>' || c == '/')
+            .unwrap_or(after.len());
+        return after[..end].to_lowercase();
+    }
+    "container".to_string()
+}
+
+/// Extract the first meaningful text from a list item.
+fn list_item_text(tree: &Tree, item_id: NodeId) -> String {
+    let node = tree.node(item_id);
+    let source = tree.source();
+    let raw = &source[node.span.start..node.span.end];
+
+    let first_line = raw.lines().next().unwrap_or("");
+    let trimmed = first_line.trim_start();
+
+    // Strip list marker and optional task checkbox
+    let text = if trimmed.starts_with("- [")
+        || trimmed.starts_with("* [")
+        || trimmed.starts_with("+ [")
+    {
+        let after_marker = &trimmed[2..];
+        after_marker
+            .strip_prefix("[x] ")
+            .or_else(|| after_marker.strip_prefix("[X] "))
+            .or_else(|| after_marker.strip_prefix("[ ] "))
+            .unwrap_or(after_marker)
+    } else if trimmed.starts_with("- ") || trimmed.starts_with("* ") || trimmed.starts_with("+ ") {
+        &trimmed[2..]
+    } else {
+        // Ordered: strip digits and `. ` or `) `
+        let digit_end = trimmed.find(|c: char| !c.is_ascii_digit()).unwrap_or(0);
+        if digit_end > 0
+            && (trimmed[digit_end..].starts_with(". ") || trimmed[digit_end..].starts_with(") "))
+        {
+            &trimmed[digit_end + 2..]
+        } else {
+            trimmed
+        }
+    };
+
+    text.trim().to_string()
+}
+
+/// Build a span-to-line range for a node.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "line numbers in markdown files won't exceed u32::MAX"
+)]
+fn node_range(tree: &Tree, node_id: NodeId) -> lsp::Range {
+    let node = tree.node(node_id);
+    let source = tree.source();
+    let start_line = source[..node.span.start]
+        .bytes()
+        .filter(|&b| b == b'\n')
+        .count() as u32;
+    let end_line = source[..node.span.end.min(source.len())]
+        .bytes()
+        .filter(|&b| b == b'\n')
+        .count() as u32;
+    lsp::Range {
+        start: lsp::Position {
+            line: start_line,
+            character: 0,
+        },
+        end: lsp::Position {
+            line: end_line,
+            character: 0,
+        },
+    }
+}
+
+/// Build document symbols for a file by walking the tree.
 fn document_symbols(workspaces: &Workspaces, uri: &str) -> Option<Vec<lsp::DocumentSymbol>> {
     let (workspace, rel_path) = workspaces.resolve(uri)?;
     let file_data = workspace.file(&rel_path)?;
-    let headings = file_data.tree.headings();
-    Some(build_heading_symbols(&headings))
+    let tree = &file_data.tree;
+    let root = 0; // Document root is always node 0
+    let children = tree.node(root).children.clone();
+    Some(build_symbol_tree(tree, &children, false))
 }
 
-/// Convert a flat list of headings into a nested symbol tree.
+/// A tagged symbol for the nesting pass. Headings carry their level
+/// so the nesting algorithm can build the correct hierarchy.
+struct TaggedSymbol {
+    /// Heading level (1–6), or 0 for non-heading symbols.
+    level: u8,
+    /// The LSP symbol.
+    symbol: lsp::DocumentSymbol,
+}
+
+/// Recursively build the symbol tree from a list of child node IDs.
 ///
-/// Headings are nested by level: H2 is a child of the preceding H1,
-/// H3 is a child of the preceding H2, etc.
-fn build_heading_symbols(headings: &[Heading]) -> Vec<lsp::DocumentSymbol> {
-    let mut stack: Vec<(u8, lsp::DocumentSymbol)> = Vec::new();
-    let mut result: Vec<lsp::DocumentSymbol> = Vec::new();
+/// `inside_scope` is true when we're inside a scope boundary (block quote,
+/// details). Headings inside scopes are emitted as flat symbols, not
+/// participating in the heading hierarchy.
+fn build_symbol_tree(
+    tree: &Tree,
+    children: &[NodeId],
+    inside_scope: bool,
+) -> Vec<lsp::DocumentSymbol> {
+    let mut tagged: Vec<TaggedSymbol> = Vec::new();
 
-    for heading in headings {
-        let symbol = heading_to_document_symbol(heading);
+    for &node_id in children {
+        let node = tree.node(node_id);
 
-        // Pop symbols at same or deeper level — they're complete.
-        while stack.last().is_some_and(|(lvl, _)| *lvl >= heading.level) {
-            let Some((_, finished)) = stack.pop() else {
-                break;
-            };
-            if let Some((_, parent)) = stack.last_mut() {
-                parent.children.get_or_insert_with(Vec::new).push(finished);
-            } else {
-                result.push(finished);
+        // Paragraphs: float links up.
+        if matches!(node.kind, ElementKind::Paragraph) {
+            for sym in collect_floated_links(tree, node_id) {
+                tagged.push(TaggedSymbol {
+                    level: 0,
+                    symbol: sym,
+                });
+            }
+            continue;
+        }
+
+        let Some(kind) = element_symbol_kind(&node.kind) else {
+            continue;
+        };
+
+        let heading_level = match &node.kind {
+            ElementKind::Heading { level } => *level,
+            _ => 0,
+        };
+
+        let (name, detail) = symbol_name(tree, node_id);
+        let range = node_range(tree, node_id);
+
+        // Code blocks get a Property child for the language tag.
+        let mut sym_children = if matches!(node.kind, ElementKind::CodeBlock | ElementKind::Math) {
+            let lang = code_block_language(&tree.source()[node.span.start..node.span.end]);
+            let child_name = lang.map_or_else(|| "code".to_string(), |l| format!("code: {l}"));
+            Some(vec![lsp::DocumentSymbol {
+                name: child_name,
+                detail: None,
+                kind: lsp::symbol_kind::PROPERTY,
+                range,
+                selection_range: range,
+                children: None,
+            }])
+        } else {
+            None
+        };
+
+        // Recurse into container elements.
+        let node_children = &tree.node(node_id).children;
+        if !node_children.is_empty()
+            && !matches!(
+                node.kind,
+                ElementKind::CodeBlock
+                    | ElementKind::Math
+                    | ElementKind::Link { .. }
+                    | ElementKind::Image { .. }
+                    | ElementKind::Import { .. }
+            )
+        {
+            let in_scope = inside_scope || is_scope_boundary(&node.kind);
+            let child_syms = build_symbol_tree(tree, node_children, in_scope);
+            if !child_syms.is_empty() {
+                sym_children.get_or_insert_with(Vec::new).extend(child_syms);
             }
         }
 
-        stack.push((heading.level, symbol));
+        tagged.push(TaggedSymbol {
+            level: heading_level,
+            symbol: lsp::DocumentSymbol {
+                name,
+                detail,
+                kind,
+                range,
+                selection_range: range,
+                children: sym_children,
+            },
+        });
     }
 
+    // If we're inside a scope boundary, headings are flat — no nesting.
+    if inside_scope {
+        return tagged.into_iter().map(|t| t.symbol).collect();
+    }
+
+    // Outside scopes, nest headings by level (H2 under H1, etc.)
+    // and attach non-heading symbols to their preceding heading.
+    nest_by_heading_level(tagged)
+}
+
+/// Nest symbols by heading level: H2 under H1, H3 under H2, etc.
+/// Non-heading symbols are attached as children of their preceding heading.
+fn nest_by_heading_level(tagged: Vec<TaggedSymbol>) -> Vec<lsp::DocumentSymbol> {
+    if !tagged.iter().any(|t| t.level > 0) {
+        return tagged.into_iter().map(|t| t.symbol).collect();
+    }
+
+    let mut stack: Vec<(u8, lsp::DocumentSymbol)> = Vec::new();
+    let mut result: Vec<lsp::DocumentSymbol> = Vec::new();
+
+    for item in tagged {
+        if item.level > 0 {
+            // Pop symbols at same or deeper level — they're complete.
+            while stack.last().is_some_and(|(lvl, _)| *lvl >= item.level) {
+                let Some((_, finished)) = stack.pop() else {
+                    break;
+                };
+                if let Some((_, parent)) = stack.last_mut() {
+                    parent.children.get_or_insert_with(Vec::new).push(finished);
+                } else {
+                    result.push(finished);
+                }
+            }
+            stack.push((item.level, item.symbol));
+        } else {
+            // Non-heading: attach to last heading on stack, else top-level.
+            if let Some((_, parent)) = stack.last_mut() {
+                parent
+                    .children
+                    .get_or_insert_with(Vec::new)
+                    .push(item.symbol);
+            } else {
+                result.push(item.symbol);
+            }
+        }
+    }
+
+    // Flush remaining stack.
     while let Some((_, finished)) = stack.pop() {
         if let Some((_, parent)) = stack.last_mut() {
             parent.children.get_or_insert_with(Vec::new).push(finished);
@@ -358,32 +862,39 @@ fn build_heading_symbols(headings: &[Heading]) -> Vec<lsp::DocumentSymbol> {
     result
 }
 
-/// Convert a single heading to a `DocumentSymbol`.
-#[allow(
-    clippy::cast_possible_truncation,
-    reason = "line numbers in markdown files won't exceed u32::MAX"
-)]
-fn heading_to_document_symbol(heading: &Heading) -> lsp::DocumentSymbol {
-    let line = heading.line.saturating_sub(1) as u32;
-    let range = lsp::Range {
-        start: lsp::Position { line, character: 0 },
-        end: lsp::Position { line, character: 0 },
-    };
-
-    lsp::DocumentSymbol {
-        name: heading.text.clone(),
-        kind: lsp::symbol_kind::STRING,
-        range,
-        selection_range: range,
-        children: None,
+/// Collect link symbols from a paragraph node (float-up).
+fn collect_floated_links(tree: &Tree, para_id: NodeId) -> Vec<lsp::DocumentSymbol> {
+    let node = tree.node(para_id);
+    let mut links = Vec::new();
+    for &child_id in &node.children {
+        let child = tree.node(child_id);
+        if element_symbol_kind(&child.kind).is_some()
+            && matches!(
+                child.kind,
+                ElementKind::Link { .. } | ElementKind::Image { .. } | ElementKind::Import { .. }
+            )
+        {
+            let kind = element_symbol_kind(&child.kind).unwrap_or(lsp::symbol_kind::FUNCTION);
+            let (name, detail) = symbol_name(tree, child_id);
+            let range = node_range(tree, child_id);
+            links.push(lsp::DocumentSymbol {
+                name,
+                detail,
+                kind,
+                range,
+                selection_range: range,
+                children: None,
+            });
+        }
     }
+    links
 }
 
 // ---------------------------------------------------------------------------
-// Workspace symbols (ticket 13)
+// Workspace symbols
 // ---------------------------------------------------------------------------
 
-/// Search headings across all workspaces.
+/// Search symbols across all workspaces, filtered by query.
 #[allow(
     clippy::cast_possible_truncation,
     reason = "line numbers in markdown files won't exceed u32::MAX"
@@ -394,31 +905,77 @@ fn workspace_symbols(workspaces: &Workspaces, query: &str) -> Vec<lsp::SymbolInf
 
     for (root, workspace) in workspaces.iter() {
         for (rel_path, file_data) in workspace.files() {
-            let headings = file_data.tree.headings();
-            for heading in &headings {
-                if !query.is_empty() && !heading.text.to_lowercase().contains(&query_lower) {
-                    continue;
-                }
-                let abs_path = root.join(rel_path);
-                let uri = path_to_uri(&abs_path);
-                let line = heading.line.saturating_sub(1) as u32;
-                symbols.push(lsp::SymbolInformation {
-                    name: heading.text.clone(),
-                    kind: lsp::symbol_kind::STRING,
-                    location: lsp::Location {
-                        uri,
-                        range: lsp::Range {
-                            start: lsp::Position { line, character: 0 },
-                            end: lsp::Position { line, character: 0 },
-                        },
-                    },
-                    container_name: Some(rel_path.display().to_string()),
-                });
-            }
+            let tree = &file_data.tree;
+            collect_workspace_symbols(tree, &query_lower, root, rel_path, &mut symbols);
         }
     }
 
     symbols
+}
+
+/// Collect flat workspace symbols from a tree, filtered by query.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "line numbers in markdown files won't exceed u32::MAX"
+)]
+fn collect_workspace_symbols(
+    tree: &Tree,
+    query_lower: &str,
+    root: &Path,
+    rel_path: &Path,
+    out: &mut Vec<lsp::SymbolInformation>,
+) {
+    let abs_path = root.join(rel_path);
+    let uri = path_to_uri(&abs_path);
+    let source = tree.source();
+
+    for (node_id, node) in tree.nodes().iter().enumerate() {
+        let Some(kind) = element_symbol_kind(&node.kind) else {
+            continue;
+        };
+
+        // Skip paragraphs (already filtered by element_symbol_kind returning
+        // None), but also skip table cells/rows for workspace — too granular.
+        if matches!(
+            node.kind,
+            ElementKind::TableRow { .. } | ElementKind::TableCell
+        ) {
+            continue;
+        }
+
+        let (name, _) = symbol_name(tree, node_id);
+        if name.is_empty() {
+            continue;
+        }
+
+        if !query_lower.is_empty() && !name.to_lowercase().contains(query_lower) {
+            continue;
+        }
+
+        let start_line = source[..node.span.start]
+            .bytes()
+            .filter(|&b| b == b'\n')
+            .count() as u32;
+
+        out.push(lsp::SymbolInformation {
+            name,
+            kind,
+            location: lsp::Location {
+                uri: uri.clone(),
+                range: lsp::Range {
+                    start: lsp::Position {
+                        line: start_line,
+                        character: 0,
+                    },
+                    end: lsp::Position {
+                        line: start_line,
+                        character: 0,
+                    },
+                },
+            },
+            container_name: Some(rel_path.display().to_string()),
+        });
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1764,40 +2321,43 @@ mod tests {
 
     #[test]
     fn heading_symbols_nest_by_level() {
-        let headings = vec![
-            test_heading(
-                1,
-                1,
-                "Title",
-                HeadingId::Computed {
-                    github: "title".to_string(),
-                    gitlab: "title".to_string(),
-                    vscode: "title".to_string(),
+        let tagged = vec![
+            TaggedSymbol {
+                level: 1,
+                symbol: lsp::DocumentSymbol {
+                    name: "Title".to_string(),
+                    detail: None,
+                    kind: lsp::symbol_kind::STRING,
+                    range: lsp::Range::default(),
+                    selection_range: lsp::Range::default(),
+                    children: None,
                 },
-            ),
-            test_heading(
-                3,
-                2,
-                "Section",
-                HeadingId::Computed {
-                    github: "section".to_string(),
-                    gitlab: "section".to_string(),
-                    vscode: "section".to_string(),
+            },
+            TaggedSymbol {
+                level: 2,
+                symbol: lsp::DocumentSymbol {
+                    name: "Section".to_string(),
+                    detail: None,
+                    kind: lsp::symbol_kind::STRING,
+                    range: lsp::Range::default(),
+                    selection_range: lsp::Range::default(),
+                    children: None,
                 },
-            ),
-            test_heading(
-                5,
-                2,
-                "Another",
-                HeadingId::Computed {
-                    github: "another".to_string(),
-                    gitlab: "another".to_string(),
-                    vscode: "another".to_string(),
+            },
+            TaggedSymbol {
+                level: 2,
+                symbol: lsp::DocumentSymbol {
+                    name: "Another".to_string(),
+                    detail: None,
+                    kind: lsp::symbol_kind::STRING,
+                    range: lsp::Range::default(),
+                    selection_range: lsp::Range::default(),
+                    children: None,
                 },
-            ),
+            },
         ];
 
-        let symbols = build_heading_symbols(&headings);
+        let symbols = nest_by_heading_level(tagged);
         assert_eq!(symbols.len(), 1, "should have one top-level symbol");
         assert_eq!(symbols[0].name, "Title", "top-level should be the H1");
         let children = symbols[0]
@@ -2651,6 +3211,370 @@ mod tests {
             "declaration should point to the ref def line"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Symbol emission (ticket 09)
+    // -----------------------------------------------------------------------
+
+    /// Parse content and return document symbols.
+    fn symbols_for(content: &str) -> Vec<lsp::DocumentSymbol> {
+        let dir = workspace_with_files(&[("test.md", content)]);
+        let workspaces = scan_workspaces(&dir);
+        document_symbols(&workspaces, &file_uri(&dir, "test.md")).expect("should produce symbols")
+    }
+
+    /// Recursively find all symbols matching a predicate.
+    fn find_symbols(
+        syms: &[lsp::DocumentSymbol],
+        pred: &dyn Fn(&lsp::DocumentSymbol) -> bool,
+    ) -> Vec<lsp::DocumentSymbol> {
+        let mut found = Vec::new();
+        for sym in syms {
+            if pred(sym) {
+                found.push(sym.clone());
+            }
+            if let Some(children) = &sym.children {
+                found.extend(find_symbols(children, pred));
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn heading_emits_string_kind() {
+        let syms = symbols_for("# Title\n\n## Section\n");
+        assert_eq!(syms.len(), 1, "should have one top-level heading");
+        assert_eq!(
+            syms[0].kind,
+            lsp::symbol_kind::STRING,
+            "heading should be STRING"
+        );
+        assert_eq!(syms[0].name, "Title", "heading name should be the text");
+    }
+
+    #[test]
+    fn link_emits_function_kind() {
+        let syms = symbols_for("# H\n\n[text](other.md \"references\")\n");
+        let links = find_symbols(&syms, &|s| s.kind == lsp::symbol_kind::FUNCTION);
+        assert_eq!(links.len(), 1, "should have one link symbol");
+        assert_eq!(
+            links[0].name, "references(other.md)",
+            "link name should be predicate(target)"
+        );
+        assert_eq!(
+            links[0].detail.as_deref(),
+            Some("text"),
+            "link detail should be display text"
+        );
+    }
+
+    #[test]
+    fn link_without_predicate_defaults_to_references() {
+        let syms = symbols_for("[go](other.md)\n");
+        let links = find_symbols(&syms, &|s| s.kind == lsp::symbol_kind::FUNCTION);
+        assert_eq!(links.len(), 1, "should have one link");
+        assert!(
+            links[0].name.starts_with("references("),
+            "should default to references predicate"
+        );
+    }
+
+    #[test]
+    fn image_emits_file_kind() {
+        let syms = symbols_for("![alt text](image.png)\n");
+        let images = find_symbols(&syms, &|s| s.kind == lsp::symbol_kind::FILE);
+        assert_eq!(images.len(), 1, "should have one image symbol");
+        assert_eq!(images[0].name, "alt text", "image name should be alt text");
+        assert_eq!(
+            images[0].detail.as_deref(),
+            Some("image.png"),
+            "image detail should be the path"
+        );
+    }
+
+    #[test]
+    fn ordered_list_emits_array() {
+        let syms = symbols_for("1. first\n2. second\n");
+        let lists = find_symbols(&syms, &|s| s.kind == lsp::symbol_kind::ARRAY);
+        assert_eq!(lists.len(), 1, "should have one ordered list");
+    }
+
+    #[test]
+    fn unordered_list_emits_enum() {
+        let syms = symbols_for("- alpha\n- beta\n");
+        let lists = find_symbols(&syms, &|s| s.kind == lsp::symbol_kind::ENUM);
+        assert_eq!(lists.len(), 1, "should have one unordered list");
+    }
+
+    #[test]
+    fn list_item_emits_enum_member() {
+        let syms = symbols_for("- hello world\n");
+        let items = find_symbols(&syms, &|s| s.kind == lsp::symbol_kind::ENUM_MEMBER);
+        assert_eq!(items.len(), 1, "should have one list item");
+        assert_eq!(
+            items[0].name, "hello world",
+            "list item name should be the text"
+        );
+    }
+
+    #[test]
+    fn task_item_emits_boolean() {
+        let syms = symbols_for("- [x] done\n- [ ] todo\n");
+        let tasks = find_symbols(&syms, &|s| s.kind == lsp::symbol_kind::BOOLEAN);
+        assert_eq!(tasks.len(), 2, "should have two task items");
+        assert_eq!(
+            tasks[0].detail.as_deref(),
+            Some("checked"),
+            "checked task should have checked detail"
+        );
+        assert_eq!(
+            tasks[1].detail.as_deref(),
+            Some("unchecked"),
+            "unchecked task should have unchecked detail"
+        );
+    }
+
+    #[test]
+    fn table_emits_struct() {
+        let syms = symbols_for("| A | B |\n|---|---|\n| 1 | 2 |\n");
+        let tables = find_symbols(&syms, &|s| s.kind == lsp::symbol_kind::STRUCT);
+        assert_eq!(tables.len(), 1, "should have one table");
+        assert!(
+            tables[0].detail.as_ref().is_some_and(|d| d.contains('×')),
+            "table detail should have dimensions"
+        );
+    }
+
+    #[test]
+    fn code_block_emits_object_with_property_child() {
+        let syms = symbols_for("```rust\nfn main() {}\n```\n");
+        let blocks = find_symbols(&syms, &|s| s.kind == lsp::symbol_kind::OBJECT);
+        assert_eq!(blocks.len(), 1, "should have one code block");
+        assert_eq!(
+            blocks[0].name, "code: rust",
+            "code block name should include language"
+        );
+        let children = blocks[0]
+            .children
+            .as_ref()
+            .expect("code block should have children");
+        let props: Vec<_> = children
+            .iter()
+            .filter(|c| c.kind == lsp::symbol_kind::PROPERTY)
+            .collect();
+        assert_eq!(props.len(), 1, "code block should have one Property child");
+        assert_eq!(
+            props[0].name, "code: rust",
+            "property child should name the language"
+        );
+    }
+
+    #[test]
+    fn code_block_without_language() {
+        let syms = symbols_for("```\nsome code\n```\n");
+        let blocks = find_symbols(&syms, &|s| s.kind == lsp::symbol_kind::OBJECT);
+        assert_eq!(blocks.len(), 1, "should have one code block");
+        assert_eq!(
+            blocks[0].name, "code",
+            "unnamed code block should be 'code'"
+        );
+    }
+
+    #[test]
+    fn blockquote_emits_module() {
+        let syms = symbols_for("> quoted text\n");
+        let quotes = find_symbols(&syms, &|s| s.kind == lsp::symbol_kind::MODULE);
+        assert_eq!(quotes.len(), 1, "should have one blockquote");
+    }
+
+    #[test]
+    fn thematic_break_emits_operator() {
+        let syms = symbols_for("---\n");
+        let breaks = find_symbols(&syms, &|s| s.kind == lsp::symbol_kind::OPERATOR);
+        assert_eq!(breaks.len(), 1, "should have one thematic break");
+        assert_eq!(breaks[0].name, "---", "thematic break name should be ---");
+    }
+
+    #[test]
+    fn paragraph_not_emitted_as_symbol() {
+        let syms = symbols_for("Just a paragraph.\n");
+        let all = find_symbols(&syms, &|_| true);
+        assert!(
+            all.iter().all(|s| s.name != "Just a paragraph."),
+            "paragraphs should not be emitted as symbols"
+        );
+    }
+
+    #[test]
+    fn paragraph_links_float_up() {
+        let syms = symbols_for("# Section\n\nSee [link](other.md) for details.\n");
+        let links = find_symbols(&syms, &|s| s.kind == lsp::symbol_kind::FUNCTION);
+        assert_eq!(links.len(), 1, "floated link should be emitted");
+    }
+
+    #[test]
+    fn scope_boundary_headings_are_flat() {
+        let content = "# Top\n\n> ## Quoted heading\n>\n> text\n\n## After\n";
+        let syms = symbols_for(content);
+        assert_eq!(syms.len(), 1, "should have one top-level heading");
+        let top_children = syms[0].children.as_ref().expect("Top should have children");
+
+        let after = top_children
+            .iter()
+            .find(|s| s.name == "After")
+            .expect("'After' should be a child of 'Top'");
+        assert_eq!(
+            after.kind,
+            lsp::symbol_kind::STRING,
+            "After should be a heading"
+        );
+
+        let quote = top_children
+            .iter()
+            .find(|s| s.kind == lsp::symbol_kind::MODULE)
+            .expect("blockquote should be a child of Top");
+        let inner_headings = find_symbols(quote.children.as_deref().unwrap_or(&[]), &|s| {
+            s.kind == lsp::symbol_kind::STRING
+        });
+        assert_eq!(
+            inner_headings.len(),
+            1,
+            "quoted heading should be inside the blockquote"
+        );
+    }
+
+    #[test]
+    fn non_heading_symbols_nest_under_heading() {
+        let tagged = vec![
+            TaggedSymbol {
+                level: 1,
+                symbol: lsp::DocumentSymbol {
+                    name: "Title".to_string(),
+                    detail: None,
+                    kind: lsp::symbol_kind::STRING,
+                    range: lsp::Range::default(),
+                    selection_range: lsp::Range::default(),
+                    children: None,
+                },
+            },
+            TaggedSymbol {
+                level: 0,
+                symbol: lsp::DocumentSymbol {
+                    name: "---".to_string(),
+                    detail: None,
+                    kind: lsp::symbol_kind::OPERATOR,
+                    range: lsp::Range::default(),
+                    selection_range: lsp::Range::default(),
+                    children: None,
+                },
+            },
+        ];
+
+        let symbols = nest_by_heading_level(tagged);
+        assert_eq!(symbols.len(), 1, "thematic break should nest under heading");
+        let children = symbols[0]
+            .children
+            .as_ref()
+            .expect("heading should have children");
+        assert_eq!(
+            children[0].kind,
+            lsp::symbol_kind::OPERATOR,
+            "child should be the thematic break"
+        );
+    }
+
+    #[test]
+    fn workspace_symbols_includes_links() {
+        let dir = workspace_with_files(&[("a.md", "# Title\n\n[go](b.md)\n"), ("b.md", "# B\n")]);
+        let workspaces = scan_workspaces(&dir);
+        let syms = workspace_symbols(&workspaces, "");
+        assert!(
+            syms.iter().any(|s| s.kind == lsp::symbol_kind::FUNCTION),
+            "workspace symbols should include links"
+        );
+    }
+
+    #[test]
+    fn workspace_symbols_query_filters_new_kinds() {
+        let dir = workspace_with_files(&[("a.md", "# Title\n\n## Section\n")]);
+        let workspaces = scan_workspaces(&dir);
+        let syms = workspace_symbols(&workspaces, "Section");
+        assert_eq!(syms.len(), 1, "query should filter to matching symbols");
+        assert_eq!(syms[0].name, "Section", "should match the section heading");
+    }
+
+    #[test]
+    fn footnote_def_emits_constant() {
+        let syms = symbols_for("text[^1]\n\n[^1]: footnote content\n");
+        let footnotes = find_symbols(&syms, &|s| s.kind == lsp::symbol_kind::CONSTANT);
+        assert_eq!(footnotes.len(), 1, "should have one footnote definition");
+        assert_eq!(
+            footnotes[0].name, "[^1]",
+            "footnote name should include the label"
+        );
+    }
+
+    #[test]
+    fn heading_nesting_deep() {
+        let tagged = vec![
+            TaggedSymbol {
+                level: 1,
+                symbol: lsp::DocumentSymbol {
+                    name: "H1".to_string(),
+                    detail: None,
+                    kind: lsp::symbol_kind::STRING,
+                    range: lsp::Range::default(),
+                    selection_range: lsp::Range::default(),
+                    children: None,
+                },
+            },
+            TaggedSymbol {
+                level: 2,
+                symbol: lsp::DocumentSymbol {
+                    name: "H2".to_string(),
+                    detail: None,
+                    kind: lsp::symbol_kind::STRING,
+                    range: lsp::Range::default(),
+                    selection_range: lsp::Range::default(),
+                    children: None,
+                },
+            },
+            TaggedSymbol {
+                level: 3,
+                symbol: lsp::DocumentSymbol {
+                    name: "H3".to_string(),
+                    detail: None,
+                    kind: lsp::symbol_kind::STRING,
+                    range: lsp::Range::default(),
+                    selection_range: lsp::Range::default(),
+                    children: None,
+                },
+            },
+        ];
+
+        let symbols = nest_by_heading_level(tagged);
+        assert_eq!(symbols.len(), 1, "should have one top-level H1");
+        let h2 = &symbols[0].children.as_ref().expect("H1 children")[0];
+        assert_eq!(h2.name, "H2", "child should be H2");
+        let h3 = &h2.children.as_ref().expect("H2 children")[0];
+        assert_eq!(h3.name, "H3", "grandchild should be H3");
+    }
+
+    #[test]
+    fn interface_not_used_in_symbols() {
+        // The LSP SymbolKind for Interface is 11 — verify it's never emitted.
+        let content = "# Title\n\n[link](a.md)\n\n- item\n\n```rust\ncode\n```\n\n---\n\n> quote\n";
+        let syms = symbols_for(content);
+        let all = find_symbols(&syms, &|_| true);
+        assert!(
+            all.iter().all(|s| s.kind != 11),
+            "Interface (kind 11) should never be emitted"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Navigation — declaration (ticket 08, continued)
+    // -----------------------------------------------------------------------
 
     #[test]
     fn declaration_inline_link_falls_through_to_target() {
