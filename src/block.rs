@@ -103,6 +103,29 @@ pub enum ElementKind {
         /// unchecked, `Some(true)` for checked.
         task: Option<bool>,
     },
+    /// GFM pipe table container.
+    Table {
+        /// Per-column alignment derived from the delimiter row.
+        alignments: Vec<TableAlignment>,
+    },
+    /// A row in a GFM pipe table.
+    TableRow {
+        /// Whether this is the header row.
+        header: bool,
+    },
+    /// A cell in a GFM pipe table row.
+    TableCell,
+}
+
+/// Column alignment for a GFM pipe table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableAlignment {
+    /// Left-aligned (default): `---` or `:---`.
+    Left,
+    /// Center-aligned: `:---:`.
+    Center,
+    /// Right-aligned: `---:`.
+    Right,
 }
 
 /// Which syntax produced a node.
@@ -1082,6 +1105,177 @@ struct ListContext {
 }
 
 // ---------------------------------------------------------------------------
+// Table helpers
+// ---------------------------------------------------------------------------
+
+/// Parse a GFM delimiter row and return per-column alignments.
+///
+/// A delimiter row consists of cells separated by pipes, where each cell
+/// is optional `:`, at least one `-`, optional `:`, surrounded by optional
+/// spaces. Returns `None` if the line is not a valid delimiter row or has
+/// zero columns.
+fn parse_delimiter_row(line: &str) -> Option<Vec<TableAlignment>> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    // Strip optional leading/trailing pipes.
+    let inner = trimmed.strip_prefix('|').unwrap_or(trimmed);
+    let inner = inner.strip_suffix('|').unwrap_or(inner);
+
+    if inner.trim().is_empty() {
+        return None;
+    }
+
+    let mut alignments = Vec::new();
+    for cell in inner.split('|') {
+        let cell = cell.trim();
+        if cell.is_empty() {
+            return None;
+        }
+        let left = cell.starts_with(':');
+        let right = cell.ends_with(':');
+        let dashes = cell
+            .trim_start_matches(':')
+            .trim_end_matches(':')
+            .trim_matches(' ');
+        if dashes.is_empty() || !dashes.bytes().all(|b| b == b'-') {
+            return None;
+        }
+        alignments.push(match (left, right) {
+            (true, true) => TableAlignment::Center,
+            (false, true) => TableAlignment::Right,
+            _ => TableAlignment::Left,
+        });
+    }
+
+    if alignments.is_empty() {
+        None
+    } else {
+        Some(alignments)
+    }
+}
+
+/// Split a table row into cell content spans, respecting backtick code spans.
+///
+/// Pipes inside backtick code spans do not split cells. Returns byte offsets
+/// relative to `row_start` for each cell's trimmed content.
+fn split_table_cells(line: &str, row_start: usize) -> Vec<Span> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+
+    // Locate `trimmed` within `line`.
+    let trim_offset = line.len() - line.trim_start().len();
+    let inner_start_in_line = trim_offset;
+
+    // Strip optional leading pipe.
+    let (inner, inner_offset) = trimmed
+        .strip_prefix('|')
+        .map_or((trimmed, inner_start_in_line), |stripped| {
+            (stripped, inner_start_in_line + 1)
+        });
+
+    // Strip optional trailing pipe.
+    let inner = if inner.ends_with('|') && !inner.ends_with("\\|") {
+        &inner[..inner.len() - 1]
+    } else {
+        inner
+    };
+
+    let bytes = inner.as_bytes();
+    let mut cells = Vec::new();
+    let mut cell_start = 0;
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if bytes[i] == b'`' {
+            // Skip backtick code span.
+            let bt_count = bytes[i..].iter().take_while(|&&b| b == b'`').count();
+            let after = i + bt_count;
+            // Find matching closing backticks.
+            if let Some(close_pos) = inner[after..].find(&inner[i..i + bt_count]) {
+                i = after + close_pos + bt_count;
+            } else {
+                i = bytes.len();
+            }
+        } else if bytes[i] == b'\\' && i + 1 < bytes.len() && bytes[i + 1] == b'|' {
+            // Escaped pipe — skip both characters.
+            i += 2;
+        } else if bytes[i] == b'|' {
+            // Cell boundary.
+            let raw = &inner[cell_start..i];
+            let cell_trimmed = raw.trim();
+            if cell_trimmed.is_empty() {
+                cells.push(Span::new(
+                    row_start + inner_offset + cell_start,
+                    row_start + inner_offset + cell_start,
+                ));
+            } else {
+                let leading = raw.len() - raw.trim_start().len();
+                let s = cell_start + leading;
+                let e = s + cell_trimmed.len();
+                cells.push(Span::new(
+                    row_start + inner_offset + s,
+                    row_start + inner_offset + e,
+                ));
+            }
+            cell_start = i + 1;
+            i += 1;
+        } else {
+            i += 1;
+        }
+    }
+
+    // Last cell after the final pipe.
+    let raw = &inner[cell_start..];
+    let cell_trimmed = raw.trim();
+    if cell_trimmed.is_empty() {
+        cells.push(Span::new(
+            row_start + inner_offset + cell_start,
+            row_start + inner_offset + cell_start,
+        ));
+    } else {
+        let leading = raw.len() - raw.trim_start().len();
+        let s = cell_start + leading;
+        let e = s + cell_trimmed.len();
+        cells.push(Span::new(
+            row_start + inner_offset + s,
+            row_start + inner_offset + e,
+        ));
+    }
+
+    cells
+}
+
+/// Check if a line could be a table row (has at least one unescaped pipe
+/// outside backtick code spans).
+fn is_table_row(line: &str) -> bool {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'`' {
+            let bt_count = bytes[i..].iter().take_while(|&&b| b == b'`').count();
+            let after = i + bt_count;
+            if let Some(close_pos) = line[after..].find(&line[i..i + bt_count]) {
+                i = after + close_pos + bt_count;
+            } else {
+                i = bytes.len();
+            }
+        } else if bytes[i] == b'\\' && i + 1 < bytes.len() && bytes[i + 1] == b'|' {
+            i += 2;
+        } else if bytes[i] == b'|' {
+            return true;
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
+// ---------------------------------------------------------------------------
 // Block quote helpers
 // ---------------------------------------------------------------------------
 
@@ -2054,7 +2248,7 @@ impl<'a> TreeBuilder<'a> {
         );
     }
 
-    /// Parse a paragraph, detecting setext headings.
+    /// Parse a paragraph, detecting setext headings and GFM tables.
     ///
     /// Handles block quote continuation markers on each continuation line,
     /// with lazy continuation fallback (lines without `>` markers can
@@ -2070,6 +2264,23 @@ impl<'a> TreeBuilder<'a> {
     ) {
         *pos += first_line_raw_len;
         *line_idx += 1;
+
+        // Check for GFM table: header row with pipes followed by delimiter row.
+        let header_end = self.source[para_start..]
+            .find('\n')
+            .map_or(self.source.len(), |p| para_start + p);
+        let header_line = &self.source[para_start..header_end];
+
+        if is_table_row(header_line) && *line_idx < lines.len() {
+            let next_line = lines[*line_idx];
+            let next_start = body_offset + *pos;
+            if let Some((content, _)) = self.strip_continuation(next_line, next_start)
+                && let Some(alignments) = parse_delimiter_row(content)
+            {
+                self.parse_table(lines, pos, line_idx, body_offset, para_start, alignments);
+                return;
+            }
+        }
 
         // Consume paragraph continuation lines.
         loop {
@@ -2173,6 +2384,128 @@ impl<'a> TreeBuilder<'a> {
             Syntax::Markdown,
             Span::new(para_start, body_offset + *pos),
         );
+    }
+
+    /// Parse a GFM pipe table.
+    ///
+    /// Called after the header row has been consumed and a delimiter row
+    /// has been detected at the current `line_idx`. Creates `Table`,
+    /// `TableRow`, and `TableCell` nodes.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "table parameters are distinct concerns"
+    )]
+    fn parse_table(
+        &mut self,
+        lines: &[&str],
+        pos: &mut usize,
+        line_idx: &mut usize,
+        body_offset: usize,
+        header_start: usize,
+        alignments: Vec<TableAlignment>,
+    ) {
+        let col_count = alignments.len();
+
+        // Open Table container.
+        self.push_scope(
+            ElementKind::Table { alignments },
+            Syntax::Markdown,
+            Span::new(header_start, header_start),
+        );
+
+        // Parse header row cells.
+        let header_end = self.source[header_start..]
+            .find('\n')
+            .map_or(self.source.len(), |p| header_start + p);
+        let header_line = &self.source[header_start..header_end];
+        self.emit_table_row(header_line, header_start, header_end, col_count, true);
+
+        // Consume the delimiter row (advance past it, no node emitted).
+        let delim_len = lines[*line_idx].len();
+        *pos += delim_len;
+        *line_idx += 1;
+
+        // Consume body rows.
+        while *line_idx < lines.len() {
+            let raw_line = lines[*line_idx];
+            let raw_start = body_offset + *pos;
+            let raw_len = raw_line.len();
+
+            // Strip continuation markers.
+            let Some((content, content_start)) = self.strip_continuation(raw_line, raw_start)
+            else {
+                break;
+            };
+
+            // Blank line or non-table-row line ends the table.
+            if content.trim().is_empty() || !is_table_row(content) {
+                break;
+            }
+
+            // Trim trailing newline from content for cell parsing.
+            let content_trimmed = content.trim_end_matches('\n').trim_end_matches('\r');
+            let content_end = content_start + content_trimmed.len();
+            self.emit_table_row(
+                content_trimmed,
+                content_start,
+                content_end,
+                col_count,
+                false,
+            );
+
+            *pos += raw_len;
+            *line_idx += 1;
+        }
+
+        // Close the Table scope.
+        self.pop_scope(body_offset + *pos);
+    }
+
+    /// Emit a single table row with cells, padding or truncating to `col_count`.
+    fn emit_table_row(
+        &mut self,
+        line: &str,
+        row_start: usize,
+        row_end: usize,
+        col_count: usize,
+        header: bool,
+    ) {
+        self.push_scope(
+            ElementKind::TableRow { header },
+            Syntax::Markdown,
+            Span::new(row_start, row_end),
+        );
+
+        let cell_spans = split_table_cells(line, row_start);
+        let actual_count = cell_spans.len();
+
+        // Emit cells up to col_count.
+        for (i, span) in cell_spans.into_iter().enumerate() {
+            if i >= col_count {
+                break;
+            }
+            self.add_leaf(ElementKind::TableCell, Syntax::Markdown, span);
+        }
+
+        // Pad with empty cells if fewer than col_count.
+        for _ in actual_count..col_count {
+            self.add_leaf(
+                ElementKind::TableCell,
+                Syntax::Markdown,
+                Span::new(row_end, row_end),
+            );
+        }
+
+        // Record mismatch diagnostic.
+        if actual_count != col_count {
+            self.diagnostics.push(Diagnostic {
+                span: Span::new(row_start, row_end),
+                message: format!("table row has {actual_count} cells, expected {col_count}"),
+            });
+        }
+
+        // Close the row scope.
+        self.pop_scope(row_end);
     }
 }
 
@@ -3732,5 +4065,472 @@ mod tests {
         // paragraph continuation.
         assert_eq!(children.len(), 1, "single paragraph");
         assert_kind(&tree, children[0], &ElementKind::Paragraph);
+    }
+
+    // --- Tables: basic ---
+
+    #[test]
+    fn basic_table() {
+        let source = "| A | B |\n| --- | --- |\n| 1 | 2 |\n";
+        let tree = parse(source);
+        let children = root_children(&tree);
+
+        assert_eq!(children.len(), 1, "one table");
+        let table = tree.node(children[0]);
+        assert!(
+            matches!(&table.kind, ElementKind::Table { alignments } if alignments.len() == 2),
+            "table with 2 columns"
+        );
+
+        let rows = tree.children(children[0]);
+        assert_eq!(rows.len(), 2, "header row + 1 body row");
+
+        // Header row.
+        assert_kind(&tree, rows[0], &ElementKind::TableRow { header: true });
+        let header_cells = tree.children(rows[0]);
+        assert_eq!(header_cells.len(), 2, "header has 2 cells");
+        assert_kind(&tree, header_cells[0], &ElementKind::TableCell);
+        assert_kind(&tree, header_cells[1], &ElementKind::TableCell);
+        assert_eq!(
+            tree.text(&tree.node(header_cells[0]).span),
+            "A",
+            "first header cell text"
+        );
+        assert_eq!(
+            tree.text(&tree.node(header_cells[1]).span),
+            "B",
+            "second header cell text"
+        );
+
+        // Body row.
+        assert_kind(&tree, rows[1], &ElementKind::TableRow { header: false });
+        let body_cells = tree.children(rows[1]);
+        assert_eq!(body_cells.len(), 2, "body has 2 cells");
+        assert_eq!(
+            tree.text(&tree.node(body_cells[0]).span),
+            "1",
+            "first body cell text"
+        );
+        assert_eq!(
+            tree.text(&tree.node(body_cells[1]).span),
+            "2",
+            "second body cell text"
+        );
+    }
+
+    #[test]
+    fn table_multiple_body_rows() {
+        let source = "| H |\n| --- |\n| a |\n| b |\n| c |\n";
+        let tree = parse(source);
+        let children = root_children(&tree);
+
+        assert_eq!(children.len(), 1, "one table");
+        let rows = tree.children(children[0]);
+        assert_eq!(rows.len(), 4, "header + 3 body rows");
+        assert_kind(&tree, rows[0], &ElementKind::TableRow { header: true });
+        for &row_id in &rows[1..] {
+            assert_kind(&tree, row_id, &ElementKind::TableRow { header: false });
+        }
+    }
+
+    #[test]
+    fn table_header_only() {
+        let source = "| H1 | H2 |\n| --- | --- |\n";
+        let tree = parse(source);
+        let children = root_children(&tree);
+
+        assert_eq!(children.len(), 1, "one table");
+        let rows = tree.children(children[0]);
+        assert_eq!(rows.len(), 1, "header row only");
+    }
+
+    // --- Tables: alignment ---
+
+    #[test]
+    fn table_alignment_left() {
+        let source = "| A |\n| --- |\n| x |\n";
+        let tree = parse(source);
+        let table = tree.node(root_children(&tree)[0]);
+
+        assert!(
+            matches!(&table.kind, ElementKind::Table { alignments }
+                if alignments == &[TableAlignment::Left]),
+            "default left alignment"
+        );
+    }
+
+    #[test]
+    fn table_alignment_left_colon() {
+        let source = "| A |\n| :--- |\n| x |\n";
+        let tree = parse(source);
+        let table = tree.node(root_children(&tree)[0]);
+
+        assert!(
+            matches!(&table.kind, ElementKind::Table { alignments }
+                if alignments == &[TableAlignment::Left]),
+            "explicit left alignment"
+        );
+    }
+
+    #[test]
+    fn table_alignment_center() {
+        let source = "| A |\n| :---: |\n| x |\n";
+        let tree = parse(source);
+        let table = tree.node(root_children(&tree)[0]);
+
+        assert!(
+            matches!(&table.kind, ElementKind::Table { alignments }
+                if alignments == &[TableAlignment::Center]),
+            "center alignment"
+        );
+    }
+
+    #[test]
+    fn table_alignment_right() {
+        let source = "| A |\n| ---: |\n| x |\n";
+        let tree = parse(source);
+        let table = tree.node(root_children(&tree)[0]);
+
+        assert!(
+            matches!(&table.kind, ElementKind::Table { alignments }
+                if alignments == &[TableAlignment::Right]),
+            "right alignment"
+        );
+    }
+
+    #[test]
+    fn table_mixed_alignment() {
+        let source = "| L | C | R |\n| --- | :---: | ---: |\n| a | b | c |\n";
+        let tree = parse(source);
+        let table = tree.node(root_children(&tree)[0]);
+
+        assert!(
+            matches!(&table.kind, ElementKind::Table { alignments }
+            if alignments == &[
+                TableAlignment::Left,
+                TableAlignment::Center,
+                TableAlignment::Right,
+            ]),
+            "mixed alignment"
+        );
+    }
+
+    // --- Tables: column count mismatches ---
+
+    #[test]
+    fn table_fewer_cells_padded() {
+        let source = "| A | B | C |\n| --- | --- | --- |\n| 1 |\n";
+        let tree = parse(source);
+        let children = root_children(&tree);
+        let rows = tree.children(children[0]);
+
+        // Body row should be padded to 3 cells.
+        let body_cells = tree.children(rows[1]);
+        assert_eq!(body_cells.len(), 3, "padded to 3 cells");
+
+        // First cell has content, rest are empty.
+        assert_eq!(
+            tree.text(&tree.node(body_cells[0]).span),
+            "1",
+            "first cell has content"
+        );
+        assert!(
+            tree.node(body_cells[1]).span.is_empty(),
+            "second cell is empty"
+        );
+        assert!(
+            tree.node(body_cells[2]).span.is_empty(),
+            "third cell is empty"
+        );
+    }
+
+    #[test]
+    fn table_excess_cells_ignored() {
+        let source = "| A |\n| --- |\n| 1 | 2 | 3 |\n";
+        let tree = parse(source);
+        let children = root_children(&tree);
+        let rows = tree.children(children[0]);
+
+        // Body row should have only 1 cell (excess ignored).
+        let body_cells = tree.children(rows[1]);
+        assert_eq!(body_cells.len(), 1, "excess cells ignored");
+    }
+
+    #[test]
+    fn table_mismatch_diagnostic() {
+        let source = "| A | B |\n| --- | --- |\n| 1 |\n";
+        let tree = parse(source);
+
+        let mismatch_diags: Vec<_> = tree
+            .diagnostics()
+            .iter()
+            .filter(|d| d.message.contains("cells"))
+            .collect();
+        assert_eq!(mismatch_diags.len(), 1, "one mismatch diagnostic");
+        assert!(
+            mismatch_diags[0].message.contains("1 cells, expected 2"),
+            "diagnostic message: {}",
+            mismatch_diags[0].message
+        );
+    }
+
+    // --- Tables: pipes in inline code ---
+
+    #[test]
+    fn table_pipe_in_inline_code() {
+        let source = "| A | B |\n| --- | --- |\n| `a|b` | c |\n";
+        let tree = parse(source);
+        let children = root_children(&tree);
+        let rows = tree.children(children[0]);
+
+        let body_cells = tree.children(rows[1]);
+        assert_eq!(body_cells.len(), 2, "pipe in code does not split");
+        assert_eq!(
+            tree.text(&tree.node(body_cells[0]).span),
+            "`a|b`",
+            "code span preserved"
+        );
+    }
+
+    #[test]
+    fn table_pipe_in_double_backtick_code() {
+        let source = "| A |\n| --- |\n| ``a | b`` |\n";
+        let tree = parse(source);
+        let children = root_children(&tree);
+        let rows = tree.children(children[0]);
+
+        let body_cells = tree.children(rows[1]);
+        assert_eq!(
+            body_cells.len(),
+            1,
+            "pipe in double-backtick code does not split"
+        );
+    }
+
+    // --- Tables: links in cells ---
+
+    #[test]
+    fn table_with_links() {
+        let source = "| Name |\n| --- |\n| [foo](bar.md) |\n";
+        let tree = parse(source);
+        let children = root_children(&tree);
+
+        assert_eq!(children.len(), 1, "one table");
+        let rows = tree.children(children[0]);
+        let body_cells = tree.children(rows[1]);
+
+        // The cell should have inline children from the inline parser.
+        let cell_children = tree.children(body_cells[0]);
+        let has_link = cell_children
+            .iter()
+            .any(|&id| matches!(tree.node(id).kind, ElementKind::Link { .. }));
+        assert!(has_link, "cell should contain a link from inline parsing");
+    }
+
+    // --- Tables: edge cases ---
+
+    #[test]
+    fn table_single_column() {
+        let source = "| A |\n| --- |\n| x |\n";
+        let tree = parse(source);
+        let children = root_children(&tree);
+
+        assert_eq!(children.len(), 1, "one table");
+        let table = tree.node(children[0]);
+        assert!(
+            matches!(&table.kind, ElementKind::Table { alignments } if alignments.len() == 1),
+            "single column table"
+        );
+    }
+
+    #[test]
+    fn table_no_leading_trailing_pipes() {
+        let source = "A | B\n--- | ---\n1 | 2\n";
+        let tree = parse(source);
+        let children = root_children(&tree);
+
+        assert_eq!(children.len(), 1, "one table");
+        let rows = tree.children(children[0]);
+        assert_eq!(rows.len(), 2, "header + body");
+
+        let body_cells = tree.children(rows[1]);
+        assert_eq!(
+            body_cells.len(),
+            2,
+            "2 cells without leading/trailing pipes"
+        );
+        assert_eq!(tree.text(&tree.node(body_cells[0]).span), "1", "first cell");
+        assert_eq!(
+            tree.text(&tree.node(body_cells[1]).span),
+            "2",
+            "second cell"
+        );
+    }
+
+    #[test]
+    fn table_empty_cells() {
+        let source = "| A | B |\n| --- | --- |\n| | |\n";
+        let tree = parse(source);
+        let children = root_children(&tree);
+        let rows = tree.children(children[0]);
+
+        let body_cells = tree.children(rows[1]);
+        assert_eq!(body_cells.len(), 2, "two empty cells");
+        assert!(tree.node(body_cells[0]).span.is_empty(), "first cell empty");
+        assert!(
+            tree.node(body_cells[1]).span.is_empty(),
+            "second cell empty"
+        );
+    }
+
+    #[test]
+    fn table_ends_at_blank_line() {
+        let source = "| A |\n| --- |\n| x |\n\nParagraph\n";
+        let tree = parse(source);
+        let children = root_children(&tree);
+
+        assert_eq!(children.len(), 2, "table + paragraph");
+        assert!(
+            matches!(&tree.node(children[0]).kind, ElementKind::Table { .. }),
+            "first is table"
+        );
+        assert_kind(&tree, children[1], &ElementKind::Paragraph);
+    }
+
+    #[test]
+    fn table_ends_at_non_row_line() {
+        let source = "| A |\n| --- |\n| x |\n# Heading\n";
+        let tree = parse(source);
+        let children = root_children(&tree);
+
+        assert_eq!(children.len(), 2, "table + heading");
+        assert!(
+            matches!(&tree.node(children[0]).kind, ElementKind::Table { .. }),
+            "first is table"
+        );
+        assert_kind(&tree, children[1], &ElementKind::Heading { level: 1 });
+    }
+
+    #[test]
+    fn dashes_after_paragraph_is_setext_not_table() {
+        // `---` after a paragraph line is a setext heading, not a table
+        // delimiter, because the first line has no pipes.
+        let source = "Heading\n---\n";
+        let tree = parse(source);
+        let children = root_children(&tree);
+
+        assert_eq!(children.len(), 1, "one heading");
+        assert_kind(&tree, children[0], &ElementKind::Heading { level: 2 });
+    }
+
+    #[test]
+    fn not_a_table_without_delimiter() {
+        let source = "| A | B |\n| C | D |\n";
+        let tree = parse(source);
+        let children = root_children(&tree);
+
+        // Second line is not a delimiter row, so this is a paragraph.
+        assert_eq!(children.len(), 1, "one paragraph");
+        assert_kind(&tree, children[0], &ElementKind::Paragraph);
+    }
+
+    #[test]
+    fn table_in_list_item() {
+        let source = "- | A |\n  | --- |\n  | x |\n";
+        let tree = parse(source);
+        let children = root_children(&tree);
+
+        assert_eq!(children.len(), 1, "one list");
+        let items = tree.children(children[0]);
+        assert_eq!(items.len(), 1, "one item");
+
+        let item_children = tree.children(items[0]);
+        assert!(
+            item_children
+                .iter()
+                .any(|&id| matches!(&tree.node(id).kind, ElementKind::Table { .. })),
+            "list item contains table"
+        );
+    }
+
+    #[test]
+    fn table_in_block_quote() {
+        let source = "> | A |\n> | --- |\n> | x |\n";
+        let tree = parse(source);
+        let children = root_children(&tree);
+
+        assert_eq!(children.len(), 1, "one block quote");
+        assert_kind(&tree, children[0], &ElementKind::QuoteBlock);
+
+        let quote_children = tree.children(children[0]);
+        assert!(
+            quote_children
+                .iter()
+                .any(|&id| matches!(&tree.node(id).kind, ElementKind::Table { .. })),
+            "block quote contains table"
+        );
+    }
+
+    #[test]
+    fn table_tree_structure() {
+        // Verify parent-child relationships throughout.
+        let source = "| A | B |\n| --- | --- |\n| 1 | 2 |\n";
+        let tree = parse(source);
+        let table_id = root_children(&tree)[0];
+        let rows = tree.children(table_id);
+
+        for &row_id in rows {
+            assert_eq!(
+                tree.node(row_id).parent,
+                Some(table_id),
+                "row parent is table"
+            );
+            for &cell_id in tree.children(row_id) {
+                assert_eq!(
+                    tree.node(cell_id).parent,
+                    Some(row_id),
+                    "cell parent is row"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn table_span_covers_all_content() {
+        let source = "| A |\n| --- |\n| x |\n";
+        let tree = parse(source);
+        let table = tree.node(root_children(&tree)[0]);
+
+        assert_eq!(
+            tree.text(&table.span),
+            source,
+            "table span covers all rows including delimiter"
+        );
+    }
+
+    // --- Tables: delimiter row validation ---
+
+    #[test]
+    fn delimiter_row_requires_dashes() {
+        // Spaces-only cells are not valid delimiter rows.
+        let source = "| A |\n|   |\n| x |\n";
+        let tree = parse(source);
+        let children = root_children(&tree);
+
+        // Should be a paragraph (no valid delimiter row).
+        assert_kind(&tree, children[0], &ElementKind::Paragraph);
+    }
+
+    #[test]
+    fn delimiter_row_minimum_one_dash() {
+        let source = "| A |\n| - |\n| x |\n";
+        let tree = parse(source);
+        let children = root_children(&tree);
+
+        assert_eq!(children.len(), 1, "one table");
+        assert!(
+            matches!(&tree.node(children[0]).kind, ElementKind::Table { .. }),
+            "single dash is valid delimiter"
+        );
     }
 }

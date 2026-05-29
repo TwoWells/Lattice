@@ -80,7 +80,7 @@ pub fn parse_inlines(tree: &mut Tree) {
                     footnote_defs.insert(label.clone(), (id, false));
                 }
             }
-            ElementKind::Paragraph | ElementKind::Heading { .. } => {
+            ElementKind::Paragraph | ElementKind::Heading { .. } | ElementKind::TableCell => {
                 hosts.push((id, node.span));
             }
             _ => {}
