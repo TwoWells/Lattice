@@ -735,10 +735,11 @@ pub fn parse_tree(source: &str, frontmatter_span: Option<Span>) -> Tree {
     let body = &source[body_offset..];
     builder.parse_body(body, body_offset);
 
-    // Close any remaining open scopes.
+    // Close any remaining open scopes (finalizes spans).
     while builder.scope_stack.len() > 1 {
-        builder.scope_stack.pop();
+        builder.pop_scope(source.len());
     }
+    builder.quote_depth = 0;
 
     // Finalize the document span.
     builder.nodes[doc_id].span = Span::new(0, source.len());
@@ -760,6 +761,8 @@ struct TreeBuilder<'a> {
     scope_stack: Vec<NodeId>,
     /// Accumulated diagnostics.
     diagnostics: Vec<Diagnostic>,
+    /// Current block quote nesting depth (open `QuoteBlock` scopes).
+    quote_depth: usize,
 }
 
 impl<'a> TreeBuilder<'a> {
@@ -769,6 +772,7 @@ impl<'a> TreeBuilder<'a> {
             nodes: Vec::new(),
             scope_stack: Vec::new(),
             diagnostics: Vec::new(),
+            quote_depth: 0,
         }
     }
 
@@ -833,80 +837,95 @@ impl<'a> TreeBuilder<'a> {
     }
 
     /// Parse the body of a document (everything after frontmatter).
+    ///
+    /// Each line is processed through the scope stack: block quote markers
+    /// are stripped and scopes opened/closed before classification. This
+    /// means the main loop handles all block types in one place — there is
+    /// no separate block quote parser.
     fn parse_body(&mut self, body: &str, body_offset: usize) {
         let lines: Vec<&str> = split_lines(body);
         let mut pos = 0;
         let mut line_idx = 0;
 
         while line_idx < lines.len() {
-            let line = lines[line_idx];
-            let line_start = body_offset + pos;
-            let line_byte_len = line.len();
+            let raw_line = lines[line_idx];
+            let raw_start = body_offset + pos;
+            let raw_len = raw_line.len();
 
-            let (expanded, _mappings) = expand_leading_tabs(line);
+            // Blank lines close block quotes.
+            if raw_line.trim().is_empty() {
+                self.close_block_quotes(raw_start);
+                pos += raw_len;
+                line_idx += 1;
+                continue;
+            }
+
+            // Handle block quote continuation and new block quote opening.
+            let (content, content_start) = self.handle_quote_markers(raw_line, raw_start);
+
+            // Blank content after marker stripping (e.g. `> \n`).
+            if content.trim().is_empty() {
+                pos += raw_len;
+                line_idx += 1;
+                continue;
+            }
+
+            // Classify the content.
+            let (expanded, _) = expand_leading_tabs(content);
             let indent = count_indent(&expanded);
 
-            if expanded.trim().is_empty() {
-                // Blank lines close block quotes.
-                self.close_block_quotes(line_start);
-                pos += line_byte_len;
-                line_idx += 1;
-            } else if let Some((fence_char, fence_len, info)) = fenced_code_open(&expanded) {
-                pos += line_byte_len;
+            if let Some((fence_char, fence_len, info)) = fenced_code_open(&expanded) {
+                pos += raw_len;
                 line_idx += 1;
                 self.parse_fenced_code(
                     &lines,
                     &mut pos,
                     &mut line_idx,
                     body_offset,
-                    line_start,
-                    line_byte_len,
+                    content_start,
+                    raw_start + raw_len,
                     fence_char,
                     fence_len,
                     info.as_ref(),
                 );
             } else if block_math_open(&expanded) {
-                pos += line_byte_len;
+                pos += raw_len;
                 line_idx += 1;
                 self.parse_block_math(
                     &lines,
                     &mut pos,
                     &mut line_idx,
                     body_offset,
-                    line_start,
-                    line_byte_len,
+                    content_start,
+                    raw_start + raw_len,
                 );
-            } else if atx_heading_level(&expanded).is_some() {
-                let level = atx_heading_level(&expanded).unwrap_or(1);
+            } else if let Some(level) = atx_heading_level(&expanded) {
                 self.add_leaf(
                     ElementKind::Heading { level },
                     Syntax::Markdown,
-                    Span::new(line_start, line_start + line_byte_len),
+                    Span::new(content_start, raw_start + raw_len),
                 );
-                pos += line_byte_len;
+                pos += raw_len;
                 line_idx += 1;
-            } else if html_block_start(&expanded).is_some() {
-                let html_type = html_block_start(&expanded).unwrap_or(7);
+            } else if let Some(html_type) = html_block_start(&expanded) {
                 self.parse_html_block(
                     &lines,
                     &mut pos,
                     &mut line_idx,
                     body_offset,
-                    line_start,
-                    line_byte_len,
-                    line,
+                    content_start,
+                    raw_len,
+                    content,
                     html_type,
                 );
-            } else if strip_blockquote_marker(&expanded).is_some() {
-                self.parse_block_quote(&lines, &mut pos, &mut line_idx, body_offset, line_start);
             } else if indent >= 4 && !self.last_child_is_paragraph() {
                 self.parse_indented_code(
                     &lines,
                     &mut pos,
                     &mut line_idx,
                     body_offset,
-                    line_start,
-                    line_byte_len,
+                    content_start,
+                    raw_len,
                 );
             } else {
                 self.parse_paragraph(
@@ -914,22 +933,71 @@ impl<'a> TreeBuilder<'a> {
                     &mut pos,
                     &mut line_idx,
                     body_offset,
-                    line_start,
-                    line_byte_len,
+                    content_start,
+                    raw_len,
+                    content,
                 );
             }
         }
     }
 
-    /// Close all open block quote scopes (called on blank line).
+    /// Close all open block quote scopes.
     fn close_block_quotes(&mut self, pos: usize) {
-        while self.scope_stack.len() > 1 {
-            let top = self.current_scope();
-            if matches!(self.nodes[top].kind, ElementKind::QuoteBlock) {
-                self.pop_scope(pos);
-            } else {
-                break;
-            }
+        while self.quote_depth > 0 {
+            self.pop_scope(pos);
+            self.quote_depth -= 1;
+        }
+    }
+
+    /// Handle block quote continuation and new block quote opening.
+    ///
+    /// 1. Strips continuation markers for existing open block quotes.
+    /// 2. Closes scopes for any unmatched levels.
+    /// 3. Opens new `QuoteBlock` scopes for additional `>` markers.
+    ///
+    /// Returns `(content, content_start)` after all markers are stripped.
+    fn handle_quote_markers<'b>(&mut self, line: &'b str, line_start: usize) -> (&'b str, usize) {
+        // Step 1: Strip continuation markers for existing depth.
+        let (matched, after_cont) = strip_n_quote_markers(line, self.quote_depth);
+        for _ in matched..self.quote_depth {
+            self.pop_scope(line_start);
+        }
+        self.quote_depth = matched;
+
+        let marker_bytes = line.len() - after_cont.len();
+        let mut content = after_cont;
+        let mut content_start = line_start + marker_bytes;
+
+        // Step 2: Open new block quote scopes for additional `>` markers.
+        while let Some((ml, inner)) = strip_blockquote_marker(content) {
+            self.push_scope(
+                ElementKind::QuoteBlock,
+                Syntax::Markdown,
+                Span::new(content_start, content_start),
+            );
+            self.quote_depth += 1;
+            content_start += ml;
+            content = inner;
+        }
+
+        (content, content_start)
+    }
+
+    /// Strip continuation markers from a line inside a multi-line block.
+    ///
+    /// Returns `Some((content, content_start))` if the current quote depth
+    /// is fully matched. Returns `None` if the line cannot continue the
+    /// current block quotes (caller should close the block).
+    fn strip_continuation<'b>(&self, line: &'b str, line_start: usize) -> Option<(&'b str, usize)> {
+        if self.quote_depth == 0 {
+            return Some((line, line_start));
+        }
+        let (matched, remaining) = strip_n_quote_markers(line, self.quote_depth);
+        if matched == self.quote_depth {
+            let marker_bytes = line.len() - remaining.len();
+            Some((remaining, line_start + marker_bytes))
+        } else {
+            None
         }
     }
 
@@ -945,7 +1013,7 @@ impl<'a> TreeBuilder<'a> {
         line_idx: &mut usize,
         body_offset: usize,
         open_start: usize,
-        open_line_len: usize,
+        open_raw_end: usize,
         fence_char: u8,
         fence_len: usize,
         _info: Option<&String>,
@@ -958,18 +1026,35 @@ impl<'a> TreeBuilder<'a> {
                     Span::new(open_start, body_offset + *pos),
                 );
                 self.diagnostics.push(Diagnostic {
-                    span: Span::new(open_start, open_start + open_line_len),
+                    span: Span::new(open_start, open_raw_end),
                     message: "unclosed fenced code block".to_string(),
                 });
                 break;
             }
 
             let inner_line = lines[*line_idx];
-            let inner_byte_len = inner_line.len();
-            let (inner_expanded, _) = expand_leading_tabs(inner_line);
+            let inner_start = body_offset + *pos;
+            let inner_len = inner_line.len();
+
+            // Strip quote continuation markers.
+            let Some((content, _)) = self.strip_continuation(inner_line, inner_start) else {
+                // Quote ended — code block is unclosed.
+                self.add_leaf(
+                    ElementKind::CodeBlock,
+                    Syntax::Markdown,
+                    Span::new(open_start, body_offset + *pos),
+                );
+                self.diagnostics.push(Diagnostic {
+                    span: Span::new(open_start, open_raw_end),
+                    message: "unclosed fenced code block".to_string(),
+                });
+                break;
+            };
+
+            let (inner_expanded, _) = expand_leading_tabs(content);
 
             if fenced_code_close(&inner_expanded, fence_char, fence_len) {
-                *pos += inner_byte_len;
+                *pos += inner_len;
                 *line_idx += 1;
 
                 self.add_leaf(
@@ -980,7 +1065,7 @@ impl<'a> TreeBuilder<'a> {
                 break;
             }
 
-            *pos += inner_byte_len;
+            *pos += inner_len;
             *line_idx += 1;
         }
     }
@@ -993,16 +1078,21 @@ impl<'a> TreeBuilder<'a> {
         line_idx: &mut usize,
         body_offset: usize,
         open_start: usize,
-        open_line_len: usize,
+        open_raw_end: usize,
     ) {
         let mut found_close = false;
 
         while *line_idx < lines.len() {
             let inner_line = lines[*line_idx];
-            let inner_byte_len = inner_line.len();
+            let inner_start = body_offset + *pos;
+            let inner_len = inner_line.len();
 
-            if block_math_close(inner_line) {
-                *pos += inner_byte_len;
+            let Some((content, _)) = self.strip_continuation(inner_line, inner_start) else {
+                break; // Quote ended.
+            };
+
+            if block_math_close(content) {
+                *pos += inner_len;
                 *line_idx += 1;
                 found_close = true;
 
@@ -1014,7 +1104,7 @@ impl<'a> TreeBuilder<'a> {
                 break;
             }
 
-            *pos += inner_byte_len;
+            *pos += inner_len;
             *line_idx += 1;
         }
 
@@ -1025,7 +1115,7 @@ impl<'a> TreeBuilder<'a> {
                 Span::new(open_start, body_offset + *pos),
             );
             self.diagnostics.push(Diagnostic {
-                span: Span::new(open_start, open_start + open_line_len),
+                span: Span::new(open_start, open_raw_end),
                 message: "unclosed block math".to_string(),
             });
         }
@@ -1043,34 +1133,47 @@ impl<'a> TreeBuilder<'a> {
         line_idx: &mut usize,
         body_offset: usize,
         block_start: usize,
-        first_line_len: usize,
-        first_line: &str,
+        first_line_raw_len: usize,
+        first_content: &str,
         html_type: u8,
     ) {
         if matches!(html_type, 6 | 7) {
-            *pos += first_line_len;
+            *pos += first_line_raw_len;
             *line_idx += 1;
 
             while *line_idx < lines.len() {
                 let inner_line = lines[*line_idx];
-                if inner_line.trim().is_empty() {
+                let inner_start = body_offset + *pos;
+
+                let Some((content, _)) = self.strip_continuation(inner_line, inner_start) else {
+                    break;
+                };
+
+                if content.trim().is_empty() {
                     break;
                 }
                 *pos += inner_line.len();
                 *line_idx += 1;
             }
         } else {
-            let end_on_first = html_block_end(first_line, html_type);
-            *pos += first_line_len;
+            let end_on_first = html_block_end(first_content, html_type);
+            *pos += first_line_raw_len;
             *line_idx += 1;
 
             if !end_on_first {
                 while *line_idx < lines.len() {
                     let inner_line = lines[*line_idx];
+                    let inner_start = body_offset + *pos;
+
+                    let Some((content, _)) = self.strip_continuation(inner_line, inner_start)
+                    else {
+                        break;
+                    };
+
                     *pos += inner_line.len();
                     *line_idx += 1;
 
-                    if html_block_end(inner_line, html_type) {
+                    if html_block_end(content, html_type) {
                         break;
                     }
                 }
@@ -1084,313 +1187,6 @@ impl<'a> TreeBuilder<'a> {
         );
     }
 
-    /// Parse a block quote as a container scope.
-    ///
-    /// Pushes `QuoteBlock` scope(s) for nesting and parses the content
-    /// inline. Nested block quotes (`> > text`) produce nested scopes.
-    fn parse_block_quote(
-        &mut self,
-        lines: &[&str],
-        pos: &mut usize,
-        line_idx: &mut usize,
-        body_offset: usize,
-        block_start: usize,
-    ) {
-        // Collect continuation lines and strip markers.
-        let (depth, inner_lines) =
-            self.collect_block_quote_lines(lines, pos, line_idx, body_offset);
-
-        // Push `depth` QuoteBlock scopes.
-        for _ in 0..depth {
-            self.push_scope(
-                ElementKind::QuoteBlock,
-                Syntax::Markdown,
-                Span::new(block_start, block_start),
-            );
-        }
-
-        // Parse the inner content.
-        if !inner_lines.is_empty() {
-            self.parse_inner_block_quote_lines(&inner_lines);
-        }
-
-        let end = body_offset + *pos;
-        // Pop all the block quote scopes we pushed.
-        for _ in 0..depth {
-            self.pop_scope(end);
-        }
-    }
-
-    /// Collect block quote continuation lines and strip markers.
-    ///
-    /// Returns the nesting depth of the first line and the stripped inner
-    /// lines (with their absolute byte offsets).
-    #[allow(clippy::unused_self, reason = "will read self fields in later tickets")]
-    fn collect_block_quote_lines(
-        &self,
-        lines: &[&str],
-        pos: &mut usize,
-        line_idx: &mut usize,
-        body_offset: usize,
-    ) -> (usize, Vec<InnerLine>) {
-        let mut inner_lines = Vec::new();
-
-        // Process first line — determine nesting depth.
-        let first_line = lines[*line_idx];
-        let first_start = body_offset + *pos;
-        let (depth, stripped) = strip_all_quote_markers(first_line);
-        inner_lines.push(InnerLine {
-            text: stripped.to_string(),
-            offset: first_start,
-            raw_len: first_line.len(),
-        });
-        *pos += first_line.len();
-        *line_idx += 1;
-
-        // Continuation lines.
-        while *line_idx < lines.len() {
-            let line = lines[*line_idx];
-
-            if line.trim().is_empty() {
-                break;
-            }
-
-            if strip_blockquote_marker(line).is_some() {
-                let line_start = body_offset + *pos;
-                let (_, s) = strip_n_quote_markers(line, depth);
-                inner_lines.push(InnerLine {
-                    text: s.to_string(),
-                    offset: line_start,
-                    raw_len: line.len(),
-                });
-                *pos += line.len();
-                *line_idx += 1;
-            } else if !is_thematic_break(line)
-                && atx_heading_level(line).is_none()
-                && fenced_code_open(line).is_none()
-                && html_block_start(line).is_none()
-            {
-                // Lazy continuation.
-                let line_start = body_offset + *pos;
-                inner_lines.push(InnerLine {
-                    text: line.to_string(),
-                    offset: line_start,
-                    raw_len: line.len(),
-                });
-                *pos += line.len();
-                *line_idx += 1;
-            } else {
-                break;
-            }
-        }
-
-        (depth, inner_lines)
-    }
-
-    /// Parse inner block quote lines (already marker-stripped) into the
-    /// current tree under the current scope.
-    #[allow(
-        clippy::too_many_lines,
-        reason = "line classification mirrors top-level parse loop"
-    )]
-    fn parse_inner_block_quote_lines(&mut self, inner_lines: &[InnerLine]) {
-        let mut i = 0;
-        while i < inner_lines.len() {
-            let il = &inner_lines[i];
-            let (expanded, _) = expand_leading_tabs(&il.text);
-            let indent = count_indent(&expanded);
-
-            if expanded.trim().is_empty() {
-                i += 1;
-                continue;
-            }
-
-            if let Some((fence_char, fence_len, _info)) = fenced_code_open(&expanded) {
-                let open_start = il.offset;
-                let open_line_len = il.raw_len;
-                i += 1;
-                let mut end_offset = open_start + open_line_len;
-
-                let mut found_close = false;
-                while i < inner_lines.len() {
-                    let inner = &inner_lines[i];
-                    let (inner_exp, _) = expand_leading_tabs(&inner.text);
-                    if fenced_code_close(&inner_exp, fence_char, fence_len) {
-                        end_offset = inner.offset + inner.raw_len;
-                        i += 1;
-                        found_close = true;
-                        break;
-                    }
-                    end_offset = inner.offset + inner.raw_len;
-                    i += 1;
-                }
-
-                self.add_leaf(
-                    ElementKind::CodeBlock,
-                    Syntax::Markdown,
-                    Span::new(open_start, end_offset),
-                );
-
-                if !found_close {
-                    self.diagnostics.push(Diagnostic {
-                        span: Span::new(open_start, open_start + open_line_len),
-                        message: "unclosed fenced code block".to_string(),
-                    });
-                }
-            } else if block_math_open(&expanded) {
-                let open_start = il.offset;
-                let open_line_len = il.raw_len;
-                i += 1;
-                let mut end_offset = open_start + open_line_len;
-
-                let mut found_close = false;
-                while i < inner_lines.len() {
-                    let inner = &inner_lines[i];
-                    if block_math_close(&inner.text) {
-                        end_offset = inner.offset + inner.raw_len;
-                        i += 1;
-                        found_close = true;
-                        break;
-                    }
-                    end_offset = inner.offset + inner.raw_len;
-                    i += 1;
-                }
-
-                self.add_leaf(
-                    ElementKind::Math,
-                    Syntax::Markdown,
-                    Span::new(open_start, end_offset),
-                );
-
-                if !found_close {
-                    self.diagnostics.push(Diagnostic {
-                        span: Span::new(open_start, open_start + open_line_len),
-                        message: "unclosed block math".to_string(),
-                    });
-                }
-            } else if let Some(level) = atx_heading_level(&expanded) {
-                self.add_leaf(
-                    ElementKind::Heading { level },
-                    Syntax::Markdown,
-                    Span::new(il.offset, il.offset + il.raw_len),
-                );
-                i += 1;
-            } else if is_thematic_break(expanded.trim_end_matches('\n').trim_end_matches('\r')) {
-                self.add_leaf(
-                    ElementKind::Rules,
-                    Syntax::Markdown,
-                    Span::new(il.offset, il.offset + il.raw_len),
-                );
-                i += 1;
-            } else if indent >= 4 && !self.last_child_is_paragraph() {
-                let block_start_offset = il.offset;
-                let mut end_offset = il.offset + il.raw_len;
-                i += 1;
-
-                while i < inner_lines.len() {
-                    let inner = &inner_lines[i];
-                    let (inner_exp, _) = expand_leading_tabs(&inner.text);
-                    let inner_indent = count_indent(&inner_exp);
-                    if inner_exp.trim().is_empty() || inner_indent >= 4 {
-                        end_offset = inner.offset + inner.raw_len;
-                        i += 1;
-                    } else {
-                        break;
-                    }
-                }
-
-                self.add_leaf(
-                    ElementKind::CodeBlock,
-                    Syntax::Markdown,
-                    Span::new(block_start_offset, end_offset),
-                );
-            } else if let Some(html_type) = html_block_start(&expanded) {
-                let block_start_offset = il.offset;
-                let mut end_offset = il.offset + il.raw_len;
-
-                if matches!(html_type, 6 | 7) {
-                    i += 1;
-                    while i < inner_lines.len() {
-                        let inner = &inner_lines[i];
-                        if inner.text.trim().is_empty() {
-                            break;
-                        }
-                        end_offset = inner.offset + inner.raw_len;
-                        i += 1;
-                    }
-                } else {
-                    let end_on_first = html_block_end(&il.text, html_type);
-                    i += 1;
-                    if !end_on_first {
-                        while i < inner_lines.len() {
-                            let inner = &inner_lines[i];
-                            end_offset = inner.offset + inner.raw_len;
-                            i += 1;
-                            if html_block_end(&inner.text, html_type) {
-                                break;
-                            }
-                        }
-                    }
-                }
-
-                self.add_leaf(
-                    ElementKind::HtmlBlock,
-                    Syntax::Markdown,
-                    Span::new(block_start_offset, end_offset),
-                );
-            } else {
-                // Paragraph — accumulate continuation lines, check setext.
-                let para_start = il.offset;
-                let mut para_end = il.offset + il.raw_len;
-
-                i += 1;
-                let mut is_setext = false;
-
-                while i < inner_lines.len() {
-                    let next = &inner_lines[i];
-                    let (next_exp, _) = expand_leading_tabs(&next.text);
-
-                    if next_exp.trim().is_empty() {
-                        break;
-                    }
-
-                    if let Some(level) = setext_level(&next_exp) {
-                        let setext_end = next.offset + next.raw_len;
-                        self.add_leaf(
-                            ElementKind::Heading { level },
-                            Syntax::Markdown,
-                            Span::new(para_start, setext_end),
-                        );
-                        i += 1;
-                        is_setext = true;
-                        break;
-                    }
-
-                    if is_thematic_break(&next_exp)
-                        || atx_heading_level(&next_exp).is_some()
-                        || fenced_code_open(&next_exp).is_some()
-                        || strip_blockquote_marker(&next_exp).is_some()
-                        || html_block_start(&next_exp).is_some_and(|ht| ht <= 6)
-                        || block_math_open(&next_exp)
-                    {
-                        break;
-                    }
-
-                    para_end = next.offset + next.raw_len;
-                    i += 1;
-                }
-
-                if !is_setext {
-                    self.add_leaf(
-                        ElementKind::Paragraph,
-                        Syntax::Markdown,
-                        Span::new(para_start, para_end),
-                    );
-                }
-            }
-        }
-    }
-
     /// Parse an indented code block.
     fn parse_indented_code(
         &mut self,
@@ -1399,14 +1195,20 @@ impl<'a> TreeBuilder<'a> {
         line_idx: &mut usize,
         body_offset: usize,
         block_start: usize,
-        first_line_len: usize,
+        first_line_raw_len: usize,
     ) {
-        *pos += first_line_len;
+        *pos += first_line_raw_len;
         *line_idx += 1;
 
         while *line_idx < lines.len() {
             let inner_line = lines[*line_idx];
-            let (inner_expanded, _) = expand_leading_tabs(inner_line);
+            let inner_start = body_offset + *pos;
+
+            let Some((content, _)) = self.strip_continuation(inner_line, inner_start) else {
+                break;
+            };
+
+            let (inner_expanded, _) = expand_leading_tabs(content);
             let inner_indent = count_indent(&inner_expanded);
 
             if inner_expanded.trim().is_empty() || inner_indent >= 4 {
@@ -1425,6 +1227,14 @@ impl<'a> TreeBuilder<'a> {
     }
 
     /// Parse a paragraph, detecting setext headings and thematic breaks.
+    ///
+    /// Handles block quote continuation markers on each continuation line,
+    /// with lazy continuation fallback (lines without `>` markers can
+    /// continue a paragraph inside a block quote).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "content and raw-length are both needed"
+    )]
     fn parse_paragraph(
         &mut self,
         lines: &[&str],
@@ -1432,31 +1242,54 @@ impl<'a> TreeBuilder<'a> {
         line_idx: &mut usize,
         body_offset: usize,
         para_start: usize,
-        first_line_len: usize,
+        first_line_raw_len: usize,
+        first_content: &str,
     ) {
-        *pos += first_line_len;
+        *pos += first_line_raw_len;
         *line_idx += 1;
 
-        // Check if this single line is actually a standalone thematic break
-        let first_line = &self.source[para_start..para_start + first_line_len];
-        let first_trimmed = first_line.trim_end_matches('\n').trim_end_matches('\r');
+        // Check if this single line is actually a standalone thematic break.
+        let first_trimmed = first_content.trim_end_matches('\n').trim_end_matches('\r');
         if is_thematic_break(first_trimmed) {
             self.add_leaf(
                 ElementKind::Rules,
                 Syntax::Markdown,
-                Span::new(para_start, para_start + first_line_len),
+                Span::new(para_start, body_offset + *pos),
             );
             return;
         }
 
-        // Consume paragraph continuation lines
+        // Consume paragraph continuation lines.
         loop {
             if *line_idx >= lines.len() {
                 break;
             }
 
             let next_line = lines[*line_idx];
-            let (next_expanded, _) = expand_leading_tabs(next_line);
+            let next_start = body_offset + *pos;
+            let next_len = next_line.len();
+
+            // Strip continuation markers, with lazy fallback.
+            let content = match self.strip_continuation(next_line, next_start) {
+                Some((c, _)) => c,
+                None => {
+                    // Lazy continuation: line without markers that is not a
+                    // block-starting construct can continue a paragraph.
+                    if self.quote_depth > 0
+                        && strip_blockquote_marker(next_line).is_none()
+                        && !is_thematic_break(next_line)
+                        && atx_heading_level(next_line).is_none()
+                        && fenced_code_open(next_line).is_none()
+                        && html_block_start(next_line).is_none()
+                    {
+                        next_line
+                    } else {
+                        break;
+                    }
+                }
+            };
+
+            let (next_expanded, _) = expand_leading_tabs(content);
 
             // Blank line ends paragraph
             if next_expanded.trim().is_empty() {
@@ -1465,7 +1298,7 @@ impl<'a> TreeBuilder<'a> {
 
             // Setext heading underline
             if let Some(level) = setext_level(&next_expanded) {
-                *pos += next_line.len();
+                *pos += next_len;
                 *line_idx += 1;
 
                 self.add_leaf(
@@ -1509,7 +1342,7 @@ impl<'a> TreeBuilder<'a> {
             }
 
             // Otherwise, continue the paragraph
-            *pos += next_line.len();
+            *pos += next_len;
             *line_idx += 1;
         }
 
@@ -1519,29 +1352,6 @@ impl<'a> TreeBuilder<'a> {
             Span::new(para_start, body_offset + *pos),
         );
     }
-}
-
-/// A line inside a block quote with its original byte offset.
-struct InnerLine {
-    /// The text content (with block quote markers stripped).
-    text: String,
-    /// Byte offset in the original source where this line starts.
-    offset: usize,
-    /// Length of the raw line (before marker stripping) in the original source.
-    raw_len: usize,
-}
-
-/// Strip all nested `>` markers from a line, returning the depth and content.
-fn strip_all_quote_markers(line: &str) -> (usize, &str) {
-    let mut depth = 0;
-    let mut remaining = line;
-
-    while let Some((_, content)) = strip_blockquote_marker(remaining) {
-        depth += 1;
-        remaining = content;
-    }
-
-    (depth.max(1), remaining)
 }
 
 /// Strip exactly `n` levels of `>` markers from a line.
@@ -2442,5 +2252,60 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn block_quote_child_span_excludes_markers() {
+        let source = "> # Heading\n";
+        let tree = parse(source);
+        let children = root_children(&tree);
+        let quote_children = tree.children(children[0]);
+        let heading = tree.node(quote_children[0]);
+
+        // Heading span starts after "> ", not at the raw line start.
+        assert_eq!(
+            heading.span.start, 2,
+            "heading span starts after quote marker"
+        );
+        assert_eq!(
+            &source[heading.span.start..heading.span.end],
+            "# Heading\n",
+            "heading span content excludes marker"
+        );
+    }
+
+    #[test]
+    fn nested_quote_child_spans_exclude_all_markers() {
+        let source = "> > text\n";
+        let tree = parse(source);
+
+        // Outer QuoteBlock starts at 0 (owns the first `>`).
+        let outer = root_children(&tree)[0];
+        assert_eq!(
+            tree.node(outer).span.start,
+            0,
+            "outer quote starts at raw line start"
+        );
+
+        // Inner QuoteBlock starts at 2 (owns the second `>`).
+        let inner = tree.children(outer)[0];
+        assert_eq!(
+            tree.node(inner).span.start,
+            2,
+            "inner quote starts after first marker"
+        );
+
+        // Paragraph starts at 4 (after both `> >`).
+        let para = tree.children(inner)[0];
+        assert_eq!(
+            tree.node(para).span.start,
+            4,
+            "paragraph starts after all markers"
+        );
+        assert_eq!(
+            &source[tree.node(para).span.start..tree.node(para).span.end],
+            "text\n",
+            "paragraph content excludes all markers"
+        );
     }
 }
