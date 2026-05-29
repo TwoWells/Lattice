@@ -88,6 +88,21 @@ pub enum ElementKind {
         /// The import path (without leading `@`).
         path: String,
     },
+    /// List container (ordered or unordered).
+    List {
+        /// Whether this is an ordered list.
+        ordered: bool,
+        /// Start number (0 for unordered).
+        start: u32,
+        /// Whether the list is tight (no blank lines between items).
+        tight: bool,
+    },
+    /// List item container.
+    ListItem {
+        /// Task state: `None` for regular items, `Some(false)` for
+        /// unchecked, `Some(true)` for checked.
+        task: Option<bool>,
+    },
 }
 
 /// Which syntax produced a node.
@@ -295,6 +310,14 @@ struct TabMapping {
 /// Count leading spaces in a string (after tab expansion).
 fn count_indent(line: &str) -> usize {
     line.bytes().take_while(|&b| b == b' ').count()
+}
+
+/// Strip up to `n` leading spaces from a string.
+///
+/// If the string has fewer than `n` leading spaces, strips all of them.
+fn strip_n_spaces(line: &str, n: usize) -> &str {
+    let count = line.bytes().take(n).take_while(|&b| b == b' ').count();
+    &line[count..]
 }
 
 /// Strip a trailing `\n` or `\r\n` from a byte offset into source.
@@ -883,6 +906,153 @@ fn html_block_end(line: &str, html_type: u8) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// List helpers
+// ---------------------------------------------------------------------------
+
+/// Information about a recognized list marker.
+struct ListMarkerInfo {
+    /// Whether this is an ordered list.
+    ordered: bool,
+    /// The marker character: bullet char (`-`, `*`, `+`) for unordered,
+    /// or delimiter (`.`, `)`) for ordered.
+    marker_char: u8,
+    /// Start number for ordered lists, 0 for unordered.
+    start: u32,
+    /// Column where the marker starts (leading spaces).
+    marker_indent: usize,
+    /// Column where item content starts (after marker + spaces).
+    content_column: usize,
+    /// Byte offset into the line where content begins.
+    content_offset: usize,
+}
+
+/// Recognize a list marker at the start of a (tab-expanded) line.
+///
+/// Returns `None` if the line doesn't start with a list marker, or if
+/// the line is actually a thematic break.
+fn recognize_list_marker(line: &str) -> Option<ListMarkerInfo> {
+    let trimmed = line.trim_start_matches(' ');
+    let indent = line.len() - trimmed.len();
+    if indent > 3 || trimmed.is_empty() {
+        return None;
+    }
+
+    // Reject thematic breaks — they take priority over list markers.
+    let trimmed_end = trimmed.trim_end();
+    if is_thematic_break(trimmed_end) {
+        return None;
+    }
+
+    let first = trimmed.as_bytes()[0];
+
+    if matches!(first, b'-' | b'*' | b'+') {
+        // Unordered: marker char + at least one space.
+        let after_marker = &trimmed[1..];
+        if after_marker.is_empty() || !after_marker.starts_with(' ') {
+            return None;
+        }
+        let spaces_after = after_marker.len() - after_marker.trim_start_matches(' ').len();
+        let content_column = indent + 1 + spaces_after;
+        let content_offset = content_column;
+        // If rest is blank, content column = marker pos + 2
+        let content_column = if after_marker.trim().is_empty() {
+            indent + 2
+        } else {
+            content_column
+        };
+        let content_offset = if after_marker.trim().is_empty() {
+            line.len()
+        } else {
+            content_offset
+        };
+        Some(ListMarkerInfo {
+            ordered: false,
+            marker_char: first,
+            start: 0,
+            marker_indent: indent,
+            content_column,
+            content_offset,
+        })
+    } else if first.is_ascii_digit() {
+        // Ordered: digits + delimiter (. or )) + at least one space.
+        let digit_count = trimmed.bytes().take_while(u8::is_ascii_digit).count();
+        if digit_count == 0 || digit_count > 9 {
+            return None;
+        }
+        let after_digits = &trimmed[digit_count..];
+        if after_digits.is_empty() {
+            return None;
+        }
+        let delimiter = after_digits.as_bytes()[0];
+        if !matches!(delimiter, b'.' | b')') {
+            return None;
+        }
+        let after_delim = &after_digits[1..];
+        if after_delim.is_empty() || !after_delim.starts_with(' ') {
+            return None;
+        }
+        let start: u32 = trimmed[..digit_count].parse().ok()?;
+        let spaces_after = after_delim.len() - after_delim.trim_start_matches(' ').len();
+        let marker_width = digit_count + 1; // digits + delimiter
+        let content_column = indent + marker_width + spaces_after;
+        let content_offset = content_column;
+        let content_column = if after_delim.trim().is_empty() {
+            indent + marker_width + 1
+        } else {
+            content_column
+        };
+        let content_offset = if after_delim.trim().is_empty() {
+            line.len()
+        } else {
+            content_offset
+        };
+        Some(ListMarkerInfo {
+            ordered: true,
+            marker_char: delimiter,
+            start,
+            marker_indent: indent,
+            content_column,
+            content_offset,
+        })
+    } else {
+        None
+    }
+}
+
+/// Recognize a task list item checkbox at the start of item content.
+///
+/// Returns `Some(false)` for `[ ] `, `Some(true)` for `[x] ` or `[X] `.
+fn recognize_task(content: &str) -> Option<bool> {
+    if content.starts_with("[ ] ") {
+        Some(false)
+    } else if content.starts_with("[x] ") || content.starts_with("[X] ") {
+        Some(true)
+    } else {
+        None
+    }
+}
+
+/// Tracking state for an open list on the scope stack.
+struct ListContext {
+    /// The `List` node ID in the tree.
+    list_node: NodeId,
+    /// The current `ListItem` node ID.
+    item_node: NodeId,
+    /// Marker character: bullet for unordered, delimiter for ordered.
+    marker_char: u8,
+    /// Whether this is an ordered list.
+    ordered: bool,
+    /// Column where the marker starts.
+    marker_indent: usize,
+    /// Column where item content starts.
+    content_column: usize,
+    /// A blank line was seen in the current item.
+    saw_blank: bool,
+    /// Any blank line appeared between items (list is loose).
+    loose: bool,
+}
+
+// ---------------------------------------------------------------------------
 // Block quote helpers
 // ---------------------------------------------------------------------------
 
@@ -942,6 +1112,9 @@ pub fn parse_tree(source: &str, frontmatter_span: Option<Span>) -> Tree {
     let body = &source[body_offset..];
     builder.parse_body(body, body_offset);
 
+    // Close any remaining open lists (finalizes tight/loose).
+    builder.close_all_lists(source.len());
+
     // Close any remaining open scopes (finalizes spans).
     while builder.scope_stack.len() > 1 {
         builder.pop_scope(source.len());
@@ -975,6 +1148,8 @@ struct TreeBuilder<'a> {
     diagnostics: Vec<Diagnostic>,
     /// Current block quote nesting depth (open `QuoteBlock` scopes).
     quote_depth: usize,
+    /// Stack of open list contexts.
+    list_stack: Vec<ListContext>,
 }
 
 impl<'a> TreeBuilder<'a> {
@@ -985,6 +1160,7 @@ impl<'a> TreeBuilder<'a> {
             scope_stack: Vec::new(),
             diagnostics: Vec::new(),
             quote_depth: 0,
+            list_stack: Vec::new(),
         }
     }
 
@@ -1048,6 +1224,157 @@ impl<'a> TreeBuilder<'a> {
             .is_some_and(|&id| matches!(self.nodes[id].kind, ElementKind::Paragraph))
     }
 
+    // -- List scope management ------------------------------------------------
+
+    /// Open a new list and its first item.
+    fn open_list(&mut self, marker: &ListMarkerInfo, span_start: usize) {
+        let list_node = self.push_scope(
+            ElementKind::List {
+                ordered: marker.ordered,
+                start: marker.start,
+                tight: true, // default, updated on close
+            },
+            Syntax::Markdown,
+            Span::new(span_start, span_start),
+        );
+        let content = if marker.content_offset < usize::MAX {
+            // Check for task item
+            &self.source[span_start + marker.content_offset..]
+        } else {
+            ""
+        };
+        let task = if marker.ordered {
+            None
+        } else {
+            recognize_task(content)
+        };
+        let item_node = self.push_scope(
+            ElementKind::ListItem { task },
+            Syntax::Markdown,
+            Span::new(span_start, span_start),
+        );
+        self.list_stack.push(ListContext {
+            list_node,
+            item_node,
+            marker_char: marker.marker_char,
+            ordered: marker.ordered,
+            marker_indent: marker.marker_indent,
+            content_column: marker.content_column,
+            saw_blank: false,
+            loose: false,
+        });
+    }
+
+    /// Close the current list item (pop `ListItem` scope).
+    fn close_list_item(&mut self, pos: usize) {
+        self.pop_scope(pos);
+    }
+
+    /// Close the current list: finalize tight/loose, pop scopes.
+    fn close_list(&mut self, pos: usize) {
+        if let Some(ctx) = self.list_stack.pop() {
+            // Update the List node's tight flag.
+            if let ElementKind::List { ref mut tight, .. } = self.nodes[ctx.list_node].kind {
+                *tight = !ctx.loose;
+            }
+            self.pop_scope(pos); // pop the List scope
+        }
+    }
+
+    /// Close all open list levels.
+    fn close_all_lists(&mut self, pos: usize) {
+        while !self.list_stack.is_empty() {
+            self.close_list_item(pos);
+            self.close_list(pos);
+        }
+    }
+
+    /// Record a blank line inside the current list.
+    fn mark_list_blank(&mut self) {
+        if let Some(ctx) = self.list_stack.last_mut() {
+            ctx.saw_blank = true;
+        }
+    }
+
+    /// Handle list continuation, new items, or list closure.
+    ///
+    /// Called on each non-blank line when inside a list. Returns the
+    /// adjusted `(content, content_start)` after stripping list
+    /// indentation or handling item transitions.
+    fn handle_list_continuation<'b>(
+        &mut self,
+        line: &'b str,
+        line_start: usize,
+    ) -> (&'b str, usize) {
+        if self.list_stack.is_empty() {
+            return (line, line_start);
+        }
+
+        let (expanded, _) = expand_leading_tabs(line);
+        let indent = count_indent(&expanded);
+
+        while let Some(ctx) = self.list_stack.last() {
+            // Case 1: line continues the current item (sufficient indent).
+            if indent >= ctx.content_column {
+                let col = ctx.content_column;
+                // A continuation line means any prior blank was within
+                // the item, not between items — reset the flag.
+                if let Some(ctx) = self.list_stack.last_mut() {
+                    ctx.saw_blank = false;
+                }
+                // Strip content_column worth of leading spaces.
+                let stripped = strip_n_spaces(line, col);
+                let byte_offset = line.len() - stripped.len();
+                return (stripped, line_start + byte_offset);
+            }
+
+            // Case 2: new item in the same list (matching marker at same indent).
+            if let Some(marker) = recognize_list_marker(&expanded)
+                && marker.marker_indent == ctx.marker_indent
+                && marker.ordered == ctx.ordered
+                && marker.marker_char == ctx.marker_char
+            {
+                // Blank between items → list is loose.
+                let make_loose = ctx.saw_blank;
+                self.close_list_item(line_start);
+                if let Some(ctx) = self.list_stack.last_mut() {
+                    if make_loose {
+                        ctx.loose = true;
+                    }
+                    ctx.saw_blank = false;
+                }
+
+                // Open new item.
+                let content_after = &line[marker.content_offset..];
+                let task = if marker.ordered {
+                    None
+                } else {
+                    recognize_task(content_after)
+                };
+                let item_node = self.push_scope(
+                    ElementKind::ListItem { task },
+                    Syntax::Markdown,
+                    Span::new(line_start, line_start),
+                );
+                if let Some(ctx) = self.list_stack.last_mut() {
+                    ctx.item_node = item_node;
+                    ctx.content_column = marker.content_column;
+                }
+
+                return (
+                    &line[marker.content_offset..],
+                    line_start + marker.content_offset,
+                );
+            }
+
+            // Case 3: line breaks this list level.
+            self.close_list_item(line_start);
+            self.close_list(line_start);
+        }
+
+        (line, line_start)
+    }
+
     /// Parse the body of a document (everything after frontmatter).
     ///
     /// Each line is processed through the scope stack: block quote markers
@@ -1068,9 +1395,10 @@ impl<'a> TreeBuilder<'a> {
             let raw_start = body_offset + pos;
             let raw_len = raw_line.len();
 
-            // Blank lines close block quotes.
+            // Blank lines close block quotes but not lists.
             if raw_line.trim().is_empty() {
                 self.close_block_quotes(raw_start);
+                self.mark_list_blank();
                 pos += raw_len;
                 line_idx += 1;
                 continue;
@@ -1085,6 +1413,9 @@ impl<'a> TreeBuilder<'a> {
                 line_idx += 1;
                 continue;
             }
+
+            // Handle list continuation, new items, or list closure.
+            let (content, content_start) = self.handle_list_continuation(content, content_start);
 
             // Classify the content.
             let (expanded, _) = expand_leading_tabs(content);
@@ -1157,6 +1488,30 @@ impl<'a> TreeBuilder<'a> {
                     content,
                     html_type,
                 );
+            } else if is_thematic_break(expanded.trim_end()) {
+                self.add_leaf(
+                    ElementKind::Rules,
+                    Syntax::Markdown,
+                    Span::new(content_start, raw_start + raw_len),
+                );
+                pos += raw_len;
+                line_idx += 1;
+            } else if let Some(marker) = recognize_list_marker(&expanded) {
+                self.open_list(&marker, content_start);
+                let after = &content[marker.content_offset..];
+                if after.trim().is_empty() {
+                    pos += raw_len;
+                    line_idx += 1;
+                } else {
+                    self.parse_paragraph(
+                        &lines,
+                        &mut pos,
+                        &mut line_idx,
+                        body_offset,
+                        content_start + marker.content_offset,
+                        raw_len,
+                    );
+                }
             } else if indent >= 4 && !self.last_child_is_paragraph() {
                 self.parse_indented_code(
                     &lines,
@@ -1174,7 +1529,6 @@ impl<'a> TreeBuilder<'a> {
                     body_offset,
                     content_start,
                     raw_len,
-                    content,
                 );
             }
         }
@@ -1224,19 +1578,38 @@ impl<'a> TreeBuilder<'a> {
 
     /// Strip continuation markers from a line inside a multi-line block.
     ///
+    /// Strips block quote markers first, then list item indentation.
     /// Returns `Some((content, content_start))` if the current quote depth
-    /// is fully matched. Returns `None` if the line cannot continue the
-    /// current block quotes (caller should close the block).
+    /// is fully matched and any list indentation is satisfied. Returns
+    /// `None` if the line cannot continue the current context.
     fn strip_continuation<'b>(&self, line: &'b str, line_start: usize) -> Option<(&'b str, usize)> {
-        if self.quote_depth == 0 {
-            return Some((line, line_start));
-        }
-        let (matched, remaining) = strip_n_quote_markers(line, self.quote_depth);
-        if matched == self.quote_depth {
-            let marker_bytes = line.len() - remaining.len();
-            Some((remaining, line_start + marker_bytes))
+        // Strip block quote markers.
+        let (content, content_start) = if self.quote_depth == 0 {
+            (line, line_start)
         } else {
-            None
+            let (matched, remaining) = strip_n_quote_markers(line, self.quote_depth);
+            if matched == self.quote_depth {
+                let marker_bytes = line.len() - remaining.len();
+                (remaining, line_start + marker_bytes)
+            } else {
+                return None;
+            }
+        };
+
+        // Strip list item indentation. If the line doesn't have enough
+        // indent to continue the list item, return None so callers
+        // break out of their continuation loops.
+        if let Some(ctx) = self.list_stack.last() {
+            let (expanded, _) = expand_leading_tabs(content);
+            let indent = count_indent(&expanded);
+            if indent < ctx.content_column && !content.trim().is_empty() {
+                return None;
+            }
+            let stripped = strip_n_spaces(content, ctx.content_column);
+            let byte_offset = content.len() - stripped.len();
+            Some((stripped, content_start + byte_offset))
+        } else {
+            Some((content, content_start))
         }
     }
 
@@ -1600,15 +1973,11 @@ impl<'a> TreeBuilder<'a> {
         );
     }
 
-    /// Parse a paragraph, detecting setext headings and thematic breaks.
+    /// Parse a paragraph, detecting setext headings.
     ///
     /// Handles block quote continuation markers on each continuation line,
     /// with lazy continuation fallback (lines without `>` markers can
     /// continue a paragraph inside a block quote).
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "content and raw-length are both needed"
-    )]
     fn parse_paragraph(
         &mut self,
         lines: &[&str],
@@ -1617,21 +1986,9 @@ impl<'a> TreeBuilder<'a> {
         body_offset: usize,
         para_start: usize,
         first_line_raw_len: usize,
-        first_content: &str,
     ) {
         *pos += first_line_raw_len;
         *line_idx += 1;
-
-        // Check if this single line is actually a standalone thematic break.
-        let first_trimmed = first_content.trim_end_matches('\n').trim_end_matches('\r');
-        if is_thematic_break(first_trimmed) {
-            self.add_leaf(
-                ElementKind::Rules,
-                Syntax::Markdown,
-                Span::new(para_start, body_offset + *pos),
-            );
-            return;
-        }
 
         // Consume paragraph continuation lines.
         loop {
@@ -1712,6 +2069,14 @@ impl<'a> TreeBuilder<'a> {
 
             // Block math ends paragraph
             if block_math_open(&next_expanded) {
+                break;
+            }
+
+            // List marker ends paragraph (ordered with start != 1 cannot
+            // interrupt a paragraph per CommonMark)
+            if let Some(marker) = recognize_list_marker(&next_expanded)
+                && (!marker.ordered || marker.start == 1)
+            {
                 break;
             }
 
@@ -2681,5 +3046,454 @@ mod tests {
             "text\n",
             "paragraph content excludes all markers"
         );
+    }
+
+    // --- Lists: basic ---
+
+    #[test]
+    fn single_unordered_item() {
+        let source = "- item\n";
+        let tree = parse(source);
+        let children = root_children(&tree);
+
+        assert_eq!(children.len(), 1, "should find one list");
+        let list_id = children[0];
+        assert!(
+            matches!(
+                tree.node(list_id).kind,
+                ElementKind::List {
+                    ordered: false,
+                    tight: true,
+                    ..
+                }
+            ),
+            "should be an unordered tight list"
+        );
+
+        let items = tree.children(list_id);
+        assert_eq!(items.len(), 1, "list has one item");
+        assert_kind(&tree, items[0], &ElementKind::ListItem { task: None });
+
+        let item_children = tree.children(items[0]);
+        assert_eq!(item_children.len(), 1, "item has one child");
+        assert_kind(&tree, item_children[0], &ElementKind::Paragraph);
+    }
+
+    #[test]
+    fn multi_item_unordered() {
+        let source = "- a\n- b\n- c\n";
+        let tree = parse(source);
+        let children = root_children(&tree);
+
+        assert_eq!(children.len(), 1, "should find one list");
+        let items = tree.children(children[0]);
+        assert_eq!(items.len(), 3, "list has three items");
+        for &item in items {
+            assert!(
+                matches!(tree.node(item).kind, ElementKind::ListItem { task: None }),
+                "each item is a regular ListItem"
+            );
+        }
+    }
+
+    #[test]
+    fn unordered_marker_star() {
+        let source = "* item\n";
+        let tree = parse(source);
+        let children = root_children(&tree);
+
+        assert_eq!(children.len(), 1, "should find one list");
+        assert!(
+            matches!(
+                tree.node(children[0]).kind,
+                ElementKind::List { ordered: false, .. }
+            ),
+            "star marker produces unordered list"
+        );
+    }
+
+    #[test]
+    fn unordered_marker_plus() {
+        let source = "+ item\n";
+        let tree = parse(source);
+        let children = root_children(&tree);
+
+        assert_eq!(children.len(), 1, "should find one list");
+        assert!(
+            matches!(
+                tree.node(children[0]).kind,
+                ElementKind::List { ordered: false, .. }
+            ),
+            "plus marker produces unordered list"
+        );
+    }
+
+    #[test]
+    fn ordered_list_dot() {
+        let source = "1. first\n2. second\n";
+        let tree = parse(source);
+        let children = root_children(&tree);
+
+        assert_eq!(children.len(), 1, "should find one list");
+        assert!(
+            matches!(
+                tree.node(children[0]).kind,
+                ElementKind::List {
+                    ordered: true,
+                    start: 1,
+                    ..
+                }
+            ),
+            "ordered list with dot delimiter"
+        );
+        let items = tree.children(children[0]);
+        assert_eq!(items.len(), 2, "list has two items");
+    }
+
+    #[test]
+    fn ordered_list_paren() {
+        let source = "1) first\n2) second\n";
+        let tree = parse(source);
+        let children = root_children(&tree);
+
+        assert_eq!(children.len(), 1, "should find one list");
+        assert!(
+            matches!(
+                tree.node(children[0]).kind,
+                ElementKind::List {
+                    ordered: true,
+                    start: 1,
+                    ..
+                }
+            ),
+            "ordered list with paren delimiter"
+        );
+    }
+
+    #[test]
+    fn ordered_list_start_number() {
+        let source = "3. third\n4. fourth\n";
+        let tree = parse(source);
+        let children = root_children(&tree);
+
+        assert_eq!(children.len(), 1, "should find one list");
+        assert!(
+            matches!(
+                tree.node(children[0]).kind,
+                ElementKind::List {
+                    ordered: true,
+                    start: 3,
+                    ..
+                }
+            ),
+            "ordered list preserves start number"
+        );
+    }
+
+    // --- Lists: structure ---
+
+    #[test]
+    fn list_items_are_children_of_list() {
+        let source = "- a\n- b\n";
+        let tree = parse(source);
+        let list_id = root_children(&tree)[0];
+        let items = tree.children(list_id);
+
+        for &item_id in items {
+            assert_eq!(
+                tree.node(item_id).parent,
+                Some(list_id),
+                "item parent is the list"
+            );
+        }
+    }
+
+    #[test]
+    fn list_span_covers_all_items() {
+        let source = "- a\n- b\n- c\n";
+        let tree = parse(source);
+        let list = tree.node(root_children(&tree)[0]);
+
+        assert_eq!(
+            list.span,
+            Span::new(0, source.len()),
+            "list span covers entire content"
+        );
+    }
+
+    // --- Lists: nested ---
+
+    #[test]
+    fn nested_list_two_levels() {
+        let source = "- outer\n  - inner\n";
+        let tree = parse(source);
+        let children = root_children(&tree);
+
+        assert_eq!(children.len(), 1, "one top-level list");
+        let outer_items = tree.children(children[0]);
+        assert_eq!(outer_items.len(), 1, "one outer item");
+
+        // Outer item contains: paragraph + nested list
+        let outer_item_children = tree.children(outer_items[0]);
+        assert!(
+            outer_item_children.len() >= 2,
+            "outer item has paragraph + nested list, got {}",
+            outer_item_children.len()
+        );
+
+        // Find the nested list
+        let nested_list = outer_item_children
+            .iter()
+            .find(|&&id| matches!(tree.node(id).kind, ElementKind::List { .. }))
+            .expect("should find nested list");
+        let nested_items = tree.children(*nested_list);
+        assert_eq!(nested_items.len(), 1, "nested list has one item");
+    }
+
+    #[test]
+    fn nested_list_three_levels() {
+        let source = "- a\n  - b\n    - c\n";
+        let tree = parse(source);
+        let children = root_children(&tree);
+
+        assert_eq!(children.len(), 1, "one top-level list");
+        let l1_items = tree.children(children[0]);
+        let l1_item_children = tree.children(l1_items[0]);
+
+        // Find level 2 list
+        let l2_list = l1_item_children
+            .iter()
+            .find(|&&id| matches!(tree.node(id).kind, ElementKind::List { .. }))
+            .expect("should find level 2 list");
+        let l2_items = tree.children(*l2_list);
+        let l2_item_children = tree.children(l2_items[0]);
+
+        // Find level 3 list
+        let l3_list = l2_item_children
+            .iter()
+            .find(|&&id| matches!(tree.node(id).kind, ElementKind::List { .. }))
+            .expect("should find level 3 list");
+        let l3_items = tree.children(*l3_list);
+        assert_eq!(l3_items.len(), 1, "level 3 has one item");
+    }
+
+    // --- Lists: tight vs loose ---
+
+    #[test]
+    fn tight_list_no_blanks() {
+        let source = "- a\n- b\n- c\n";
+        let tree = parse(source);
+        let list = tree.node(root_children(&tree)[0]);
+
+        assert!(
+            matches!(list.kind, ElementKind::List { tight: true, .. }),
+            "no blank lines → tight"
+        );
+    }
+
+    #[test]
+    fn loose_list_blank_between_items() {
+        let source = "- a\n\n- b\n";
+        let tree = parse(source);
+        let list = tree.node(root_children(&tree)[0]);
+
+        assert!(
+            matches!(list.kind, ElementKind::List { tight: false, .. }),
+            "blank between items → loose"
+        );
+    }
+
+    #[test]
+    fn blank_within_item_not_loose() {
+        let source = "- a\n\n  b\n- c\n";
+        let tree = parse(source);
+        let children = root_children(&tree);
+        let list = tree.node(children[0]);
+
+        // The blank is within the first item (between paragraphs),
+        // but the next item follows without a blank → still tight
+        // at the list level (blank between items makes it loose).
+        // Actually per CommonMark, a blank within an item that has
+        // a subsequent item with blank between them → loose.
+        // Here: "- a\n\n  b\n- c\n" → blank after item 1's first
+        // paragraph, continuation "  b" at content column, then
+        // item 2 "- c". The blank is within item 1, not between
+        // items, so the list is tight.
+        assert!(
+            matches!(list.kind, ElementKind::List { tight: true, .. }),
+            "blank within item does not make list loose"
+        );
+    }
+
+    // --- Lists: task items ---
+
+    #[test]
+    fn task_item_unchecked() {
+        let source = "- [ ] todo\n";
+        let tree = parse(source);
+        let list_id = root_children(&tree)[0];
+        let items = tree.children(list_id);
+
+        assert_eq!(items.len(), 1, "one item");
+        assert_kind(
+            &tree,
+            items[0],
+            &ElementKind::ListItem { task: Some(false) },
+        );
+    }
+
+    #[test]
+    fn task_item_checked() {
+        let source = "- [x] done\n";
+        let tree = parse(source);
+        let list_id = root_children(&tree)[0];
+        let items = tree.children(list_id);
+
+        assert_kind(&tree, items[0], &ElementKind::ListItem { task: Some(true) });
+    }
+
+    #[test]
+    fn task_item_checked_uppercase() {
+        let source = "- [X] done\n";
+        let tree = parse(source);
+        let list_id = root_children(&tree)[0];
+        let items = tree.children(list_id);
+
+        assert_kind(&tree, items[0], &ElementKind::ListItem { task: Some(true) });
+    }
+
+    #[test]
+    fn mixed_task_and_regular() {
+        let source = "- [ ] todo\n- regular\n- [x] done\n";
+        let tree = parse(source);
+        let list_id = root_children(&tree)[0];
+        let items = tree.children(list_id);
+
+        assert_eq!(items.len(), 3, "three items");
+        assert_kind(
+            &tree,
+            items[0],
+            &ElementKind::ListItem { task: Some(false) },
+        );
+        assert_kind(&tree, items[1], &ElementKind::ListItem { task: None });
+        assert_kind(&tree, items[2], &ElementKind::ListItem { task: Some(true) });
+    }
+
+    // --- Lists: continuation ---
+
+    #[test]
+    fn multiline_item_continuation() {
+        let source = "- line one\n  line two\n";
+        let tree = parse(source);
+        let children = root_children(&tree);
+
+        assert_eq!(children.len(), 1, "one list");
+        let items = tree.children(children[0]);
+        assert_eq!(items.len(), 1, "one item");
+        let item_children = tree.children(items[0]);
+        assert_eq!(item_children.len(), 1, "item has one paragraph");
+        assert_kind(&tree, item_children[0], &ElementKind::Paragraph);
+    }
+
+    // --- Lists: marker changes ---
+
+    #[test]
+    fn different_marker_starts_new_list() {
+        let source = "* item a\n- item b\n";
+        let tree = parse(source);
+        let children = root_children(&tree);
+
+        assert_eq!(children.len(), 2, "two separate lists");
+        assert!(
+            matches!(tree.node(children[0]).kind, ElementKind::List { .. }),
+            "first is a list"
+        );
+        assert!(
+            matches!(tree.node(children[1]).kind, ElementKind::List { .. }),
+            "second is a list"
+        );
+    }
+
+    // --- Lists: items with block constructs ---
+
+    #[test]
+    fn item_containing_fenced_code() {
+        let source = "- code:\n  ```\n  fn main() {}\n  ```\n";
+        let tree = parse(source);
+        let children = root_children(&tree);
+
+        assert_eq!(children.len(), 1, "one list");
+        let items = tree.children(children[0]);
+        assert_eq!(items.len(), 1, "one item");
+        let item_children = tree.children(items[0]);
+
+        let has_code = item_children
+            .iter()
+            .any(|&id| matches!(tree.node(id).kind, ElementKind::CodeBlock));
+        assert!(has_code, "item should contain a code block");
+    }
+
+    #[test]
+    fn item_containing_block_quote() {
+        let source = "- text\n  > quoted\n";
+        let tree = parse(source);
+        let children = root_children(&tree);
+
+        assert_eq!(children.len(), 1, "one list");
+        let items = tree.children(children[0]);
+        let item_children = tree.children(items[0]);
+
+        let has_quote = item_children
+            .iter()
+            .any(|&id| matches!(tree.node(id).kind, ElementKind::QuoteBlock));
+        assert!(has_quote, "item should contain a block quote");
+    }
+
+    // --- Lists: interactions ---
+
+    #[test]
+    fn thematic_break_not_list_dashes() {
+        let source = "---\n";
+        let tree = parse(source);
+        let children = root_children(&tree);
+
+        assert_eq!(children.len(), 1, "one block");
+        assert_kind(&tree, children[0], &ElementKind::Rules);
+    }
+
+    #[test]
+    fn thematic_break_not_list_spaced_dashes() {
+        let source = "- - -\n";
+        let tree = parse(source);
+        let children = root_children(&tree);
+
+        assert_eq!(children.len(), 1, "one block");
+        assert_kind(&tree, children[0], &ElementKind::Rules);
+    }
+
+    #[test]
+    fn list_after_paragraph() {
+        let source = "Paragraph\n- item\n";
+        let tree = parse(source);
+        let children = root_children(&tree);
+
+        assert_eq!(children.len(), 2, "paragraph + list");
+        assert_kind(&tree, children[0], &ElementKind::Paragraph);
+        assert!(
+            matches!(tree.node(children[1]).kind, ElementKind::List { .. }),
+            "second child is a list"
+        );
+    }
+
+    #[test]
+    fn ordered_start_not_1_cannot_interrupt_paragraph() {
+        let source = "Paragraph\n3. item\n";
+        let tree = parse(source);
+        let children = root_children(&tree);
+
+        // "3. item" cannot interrupt a paragraph, so it's part of the
+        // paragraph continuation.
+        assert_eq!(children.len(), 1, "single paragraph");
+        assert_kind(&tree, children[0], &ElementKind::Paragraph);
     }
 }
