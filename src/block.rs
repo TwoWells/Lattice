@@ -46,6 +46,48 @@ pub enum ElementKind {
     QuoteBlock,
     /// HTML block (opaque at this stage).
     HtmlBlock,
+    /// Link reference definition (`[label]: url "title"`).
+    ReferenceDef {
+        /// Normalized label (case-folded, whitespace-collapsed).
+        label: String,
+        /// Link destination URL.
+        url: String,
+        /// Link title (empty if none).
+        title: String,
+    },
+    /// Footnote definition container (`[^label]: content`).
+    FootnoteDef {
+        /// Footnote label (without `^` prefix).
+        label: String,
+    },
+    /// Inline or reference-style link.
+    Link {
+        /// Link destination URL.
+        url: String,
+        /// Link title / predicate (empty if none).
+        title: String,
+    },
+    /// Inline or reference-style image.
+    Image {
+        /// Image source URL.
+        url: String,
+        /// Image title (empty if none).
+        title: String,
+    },
+    /// Footnote reference call site (`[^label]`).
+    FootnoteRef {
+        /// Footnote label (without `^` prefix).
+        label: String,
+    },
+    /// Inline code span (backtick-delimited, content skipped).
+    InlineCode,
+    /// Inline math span (`$...$`, content skipped).
+    InlineMath,
+    /// Import directive (`@path`).
+    Import {
+        /// The import path (without leading `@`).
+        path: String,
+    },
 }
 
 /// Which syntax produced a node.
@@ -156,6 +198,31 @@ impl Tree {
     pub fn children(&self, id: NodeId) -> &[NodeId] {
         &self.nodes[id].children
     }
+
+    /// Add a child node to an existing node (used by the inline parser).
+    pub fn add_child(
+        &mut self,
+        parent: NodeId,
+        kind: ElementKind,
+        syntax: Syntax,
+        span: Span,
+    ) -> NodeId {
+        let id = self.nodes.len();
+        self.nodes.push(Node {
+            kind,
+            syntax,
+            span,
+            parent: Some(parent),
+            children: Vec::new(),
+        });
+        self.nodes[parent].children.push(id);
+        id
+    }
+
+    /// Append a diagnostic (used by the inline parser).
+    pub fn add_diagnostic(&mut self, diagnostic: Diagnostic) {
+        self.diagnostics.push(diagnostic);
+    }
 }
 
 /// An explicit `{#id}` attribute on an ATX heading.
@@ -245,6 +312,121 @@ fn strip_trailing_newline(source: &str, end: usize) -> usize {
     } else {
         end
     }
+}
+
+/// Normalize a reference label per `CommonMark` rules.
+///
+/// Case-fold (lowercase) and collapse consecutive whitespace to a single space.
+pub fn normalize_label(label: &str) -> String {
+    label
+        .split_whitespace()
+        .collect::<Vec<&str>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+/// Try to parse a link reference definition from a line.
+///
+/// Returns `Some((label, url, title))` if the line is a reference definition.
+/// Labels are normalized (case-folded, whitespace-collapsed).
+fn parse_reference_def(line: &str) -> Option<(String, String, String)> {
+    let trimmed = line.trim_start_matches(' ');
+    let indent = line.len() - trimmed.len();
+    if indent > 3 {
+        return None;
+    }
+
+    let rest = trimmed.strip_prefix('[')?;
+
+    // Must not start with `^` (that is a footnote definition)
+    if rest.starts_with('^') {
+        return None;
+    }
+
+    let bracket_end = rest.find("]:")?;
+    let label_text = &rest[..bracket_end];
+
+    if label_text.is_empty() || label_text.trim().is_empty() || label_text.len() > 999 {
+        return None;
+    }
+
+    // No unescaped `[` in label
+    if label_text.contains('[') {
+        return None;
+    }
+
+    let after = rest[bracket_end + 2..].trim_start();
+
+    if after.is_empty() || after.starts_with('\n') || after.starts_with('\r') {
+        return None;
+    }
+
+    // Parse URL (optionally angle-bracketed)
+    let (url, rest_after_url) = if let Some(inner) = after.strip_prefix('<') {
+        let close = inner.find('>')?;
+        (inner[..close].to_string(), inner[close + 1..].trim_start())
+    } else {
+        let end = after
+            .find(|c: char| c.is_whitespace())
+            .unwrap_or(after.len());
+        if end == 0 {
+            return None;
+        }
+        (after[..end].to_string(), after[end..].trim_start())
+    };
+
+    // Parse optional title
+    let title = if rest_after_url.trim().is_empty() {
+        String::new()
+    } else if let Some(s) = rest_after_url.strip_prefix('"') {
+        let end = s.find('"')?;
+        if !s[end + 1..].trim().is_empty() {
+            return None;
+        }
+        s[..end].to_string()
+    } else if let Some(s) = rest_after_url.strip_prefix('\'') {
+        let end = s.find('\'')?;
+        if !s[end + 1..].trim().is_empty() {
+            return None;
+        }
+        s[..end].to_string()
+    } else if let Some(s) = rest_after_url.strip_prefix('(') {
+        let end = s.find(')')?;
+        if !s[end + 1..].trim().is_empty() {
+            return None;
+        }
+        s[..end].to_string()
+    } else {
+        return None;
+    };
+
+    Some((normalize_label(label_text), url, title))
+}
+
+/// Try to parse the start of a footnote definition.
+///
+/// Returns `Some(label)` if the line starts with `[^label]:`.
+fn parse_footnote_def_start(line: &str) -> Option<String> {
+    let trimmed = line.trim_start_matches(' ');
+    let indent = line.len() - trimmed.len();
+    if indent > 3 {
+        return None;
+    }
+
+    let rest = trimmed.strip_prefix("[^")?;
+    let label_end = rest.find(']')?;
+    let label = &rest[..label_end];
+
+    if label.is_empty() || label.contains('[') || label.contains(']') {
+        return None;
+    }
+
+    let after_bracket = &rest[label_end + 1..];
+    if !after_bracket.starts_with(':') {
+        return None;
+    }
+
+    Some(label.to_string())
 }
 
 /// Check if a line is an ATX heading opener. Returns `Some(level)` if so.
@@ -744,11 +926,16 @@ pub fn parse_tree(source: &str, frontmatter_span: Option<Span>) -> Tree {
     // Finalize the document span.
     builder.nodes[doc_id].span = Span::new(0, source.len());
 
-    Tree {
+    let mut tree = Tree {
         source: source.to_string(),
         nodes: builder.nodes,
         diagnostics: builder.diagnostics,
-    }
+    };
+
+    // Second pass: parse inline elements in Paragraph and Heading nodes.
+    crate::inline::parse_inlines(&mut tree);
+
+    tree
 }
 
 /// Internal tree builder with scope stack.
@@ -842,6 +1029,10 @@ impl<'a> TreeBuilder<'a> {
     /// are stripped and scopes opened/closed before classification. This
     /// means the main loop handles all block types in one place — there is
     /// no separate block quote parser.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "single-loop classifier over all block types"
+    )]
     fn parse_body(&mut self, body: &str, body_offset: usize) {
         let lines: Vec<&str> = split_lines(body);
         let mut pos = 0;
@@ -907,6 +1098,25 @@ impl<'a> TreeBuilder<'a> {
                 );
                 pos += raw_len;
                 line_idx += 1;
+            } else if let Some((label, url, title)) = parse_reference_def(content) {
+                self.add_leaf(
+                    ElementKind::ReferenceDef { label, url, title },
+                    Syntax::Markdown,
+                    Span::new(content_start, raw_start + raw_len),
+                );
+                pos += raw_len;
+                line_idx += 1;
+            } else if let Some(label) = parse_footnote_def_start(content) {
+                self.parse_footnote_def(
+                    &lines,
+                    &mut pos,
+                    &mut line_idx,
+                    body_offset,
+                    content_start,
+                    raw_len,
+                    &label,
+                    content,
+                );
             } else if let Some(html_type) = html_block_start(&expanded) {
                 self.parse_html_block(
                     &lines,
@@ -1185,6 +1395,96 @@ impl<'a> TreeBuilder<'a> {
             Syntax::Markdown,
             Span::new(block_start, body_offset + *pos),
         );
+    }
+
+    /// Parse a footnote definition container.
+    ///
+    /// Consumes the first line and any indented (4+ spaces) continuation
+    /// lines. Inner content is added as `Paragraph` children.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "footnote parameters are distinct concerns"
+    )]
+    fn parse_footnote_def(
+        &mut self,
+        lines: &[&str],
+        pos: &mut usize,
+        line_idx: &mut usize,
+        body_offset: usize,
+        def_start: usize,
+        first_raw_len: usize,
+        label: &str,
+        first_line: &str,
+    ) {
+        self.push_scope(
+            ElementKind::FootnoteDef {
+                label: label.to_string(),
+            },
+            Syntax::Markdown,
+            Span::new(def_start, def_start),
+        );
+
+        // Find content start: after `[^label]: `
+        let marker = format!("[^{label}]:");
+        let content_offset = first_line.find(&marker).map_or(first_line.len(), |p| {
+            let after = p + marker.len();
+            if first_line.get(after..after + 1) == Some(" ") {
+                after + 1
+            } else {
+                after
+            }
+        });
+
+        let first_text = &first_line[content_offset..];
+        if !first_text.trim().is_empty() {
+            self.add_leaf(
+                ElementKind::Paragraph,
+                Syntax::Markdown,
+                Span::new(
+                    def_start + content_offset,
+                    body_offset + *pos + first_raw_len,
+                ),
+            );
+        }
+
+        *pos += first_raw_len;
+        *line_idx += 1;
+
+        while *line_idx < lines.len() {
+            let inner_line = lines[*line_idx];
+            let inner_start = body_offset + *pos;
+            let inner_len = inner_line.len();
+
+            let Some((inner_content, inner_content_start)) =
+                self.strip_continuation(inner_line, inner_start)
+            else {
+                break;
+            };
+
+            if inner_content.trim().is_empty() {
+                *pos += inner_len;
+                *line_idx += 1;
+                continue;
+            }
+
+            let (inner_expanded, _) = expand_leading_tabs(inner_content);
+            let inner_indent = count_indent(&inner_expanded);
+
+            if inner_indent < 4 {
+                break;
+            }
+
+            self.add_leaf(
+                ElementKind::Paragraph,
+                Syntax::Markdown,
+                Span::new(inner_content_start, inner_start + inner_len),
+            );
+
+            *pos += inner_len;
+            *line_idx += 1;
+        }
+
+        self.pop_scope(body_offset + *pos);
     }
 
     /// Parse an indented code block.

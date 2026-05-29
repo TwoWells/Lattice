@@ -16,6 +16,11 @@ mod block;
 mod cli;
 mod config;
 mod frontmatter;
+#[allow(
+    dead_code,
+    reason = "public API consumed by consumer migration ticket 06"
+)]
+mod inline;
 mod lint;
 mod lsp;
 mod markdown;
