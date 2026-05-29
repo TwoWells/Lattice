@@ -50,7 +50,6 @@ phf = { version = "0.11", features = ["macros"] }
 clap = { version = "4", features = ["derive"] }
 ignore = "0.4"
 lsp-server = "0.7"
-pulldown-cmark = "0.12"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

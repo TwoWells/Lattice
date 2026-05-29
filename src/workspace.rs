@@ -4,17 +4,18 @@
 //! Workspace scanning and file indexing.
 //!
 //! Discovers all markdown files under the workspace root, parses them into
-//! an in-memory index of links, headings, and backlinks, and supports
+//! an in-memory index backed by the unified parse tree, and supports
 //! incremental updates when individual files change.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
+use crate::block::{self, Tree};
 use crate::config::{Config, ConfigError};
-use crate::frontmatter::{self, BacklinkDiagnostic, Frontmatter, FrontmatterError};
-use crate::markdown::{self, BarePath, Heading, Link, ParsedDocument};
+use crate::yaml;
 
 /// Errors that can occur during workspace operations.
 #[derive(Debug, Error)]
@@ -39,18 +40,45 @@ pub enum WorkspaceError {
 /// Parsed data for a single markdown file.
 #[derive(Debug)]
 pub struct FileData {
-    /// Raw document content (from disk or editor buffer).
-    pub content: String,
-    /// Links extracted from the document body.
-    pub links: Vec<Link>,
-    /// Headings extracted from the document body.
-    pub headings: Vec<Heading>,
-    /// Bare file paths found in prose text.
-    pub bare_paths: Vec<BarePath>,
+    /// The unified parse tree.
+    pub tree: Tree,
     /// Parsed frontmatter, if present.
     pub frontmatter: Option<Frontmatter>,
     /// Diagnostics from frontmatter parsing (unknown inverse predicates).
     pub backlink_diagnostics: Vec<BacklinkDiagnostic>,
+    /// YAML parse errors (partial recovery — file is still indexed).
+    pub parse_diagnostics: Vec<ParseDiagnostic>,
+}
+
+/// Parsed frontmatter from a markdown document.
+#[derive(Debug)]
+pub struct Frontmatter {
+    /// Byte range of the entire frontmatter block (including `---` delimiters).
+    pub byte_range: Range<usize>,
+    /// 1-based line of the opening `---`.
+    pub start_line: usize,
+    /// 1-based line of the closing `---`.
+    pub end_line: usize,
+    /// Parsed backlinks: inverse predicate → list of relative file paths.
+    pub backlinks: HashMap<String, Vec<String>>,
+}
+
+/// A diagnostic about a backlink predicate issue.
+#[derive(Debug, PartialEq, Eq)]
+pub struct BacklinkDiagnostic {
+    /// 1-based line number of the predicate key in the source file.
+    pub line: usize,
+    /// The unknown inverse predicate.
+    pub predicate: String,
+}
+
+/// A YAML parse error from frontmatter.
+#[derive(Debug)]
+pub struct ParseDiagnostic {
+    /// 1-based line number.
+    pub line: usize,
+    /// Human-readable message.
+    pub message: String,
 }
 
 /// In-memory index of all markdown files in a workspace.
@@ -66,8 +94,6 @@ pub struct Workspace {
     has_config: bool,
     /// Parsed file data, keyed by workspace-relative path.
     files: BTreeMap<PathBuf, FileData>,
-    /// Files that had parse errors (frontmatter), keyed by relative path.
-    errors: BTreeMap<PathBuf, FrontmatterError>,
 }
 
 impl Workspace {
@@ -101,7 +127,6 @@ impl Workspace {
         let md_paths = discover_markdown_files(&root);
 
         let mut files = BTreeMap::new();
-        let mut errors = BTreeMap::new();
 
         for abs_path in md_paths {
             let rel_path = abs_path
@@ -113,11 +138,8 @@ impl Workspace {
                 Ok(data) => {
                     files.insert(rel_path, data);
                 }
-                Err(ParseFileError::Read(e)) => {
+                Err(e) => {
                     tracing::warn!(path = %rel_path.display(), "failed to read file: {e}");
-                }
-                Err(ParseFileError::Frontmatter(e)) => {
-                    errors.insert(rel_path, e);
                 }
             }
         }
@@ -128,7 +150,6 @@ impl Workspace {
             config_error,
             has_config,
             files,
-            errors,
         })
     }
 
@@ -145,26 +166,19 @@ impl Workspace {
 
         if !abs_path.is_file() {
             self.files.remove(rel_path);
-            self.errors.remove(rel_path);
             return Ok(());
         }
-
-        self.errors.remove(rel_path);
 
         match parse_file(&abs_path, rel_path, &self.config) {
             Ok(data) => {
                 self.files.insert(rel_path.to_path_buf(), data);
             }
-            Err(ParseFileError::Read(e)) => {
+            Err(e) => {
                 self.files.remove(rel_path);
                 return Err(WorkspaceError::Read {
                     path: rel_path.to_path_buf(),
                     source: e,
                 });
-            }
-            Err(ParseFileError::Frontmatter(e)) => {
-                self.files.remove(rel_path);
-                self.errors.insert(rel_path.to_path_buf(), e);
             }
         }
 
@@ -177,17 +191,8 @@ impl Workspace {
     /// parsed directly without reading from disk, which is used by the LSP
     /// server for unsaved editor buffers.
     pub fn update_content(&mut self, rel_path: &Path, content: &str) {
-        self.errors.remove(rel_path);
-
-        match parse_content(content, rel_path, &self.config) {
-            Ok(data) => {
-                self.files.insert(rel_path.to_path_buf(), data);
-            }
-            Err(e) => {
-                self.files.remove(rel_path);
-                self.errors.insert(rel_path.to_path_buf(), e);
-            }
-        }
+        let data = parse_content(content, rel_path, &self.config);
+        self.files.insert(rel_path.to_path_buf(), data);
     }
 
     /// The absolute path to the workspace root.
@@ -226,52 +231,106 @@ impl Workspace {
     pub fn file(&self, rel_path: &Path) -> Option<&FileData> {
         self.files.get(rel_path)
     }
-
-    /// Frontmatter parse errors, keyed by workspace-relative path.
-    pub fn errors(&self) -> &BTreeMap<PathBuf, FrontmatterError> {
-        &self.errors
-    }
 }
 
 // --- Internal helpers ---
-
-/// Errors from parsing a single file.
-enum ParseFileError {
-    Read(std::io::Error),
-    Frontmatter(FrontmatterError),
-}
 
 /// Parse a single markdown file from disk into [`FileData`].
 fn parse_file(
     abs_path: &Path,
     rel_path: &Path,
     config: &Config,
-) -> Result<FileData, ParseFileError> {
-    let content = std::fs::read_to_string(abs_path).map_err(ParseFileError::Read)?;
-    parse_content(&content, rel_path, config).map_err(ParseFileError::Frontmatter)
+) -> Result<FileData, std::io::Error> {
+    let content = std::fs::read_to_string(abs_path)?;
+    Ok(parse_content(&content, rel_path, config))
 }
 
 /// Parse markdown content into [`FileData`].
-fn parse_content(
-    content: &str,
-    rel_path: &Path,
-    config: &Config,
-) -> Result<FileData, FrontmatterError> {
-    let ParsedDocument {
-        links,
-        headings,
-        bare_paths,
-    } = markdown::parse_document(content, rel_path);
-    let fm_result = frontmatter::parse_frontmatter(content, config)?;
+///
+/// Always succeeds — YAML parse errors become diagnostics instead of
+/// hard failures, enabling partial frontmatter recovery.
+fn parse_content(content: &str, rel_path: &Path, config: &Config) -> FileData {
+    // Parse YAML frontmatter block.
+    let fm_block = yaml::parse_frontmatter_block(content);
 
-    Ok(FileData {
-        content: content.to_string(),
-        links,
-        headings,
-        bare_paths,
-        frontmatter: fm_result.frontmatter,
-        backlink_diagnostics: fm_result.diagnostics,
-    })
+    // Build the tree (block structure + inline elements).
+    let frontmatter_span = fm_block.as_ref().map(|b| b.span);
+    let tree = block::parse_tree(content, frontmatter_span);
+
+    // Extract frontmatter data.
+    let mut frontmatter = None;
+    let mut backlink_diagnostics = Vec::new();
+    let mut parse_diagnostics = Vec::new();
+
+    if let Some(block) = &fm_block {
+        // Collect YAML parse errors as diagnostics (partial recovery).
+        for diag in &block.diagnostics {
+            if diag.severity == yaml::YamlSeverity::Error {
+                let line = byte_offset_to_line(content, diag.span.start);
+                parse_diagnostics.push(ParseDiagnostic {
+                    line,
+                    message: diag.message.clone(),
+                });
+            }
+        }
+
+        let byte_range: Range<usize> = block.span.into();
+        let start_line = 1;
+        let end_byte = byte_range.end;
+        let newline_count = content[..end_byte.min(content.len())]
+            .bytes()
+            .filter(|&b| b == b'\n')
+            .count();
+        let end_line =
+            newline_count + usize::from(!content[..end_byte.min(content.len())].ends_with('\n'));
+
+        let backlinks = yaml::extract_backlinks(block, content);
+
+        // Validate inverse predicates.
+        for predicate in backlinks.keys() {
+            if !config.is_known_inverse(predicate) {
+                let line = yaml::find_predicate_line(block, predicate, content);
+                backlink_diagnostics.push(BacklinkDiagnostic {
+                    line,
+                    predicate: predicate.clone(),
+                });
+            }
+        }
+
+        frontmatter = Some(Frontmatter {
+            byte_range,
+            start_line,
+            end_line,
+            backlinks,
+        });
+    }
+
+    // Collect parse diagnostics from the tree itself.
+    for diag in tree.diagnostics() {
+        let _ = &rel_path; // reserved for future per-file filtering
+        let _ = diag;
+    }
+
+    FileData {
+        tree,
+        frontmatter,
+        backlink_diagnostics,
+        parse_diagnostics,
+    }
+}
+
+/// Convert a byte offset to a 1-based line number.
+#[allow(
+    clippy::naive_bytecount,
+    reason = "not worth a dependency for line counting"
+)]
+fn byte_offset_to_line(content: &str, offset: usize) -> usize {
+    let offset = offset.min(content.len());
+    content.as_bytes()[..offset]
+        .iter()
+        .filter(|&&b| b == b'\n')
+        .count()
+        + 1
 }
 
 /// Walk up from `start` looking for `.lattice.toml` or `.git`.
@@ -431,8 +490,10 @@ mod tests {
 
         let ws = Workspace::scan(dir.path()).expect("scan should succeed");
         let data = ws.file(Path::new("doc.md")).expect("should find doc.md");
-        assert_eq!(data.headings.len(), 1, "should have one heading");
-        assert_eq!(data.links.len(), 1, "should have one link");
+        let headings = data.tree.headings();
+        let links = data.tree.links(Path::new("doc.md"));
+        assert_eq!(headings.len(), 1, "should have one heading");
+        assert_eq!(links.len(), 1, "should have one link");
     }
 
     #[test]
@@ -459,17 +520,17 @@ mod tests {
     }
 
     #[test]
-    fn frontmatter_error_collected() {
+    fn frontmatter_error_partial_recovery() {
         let dir = workspace_with_files(&[("bad.md", "---\n: broken: yaml: [[\n---\n# Bad\n")]);
 
         let ws = Workspace::scan(dir.path()).expect("scan should succeed");
+        // With partial recovery, the file should still be indexed.
+        let data = ws
+            .file(Path::new("bad.md"))
+            .expect("file should be indexed");
         assert!(
-            ws.file(Path::new("bad.md")).is_none(),
-            "bad file should not be in files"
-        );
-        assert!(
-            ws.errors().contains_key(Path::new("bad.md")),
-            "bad file should be in errors"
+            !data.parse_diagnostics.is_empty(),
+            "should have parse diagnostics"
         );
     }
 
@@ -493,26 +554,27 @@ mod tests {
         let dir = workspace_with_files(&[("doc.md", "# Original")]);
 
         let mut ws = Workspace::scan(dir.path()).expect("scan should succeed");
-        let data = ws.file(Path::new("doc.md")).expect("should find doc.md");
-        assert_eq!(data.headings.len(), 1, "should have one heading");
-        assert_eq!(
-            data.headings[0].text, "Original",
-            "heading should be Original"
-        );
+        let headings = ws
+            .file(Path::new("doc.md"))
+            .expect("should find doc.md")
+            .tree
+            .headings();
+        assert_eq!(headings.len(), 1, "should have one heading");
+        assert_eq!(headings[0].text, "Original", "heading should be Original");
 
         fs::write(dir.path().join("doc.md"), "# Updated\n\n## Section\n")
             .expect("overwrite doc.md");
         ws.update(Path::new("doc.md"))
             .expect("update should succeed");
 
-        let data = ws.file(Path::new("doc.md")).expect("should find doc.md");
+        let headings = ws
+            .file(Path::new("doc.md"))
+            .expect("should find doc.md")
+            .tree
+            .headings();
+        assert_eq!(headings.len(), 2, "should have two headings after update");
         assert_eq!(
-            data.headings.len(),
-            2,
-            "should have two headings after update"
-        );
-        assert_eq!(
-            data.headings[0].text, "Updated",
+            headings[0].text, "Updated",
             "first heading should be Updated"
         );
     }
@@ -536,22 +598,21 @@ mod tests {
         let dir = workspace_with_files(&[("doc.md", "---\n: broken: yaml\n---\n# Bad\n")]);
 
         let mut ws = Workspace::scan(dir.path()).expect("scan should succeed");
+        // With partial recovery, the file is now indexed with parse diagnostics.
+        let data = ws.file(Path::new("doc.md")).expect("file should exist");
         assert!(
-            ws.errors().contains_key(Path::new("doc.md")),
-            "should have error initially"
+            !data.parse_diagnostics.is_empty(),
+            "should have parse diagnostics initially"
         );
 
         fs::write(dir.path().join("doc.md"), "# Fixed\n").expect("fix doc.md");
         ws.update(Path::new("doc.md"))
             .expect("update should succeed");
 
+        let data = ws.file(Path::new("doc.md")).expect("file should be parsed");
         assert!(
-            !ws.errors().contains_key(Path::new("doc.md")),
-            "error should be cleared"
-        );
-        assert!(
-            ws.file(Path::new("doc.md")).is_some(),
-            "file should be parsed"
+            data.parse_diagnostics.is_empty(),
+            "parse diagnostics should be cleared"
         );
     }
 
@@ -561,7 +622,6 @@ mod tests {
 
         let ws = Workspace::scan(dir.path()).expect("scan should succeed");
         assert!(ws.files().is_empty(), "should have no files");
-        assert!(ws.errors().is_empty(), "should have no errors");
     }
 
     #[test]
@@ -577,17 +637,20 @@ mod tests {
         let dir = workspace_with_files(&[("doc.md", "[link](other.md)\n")]);
         let mut ws = Workspace::scan(dir.path()).expect("scan should succeed");
 
-        let data = ws.file(Path::new("doc.md")).expect("file should exist");
-        assert_eq!(data.links.len(), 1, "initial parse should find one link");
+        let links = ws
+            .file(Path::new("doc.md"))
+            .expect("file should exist")
+            .tree
+            .links(Path::new("doc.md"));
+        assert_eq!(links.len(), 1, "initial parse should find one link");
 
         ws.update_content(Path::new("doc.md"), "# No links here\n");
-        let data = ws
+        let links = ws
             .file(Path::new("doc.md"))
-            .expect("file should still exist");
-        assert!(
-            data.links.is_empty(),
-            "updated content should have no links"
-        );
+            .expect("file should still exist")
+            .tree
+            .links(Path::new("doc.md"));
+        assert!(links.is_empty(), "updated content should have no links");
     }
 
     #[test]

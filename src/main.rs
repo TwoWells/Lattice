@@ -8,27 +8,13 @@ use std::process::ExitCode;
 
 use clap::Parser;
 
-#[allow(
-    dead_code,
-    reason = "public API consumed by consumer migration ticket 06"
-)]
 mod block;
 mod cli;
 mod config;
-mod frontmatter;
-#[allow(
-    dead_code,
-    reason = "public API consumed by consumer migration ticket 06"
-)]
 mod html;
-#[allow(
-    dead_code,
-    reason = "public API consumed by consumer migration ticket 06"
-)]
 mod inline;
 mod lint;
 mod lsp;
-mod markdown;
 mod server;
 mod span;
 mod validation;

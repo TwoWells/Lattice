@@ -20,6 +20,7 @@ pub static VOID_ELEMENTS: phf::Set<&str> = phf::phf_set! {
 };
 
 /// Block-level elements — for block-in-inline diagnostics.
+#[allow(dead_code, reason = "used by structural diagnostics ticket 07")]
 pub static BLOCK_ELEMENTS: phf::Set<&str> = phf::phf_set! {
     "address", "article", "aside", "blockquote", "body", "canvas",
     "dd", "details", "dialog", "div", "dl", "dt", "fieldset",
@@ -31,6 +32,7 @@ pub static BLOCK_ELEMENTS: phf::Set<&str> = phf::phf_set! {
 };
 
 /// All standard HTML elements — for unknown element detection.
+#[allow(dead_code, reason = "used by structural diagnostics ticket 07")]
 pub static ALL_ELEMENTS: phf::Set<&str> = phf::phf_set! {
     "a", "abbr", "address", "area", "article", "aside", "audio",
     "b", "base", "bdi", "bdo", "blockquote", "body", "br", "button",

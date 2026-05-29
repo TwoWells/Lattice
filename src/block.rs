@@ -13,6 +13,9 @@
 //! images). Inline parsing happens in a later ticket over completed
 //! leaf nodes.
 
+use std::collections::HashMap;
+use std::path::{Component, Path, PathBuf};
+
 use crate::html::{self, HtmlTag};
 use crate::span::Span;
 
@@ -156,6 +159,7 @@ pub struct Node {
     /// Byte range in the original source covering this node.
     pub span: Span,
     /// Parent node, if any (`None` only for `Document`).
+    #[allow(dead_code, reason = "structural field used by navigation ticket 08")]
     pub parent: Option<NodeId>,
     /// Child nodes in document order.
     pub children: Vec<NodeId>,
@@ -206,8 +210,9 @@ impl Tree {
     /// The root `Document` node (always index 0).
     #[must_use]
     #[allow(
+        dead_code,
         clippy::unused_self,
-        reason = "consistent accessor API; root may vary in later tickets"
+        reason = "public API for navigation ticket 08"
     )]
     pub fn root(&self) -> NodeId {
         0
@@ -221,24 +226,28 @@ impl Tree {
 
     /// Slice the source text for a span.
     #[must_use]
+    #[allow(dead_code, reason = "public API for structural diagnostics ticket 07")]
     pub fn text(&self, span: &Span) -> &str {
         &self.source[span.start..span.end]
     }
 
     /// The number of nodes in the tree.
     #[must_use]
+    #[allow(dead_code, reason = "public API for future consumers")]
     pub fn len(&self) -> usize {
         self.nodes.len()
     }
 
     /// Whether the tree is empty (it never is — always has `Document`).
     #[must_use]
+    #[allow(dead_code, reason = "public API for future consumers")]
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty()
     }
 
     /// Direct children of a node.
     #[must_use]
+    #[allow(dead_code, reason = "public API for navigation ticket 08")]
     pub fn children(&self, id: NodeId) -> &[NodeId] {
         &self.nodes[id].children
     }
@@ -267,6 +276,90 @@ impl Tree {
     pub fn add_diagnostic(&mut self, diagnostic: Diagnostic) {
         self.diagnostics.push(diagnostic);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Consumer types
+// ---------------------------------------------------------------------------
+
+/// A link extracted from the parse tree.
+#[derive(Debug)]
+pub struct Link {
+    /// 1-based line number in the source.
+    pub line: usize,
+    /// Classification and resolved details.
+    pub kind: LinkKind,
+}
+
+/// Classification of a link.
+#[derive(Debug)]
+pub enum LinkKind {
+    /// External URL (`http://`, `https://`, `mailto:`).
+    External {
+        /// The raw URL.
+        #[allow(dead_code, reason = "stored for LSP diagnostics")]
+        url: String,
+    },
+    /// Intra-document fragment-only link (`#section`).
+    IntraDocument {
+        /// Fragment without the leading `#`.
+        #[allow(dead_code, reason = "stored for LSP diagnostics")]
+        fragment: String,
+    },
+    /// Link to a non-markdown file in the project.
+    NonMarkdown {
+        /// Resolved path to the target.
+        target: PathBuf,
+    },
+    /// Intra-project link to a markdown file.
+    IntraProject {
+        /// Resolved path to the target `.md` file.
+        target: PathBuf,
+        /// Fragment (heading anchor), if any.
+        fragment: Option<String>,
+        /// Predicate from title text, or `"references"` if absent.
+        predicate: String,
+        /// Whether the predicate was explicitly set via title text.
+        explicit_predicate: bool,
+    },
+}
+
+/// A heading extracted from the parse tree.
+#[derive(Debug)]
+pub struct Heading {
+    /// 1-based line number in the source.
+    pub line: usize,
+    /// Heading level (1–6).
+    pub level: u8,
+    /// Raw text content of the heading.
+    pub text: String,
+    /// Heading anchor ID.
+    pub id: HeadingId,
+}
+
+/// How a heading's anchor ID was determined.
+#[derive(Debug)]
+pub enum HeadingId {
+    /// Explicit `{#id}` attribute on the heading.
+    Explicit(String),
+    /// Computed slugs from the heading text.
+    Computed {
+        /// GitHub slug.
+        github: String,
+        /// GitLab slug.
+        gitlab: String,
+        /// VS Code slug.
+        vscode: String,
+    },
+}
+
+/// A bare file path found in document text.
+#[derive(Debug)]
+pub struct BarePath {
+    /// 1-based line number in the source.
+    pub line: usize,
+    /// The detected path text.
+    pub path: String,
 }
 
 /// An explicit `{#id}` attribute on an ATX heading.
@@ -2903,6 +2996,521 @@ fn split_lines(text: &str) -> Vec<&str> {
     }
 
     lines
+}
+
+// ---------------------------------------------------------------------------
+// Consumer helpers
+// ---------------------------------------------------------------------------
+
+/// Normalize a path by resolving `.` and `..` components without touching
+/// the filesystem.
+pub fn normalize_path(path: &Path) -> PathBuf {
+    let mut parts: Vec<Component<'_>> = Vec::new();
+    for c in path.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(parts.last(), Some(Component::Normal(_))) {
+                    parts.pop();
+                } else {
+                    parts.push(c);
+                }
+            }
+            _ => parts.push(c),
+        }
+    }
+    parts.iter().collect()
+}
+
+/// Check whether a URL is external (http/https/mailto).
+fn is_external(url: &str) -> bool {
+    url.starts_with("http://") || url.starts_with("https://") || url.starts_with("mailto:")
+}
+
+/// Split a URL into path and optional fragment.
+fn split_url_fragment(url: &str) -> (&str, Option<String>) {
+    match url.split_once('#') {
+        Some((path, frag)) => (path, Some(frag.to_string())),
+        None => (url, None),
+    }
+}
+
+/// Check whether a path has a `.md` extension.
+fn is_markdown_ext(path: &Path) -> bool {
+    path.extension().is_some_and(|ext| ext == "md")
+}
+
+/// Classify a raw link URL and title into a [`Link`].
+fn classify_link(url: &str, title: &str, file_path: &Path, line: usize) -> Option<Link> {
+    if url.is_empty() {
+        return None;
+    }
+
+    let kind = if is_external(url) {
+        LinkKind::External {
+            url: url.to_string(),
+        }
+    } else if let Some(fragment) = url.strip_prefix('#') {
+        LinkKind::IntraDocument {
+            fragment: fragment.to_string(),
+        }
+    } else {
+        let (path_str, fragment) = split_url_fragment(url);
+        let parent = file_path.parent().unwrap_or_else(|| Path::new(""));
+        let target = normalize_path(&parent.join(path_str));
+
+        if is_markdown_ext(&target) {
+            let explicit_predicate = !title.is_empty();
+            let predicate = if explicit_predicate {
+                title.to_string()
+            } else {
+                "references".to_string()
+            };
+            LinkKind::IntraProject {
+                target,
+                fragment,
+                predicate,
+                explicit_predicate,
+            }
+        } else {
+            LinkKind::NonMarkdown { target }
+        }
+    };
+
+    Some(Link { line, kind })
+}
+
+/// Classify an import directive path into a [`Link`].
+fn classify_import(path: &str, file_path: &Path, line: usize) -> Link {
+    let parent = file_path.parent().unwrap_or_else(|| Path::new(""));
+    let target = normalize_path(&parent.join(path));
+    let kind = if is_markdown_ext(&target) {
+        LinkKind::IntraProject {
+            target,
+            fragment: None,
+            predicate: "imports".to_string(),
+            explicit_predicate: true,
+        }
+    } else {
+        LinkKind::NonMarkdown { target }
+    };
+    Link { line, kind }
+}
+
+// --- Slug algorithms ---
+
+/// GitHub heading slug ([github-slugger] compatible).
+fn github_slug(text: &str) -> String {
+    text.to_lowercase()
+        .chars()
+        .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-' || *c == ' ')
+        .map(|c| if c == ' ' { '-' } else { c })
+        .collect()
+}
+
+/// GitLab heading slug.
+fn gitlab_slug(text: &str) -> String {
+    let raw: String = text
+        .to_lowercase()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-' || *c == ' ')
+        .map(|c| if c == ' ' { '-' } else { c })
+        .collect();
+
+    collapse_hyphens(&raw).trim_matches('-').to_string()
+}
+
+/// VS Code heading slug.
+fn vscode_slug(text: &str) -> String {
+    let raw: String = text
+        .trim()
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_whitespace() { '-' } else { c })
+        .filter(|c| !is_vscode_punctuation(*c))
+        .collect();
+
+    raw.trim_matches('-').to_string()
+}
+
+fn collapse_hyphens(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut prev_hyphen = false;
+    for c in s.chars() {
+        if c == '-' {
+            if !prev_hyphen {
+                result.push(c);
+            }
+            prev_hyphen = true;
+        } else {
+            result.push(c);
+            prev_hyphen = false;
+        }
+    }
+    result
+}
+
+const fn is_vscode_punctuation(c: char) -> bool {
+    matches!(
+        c,
+        '[' | ']'
+            | '!'
+            | '"'
+            | '#'
+            | '$'
+            | '%'
+            | '&'
+            | '\''
+            | '('
+            | ')'
+            | '*'
+            | '+'
+            | ','
+            | '.'
+            | '/'
+            | ':'
+            | ';'
+            | '<'
+            | '='
+            | '>'
+            | '?'
+            | '@'
+            | '\\'
+            | '^'
+            | '{'
+            | '|'
+            | '}'
+            | '~'
+            | '`'
+    )
+}
+
+/// Tracks slug occurrences across a document for deduplication.
+struct SlugCounts {
+    github: HashMap<String, usize>,
+    gitlab: HashMap<String, usize>,
+    vscode: HashMap<String, usize>,
+}
+
+impl SlugCounts {
+    fn new() -> Self {
+        Self {
+            github: HashMap::new(),
+            gitlab: HashMap::new(),
+            vscode: HashMap::new(),
+        }
+    }
+
+    fn next_github(&mut self, text: &str) -> String {
+        deduplicate(github_slug(text), &mut self.github)
+    }
+
+    fn next_gitlab(&mut self, text: &str) -> String {
+        deduplicate(gitlab_slug(text), &mut self.gitlab)
+    }
+
+    fn next_vscode(&mut self, text: &str) -> String {
+        deduplicate(vscode_slug(text), &mut self.vscode)
+    }
+}
+
+/// Deduplicate a slug by appending `-1`, `-2`, etc. on collision.
+fn deduplicate(base: String, slugs: &mut HashMap<String, usize>) -> String {
+    let original = base.clone();
+    let mut slug = base;
+    while slugs.contains_key(&slug) {
+        let count = slugs.entry(original.clone()).or_insert(0);
+        *count += 1;
+        slug = format!("{original}-{count}");
+    }
+    slugs.insert(slug.clone(), 0);
+    slug
+}
+
+// --- Bare path detection ---
+
+const BARE_PATH_EXTENSIONS: &[&str] = &[".md", ".png", ".jpg", ".svg", ".pdf"];
+
+/// File extensions recognized in `@path` import directives.
+const IMPORT_EXTENSIONS: &[&str] = &[".json", ".md", ".toml", ".txt", ".xml", ".yaml", ".yml"];
+
+/// Check whether a string looks like a bare file path.
+fn is_bare_path(s: &str) -> bool {
+    !is_import_directive(s)
+        && s.contains('/')
+        && BARE_PATH_EXTENSIONS.iter().any(|ext| s.ends_with(ext))
+}
+
+/// Check whether a string is an `@path` import directive.
+fn is_import_directive(s: &str) -> bool {
+    let Some(path) = s.strip_prefix('@') else {
+        return false;
+    };
+    is_import_path(path)
+}
+
+/// Check whether a path (after stripping `@`) looks like a relative import.
+fn is_import_path(path: &str) -> bool {
+    if path.starts_with('/') || path.starts_with('~') || path.is_empty() {
+        return false;
+    }
+    IMPORT_EXTENSIONS.iter().any(|ext| path.ends_with(ext))
+}
+
+/// Scan a text segment for bare file paths.
+fn scan_bare_paths_in_text(text: &str, base_line: usize, out: &mut Vec<BarePath>) {
+    for (line_idx, line_text) in text.split('\n').enumerate() {
+        for word in line_text.split_whitespace() {
+            let cleaned = word
+                .trim_start_matches(['(', '[', '"', '\''])
+                .trim_end_matches([',', '.', ';', ':', '!', '?', ')', ']', '"', '\'']);
+
+            if is_bare_path(cleaned) {
+                out.push(BarePath {
+                    line: base_line + line_idx,
+                    path: cleaned.to_string(),
+                });
+            }
+        }
+    }
+}
+
+// --- Text helpers ---
+
+/// Convert a byte offset to a 1-based line number.
+#[allow(
+    clippy::naive_bytecount,
+    reason = "not worth a dependency for line counting"
+)]
+fn byte_offset_to_line(content: &str, offset: usize) -> usize {
+    let offset = offset.min(content.len());
+    content.as_bytes()[..offset]
+        .iter()
+        .filter(|&&b| b == b'\n')
+        .count()
+        + 1
+}
+
+/// Strip backtick-delimited code spans from text, keeping inner content.
+fn strip_code_spans(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut result = String::with_capacity(text.len());
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if bytes[i] == b'`' {
+            let tick_count = bytes[i..].iter().take_while(|&&b| b == b'`').count();
+            if let Some(end) = find_code_span_close(bytes, i + tick_count, tick_count) {
+                let inner = &text[i + tick_count..end];
+                // CommonMark: strip one leading and one trailing space if both present
+                // and content is not all spaces.
+                let stripped = if inner.len() >= 2
+                    && inner.starts_with(' ')
+                    && inner.ends_with(' ')
+                    && inner.trim().len() < inner.len()
+                {
+                    &inner[1..inner.len() - 1]
+                } else {
+                    inner
+                };
+                result.push_str(stripped);
+                i = end + tick_count;
+            } else {
+                for _ in 0..tick_count {
+                    result.push('`');
+                }
+                i += tick_count;
+            }
+        } else {
+            let ch = text[i..].chars().next().unwrap_or(' ');
+            result.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+
+    result
+}
+
+/// Find closing backticks of exactly `count` length.
+fn find_code_span_close(bytes: &[u8], start: usize, count: usize) -> Option<usize> {
+    let mut i = start;
+    while i < bytes.len() {
+        if bytes[i] == b'`' {
+            let n = bytes[i..].iter().take_while(|&&b| b == b'`').count();
+            if n == count {
+                return Some(i);
+            }
+            i += n;
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
+/// Extract display text from an HTML heading like `<h1>text</h1>`.
+fn extract_html_heading_text(source: &str) -> String {
+    // Strip the opening tag
+    let after_open = source.find('>').map_or(source, |i| &source[i + 1..]);
+    // Strip the closing tag
+    let before_close = after_open
+        .rfind("</")
+        .map_or(after_open, |i| &after_open[..i]);
+    // Join lines and trim
+    before_close
+        .lines()
+        .map(str::trim)
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Tree accessors
+// ---------------------------------------------------------------------------
+
+impl Tree {
+    /// Extract links from the tree, classified relative to `file_path`.
+    ///
+    /// `file_path` is the workspace-relative path of the file, used to
+    /// resolve relative link targets.
+    #[must_use]
+    pub fn links(&self, file_path: &Path) -> Vec<Link> {
+        let mut links = Vec::new();
+
+        for node in &self.nodes {
+            match &node.kind {
+                ElementKind::Link { url, title } => {
+                    let line = byte_offset_to_line(&self.source, node.span.start);
+                    if let Some(link) = classify_link(url, title, file_path, line) {
+                        links.push(link);
+                    }
+                }
+                ElementKind::Import { path } => {
+                    let line = byte_offset_to_line(&self.source, node.span.start);
+                    links.push(classify_import(path, file_path, line));
+                }
+                _ => {}
+            }
+        }
+
+        links
+    }
+
+    /// Extract headings with computed slugs.
+    #[must_use]
+    pub fn headings(&self) -> Vec<Heading> {
+        let mut slugs = SlugCounts::new();
+        let mut headings = Vec::new();
+
+        for (id, node) in self.nodes.iter().enumerate() {
+            let ElementKind::Heading { level } = &node.kind else {
+                continue;
+            };
+
+            let line = byte_offset_to_line(&self.source, node.span.start);
+            let (text, explicit_id) = self.heading_content(id);
+            let level = *level;
+
+            let heading_id = explicit_id.map_or_else(
+                || HeadingId::Computed {
+                    github: slugs.next_github(&text),
+                    gitlab: slugs.next_gitlab(&text),
+                    vscode: slugs.next_vscode(&text),
+                },
+                HeadingId::Explicit,
+            );
+
+            headings.push(Heading {
+                line,
+                level,
+                text,
+                id: heading_id,
+            });
+        }
+
+        headings
+    }
+
+    /// Scan paragraphs for bare file paths.
+    #[must_use]
+    pub fn bare_paths(&self) -> Vec<BarePath> {
+        let mut bare_paths = Vec::new();
+
+        for (id, node) in self.nodes.iter().enumerate() {
+            if !matches!(node.kind, ElementKind::Paragraph) {
+                continue;
+            }
+            self.scan_bare_paths_in_node(id, &mut bare_paths);
+        }
+
+        bare_paths
+    }
+
+    /// Extract heading display text and optional explicit ID.
+    fn heading_content(&self, node_id: NodeId) -> (String, Option<String>) {
+        let node = &self.nodes[node_id];
+        let raw = &self.source[node.span.start..node.span.end];
+
+        if node.syntax == Syntax::Html {
+            let text = extract_html_heading_text(raw);
+            let clean = strip_code_spans(&text);
+            return (clean, None);
+        }
+
+        // Check if ATX (starts with '#') or setext
+        let trimmed = raw.trim_start();
+        if trimmed.starts_with('#') {
+            let first_line = raw.lines().next().unwrap_or("");
+            let (content_span, atx_id) = extract_atx_content(first_line, node.span.start);
+            let content = &self.source[content_span.start..content_span.end];
+            let clean = strip_code_spans(content);
+            (clean.trim().to_string(), atx_id.map(|a| a.id))
+        } else {
+            // Setext: text is all lines except the last (underline)
+            let lines: Vec<&str> = raw.lines().collect();
+            let text_lines = if lines.len() > 1 {
+                &lines[..lines.len() - 1]
+            } else {
+                &lines[..]
+            };
+            let joined = text_lines.join(" ");
+            let clean = strip_code_spans(&joined);
+            (clean.trim().to_string(), None)
+        }
+    }
+
+    /// Scan a paragraph node for bare paths, excluding inline children.
+    fn scan_bare_paths_in_node(&self, node_id: NodeId, out: &mut Vec<BarePath>) {
+        let node = &self.nodes[node_id];
+
+        // Collect child spans (inline elements to exclude)
+        let mut excluded: Vec<Span> = node
+            .children
+            .iter()
+            .map(|&child| self.nodes[child].span)
+            .collect();
+        excluded.sort_by_key(|s| s.start);
+
+        let mut pos = node.span.start;
+
+        for exclude in &excluded {
+            if pos < exclude.start {
+                let segment = &self.source[pos..exclude.start];
+                let base_line = byte_offset_to_line(&self.source, pos);
+                scan_bare_paths_in_text(segment, base_line, out);
+            }
+            pos = exclude.end;
+        }
+
+        // Text after last child
+        if pos < node.span.end {
+            let segment = &self.source[pos..node.span.end];
+            let base_line = byte_offset_to_line(&self.source, pos);
+            scan_bare_paths_in_text(segment, base_line, out);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

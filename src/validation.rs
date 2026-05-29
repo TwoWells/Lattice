@@ -10,8 +10,8 @@
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
+use crate::block::{self, HeadingId, LinkKind};
 use crate::config::{BarePathPolicy, Config, FragmentAlgorithm, PredicatePolicy};
-use crate::markdown::{self, HeadingId, LinkKind};
 use crate::workspace::Workspace;
 
 /// Diagnostic severity level.
@@ -50,7 +50,8 @@ pub fn validate_forward_links(workspace: &Workspace) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
 
     for (file_path, file_data) in workspace.files() {
-        for link in &file_data.links {
+        let links = file_data.tree.links(file_path);
+        for link in &links {
             match &link.kind {
                 LinkKind::External { .. } | LinkKind::IntraDocument { .. } => {}
 
@@ -196,7 +197,8 @@ fn build_expected_backlinks(
     let mut expected: HashMap<PathBuf, HashMap<String, BTreeSet<PathBuf>>> = HashMap::new();
 
     for (source_path, file_data) in workspace.files() {
-        for link in &file_data.links {
+        let links = file_data.tree.links(source_path);
+        for link in &links {
             if let LinkKind::IntraProject {
                 target, predicate, ..
             } = &link.kind
@@ -229,7 +231,7 @@ fn build_expected_backlinks(
 /// directory with the backlink path and normalizes the result.
 fn resolve_backlink_path(containing_file: &Path, backlink_path: &str) -> PathBuf {
     let dir = containing_file.parent().unwrap_or_else(|| Path::new(""));
-    markdown::normalize_path(&dir.join(backlink_path))
+    block::normalize_path(&dir.join(backlink_path))
 }
 
 /// Compute the relative path from one file to another.
@@ -358,23 +360,21 @@ fn check_fragment(
     };
 
     let algorithm = config.policy.fragments;
+    let headings = target_data.tree.headings();
 
-    let found = target_data
-        .headings
-        .iter()
-        .any(|heading| match &heading.id {
-            HeadingId::Explicit(id) => id == fragment,
-            HeadingId::Computed {
-                github,
-                gitlab,
-                vscode,
-            } => match algorithm {
-                Some(FragmentAlgorithm::Github) => github == fragment,
-                Some(FragmentAlgorithm::Gitlab) => gitlab == fragment,
-                Some(FragmentAlgorithm::Vscode) => vscode == fragment,
-                None => github == fragment || gitlab == fragment || vscode == fragment,
-            },
-        });
+    let found = headings.iter().any(|heading| match &heading.id {
+        HeadingId::Explicit(id) => id == fragment,
+        HeadingId::Computed {
+            github,
+            gitlab,
+            vscode,
+        } => match algorithm {
+            Some(FragmentAlgorithm::Github) => github == fragment,
+            Some(FragmentAlgorithm::Gitlab) => gitlab == fragment,
+            Some(FragmentAlgorithm::Vscode) => vscode == fragment,
+            None => github == fragment || gitlab == fragment || vscode == fragment,
+        },
+    });
 
     if !found {
         diagnostics.push(Diagnostic {
@@ -405,7 +405,8 @@ pub fn validate_bare_paths(workspace: &Workspace) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
 
     for (file_path, file_data) in workspace.files() {
-        for bare in &file_data.bare_paths {
+        let bare_paths = file_data.tree.bare_paths();
+        for bare in &bare_paths {
             diagnostics.push(Diagnostic {
                 file: file_path.clone(),
                 line: bare.line,
@@ -444,15 +445,15 @@ pub fn collect_all(workspace: &Workspace) -> Vec<Diagnostic> {
                 message: format!("unknown inverse predicate `{}`", bd.predicate),
             });
         }
-    }
 
-    for (path, err) in workspace.errors() {
-        diagnostics.push(Diagnostic {
-            file: path.clone(),
-            line: 1,
-            severity: Severity::Error,
-            message: format!("frontmatter error: {err}"),
-        });
+        for pd in &file_data.parse_diagnostics {
+            diagnostics.push(Diagnostic {
+                file: path.clone(),
+                line: pd.line,
+                severity: Severity::Error,
+                message: format!("frontmatter error: {}", pd.message),
+            });
+        }
     }
 
     diagnostics.sort_by(|a, b| a.file.cmp(&b.file).then(a.line.cmp(&b.line)));

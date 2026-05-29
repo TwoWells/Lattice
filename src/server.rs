@@ -14,8 +14,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use lsp_server::{Connection, Message, Notification, Response};
 
+use crate::block::{Heading, HeadingId, LinkKind};
 use crate::lsp;
-use crate::markdown::{Heading, HeadingId, LinkKind};
 use crate::validation::{self, Diagnostic, Severity};
 use crate::workspace::Workspace;
 
@@ -288,7 +288,8 @@ fn handle_request(
 fn document_symbols(workspaces: &Workspaces, uri: &str) -> Option<Vec<lsp::DocumentSymbol>> {
     let (workspace, rel_path) = workspaces.resolve(uri)?;
     let file_data = workspace.file(&rel_path)?;
-    Some(build_heading_symbols(&file_data.headings))
+    let headings = file_data.tree.headings();
+    Some(build_heading_symbols(&headings))
 }
 
 /// Convert a flat list of headings into a nested symbol tree.
@@ -364,7 +365,8 @@ fn workspace_symbols(workspaces: &Workspaces, query: &str) -> Vec<lsp::SymbolInf
 
     for (root, workspace) in workspaces.iter() {
         for (rel_path, file_data) in workspace.files() {
-            for heading in &file_data.headings {
+            let headings = file_data.tree.headings();
+            for heading in &headings {
                 if !query.is_empty() && !heading.text.to_lowercase().contains(&query_lower) {
                     continue;
                 }
@@ -405,7 +407,8 @@ fn prepare_rename(
 ) -> Option<lsp::Range> {
     let (workspace, rel_path) = workspaces.resolve(&params.text_document.uri)?;
     let file_data = workspace.file(&rel_path)?;
-    let heading = heading_at_line(&file_data.headings, params.position.line)?;
+    let headings = file_data.tree.headings();
+    let heading = heading_at_line(&headings, params.position.line)?;
 
     let line = heading.line.saturating_sub(1) as u32;
     let text_len = heading.text.len() as u32;
@@ -432,7 +435,8 @@ fn prepare_rename(
 fn do_rename(workspaces: &Workspaces, params: &lsp::RenameParams) -> Option<lsp::WorkspaceEdit> {
     let (workspace, rel_path) = workspaces.resolve(&params.text_document.uri)?;
     let file_data = workspace.file(&rel_path)?;
-    let heading = heading_at_line(&file_data.headings, params.position.line)?;
+    let headings = file_data.tree.headings();
+    let heading = heading_at_line(&headings, params.position.line)?;
 
     let line = heading.line.saturating_sub(1) as u32;
     let text_len = heading.text.len() as u32;
@@ -488,15 +492,18 @@ fn find_references(workspaces: &Workspaces, params: &lsp::ReferenceParams) -> Ve
     };
 
     // Determine if the cursor is on a heading (to filter by fragment).
-    let target_heading = workspace
+    let file_headings = workspace
         .file(&rel_path)
-        .and_then(|fd| heading_at_line(&fd.headings, params.position.line));
+        .map(|fd| fd.tree.headings())
+        .unwrap_or_default();
+    let target_heading = heading_at_line(&file_headings, params.position.line);
 
     let mut locations = Vec::new();
 
     for (root, ws) in workspaces.iter() {
         for (src_path, file_data) in ws.files() {
-            for link in &file_data.links {
+            let links = file_data.tree.links(src_path);
+            for link in &links {
                 let LinkKind::IntraProject {
                     target, fragment, ..
                 } = &link.kind
@@ -554,7 +561,8 @@ fn prepare_type_hierarchy(
 ) -> Option<Vec<lsp::HierarchyItem>> {
     let (workspace, rel_path) = workspaces.resolve(&params.text_document.uri)?;
     let file_data = workspace.file(&rel_path)?;
-    let heading = heading_at_line(&file_data.headings, params.position.line)?;
+    let headings = file_data.tree.headings();
+    let heading = heading_at_line(&headings, params.position.line)?;
     let item = heading_to_hierarchy_item(heading, &workspace.root().join(&rel_path));
     Some(vec![item])
 }
@@ -571,6 +579,7 @@ fn type_hierarchy_supertypes(
     let (workspace, rel_path) = workspaces.resolve(&item.uri)?;
     let file_data = workspace.file(&rel_path)?;
     let abs_path = workspace.root().join(&rel_path);
+    let headings = file_data.tree.headings();
 
     let target_level = hierarchy_item_level(item);
     if target_level <= 1 {
@@ -578,7 +587,7 @@ fn type_hierarchy_supertypes(
     }
 
     let target_line = item.selection_range.start.line;
-    let parent = file_data.headings.iter().rev().find(|h| {
+    let parent = headings.iter().rev().find(|h| {
         let h_line = h.line.saturating_sub(1) as u32;
         h_line < target_line && h.level < target_level
     });
@@ -602,6 +611,7 @@ fn type_hierarchy_subtypes(
     let (workspace, rel_path) = workspaces.resolve(&item.uri)?;
     let file_data = workspace.file(&rel_path)?;
     let abs_path = workspace.root().join(&rel_path);
+    let headings = file_data.tree.headings();
 
     let target_level = hierarchy_item_level(item);
     let child_level = target_level + 1;
@@ -610,7 +620,7 @@ fn type_hierarchy_subtypes(
     let mut children = Vec::new();
     let mut started = false;
 
-    for heading in &file_data.headings {
+    for heading in &headings {
         let h_line = heading.line.saturating_sub(1) as u32;
 
         if h_line == target_line {
@@ -644,7 +654,8 @@ fn prepare_call_hierarchy(
 ) -> Option<Vec<lsp::HierarchyItem>> {
     let (workspace, rel_path) = workspaces.resolve(&params.text_document.uri)?;
     let file_data = workspace.file(&rel_path)?;
-    let heading = heading_at_line(&file_data.headings, params.position.line)?;
+    let headings = file_data.tree.headings();
+    let heading = heading_at_line(&headings, params.position.line)?;
     let item = heading_to_hierarchy_item(heading, &workspace.root().join(&rel_path));
     Some(vec![item])
 }
@@ -666,7 +677,9 @@ fn call_hierarchy_incoming(
 
     for (root, ws) in workspaces.iter() {
         for (src_path, file_data) in ws.files() {
-            for link in &file_data.links {
+            let links = file_data.tree.links(src_path);
+            let headings = file_data.tree.headings();
+            for link in &links {
                 let LinkKind::IntraProject { target, .. } = &link.kind else {
                     continue;
                 };
@@ -674,7 +687,7 @@ fn call_hierarchy_incoming(
                     continue;
                 }
                 let abs_src = root.join(src_path);
-                let caller_heading = enclosing_heading(&file_data.headings, link.line);
+                let caller_heading = enclosing_heading(&headings, link.line);
 
                 let caller_item = caller_heading.map_or_else(
                     || file_hierarchy_item(&abs_src, src_path),
@@ -711,13 +724,14 @@ fn call_hierarchy_outgoing(
     let Some(file_data) = workspace.file(&rel_path) else {
         return Vec::new();
     };
+    let headings = file_data.tree.headings();
+    let links = file_data.tree.links(&rel_path);
 
     let item_line = item.selection_range.start.line;
     let item_level = hierarchy_item_level(item);
 
     // Find the end of this heading's section.
-    let section_end: u32 = file_data
-        .headings
+    let section_end: u32 = headings
         .iter()
         .find(|h| {
             let h_line = h.line.saturating_sub(1) as u32;
@@ -728,7 +742,7 @@ fn call_hierarchy_outgoing(
     let root = workspace.root();
     let mut calls = Vec::new();
 
-    for link in &file_data.links {
+    for link in &links {
         let LinkKind::IntraProject { target, .. } = &link.kind else {
             continue;
         };
@@ -738,9 +752,10 @@ fn call_hierarchy_outgoing(
         }
 
         let target_abs = root.join(target);
-        let target_item = workspace
-            .file(target)
-            .and_then(|fd| fd.headings.first())
+        let target_headings = workspace.file(target).map(|fd| fd.tree.headings());
+        let target_item = target_headings
+            .as_ref()
+            .and_then(|h| h.first())
             .map_or_else(
                 || file_hierarchy_item(&target_abs, target),
                 |h| heading_to_hierarchy_item(h, &target_abs),
@@ -780,11 +795,12 @@ fn document_links(workspaces: &Workspaces, uri: &str) -> Vec<lsp::DocumentLink> 
     let Some(file_data) = workspace.file(&rel_path) else {
         return Vec::new();
     };
+    let file_links = file_data.tree.links(&rel_path);
 
     let root = workspace.root();
     let mut links = Vec::new();
 
-    for link in &file_data.links {
+    for link in &file_links {
         let target_uri = match &link.kind {
             LinkKind::IntraProject { target, .. } | LinkKind::NonMarkdown { target } => {
                 path_to_uri(&root.join(target))
@@ -869,11 +885,11 @@ fn hover_preview(
 ) -> Option<lsp::Hover> {
     let (workspace, rel_path) = workspaces.resolve(&params.text_document.uri)?;
     let file_data = workspace.file(&rel_path)?;
+    let file_links = file_data.tree.links(&rel_path);
 
     // Find the link on the cursor's line.
     let cursor_line = params.position.line;
-    let link = file_data
-        .links
+    let link = file_links
         .iter()
         .find(|l| l.line.saturating_sub(1) as u32 == cursor_line)?;
 
@@ -891,7 +907,7 @@ fn hover_preview(
 
     let target_data = workspace.file(&target)?;
 
-    let preview = build_hover_preview(&target_data.content, target_data, fragment.as_deref());
+    let preview = build_hover_preview(target_data, fragment.as_deref());
     let header = format!("**{predicate}** → `{}`", target.display());
 
     Some(lsp::Hover {
@@ -903,12 +919,10 @@ fn hover_preview(
 }
 
 /// Build a ~5 line preview from the target file content.
-fn build_hover_preview(
-    content: &str,
-    target_data: &crate::workspace::FileData,
-    fragment: Option<&str>,
-) -> String {
+fn build_hover_preview(target_data: &crate::workspace::FileData, fragment: Option<&str>) -> String {
+    let content = target_data.tree.source();
     let lines: Vec<&str> = content.lines().collect();
+    let headings = target_data.tree.headings();
 
     // Determine the start line for the preview.
     let start = fragment.map_or_else(
@@ -916,8 +930,7 @@ fn build_hover_preview(
         || target_data.frontmatter.as_ref().map_or(0, |fm| fm.end_line),
         // Fragment — find the matching heading.
         |frag| {
-            target_data
-                .headings
+            headings
                 .iter()
                 .find(|h| heading_matches_fragment(h, frag))
                 .map_or(0, |h| h.line.saturating_sub(1))
@@ -951,7 +964,7 @@ fn folding_ranges(workspaces: &Workspaces, uri: &str) -> Vec<lsp::FoldingRange> 
         return Vec::new();
     };
 
-    let total_lines = file_data.content.lines().count() as u32;
+    let total_lines = file_data.tree.source().lines().count() as u32;
 
     let mut ranges = Vec::new();
 
@@ -969,7 +982,7 @@ fn folding_ranges(workspaces: &Workspaces, uri: &str) -> Vec<lsp::FoldingRange> 
     }
 
     // Heading folding ranges.
-    let headings = &file_data.headings;
+    let headings = file_data.tree.headings();
     for (i, heading) in headings.iter().enumerate() {
         let start = heading.line.saturating_sub(1) as u32;
         // End is the line before the next heading at same or higher level, or EOF.
@@ -1022,7 +1035,7 @@ fn format_document(workspaces: &Workspaces, uri: &str) -> Option<Vec<lsp::TextEd
     }
 
     // Step 1: Sort frontmatter backlinks.
-    let mut document = file_data.content.clone();
+    let mut document = file_data.tree.source().to_string();
     if let Some(fm) = &file_data.frontmatter
         && !fm.backlinks.is_empty()
     {
@@ -1053,8 +1066,9 @@ fn format_document(workspaces: &Workspaces, uri: &str) -> Option<Vec<lsp::TextEd
     }
 
     // Replace the entire document.
-    let total_lines = file_data.content.lines().count() as u32;
-    let last_line_len = file_data.content.lines().last().map_or(0, str::len) as u32;
+    let source = file_data.tree.source();
+    let total_lines = source.lines().count() as u32;
+    let last_line_len = source.lines().last().map_or(0, str::len) as u32;
 
     let range = lsp::Range {
         start: lsp::Position {
@@ -1285,7 +1299,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::markdown::HeadingId;
+    use crate::block::HeadingId;
 
     // -----------------------------------------------------------------------
     // Test helpers
