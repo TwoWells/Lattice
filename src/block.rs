@@ -293,13 +293,10 @@ fn expand_leading_tabs(line: &str) -> (String, Vec<TabMapping>) {
 #[derive(Debug)]
 struct TabMapping {
     /// Byte offset of the tab in the original line.
-    #[allow(dead_code, reason = "used for span remapping in later tickets")]
     original_byte: usize,
     /// Column position where expansion starts.
-    #[allow(dead_code, reason = "used for span remapping in later tickets")]
     expanded_col: usize,
     /// Number of spaces this tab expanded to.
-    #[allow(dead_code, reason = "used for span remapping in later tickets")]
     num_spaces: usize,
 }
 
@@ -313,22 +310,22 @@ fn expanded_to_raw(expanded_offset: usize, raw_line: &str, mappings: &[TabMappin
         return expanded_offset.min(raw_line.len());
     }
 
-    // Walk through the mapping to compute the cumulative offset delta.
-    let mut delta: usize = 0; // expanded_offset - raw_offset so far
+    // Walk through tab mappings. Each tab occupies columns
+    // [expanded_col .. expanded_col + num_spaces) in the expanded string
+    // but only 1 byte in the raw string. We track the cumulative extra
+    // bytes introduced by prior tab expansions.
+    let mut delta: usize = 0;
     for m in mappings {
-        // In the expanded string, this tab occupies columns
-        // [m.expanded_col .. m.expanded_col + m.num_spaces).
-        // In the raw string, it's a single byte at m.original_byte.
-        let tab_expanded_end = m.expanded_col + m.num_spaces;
-        if expanded_offset <= m.expanded_col + delta {
+        if expanded_offset <= m.expanded_col {
             // Before this tab — delta is from prior tabs only.
             break;
         }
-        if expanded_offset < tab_expanded_end + delta {
+        let tab_expanded_end = m.expanded_col + m.num_spaces;
+        if expanded_offset < tab_expanded_end {
             // Inside the expansion of this tab — map to just past the tab byte.
             return m.original_byte + 1;
         }
-        // Past this tab: each tab added (num_spaces - 1) extra bytes.
+        // Past this tab: it added (num_spaces - 1) extra bytes.
         delta += m.num_spaces - 1;
     }
 
@@ -2847,6 +2844,96 @@ mod tests {
 
         assert_eq!(children.len(), 1, "should find one block");
         assert_kind(&tree, children[0], &ElementKind::CodeBlock);
+    }
+
+    #[test]
+    fn expanded_to_raw_no_tabs() {
+        let raw = "- item";
+        let (_, mappings) = expand_leading_tabs(raw);
+        assert_eq!(
+            expanded_to_raw(2, raw, &mappings),
+            2,
+            "no tabs: offset unchanged"
+        );
+    }
+
+    #[test]
+    fn expanded_to_raw_single_tab() {
+        // "\t- item" → "    - item" (tab at byte 0, 4 spaces)
+        let raw = "\t- item";
+        let (expanded, mappings) = expand_leading_tabs(raw);
+        assert_eq!(expanded, "    - item", "expansion sanity check");
+        // Offset 4 in expanded is `-`, which is byte 1 in raw
+        assert_eq!(
+            expanded_to_raw(4, raw, &mappings),
+            1,
+            "offset past tab maps to byte after tab"
+        );
+        // Offset 6 in expanded is `i`, which is byte 3 in raw
+        assert_eq!(
+            expanded_to_raw(6, raw, &mappings),
+            3,
+            "offset well past tab maps correctly"
+        );
+        // Offset 2 is inside the tab expansion → maps to byte 1 (past tab)
+        assert_eq!(
+            expanded_to_raw(2, raw, &mappings),
+            1,
+            "offset inside tab expansion maps past tab byte"
+        );
+    }
+
+    #[test]
+    fn expanded_to_raw_two_tabs() {
+        // "\t\t- x" → "        - x" (8 spaces, then "- x")
+        let raw = "\t\t- x";
+        let (expanded, mappings) = expand_leading_tabs(raw);
+        assert_eq!(expanded, "        - x", "expansion sanity check");
+        // Offset 8 in expanded is `-`, which is byte 2 in raw
+        assert_eq!(
+            expanded_to_raw(8, raw, &mappings),
+            2,
+            "offset past both tabs"
+        );
+        // Offset 5 is inside second tab → maps to byte 2 (past second tab)
+        assert_eq!(
+            expanded_to_raw(5, raw, &mappings),
+            2,
+            "offset inside second tab expansion"
+        );
+        // Offset 0 is before any tab
+        assert_eq!(expanded_to_raw(0, raw, &mappings), 0, "offset 0 stays at 0");
+    }
+
+    #[test]
+    fn expanded_to_raw_partial_tab() {
+        // " \t- item" → "    - item" (space + tab at col 1 → 3 spaces)
+        let raw = " \t- item";
+        let (expanded, mappings) = expand_leading_tabs(raw);
+        assert_eq!(expanded, "    - item", "expansion sanity check");
+        // Offset 4 is `-`, byte 2 in raw
+        assert_eq!(
+            expanded_to_raw(4, raw, &mappings),
+            2,
+            "offset past partial tab"
+        );
+        // Offset 1 is at expanded_col of the tab → inside expansion
+        assert_eq!(
+            expanded_to_raw(1, raw, &mappings),
+            1,
+            "offset at tab start maps to tab byte"
+        );
+    }
+
+    #[test]
+    fn expanded_to_raw_clamped_to_raw_len() {
+        let raw = "ab";
+        let (_, mappings) = expand_leading_tabs(raw);
+        assert_eq!(
+            expanded_to_raw(100, raw, &mappings),
+            2,
+            "offset beyond raw len is clamped"
+        );
     }
 
     #[test]
