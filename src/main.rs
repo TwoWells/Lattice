@@ -8,6 +8,10 @@ use std::process::ExitCode;
 
 use clap::Parser;
 
+#[allow(
+    dead_code,
+    reason = "public API consumed by consumer migration ticket 06"
+)]
 mod block;
 mod cli;
 mod config;

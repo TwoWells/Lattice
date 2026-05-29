@@ -1,72 +1,161 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Two Wells <contact@twowells.dev>
 
-//! Block-level markdown parser.
+//! Block-level markdown parser with tree output.
 //!
 //! Reads source text line by line and classifies each line into a
-//! block-level construct: headings, code fences, block quotes, thematic
-//! breaks, HTML blocks, indented code, paragraphs, and blank lines.
+//! block-level construct, building a [`Tree`] of [`Node`] entries with
+//! parent/children references and a scope stack. Block quotes are
+//! container nodes whose children are parsed inline — no deferred
+//! re-parsing.
 //!
 //! This module does **not** parse inline content (links, emphasis,
-//! images). It produces a flat sequence of [`Block`] values, each
-//! carrying a [`Span`] into the original source. Nested structures
-//! (block quotes containing headings) are represented by recursive
-//! parsing of the block quote content in a later ticket.
+//! images). Inline parsing happens in a later ticket over completed
+//! leaf nodes.
 
 use crate::span::Span;
 
 // ---------------------------------------------------------------------------
-// Public types
+// Tree types
 // ---------------------------------------------------------------------------
 
-/// Classification of a block-level construct.
+/// Index into `Tree::nodes`.
+pub type NodeId = usize;
+
+/// Classification of a structural element.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BlockKind {
-    /// ATX heading (`#` through `######`).
-    AtxHeading {
+pub enum ElementKind {
+    /// Root node — every tree has exactly one.
+    Document,
+    /// YAML frontmatter block (including `---` delimiters).
+    Frontmatter,
+    /// ATX or setext heading.
+    Heading {
         /// Heading level (1–6).
         level: u8,
-        /// Span of the heading text content (after `#` markers and space,
-        /// before optional closing `#` markers). Empty headings have a
-        /// zero-length span at the position after the marker space.
-        text_span: Span,
-        /// Explicit `{#id}` attribute, if present.
-        id: Option<AtxId>,
-    },
-    /// Setext heading (paragraph followed by `===` or `---` underline).
-    SetextHeading {
-        /// Heading level: 1 for `===`, 2 for `---`.
-        level: u8,
-        /// Span of the heading text (the paragraph lines above).
-        text_span: Span,
     },
     /// Thematic break (`---`, `***`, `___` with variations).
-    ThematicBreak,
-    /// Fenced code block (`` ``` `` or `~~~`).
-    FencedCodeBlock {
-        /// Language tag from the info string, if any.
-        info: Option<String>,
-        /// Span of the content between opening and closing fences.
-        content_span: Span,
-    },
-    /// Block math (`$$` delimiters).
-    BlockMath {
-        /// Span of the content between opening and closing `$$`.
-        content_span: Span,
-    },
-    /// Indented code block (4+ spaces of indentation).
-    IndentedCodeBlock,
-    /// Block quote line(s) starting with `>`.
-    BlockQuote {
-        /// Span of the content after the `>` markers.
-        content_span: Span,
-    },
-    /// HTML block (content is opaque at this stage).
-    HtmlBlock,
+    Rules,
     /// Paragraph text.
     Paragraph,
-    /// Blank line.
-    BlankLine,
+    /// Fenced or indented code block.
+    CodeBlock,
+    /// Block math (`$$` delimiters).
+    Math,
+    /// Block quote container (`>`).
+    QuoteBlock,
+    /// HTML block (opaque at this stage).
+    HtmlBlock,
+}
+
+/// Which syntax produced a node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Syntax {
+    /// YAML frontmatter.
+    Yaml,
+    /// Markdown structural syntax.
+    Markdown,
+    /// Raw HTML.
+    #[allow(dead_code, reason = "used by HTML tag parser ticket 04")]
+    Html,
+}
+
+/// A node in the parse tree.
+#[derive(Debug)]
+pub struct Node {
+    /// What kind of element this is.
+    pub kind: ElementKind,
+    /// Which syntax produced this node.
+    pub syntax: Syntax,
+    /// Byte range in the original source covering this node.
+    pub span: Span,
+    /// Parent node, if any (`None` only for `Document`).
+    pub parent: Option<NodeId>,
+    /// Child nodes in document order.
+    pub children: Vec<NodeId>,
+}
+
+/// A diagnostic emitted during parsing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Diagnostic {
+    /// Location of the error in the source.
+    pub span: Span,
+    /// Human-readable message.
+    pub message: String,
+}
+
+/// Parse tree over the source text.
+///
+/// The source text is the data. The tree is a structural view over
+/// it — spans into the source, not extracted content.
+#[derive(Debug)]
+pub struct Tree {
+    /// The full source text.
+    source: String,
+    /// All nodes in allocation order. Index 0 is always `Document`.
+    nodes: Vec<Node>,
+    /// Diagnostics emitted during parsing.
+    diagnostics: Vec<Diagnostic>,
+}
+
+impl Tree {
+    /// The full source text.
+    #[must_use]
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+
+    /// All nodes in the tree.
+    #[must_use]
+    pub fn nodes(&self) -> &[Node] {
+        &self.nodes
+    }
+
+    /// Get a node by its ID.
+    #[must_use]
+    pub fn node(&self, id: NodeId) -> &Node {
+        &self.nodes[id]
+    }
+
+    /// The root `Document` node (always index 0).
+    #[must_use]
+    #[allow(
+        clippy::unused_self,
+        reason = "consistent accessor API; root may vary in later tickets"
+    )]
+    pub fn root(&self) -> NodeId {
+        0
+    }
+
+    /// Diagnostics emitted during parsing.
+    #[must_use]
+    pub fn diagnostics(&self) -> &[Diagnostic] {
+        &self.diagnostics
+    }
+
+    /// Slice the source text for a span.
+    #[must_use]
+    pub fn text(&self, span: &Span) -> &str {
+        &self.source[span.start..span.end]
+    }
+
+    /// The number of nodes in the tree.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// Whether the tree is empty (it never is — always has `Document`).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.nodes.is_empty()
+    }
+
+    /// Direct children of a node.
+    #[must_use]
+    pub fn children(&self, id: NodeId) -> &[NodeId] {
+        &self.nodes[id].children
+    }
 }
 
 /// An explicit `{#id}` attribute on an ATX heading.
@@ -76,33 +165,6 @@ pub struct AtxId {
     pub id: String,
     /// Span of the ID text in the source.
     pub span: Span,
-}
-
-/// A classified block-level element.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Block {
-    /// What kind of block this is.
-    pub kind: BlockKind,
-    /// Byte range in the original source covering the entire block.
-    pub span: Span,
-}
-
-/// An error emitted during block parsing.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BlockDiagnostic {
-    /// Location of the error in the source.
-    pub span: Span,
-    /// Human-readable message.
-    pub message: String,
-}
-
-/// Result of block-level parsing.
-#[derive(Debug)]
-pub struct BlockParseResult {
-    /// Classified blocks in document order.
-    pub blocks: Vec<Block>,
-    /// Diagnostics emitted during parsing.
-    pub diagnostics: Vec<BlockDiagnostic>,
 }
 
 // ---------------------------------------------------------------------------
@@ -171,6 +233,7 @@ fn count_indent(line: &str) -> usize {
 /// Strip a trailing `\n` or `\r\n` from a byte offset into source.
 ///
 /// Returns the adjusted end offset with the line ending excluded.
+#[allow(dead_code, reason = "used by consumer migration ticket 06")]
 fn strip_trailing_newline(source: &str, end: usize) -> usize {
     let bytes = source.as_bytes();
     if end > 0 && bytes.get(end - 1) == Some(&b'\n') {
@@ -219,7 +282,7 @@ fn atx_heading_level(line: &str) -> Option<u8> {
 ///
 /// `line_start` is the byte offset of this line in the original source.
 /// `original_line` is the raw line from the source (not tab-expanded).
-fn extract_atx_content(original_line: &str, line_start: usize) -> (Span, Option<AtxId>) {
+pub fn extract_atx_content(original_line: &str, line_start: usize) -> (Span, Option<AtxId>) {
     let trimmed = original_line.trim_start_matches(' ');
     let leading_spaces = original_line.len() - trimmed.len();
     let hashes = trimmed.bytes().take_while(|&b| b == b'#').count();
@@ -640,59 +703,152 @@ fn strip_blockquote_marker(line: &str) -> Option<(usize, &str)> {
 // Parser
 // ---------------------------------------------------------------------------
 
-/// Parse the block structure of a markdown document.
+/// Parse a markdown document into a [`Tree`].
 ///
-/// `source` is the full document text. If frontmatter is present,
-/// `body_offset` should be the byte offset where the document body
-/// starts (after the closing `---\n`). If there is no frontmatter,
-/// pass 0.
-pub fn parse_blocks(source: &str, body_offset: usize) -> BlockParseResult {
+/// If frontmatter is present, pass its byte range as `frontmatter_span`
+/// so a `Frontmatter` node is created as the first child of `Document`.
+/// Body parsing starts after the frontmatter span.
+pub fn parse_tree(source: &str, frontmatter_span: Option<Span>) -> Tree {
+    let mut builder = TreeBuilder::new(source);
+
+    // Create Document root.
+    let doc_id = builder.add_node(
+        ElementKind::Document,
+        Syntax::Markdown,
+        Span::new(0, source.len()),
+        None,
+    );
+    builder.scope_stack.push(doc_id);
+
+    // If frontmatter is present, add it as first child.
+    let body_offset = frontmatter_span.map_or(0, |fm_span| {
+        builder.add_node(
+            ElementKind::Frontmatter,
+            Syntax::Yaml,
+            fm_span,
+            Some(doc_id),
+        );
+        fm_span.end
+    });
+
+    // Parse the body.
     let body = &source[body_offset..];
-    let mut parser = BlockParser {
-        source,
-        body_offset,
-        blocks: Vec::new(),
-        diagnostics: Vec::new(),
-    };
-    parser.parse(body);
-    BlockParseResult {
-        blocks: parser.blocks,
-        diagnostics: parser.diagnostics,
+    builder.parse_body(body, body_offset);
+
+    // Close any remaining open scopes.
+    while builder.scope_stack.len() > 1 {
+        builder.scope_stack.pop();
+    }
+
+    // Finalize the document span.
+    builder.nodes[doc_id].span = Span::new(0, source.len());
+
+    Tree {
+        source: source.to_string(),
+        nodes: builder.nodes,
+        diagnostics: builder.diagnostics,
     }
 }
 
-/// Internal parser state.
-struct BlockParser<'a> {
+/// Internal tree builder with scope stack.
+struct TreeBuilder<'a> {
     /// The full source text.
-    #[allow(dead_code, reason = "used for span slicing in diagnostics")]
     source: &'a str,
-    /// Byte offset where the body starts (after frontmatter).
-    body_offset: usize,
-    /// Accumulated blocks.
-    blocks: Vec<Block>,
+    /// All nodes built so far.
+    nodes: Vec<Node>,
+    /// Stack of open container node IDs.
+    scope_stack: Vec<NodeId>,
     /// Accumulated diagnostics.
-    diagnostics: Vec<BlockDiagnostic>,
+    diagnostics: Vec<Diagnostic>,
 }
 
-impl BlockParser<'_> {
-    fn parse(&mut self, body: &str) {
+impl<'a> TreeBuilder<'a> {
+    fn new(source: &'a str) -> Self {
+        Self {
+            source,
+            nodes: Vec::new(),
+            scope_stack: Vec::new(),
+            diagnostics: Vec::new(),
+        }
+    }
+
+    /// Add a node to the tree. If `parent` is `Some`, the node is added as
+    /// a child of that parent.
+    fn add_node(
+        &mut self,
+        kind: ElementKind,
+        syntax: Syntax,
+        span: Span,
+        parent: Option<NodeId>,
+    ) -> NodeId {
+        let id = self.nodes.len();
+        self.nodes.push(Node {
+            kind,
+            syntax,
+            span,
+            parent,
+            children: Vec::new(),
+        });
+        if let Some(pid) = parent {
+            self.nodes[pid].children.push(id);
+        }
+        id
+    }
+
+    /// Add a leaf node as a child of the current scope.
+    fn add_leaf(&mut self, kind: ElementKind, syntax: Syntax, span: Span) -> NodeId {
+        let parent = self.current_scope();
+        self.add_node(kind, syntax, span, Some(parent))
+    }
+
+    /// Push a new container scope.
+    fn push_scope(&mut self, kind: ElementKind, syntax: Syntax, span: Span) -> NodeId {
+        let parent = self.current_scope();
+        let id = self.add_node(kind, syntax, span, Some(parent));
+        self.scope_stack.push(id);
+        id
+    }
+
+    /// Pop the current scope, finalizing its span.
+    fn pop_scope(&mut self, end: usize) {
+        if self.scope_stack.len() > 1
+            && let Some(id) = self.scope_stack.pop()
+        {
+            self.nodes[id].span.end = end;
+        }
+    }
+
+    /// The node ID of the current (innermost) scope.
+    fn current_scope(&self) -> NodeId {
+        *self.scope_stack.last().unwrap_or(&0)
+    }
+
+    /// Check if the last child of the current scope is a paragraph.
+    fn last_child_is_paragraph(&self) -> bool {
+        let scope = self.current_scope();
+        self.nodes[scope]
+            .children
+            .last()
+            .is_some_and(|&id| matches!(self.nodes[id].kind, ElementKind::Paragraph))
+    }
+
+    /// Parse the body of a document (everything after frontmatter).
+    fn parse_body(&mut self, body: &str, body_offset: usize) {
         let lines: Vec<&str> = split_lines(body);
         let mut pos = 0;
         let mut line_idx = 0;
 
         while line_idx < lines.len() {
             let line = lines[line_idx];
-            let line_start = self.body_offset + pos;
+            let line_start = body_offset + pos;
             let line_byte_len = line.len();
 
             let (expanded, _mappings) = expand_leading_tabs(line);
             let indent = count_indent(&expanded);
 
             if expanded.trim().is_empty() {
-                self.blocks.push(Block {
-                    kind: BlockKind::BlankLine,
-                    span: Span::new(line_start, line_start + line_byte_len),
-                });
+                // Blank lines close block quotes.
+                self.close_block_quotes(line_start);
                 pos += line_byte_len;
                 line_idx += 1;
             } else if let Some((fence_char, fence_len, info)) = fenced_code_open(&expanded) {
@@ -702,57 +858,77 @@ impl BlockParser<'_> {
                     &lines,
                     &mut pos,
                     &mut line_idx,
+                    body_offset,
                     line_start,
                     line_byte_len,
                     fence_char,
                     fence_len,
-                    info,
+                    info.as_ref(),
                 );
             } else if block_math_open(&expanded) {
                 pos += line_byte_len;
                 line_idx += 1;
-                self.parse_block_math(&lines, &mut pos, &mut line_idx, line_start, line_byte_len);
-            } else if let Some(level) = atx_heading_level(&expanded) {
-                let (text_span, id) = extract_atx_content(line, line_start);
-                self.blocks.push(Block {
-                    kind: BlockKind::AtxHeading {
-                        level,
-                        text_span,
-                        id,
-                    },
-                    span: Span::new(line_start, line_start + line_byte_len),
-                });
+                self.parse_block_math(
+                    &lines,
+                    &mut pos,
+                    &mut line_idx,
+                    body_offset,
+                    line_start,
+                    line_byte_len,
+                );
+            } else if atx_heading_level(&expanded).is_some() {
+                let level = atx_heading_level(&expanded).unwrap_or(1);
+                self.add_leaf(
+                    ElementKind::Heading { level },
+                    Syntax::Markdown,
+                    Span::new(line_start, line_start + line_byte_len),
+                );
                 pos += line_byte_len;
                 line_idx += 1;
-            } else if let Some(html_type) = html_block_start(&expanded) {
+            } else if html_block_start(&expanded).is_some() {
+                let html_type = html_block_start(&expanded).unwrap_or(7);
                 self.parse_html_block(
                     &lines,
                     &mut pos,
                     &mut line_idx,
+                    body_offset,
                     line_start,
                     line_byte_len,
                     line,
                     html_type,
                 );
             } else if strip_blockquote_marker(&expanded).is_some() {
-                self.parse_block_quote(
-                    &lines,
-                    &mut pos,
-                    &mut line_idx,
-                    line_start,
-                    line_byte_len,
-                    line,
-                );
-            } else if indent >= 4 && !self.prev_is_paragraph() {
+                self.parse_block_quote(&lines, &mut pos, &mut line_idx, body_offset, line_start);
+            } else if indent >= 4 && !self.last_child_is_paragraph() {
                 self.parse_indented_code(
                     &lines,
                     &mut pos,
                     &mut line_idx,
+                    body_offset,
                     line_start,
                     line_byte_len,
                 );
             } else {
-                self.parse_paragraph(&lines, &mut pos, &mut line_idx, line_start, line_byte_len);
+                self.parse_paragraph(
+                    &lines,
+                    &mut pos,
+                    &mut line_idx,
+                    body_offset,
+                    line_start,
+                    line_byte_len,
+                );
+            }
+        }
+    }
+
+    /// Close all open block quote scopes (called on blank line).
+    fn close_block_quotes(&mut self, pos: usize) {
+        while self.scope_stack.len() > 1 {
+            let top = self.current_scope();
+            if matches!(self.nodes[top].kind, ElementKind::QuoteBlock) {
+                self.pop_scope(pos);
+            } else {
+                break;
             }
         }
     }
@@ -767,26 +943,21 @@ impl BlockParser<'_> {
         lines: &[&str],
         pos: &mut usize,
         line_idx: &mut usize,
+        body_offset: usize,
         open_start: usize,
         open_line_len: usize,
         fence_char: u8,
         fence_len: usize,
-        info: Option<String>,
+        _info: Option<&String>,
     ) {
-        let content_start = self.body_offset + *pos;
-        let mut info = Some(info);
-
         loop {
             if *line_idx >= lines.len() {
-                let content_end = self.body_offset + *pos;
-                self.blocks.push(Block {
-                    kind: BlockKind::FencedCodeBlock {
-                        info: info.take().unwrap_or_default(),
-                        content_span: Span::new(content_start, content_end),
-                    },
-                    span: Span::new(open_start, self.body_offset + *pos),
-                });
-                self.diagnostics.push(BlockDiagnostic {
+                self.add_leaf(
+                    ElementKind::CodeBlock,
+                    Syntax::Markdown,
+                    Span::new(open_start, body_offset + *pos),
+                );
+                self.diagnostics.push(Diagnostic {
                     span: Span::new(open_start, open_start + open_line_len),
                     message: "unclosed fenced code block".to_string(),
                 });
@@ -798,17 +969,14 @@ impl BlockParser<'_> {
             let (inner_expanded, _) = expand_leading_tabs(inner_line);
 
             if fenced_code_close(&inner_expanded, fence_char, fence_len) {
-                let content_end = self.body_offset + *pos;
                 *pos += inner_byte_len;
                 *line_idx += 1;
 
-                self.blocks.push(Block {
-                    kind: BlockKind::FencedCodeBlock {
-                        info: info.take().unwrap_or_default(),
-                        content_span: Span::new(content_start, content_end),
-                    },
-                    span: Span::new(open_start, self.body_offset + *pos),
-                });
+                self.add_leaf(
+                    ElementKind::CodeBlock,
+                    Syntax::Markdown,
+                    Span::new(open_start, body_offset + *pos),
+                );
                 break;
             }
 
@@ -823,10 +991,10 @@ impl BlockParser<'_> {
         lines: &[&str],
         pos: &mut usize,
         line_idx: &mut usize,
+        body_offset: usize,
         open_start: usize,
         open_line_len: usize,
     ) {
-        let content_start = self.body_offset + *pos;
         let mut found_close = false;
 
         while *line_idx < lines.len() {
@@ -834,17 +1002,15 @@ impl BlockParser<'_> {
             let inner_byte_len = inner_line.len();
 
             if block_math_close(inner_line) {
-                let content_end = self.body_offset + *pos;
                 *pos += inner_byte_len;
                 *line_idx += 1;
                 found_close = true;
 
-                self.blocks.push(Block {
-                    kind: BlockKind::BlockMath {
-                        content_span: Span::new(content_start, content_end),
-                    },
-                    span: Span::new(open_start, self.body_offset + *pos),
-                });
+                self.add_leaf(
+                    ElementKind::Math,
+                    Syntax::Markdown,
+                    Span::new(open_start, body_offset + *pos),
+                );
                 break;
             }
 
@@ -853,14 +1019,12 @@ impl BlockParser<'_> {
         }
 
         if !found_close {
-            let content_end = self.body_offset + *pos;
-            self.blocks.push(Block {
-                kind: BlockKind::BlockMath {
-                    content_span: Span::new(content_start, content_end),
-                },
-                span: Span::new(open_start, self.body_offset + *pos),
-            });
-            self.diagnostics.push(BlockDiagnostic {
+            self.add_leaf(
+                ElementKind::Math,
+                Syntax::Markdown,
+                Span::new(open_start, body_offset + *pos),
+            );
+            self.diagnostics.push(Diagnostic {
                 span: Span::new(open_start, open_start + open_line_len),
                 message: "unclosed block math".to_string(),
             });
@@ -877,6 +1041,7 @@ impl BlockParser<'_> {
         lines: &[&str],
         pos: &mut usize,
         line_idx: &mut usize,
+        body_offset: usize,
         block_start: usize,
         first_line_len: usize,
         first_line: &str,
@@ -912,69 +1077,318 @@ impl BlockParser<'_> {
             }
         }
 
-        self.blocks.push(Block {
-            kind: BlockKind::HtmlBlock,
-            span: Span::new(block_start, self.body_offset + *pos),
-        });
+        self.add_leaf(
+            ElementKind::HtmlBlock,
+            Syntax::Markdown,
+            Span::new(block_start, body_offset + *pos),
+        );
     }
 
-    /// Parse a block quote.
+    /// Parse a block quote as a container scope.
+    ///
+    /// Pushes `QuoteBlock` scope(s) for nesting and parses the content
+    /// inline. Nested block quotes (`> > text`) produce nested scopes.
     fn parse_block_quote(
         &mut self,
         lines: &[&str],
         pos: &mut usize,
         line_idx: &mut usize,
-        line_start: usize,
-        first_line_len: usize,
-        first_line: &str,
+        body_offset: usize,
+        block_start: usize,
     ) {
-        let mut content_parts: Vec<(usize, usize)> = Vec::new();
+        // Collect continuation lines and strip markers.
+        let (depth, inner_lines) =
+            self.collect_block_quote_lines(lines, pos, line_idx, body_offset);
 
-        if let Some((marker_len, _)) = strip_blockquote_marker(first_line) {
-            content_parts.push((line_start + marker_len, line_start + first_line_len));
+        // Push `depth` QuoteBlock scopes.
+        for _ in 0..depth {
+            self.push_scope(
+                ElementKind::QuoteBlock,
+                Syntax::Markdown,
+                Span::new(block_start, block_start),
+            );
         }
 
-        *pos += first_line_len;
+        // Parse the inner content.
+        if !inner_lines.is_empty() {
+            self.parse_inner_block_quote_lines(&inner_lines);
+        }
+
+        let end = body_offset + *pos;
+        // Pop all the block quote scopes we pushed.
+        for _ in 0..depth {
+            self.pop_scope(end);
+        }
+    }
+
+    /// Collect block quote continuation lines and strip markers.
+    ///
+    /// Returns the nesting depth of the first line and the stripped inner
+    /// lines (with their absolute byte offsets).
+    #[allow(clippy::unused_self, reason = "will read self fields in later tickets")]
+    fn collect_block_quote_lines(
+        &self,
+        lines: &[&str],
+        pos: &mut usize,
+        line_idx: &mut usize,
+        body_offset: usize,
+    ) -> (usize, Vec<InnerLine>) {
+        let mut inner_lines = Vec::new();
+
+        // Process first line — determine nesting depth.
+        let first_line = lines[*line_idx];
+        let first_start = body_offset + *pos;
+        let (depth, stripped) = strip_all_quote_markers(first_line);
+        inner_lines.push(InnerLine {
+            text: stripped.to_string(),
+            offset: first_start,
+            raw_len: first_line.len(),
+        });
+        *pos += first_line.len();
         *line_idx += 1;
 
+        // Continuation lines.
         while *line_idx < lines.len() {
-            let inner_line = lines[*line_idx];
-            let inner_start = self.body_offset + *pos;
+            let line = lines[*line_idx];
 
-            if inner_line.trim().is_empty() {
+            if line.trim().is_empty() {
                 break;
             }
 
-            if let Some((ml, _)) = strip_blockquote_marker(inner_line) {
-                content_parts.push((inner_start + ml, inner_start + inner_line.len()));
-                *pos += inner_line.len();
+            if strip_blockquote_marker(line).is_some() {
+                let line_start = body_offset + *pos;
+                let (_, s) = strip_n_quote_markers(line, depth);
+                inner_lines.push(InnerLine {
+                    text: s.to_string(),
+                    offset: line_start,
+                    raw_len: line.len(),
+                });
+                *pos += line.len();
                 *line_idx += 1;
-            } else if !is_thematic_break(inner_line)
-                && atx_heading_level(inner_line).is_none()
-                && fenced_code_open(inner_line).is_none()
-                && html_block_start(inner_line).is_none()
+            } else if !is_thematic_break(line)
+                && atx_heading_level(line).is_none()
+                && fenced_code_open(line).is_none()
+                && html_block_start(line).is_none()
             {
-                content_parts.push((inner_start, inner_start + inner_line.len()));
-                *pos += inner_line.len();
+                // Lazy continuation.
+                let line_start = body_offset + *pos;
+                inner_lines.push(InnerLine {
+                    text: line.to_string(),
+                    offset: line_start,
+                    raw_len: line.len(),
+                });
+                *pos += line.len();
                 *line_idx += 1;
             } else {
                 break;
             }
         }
 
-        let content_span = if content_parts.is_empty() {
-            Span::new(line_start, line_start)
-        } else {
-            Span::new(
-                content_parts[0].0,
-                content_parts.last().map_or(line_start, |p| p.1),
-            )
-        };
+        (depth, inner_lines)
+    }
 
-        self.blocks.push(Block {
-            kind: BlockKind::BlockQuote { content_span },
-            span: Span::new(line_start, self.body_offset + *pos),
-        });
+    /// Parse inner block quote lines (already marker-stripped) into the
+    /// current tree under the current scope.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "line classification mirrors top-level parse loop"
+    )]
+    fn parse_inner_block_quote_lines(&mut self, inner_lines: &[InnerLine]) {
+        let mut i = 0;
+        while i < inner_lines.len() {
+            let il = &inner_lines[i];
+            let (expanded, _) = expand_leading_tabs(&il.text);
+            let indent = count_indent(&expanded);
+
+            if expanded.trim().is_empty() {
+                i += 1;
+                continue;
+            }
+
+            if let Some((fence_char, fence_len, _info)) = fenced_code_open(&expanded) {
+                let open_start = il.offset;
+                let open_line_len = il.raw_len;
+                i += 1;
+                let mut end_offset = open_start + open_line_len;
+
+                let mut found_close = false;
+                while i < inner_lines.len() {
+                    let inner = &inner_lines[i];
+                    let (inner_exp, _) = expand_leading_tabs(&inner.text);
+                    if fenced_code_close(&inner_exp, fence_char, fence_len) {
+                        end_offset = inner.offset + inner.raw_len;
+                        i += 1;
+                        found_close = true;
+                        break;
+                    }
+                    end_offset = inner.offset + inner.raw_len;
+                    i += 1;
+                }
+
+                self.add_leaf(
+                    ElementKind::CodeBlock,
+                    Syntax::Markdown,
+                    Span::new(open_start, end_offset),
+                );
+
+                if !found_close {
+                    self.diagnostics.push(Diagnostic {
+                        span: Span::new(open_start, open_start + open_line_len),
+                        message: "unclosed fenced code block".to_string(),
+                    });
+                }
+            } else if block_math_open(&expanded) {
+                let open_start = il.offset;
+                let open_line_len = il.raw_len;
+                i += 1;
+                let mut end_offset = open_start + open_line_len;
+
+                let mut found_close = false;
+                while i < inner_lines.len() {
+                    let inner = &inner_lines[i];
+                    if block_math_close(&inner.text) {
+                        end_offset = inner.offset + inner.raw_len;
+                        i += 1;
+                        found_close = true;
+                        break;
+                    }
+                    end_offset = inner.offset + inner.raw_len;
+                    i += 1;
+                }
+
+                self.add_leaf(
+                    ElementKind::Math,
+                    Syntax::Markdown,
+                    Span::new(open_start, end_offset),
+                );
+
+                if !found_close {
+                    self.diagnostics.push(Diagnostic {
+                        span: Span::new(open_start, open_start + open_line_len),
+                        message: "unclosed block math".to_string(),
+                    });
+                }
+            } else if let Some(level) = atx_heading_level(&expanded) {
+                self.add_leaf(
+                    ElementKind::Heading { level },
+                    Syntax::Markdown,
+                    Span::new(il.offset, il.offset + il.raw_len),
+                );
+                i += 1;
+            } else if is_thematic_break(expanded.trim_end_matches('\n').trim_end_matches('\r')) {
+                self.add_leaf(
+                    ElementKind::Rules,
+                    Syntax::Markdown,
+                    Span::new(il.offset, il.offset + il.raw_len),
+                );
+                i += 1;
+            } else if indent >= 4 && !self.last_child_is_paragraph() {
+                let block_start_offset = il.offset;
+                let mut end_offset = il.offset + il.raw_len;
+                i += 1;
+
+                while i < inner_lines.len() {
+                    let inner = &inner_lines[i];
+                    let (inner_exp, _) = expand_leading_tabs(&inner.text);
+                    let inner_indent = count_indent(&inner_exp);
+                    if inner_exp.trim().is_empty() || inner_indent >= 4 {
+                        end_offset = inner.offset + inner.raw_len;
+                        i += 1;
+                    } else {
+                        break;
+                    }
+                }
+
+                self.add_leaf(
+                    ElementKind::CodeBlock,
+                    Syntax::Markdown,
+                    Span::new(block_start_offset, end_offset),
+                );
+            } else if let Some(html_type) = html_block_start(&expanded) {
+                let block_start_offset = il.offset;
+                let mut end_offset = il.offset + il.raw_len;
+
+                if matches!(html_type, 6 | 7) {
+                    i += 1;
+                    while i < inner_lines.len() {
+                        let inner = &inner_lines[i];
+                        if inner.text.trim().is_empty() {
+                            break;
+                        }
+                        end_offset = inner.offset + inner.raw_len;
+                        i += 1;
+                    }
+                } else {
+                    let end_on_first = html_block_end(&il.text, html_type);
+                    i += 1;
+                    if !end_on_first {
+                        while i < inner_lines.len() {
+                            let inner = &inner_lines[i];
+                            end_offset = inner.offset + inner.raw_len;
+                            i += 1;
+                            if html_block_end(&inner.text, html_type) {
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                self.add_leaf(
+                    ElementKind::HtmlBlock,
+                    Syntax::Markdown,
+                    Span::new(block_start_offset, end_offset),
+                );
+            } else {
+                // Paragraph — accumulate continuation lines, check setext.
+                let para_start = il.offset;
+                let mut para_end = il.offset + il.raw_len;
+
+                i += 1;
+                let mut is_setext = false;
+
+                while i < inner_lines.len() {
+                    let next = &inner_lines[i];
+                    let (next_exp, _) = expand_leading_tabs(&next.text);
+
+                    if next_exp.trim().is_empty() {
+                        break;
+                    }
+
+                    if let Some(level) = setext_level(&next_exp) {
+                        let setext_end = next.offset + next.raw_len;
+                        self.add_leaf(
+                            ElementKind::Heading { level },
+                            Syntax::Markdown,
+                            Span::new(para_start, setext_end),
+                        );
+                        i += 1;
+                        is_setext = true;
+                        break;
+                    }
+
+                    if is_thematic_break(&next_exp)
+                        || atx_heading_level(&next_exp).is_some()
+                        || fenced_code_open(&next_exp).is_some()
+                        || strip_blockquote_marker(&next_exp).is_some()
+                        || html_block_start(&next_exp).is_some_and(|ht| ht <= 6)
+                        || block_math_open(&next_exp)
+                    {
+                        break;
+                    }
+
+                    para_end = next.offset + next.raw_len;
+                    i += 1;
+                }
+
+                if !is_setext {
+                    self.add_leaf(
+                        ElementKind::Paragraph,
+                        Syntax::Markdown,
+                        Span::new(para_start, para_end),
+                    );
+                }
+            }
+        }
     }
 
     /// Parse an indented code block.
@@ -983,6 +1397,7 @@ impl BlockParser<'_> {
         lines: &[&str],
         pos: &mut usize,
         line_idx: &mut usize,
+        body_offset: usize,
         block_start: usize,
         first_line_len: usize,
     ) {
@@ -1002,10 +1417,11 @@ impl BlockParser<'_> {
             }
         }
 
-        self.blocks.push(Block {
-            kind: BlockKind::IndentedCodeBlock,
-            span: Span::new(block_start, self.body_offset + *pos),
-        });
+        self.add_leaf(
+            ElementKind::CodeBlock,
+            Syntax::Markdown,
+            Span::new(block_start, body_offset + *pos),
+        );
     }
 
     /// Parse a paragraph, detecting setext headings and thematic breaks.
@@ -1014,21 +1430,22 @@ impl BlockParser<'_> {
         lines: &[&str],
         pos: &mut usize,
         line_idx: &mut usize,
+        body_offset: usize,
         para_start: usize,
         first_line_len: usize,
     ) {
-        let mut para_text_end = para_start + first_line_len;
         *pos += first_line_len;
         *line_idx += 1;
 
         // Check if this single line is actually a standalone thematic break
-        let first_line = &self.source[para_start..para_text_end];
+        let first_line = &self.source[para_start..para_start + first_line_len];
         let first_trimmed = first_line.trim_end_matches('\n').trim_end_matches('\r');
         if is_thematic_break(first_trimmed) {
-            self.blocks.push(Block {
-                kind: BlockKind::ThematicBreak,
-                span: Span::new(para_start, para_start + first_line_len),
-            });
+            self.add_leaf(
+                ElementKind::Rules,
+                Syntax::Markdown,
+                Span::new(para_start, para_start + first_line_len),
+            );
             return;
         }
 
@@ -1046,23 +1463,16 @@ impl BlockParser<'_> {
                 break;
             }
 
-            // Setext heading underline? (--- after paragraph is setext, not
-            // thematic break)
+            // Setext heading underline
             if let Some(level) = setext_level(&next_expanded) {
                 *pos += next_line.len();
                 *line_idx += 1;
 
-                // Strip trailing line ending from text span so it contains
-                // only the heading text, not syntax artifacts.
-                let text_end = strip_trailing_newline(self.source, para_text_end);
-
-                self.blocks.push(Block {
-                    kind: BlockKind::SetextHeading {
-                        level,
-                        text_span: Span::new(para_start, text_end),
-                    },
-                    span: Span::new(para_start, self.body_offset + *pos),
-                });
+                self.add_leaf(
+                    ElementKind::Heading { level },
+                    Syntax::Markdown,
+                    Span::new(para_start, body_offset + *pos),
+                );
                 return;
             }
 
@@ -1099,23 +1509,57 @@ impl BlockParser<'_> {
             }
 
             // Otherwise, continue the paragraph
-            para_text_end = self.body_offset + *pos + next_line.len();
             *pos += next_line.len();
             *line_idx += 1;
         }
 
-        self.blocks.push(Block {
-            kind: BlockKind::Paragraph,
-            span: Span::new(para_start, self.body_offset + *pos),
-        });
+        self.add_leaf(
+            ElementKind::Paragraph,
+            Syntax::Markdown,
+            Span::new(para_start, body_offset + *pos),
+        );
+    }
+}
+
+/// A line inside a block quote with its original byte offset.
+struct InnerLine {
+    /// The text content (with block quote markers stripped).
+    text: String,
+    /// Byte offset in the original source where this line starts.
+    offset: usize,
+    /// Length of the raw line (before marker stripping) in the original source.
+    raw_len: usize,
+}
+
+/// Strip all nested `>` markers from a line, returning the depth and content.
+fn strip_all_quote_markers(line: &str) -> (usize, &str) {
+    let mut depth = 0;
+    let mut remaining = line;
+
+    while let Some((_, content)) = strip_blockquote_marker(remaining) {
+        depth += 1;
+        remaining = content;
     }
 
-    /// Check if the previous block was a paragraph.
-    fn prev_is_paragraph(&self) -> bool {
-        self.blocks
-            .last()
-            .is_some_and(|b| matches!(b.kind, BlockKind::Paragraph))
+    (depth.max(1), remaining)
+}
+
+/// Strip exactly `n` levels of `>` markers from a line.
+fn strip_n_quote_markers(line: &str, n: usize) -> (usize, &str) {
+    let mut remaining = line;
+    let mut stripped = 0;
+
+    for _ in 0..n {
+        match strip_blockquote_marker(remaining) {
+            Some((_, content)) => {
+                stripped += 1;
+                remaining = content;
+            }
+            None => break,
+        }
     }
+
+    (stripped, remaining)
 }
 
 /// Split text into lines, preserving the line endings in each slice.
@@ -1154,9 +1598,9 @@ fn split_lines(text: &str) -> Vec<&str> {
 mod tests {
     use super::*;
 
-    /// Helper: parse blocks with no frontmatter offset.
-    fn parse(source: &str) -> BlockParseResult {
-        parse_blocks(source, 0)
+    /// Helper: parse a tree with no frontmatter.
+    fn parse(source: &str) -> Tree {
+        parse_tree(source, None)
     }
 
     /// Helper: get the text of a span from source.
@@ -1164,131 +1608,165 @@ mod tests {
         &source[span.start..span.end]
     }
 
+    /// Helper: collect children of the root.
+    fn root_children(tree: &Tree) -> Vec<NodeId> {
+        tree.children(tree.root()).to_vec()
+    }
+
+    /// Helper: assert a node is a specific kind and return it.
+    fn assert_kind<'a>(tree: &'a Tree, id: NodeId, expected: &ElementKind) -> &'a Node {
+        let node = tree.node(id);
+        assert_eq!(
+            &node.kind, expected,
+            "node {id} should be {expected:?}, got {:?}",
+            node.kind
+        );
+        node
+    }
+
+    // --- Document root ---
+
+    #[test]
+    fn document_is_always_root() {
+        let tree = parse("");
+        assert_eq!(tree.root(), 0, "root is always node 0");
+        assert_eq!(tree.node(0).kind, ElementKind::Document, "root is Document");
+        assert!(tree.node(0).parent.is_none(), "root has no parent");
+    }
+
+    #[test]
+    fn empty_document_has_no_children() {
+        let tree = parse("");
+        assert!(
+            root_children(&tree).is_empty(),
+            "empty document has no children"
+        );
+    }
+
     // --- ATX headings ---
 
     #[test]
     fn atx_heading_levels() {
         let source = "# H1\n## H2\n### H3\n#### H4\n##### H5\n###### H6\n";
-        let result = parse(source);
+        let tree = parse(source);
+        let children = root_children(&tree);
 
-        assert_eq!(result.blocks.len(), 6, "should find six headings");
-        for (i, block) in result.blocks.iter().enumerate() {
+        assert_eq!(children.len(), 6, "should find six headings");
+        for (i, &id) in children.iter().enumerate() {
             let expected_level = (i + 1) as u8;
-            match &block.kind {
-                BlockKind::AtxHeading { level, .. } => {
-                    assert_eq!(
-                        *level, expected_level,
-                        "heading {i} should be level {expected_level}"
-                    );
-                }
-                other => panic!("expected AtxHeading, got {other:?}"),
-            }
+            assert_kind(
+                &tree,
+                id,
+                &ElementKind::Heading {
+                    level: expected_level,
+                },
+            );
         }
     }
 
     #[test]
     fn atx_heading_text_span() {
         let source = "## Hello World\n";
-        let result = parse(source);
+        let tree = parse(source);
+        let children = root_children(&tree);
 
-        assert_eq!(result.blocks.len(), 1, "should find one heading");
-        match &result.blocks[0].kind {
-            BlockKind::AtxHeading { text_span, .. } => {
-                assert_eq!(
-                    span_text(source, text_span),
-                    "Hello World",
-                    "text span content"
-                );
-            }
-            other => panic!("expected AtxHeading, got {other:?}"),
-        }
+        assert_eq!(children.len(), 1, "should find one heading");
+        let node = assert_kind(&tree, children[0], &ElementKind::Heading { level: 2 });
+        let line = &source[node.span.start..node.span.end]
+            .lines()
+            .next()
+            .expect("heading should have a line");
+        let (text_span, _) = extract_atx_content(line, node.span.start);
+        assert_eq!(
+            span_text(source, &text_span),
+            "Hello World",
+            "text span content"
+        );
     }
 
     #[test]
     fn atx_heading_with_explicit_id() {
         let source = "## My Heading {#custom-id}\n";
-        let result = parse(source);
+        let tree = parse(source);
+        let children = root_children(&tree);
 
-        assert_eq!(result.blocks.len(), 1, "should find one heading");
-        match &result.blocks[0].kind {
-            BlockKind::AtxHeading {
-                level,
-                id,
-                text_span,
-            } => {
-                assert_eq!(*level, 2, "heading level");
-                assert_eq!(
-                    span_text(source, text_span),
-                    "My Heading",
-                    "text span without id attribute"
-                );
-                let attr = id.as_ref().expect("should have id attribute");
-                assert_eq!(attr.id, "custom-id", "id text");
-            }
-            other => panic!("expected AtxHeading, got {other:?}"),
-        }
+        assert_eq!(children.len(), 1, "should find one heading");
+        let node = assert_kind(&tree, children[0], &ElementKind::Heading { level: 2 });
+        let line = &source[node.span.start..node.span.end]
+            .lines()
+            .next()
+            .expect("should have a line");
+        let (text_span, id) = extract_atx_content(line, node.span.start);
+        assert_eq!(
+            span_text(source, &text_span),
+            "My Heading",
+            "text span without id attribute"
+        );
+        let attr = id.expect("should have id attribute");
+        assert_eq!(attr.id, "custom-id", "id text");
     }
 
     #[test]
     fn atx_heading_trailing_hashes() {
         let source = "## Heading ##\n";
-        let result = parse(source);
+        let tree = parse(source);
+        let children = root_children(&tree);
 
-        assert_eq!(result.blocks.len(), 1, "should find one heading");
-        match &result.blocks[0].kind {
-            BlockKind::AtxHeading { text_span, .. } => {
-                assert_eq!(
-                    span_text(source, text_span),
-                    "Heading",
-                    "trailing hashes stripped"
-                );
-            }
-            other => panic!("expected AtxHeading, got {other:?}"),
-        }
+        assert_eq!(children.len(), 1, "should find one heading");
+        let node = assert_kind(&tree, children[0], &ElementKind::Heading { level: 2 });
+        let line = &source[node.span.start..node.span.end]
+            .lines()
+            .next()
+            .expect("should have a line");
+        let (text_span, _) = extract_atx_content(line, node.span.start);
+        assert_eq!(
+            span_text(source, &text_span),
+            "Heading",
+            "trailing hashes stripped"
+        );
     }
 
     #[test]
     fn atx_heading_empty() {
         let source = "#\n";
-        let result = parse(source);
+        let tree = parse(source);
+        let children = root_children(&tree);
 
-        assert_eq!(result.blocks.len(), 1, "should find one heading");
-        match &result.blocks[0].kind {
-            BlockKind::AtxHeading {
-                level, text_span, ..
-            } => {
-                assert_eq!(*level, 1, "heading level");
-                assert!(text_span.is_empty(), "empty heading has empty text span");
-            }
-            other => panic!("expected AtxHeading, got {other:?}"),
-        }
+        assert_eq!(children.len(), 1, "should find one heading");
+        let node = assert_kind(&tree, children[0], &ElementKind::Heading { level: 1 });
+        let line = &source[node.span.start..node.span.end]
+            .lines()
+            .next()
+            .expect("should have a line");
+        let (text_span, _) = extract_atx_content(line, node.span.start);
+        assert!(text_span.is_empty(), "empty heading has empty text span");
     }
 
     #[test]
     fn atx_heading_with_leading_spaces() {
         let source = "   ## Indented\n";
-        let result = parse(source);
+        let tree = parse(source);
+        let children = root_children(&tree);
 
-        assert_eq!(result.blocks.len(), 1, "should find one heading");
-        match &result.blocks[0].kind {
-            BlockKind::AtxHeading {
-                level, text_span, ..
-            } => {
-                assert_eq!(*level, 2, "heading level");
-                assert_eq!(span_text(source, text_span), "Indented", "text content");
-            }
-            other => panic!("expected AtxHeading, got {other:?}"),
-        }
+        assert_eq!(children.len(), 1, "should find one heading");
+        let node = assert_kind(&tree, children[0], &ElementKind::Heading { level: 2 });
+        let line = &source[node.span.start..node.span.end]
+            .lines()
+            .next()
+            .expect("should have a line");
+        let (text_span, _) = extract_atx_content(line, node.span.start);
+        assert_eq!(span_text(source, &text_span), "Indented", "text content");
     }
 
     #[test]
     fn four_leading_spaces_not_heading() {
         let source = "    ## Not a heading\n";
-        let result = parse(source);
+        let tree = parse(source);
+        let children = root_children(&tree);
 
-        assert_eq!(result.blocks.len(), 1, "should find one block");
+        assert_eq!(children.len(), 1, "should find one block");
         assert!(
-            !matches!(result.blocks[0].kind, BlockKind::AtxHeading { .. }),
+            !matches!(tree.node(children[0]).kind, ElementKind::Heading { .. }),
             "4+ spaces should not be a heading"
         );
     }
@@ -1298,58 +1776,37 @@ mod tests {
     #[test]
     fn setext_heading_level_1() {
         let source = "Heading\n=======\n";
-        let result = parse(source);
+        let tree = parse(source);
+        let children = root_children(&tree);
 
-        assert_eq!(result.blocks.len(), 1, "should find one block");
-        match &result.blocks[0].kind {
-            BlockKind::SetextHeading { level, text_span } => {
-                assert_eq!(*level, 1, "setext level 1");
-                assert_eq!(
-                    span_text(source, text_span),
-                    "Heading",
-                    "text span is heading text without trailing newline"
-                );
-            }
-            other => panic!("expected SetextHeading, got {other:?}"),
-        }
+        assert_eq!(children.len(), 1, "should find one block");
+        assert_kind(&tree, children[0], &ElementKind::Heading { level: 1 });
     }
 
     #[test]
     fn setext_heading_level_2() {
         let source = "Heading\n-------\n";
-        let result = parse(source);
+        let tree = parse(source);
+        let children = root_children(&tree);
 
-        assert_eq!(result.blocks.len(), 1, "should find one block");
-        match &result.blocks[0].kind {
-            BlockKind::SetextHeading { level, text_span } => {
-                assert_eq!(*level, 2, "setext level 2");
-                assert_eq!(
-                    span_text(source, text_span),
-                    "Heading",
-                    "text span without trailing newline"
-                );
-            }
-            other => panic!("expected SetextHeading, got {other:?}"),
-        }
+        assert_eq!(children.len(), 1, "should find one block");
+        assert_kind(&tree, children[0], &ElementKind::Heading { level: 2 });
     }
 
     #[test]
     fn setext_heading_multiline() {
         let source = "Line one\nLine two\n=========\n";
-        let result = parse(source);
+        let tree = parse(source);
+        let children = root_children(&tree);
 
-        assert_eq!(result.blocks.len(), 1, "should find one block");
-        match &result.blocks[0].kind {
-            BlockKind::SetextHeading { level, text_span } => {
-                assert_eq!(*level, 1, "setext level 1");
-                assert_eq!(
-                    span_text(source, text_span),
-                    "Line one\nLine two",
-                    "multiline: internal newlines preserved, trailing stripped"
-                );
-            }
-            other => panic!("expected SetextHeading, got {other:?}"),
-        }
+        assert_eq!(children.len(), 1, "should find one block");
+        assert_kind(&tree, children[0], &ElementKind::Heading { level: 1 });
+        let node = tree.node(children[0]);
+        assert_eq!(
+            node.span,
+            Span::new(0, source.len()),
+            "setext heading span covers all lines"
+        );
     }
 
     // --- Setext vs thematic break ---
@@ -1357,44 +1814,31 @@ mod tests {
     #[test]
     fn dashes_after_paragraph_is_setext() {
         let source = "Paragraph\n---\n";
-        let result = parse(source);
+        let tree = parse(source);
+        let children = root_children(&tree);
 
-        assert_eq!(result.blocks.len(), 1, "should find one block");
-        match &result.blocks[0].kind {
-            BlockKind::SetextHeading { level, .. } => {
-                assert_eq!(*level, 2, "--- after paragraph is setext heading");
-            }
-            other => panic!("expected SetextHeading, got {other:?}"),
-        }
+        assert_eq!(children.len(), 1, "should find one block");
+        assert_kind(&tree, children[0], &ElementKind::Heading { level: 2 });
     }
 
     #[test]
     fn dashes_after_blank_is_thematic_break() {
         let source = "\n---\n";
-        let result = parse(source);
+        let tree = parse(source);
+        let children = root_children(&tree);
 
-        let non_blank: Vec<_> = result
-            .blocks
-            .iter()
-            .filter(|b| !matches!(b.kind, BlockKind::BlankLine))
-            .collect();
-        assert_eq!(non_blank.len(), 1, "should find one non-blank block");
-        assert!(
-            matches!(non_blank[0].kind, BlockKind::ThematicBreak),
-            "--- after blank line is thematic break"
-        );
+        assert_eq!(children.len(), 1, "should find one non-blank block");
+        assert_kind(&tree, children[0], &ElementKind::Rules);
     }
 
     #[test]
     fn dashes_at_document_start_is_thematic_break() {
         let source = "---\n";
-        let result = parse(source);
+        let tree = parse(source);
+        let children = root_children(&tree);
 
-        assert_eq!(result.blocks.len(), 1, "should find one block");
-        assert!(
-            matches!(result.blocks[0].kind, BlockKind::ThematicBreak),
-            "--- at start is thematic break"
-        );
+        assert_eq!(children.len(), 1, "should find one block");
+        assert_kind(&tree, children[0], &ElementKind::Rules);
     }
 
     // --- Thematic breaks ---
@@ -1402,49 +1846,41 @@ mod tests {
     #[test]
     fn thematic_break_stars() {
         let source = "***\n";
-        let result = parse(source);
+        let tree = parse(source);
+        let children = root_children(&tree);
 
-        assert_eq!(result.blocks.len(), 1, "should find one block");
-        assert!(
-            matches!(result.blocks[0].kind, BlockKind::ThematicBreak),
-            "*** is thematic break"
-        );
+        assert_eq!(children.len(), 1, "should find one block");
+        assert_kind(&tree, children[0], &ElementKind::Rules);
     }
 
     #[test]
     fn thematic_break_underscores() {
         let source = "___\n";
-        let result = parse(source);
+        let tree = parse(source);
+        let children = root_children(&tree);
 
-        assert_eq!(result.blocks.len(), 1, "should find one block");
-        assert!(
-            matches!(result.blocks[0].kind, BlockKind::ThematicBreak),
-            "___ is thematic break"
-        );
+        assert_eq!(children.len(), 1, "should find one block");
+        assert_kind(&tree, children[0], &ElementKind::Rules);
     }
 
     #[test]
     fn thematic_break_with_spaces() {
         let source = "* * * *\n";
-        let result = parse(source);
+        let tree = parse(source);
+        let children = root_children(&tree);
 
-        assert_eq!(result.blocks.len(), 1, "should find one block");
-        assert!(
-            matches!(result.blocks[0].kind, BlockKind::ThematicBreak),
-            "* * * * is thematic break"
-        );
+        assert_eq!(children.len(), 1, "should find one block");
+        assert_kind(&tree, children[0], &ElementKind::Rules);
     }
 
     #[test]
     fn thematic_break_with_many_chars() {
         let source = "----------\n";
-        let result = parse(source);
+        let tree = parse(source);
+        let children = root_children(&tree);
 
-        assert_eq!(result.blocks.len(), 1, "should find one block");
-        assert!(
-            matches!(result.blocks[0].kind, BlockKind::ThematicBreak),
-            "many dashes is thematic break"
-        );
+        assert_eq!(children.len(), 1, "should find one block");
+        assert_kind(&tree, children[0], &ElementKind::Rules);
     }
 
     // --- Fenced code blocks ---
@@ -1452,61 +1888,44 @@ mod tests {
     #[test]
     fn fenced_code_backticks() {
         let source = "```\ncode here\n```\n";
-        let result = parse(source);
+        let tree = parse(source);
+        let children = root_children(&tree);
 
-        assert_eq!(result.blocks.len(), 1, "should find one block");
-        match &result.blocks[0].kind {
-            BlockKind::FencedCodeBlock { info, content_span } => {
-                assert!(info.is_none(), "no info string");
-                assert_eq!(
-                    span_text(source, content_span),
-                    "code here\n",
-                    "content span"
-                );
-            }
-            other => panic!("expected FencedCodeBlock, got {other:?}"),
-        }
+        assert_eq!(children.len(), 1, "should find one block");
+        assert_kind(&tree, children[0], &ElementKind::CodeBlock);
     }
 
     #[test]
     fn fenced_code_tildes() {
         let source = "~~~\ncode here\n~~~\n";
-        let result = parse(source);
+        let tree = parse(source);
+        let children = root_children(&tree);
 
-        assert_eq!(result.blocks.len(), 1, "should find one block");
-        assert!(
-            matches!(result.blocks[0].kind, BlockKind::FencedCodeBlock { .. }),
-            "tilde fence"
-        );
+        assert_eq!(children.len(), 1, "should find one block");
+        assert_kind(&tree, children[0], &ElementKind::CodeBlock);
     }
 
     #[test]
     fn fenced_code_with_info_string() {
         let source = "```rust\nfn main() {}\n```\n";
-        let result = parse(source);
+        let tree = parse(source);
+        let children = root_children(&tree);
 
-        assert_eq!(result.blocks.len(), 1, "should find one block");
-        match &result.blocks[0].kind {
-            BlockKind::FencedCodeBlock { info, .. } => {
-                assert_eq!(info.as_deref(), Some("rust"), "info string");
-            }
-            other => panic!("expected FencedCodeBlock, got {other:?}"),
-        }
+        assert_eq!(children.len(), 1, "should find one block");
+        assert_kind(&tree, children[0], &ElementKind::CodeBlock);
     }
 
     #[test]
     fn fenced_code_unclosed() {
         let source = "```\ncode here\nmore code\n";
-        let result = parse(source);
+        let tree = parse(source);
+        let children = root_children(&tree);
 
-        assert_eq!(result.blocks.len(), 1, "should find one block");
+        assert_eq!(children.len(), 1, "should find one block");
+        assert_kind(&tree, children[0], &ElementKind::CodeBlock);
+        assert_eq!(tree.diagnostics().len(), 1, "should emit one diagnostic");
         assert!(
-            matches!(result.blocks[0].kind, BlockKind::FencedCodeBlock { .. }),
-            "unclosed code block"
-        );
-        assert_eq!(result.diagnostics.len(), 1, "should emit one diagnostic");
-        assert!(
-            result.diagnostics[0].message.contains("unclosed"),
+            tree.diagnostics()[0].message.contains("unclosed"),
             "diagnostic mentions unclosed"
         );
     }
@@ -1514,37 +1933,27 @@ mod tests {
     #[test]
     fn fenced_code_longer_close() {
         let source = "```\ncode\n`````\n";
-        let result = parse(source);
+        let tree = parse(source);
+        let children = root_children(&tree);
 
-        assert_eq!(result.blocks.len(), 1, "should find one block");
-        match &result.blocks[0].kind {
-            BlockKind::FencedCodeBlock { content_span, .. } => {
-                assert_eq!(
-                    span_text(source, content_span),
-                    "code\n",
-                    "longer close fence accepted"
-                );
-            }
-            other => panic!("expected FencedCodeBlock, got {other:?}"),
-        }
+        assert_eq!(children.len(), 1, "should find one block");
+        assert_kind(&tree, children[0], &ElementKind::CodeBlock);
     }
 
     #[test]
     fn fenced_code_shorter_close_not_accepted() {
         let source = "````\ncode\n```\nmore\n````\n";
-        let result = parse(source);
+        let tree = parse(source);
+        let children = root_children(&tree);
 
-        assert_eq!(result.blocks.len(), 1, "should find one block");
-        match &result.blocks[0].kind {
-            BlockKind::FencedCodeBlock { content_span, .. } => {
-                assert_eq!(
-                    span_text(source, content_span),
-                    "code\n```\nmore\n",
-                    "shorter fence is content"
-                );
-            }
-            other => panic!("expected FencedCodeBlock, got {other:?}"),
-        }
+        assert_eq!(children.len(), 1, "should find one block");
+        assert_kind(&tree, children[0], &ElementKind::CodeBlock);
+        let node = tree.node(children[0]);
+        assert_eq!(
+            node.span,
+            Span::new(0, source.len()),
+            "shorter fence is content, span covers entire block"
+        );
     }
 
     // --- Block math ---
@@ -1552,34 +1961,24 @@ mod tests {
     #[test]
     fn block_math_basic() {
         let source = "$$\nx + y = z\n$$\n";
-        let result = parse(source);
+        let tree = parse(source);
+        let children = root_children(&tree);
 
-        assert_eq!(result.blocks.len(), 1, "should find one block");
-        match &result.blocks[0].kind {
-            BlockKind::BlockMath { content_span } => {
-                assert_eq!(
-                    span_text(source, content_span),
-                    "x + y = z\n",
-                    "math content"
-                );
-            }
-            other => panic!("expected BlockMath, got {other:?}"),
-        }
+        assert_eq!(children.len(), 1, "should find one block");
+        assert_kind(&tree, children[0], &ElementKind::Math);
     }
 
     #[test]
     fn block_math_unclosed() {
         let source = "$$\nmath content\n";
-        let result = parse(source);
+        let tree = parse(source);
+        let children = root_children(&tree);
 
-        assert_eq!(result.blocks.len(), 1, "should find one block");
+        assert_eq!(children.len(), 1, "should find one block");
+        assert_kind(&tree, children[0], &ElementKind::Math);
+        assert_eq!(tree.diagnostics().len(), 1, "should emit one diagnostic");
         assert!(
-            matches!(result.blocks[0].kind, BlockKind::BlockMath { .. }),
-            "unclosed block math"
-        );
-        assert_eq!(result.diagnostics.len(), 1, "should emit one diagnostic");
-        assert!(
-            result.diagnostics[0].message.contains("unclosed"),
+            tree.diagnostics()[0].message.contains("unclosed"),
             "diagnostic mentions unclosed"
         );
     }
@@ -1589,27 +1988,21 @@ mod tests {
     #[test]
     fn indented_code_block() {
         let source = "    code line 1\n    code line 2\n";
-        let result = parse(source);
+        let tree = parse(source);
+        let children = root_children(&tree);
 
-        assert_eq!(result.blocks.len(), 1, "should find one block");
-        assert!(
-            matches!(result.blocks[0].kind, BlockKind::IndentedCodeBlock),
-            "indented code block"
-        );
+        assert_eq!(children.len(), 1, "should find one block");
+        assert_kind(&tree, children[0], &ElementKind::CodeBlock);
     }
 
     #[test]
     fn indented_code_not_after_paragraph() {
-        // Indented text continuing a paragraph is paragraph continuation,
-        // not an indented code block
         let source = "Paragraph\n    continuation\n";
-        let result = parse(source);
+        let tree = parse(source);
+        let children = root_children(&tree);
 
-        assert_eq!(result.blocks.len(), 1, "should find one block");
-        assert!(
-            matches!(result.blocks[0].kind, BlockKind::Paragraph),
-            "indented continuation is part of paragraph"
-        );
+        assert_eq!(children.len(), 1, "should find one block");
+        assert_kind(&tree, children[0], &ElementKind::Paragraph);
     }
 
     // --- Block quotes ---
@@ -1617,49 +2010,95 @@ mod tests {
     #[test]
     fn block_quote_simple() {
         let source = "> quoted text\n";
-        let result = parse(source);
+        let tree = parse(source);
+        let children = root_children(&tree);
 
-        assert_eq!(result.blocks.len(), 1, "should find one block");
-        assert!(
-            matches!(result.blocks[0].kind, BlockKind::BlockQuote { .. }),
-            "block quote"
-        );
+        assert_eq!(children.len(), 1, "should find one block");
+        let node = assert_kind(&tree, children[0], &ElementKind::QuoteBlock);
+        assert!(node.parent == Some(0), "block quote parent is Document");
+        let quote_children = tree.children(children[0]);
+        assert_eq!(quote_children.len(), 1, "block quote has one child");
+        assert_kind(&tree, quote_children[0], &ElementKind::Paragraph);
     }
 
     #[test]
     fn block_quote_multiline() {
         let source = "> line one\n> line two\n";
-        let result = parse(source);
+        let tree = parse(source);
+        let children = root_children(&tree);
 
-        assert_eq!(result.blocks.len(), 1, "should find one block");
-        assert!(
-            matches!(result.blocks[0].kind, BlockKind::BlockQuote { .. }),
-            "multiline block quote"
-        );
+        assert_eq!(children.len(), 1, "should find one block");
+        assert_kind(&tree, children[0], &ElementKind::QuoteBlock);
     }
 
     #[test]
     fn block_quote_lazy_continuation() {
         let source = "> first line\nlazy continuation\n";
-        let result = parse(source);
+        let tree = parse(source);
+        let children = root_children(&tree);
 
-        assert_eq!(result.blocks.len(), 1, "should find one block");
-        assert!(
-            matches!(result.blocks[0].kind, BlockKind::BlockQuote { .. }),
-            "lazy continuation in block quote"
-        );
+        assert_eq!(children.len(), 1, "should find one block");
+        assert_kind(&tree, children[0], &ElementKind::QuoteBlock);
     }
 
     #[test]
     fn block_quote_nested() {
         let source = "> > nested\n";
-        let result = parse(source);
+        let tree = parse(source);
+        let children = root_children(&tree);
 
-        assert_eq!(result.blocks.len(), 1, "should find one block");
-        assert!(
-            matches!(result.blocks[0].kind, BlockKind::BlockQuote { .. }),
-            "nested block quote"
-        );
+        assert_eq!(children.len(), 1, "should find one outer block quote");
+        assert_kind(&tree, children[0], &ElementKind::QuoteBlock);
+
+        let outer_children = tree.children(children[0]);
+        assert_eq!(outer_children.len(), 1, "outer has one child");
+        assert_kind(&tree, outer_children[0], &ElementKind::QuoteBlock);
+
+        let inner_children = tree.children(outer_children[0]);
+        assert_eq!(inner_children.len(), 1, "inner has one child");
+        assert_kind(&tree, inner_children[0], &ElementKind::Paragraph);
+    }
+
+    #[test]
+    fn block_quote_with_heading() {
+        let source = "> # Heading\n";
+        let tree = parse(source);
+        let children = root_children(&tree);
+
+        assert_eq!(children.len(), 1, "should find one block");
+        assert_kind(&tree, children[0], &ElementKind::QuoteBlock);
+
+        let quote_children = tree.children(children[0]);
+        assert_eq!(quote_children.len(), 1, "block quote has one child");
+        assert_kind(&tree, quote_children[0], &ElementKind::Heading { level: 1 });
+    }
+
+    #[test]
+    fn block_quote_with_code_block() {
+        let source = "> ```\n> code\n> ```\n";
+        let tree = parse(source);
+        let children = root_children(&tree);
+
+        assert_eq!(children.len(), 1, "should find one block");
+        assert_kind(&tree, children[0], &ElementKind::QuoteBlock);
+
+        let quote_children = tree.children(children[0]);
+        assert_eq!(quote_children.len(), 1, "block quote has one child");
+        assert_kind(&tree, quote_children[0], &ElementKind::CodeBlock);
+    }
+
+    #[test]
+    fn block_quote_with_thematic_break() {
+        let source = "> ***\n";
+        let tree = parse(source);
+        let children = root_children(&tree);
+
+        assert_eq!(children.len(), 1, "should find one block");
+        assert_kind(&tree, children[0], &ElementKind::QuoteBlock);
+
+        let quote_children = tree.children(children[0]);
+        assert_eq!(quote_children.len(), 1, "block quote has one child");
+        assert_kind(&tree, quote_children[0], &ElementKind::Rules);
     }
 
     // --- HTML blocks ---
@@ -1667,71 +2106,41 @@ mod tests {
     #[test]
     fn html_block_type1_pre() {
         let source = "<pre>\ncode\n</pre>\n";
-        let result = parse(source);
+        let tree = parse(source);
+        let children = root_children(&tree);
 
-        assert_eq!(result.blocks.len(), 1, "should find one block");
-        assert!(
-            matches!(result.blocks[0].kind, BlockKind::HtmlBlock),
-            "HTML block type 1 (pre)"
-        );
+        assert_eq!(children.len(), 1, "should find one block");
+        assert_kind(&tree, children[0], &ElementKind::HtmlBlock);
     }
 
     #[test]
     fn html_block_type2_comment() {
         let source = "<!-- comment -->\n";
-        let result = parse(source);
+        let tree = parse(source);
+        let children = root_children(&tree);
 
-        assert_eq!(result.blocks.len(), 1, "should find one block");
-        assert!(
-            matches!(result.blocks[0].kind, BlockKind::HtmlBlock),
-            "HTML block type 2 (comment)"
-        );
+        assert_eq!(children.len(), 1, "should find one block");
+        assert_kind(&tree, children[0], &ElementKind::HtmlBlock);
     }
 
     #[test]
     fn html_block_type6_div() {
         let source = "<div>\ncontent\n</div>\n\n";
-        let result = parse(source);
+        let tree = parse(source);
+        let children = root_children(&tree);
 
-        let non_blank: Vec<_> = result
-            .blocks
-            .iter()
-            .filter(|b| !matches!(b.kind, BlockKind::BlankLine))
-            .collect();
-        assert_eq!(non_blank.len(), 1, "should find one non-blank block");
-        assert!(
-            matches!(non_blank[0].kind, BlockKind::HtmlBlock),
-            "HTML block type 6 (div)"
-        );
+        assert_eq!(children.len(), 1, "should find one non-blank block");
+        assert_kind(&tree, children[0], &ElementKind::HtmlBlock);
     }
 
     #[test]
     fn html_block_type7_cannot_interrupt_paragraph() {
-        // Type 7 HTML block cannot interrupt a paragraph
         let source = "Paragraph\n<span>inline</span>\n";
-        let result = parse(source);
+        let tree = parse(source);
+        let children = root_children(&tree);
 
-        assert_eq!(result.blocks.len(), 1, "should find one block");
-        assert!(
-            matches!(result.blocks[0].kind, BlockKind::Paragraph),
-            "type 7 HTML cannot interrupt paragraph"
-        );
-    }
-
-    // --- Blank lines ---
-
-    #[test]
-    fn blank_lines() {
-        let source = "\n\n\n";
-        let result = parse(source);
-
-        assert_eq!(result.blocks.len(), 3, "should find three blank lines");
-        for block in &result.blocks {
-            assert!(
-                matches!(block.kind, BlockKind::BlankLine),
-                "should be blank line"
-            );
-        }
+        assert_eq!(children.len(), 1, "should find one block");
+        assert_kind(&tree, children[0], &ElementKind::Paragraph);
     }
 
     // --- Paragraphs ---
@@ -1739,25 +2148,21 @@ mod tests {
     #[test]
     fn simple_paragraph() {
         let source = "Hello world.\n";
-        let result = parse(source);
+        let tree = parse(source);
+        let children = root_children(&tree);
 
-        assert_eq!(result.blocks.len(), 1, "should find one block");
-        assert!(
-            matches!(result.blocks[0].kind, BlockKind::Paragraph),
-            "simple paragraph"
-        );
+        assert_eq!(children.len(), 1, "should find one block");
+        assert_kind(&tree, children[0], &ElementKind::Paragraph);
     }
 
     #[test]
     fn multiline_paragraph() {
         let source = "Line one.\nLine two.\n";
-        let result = parse(source);
+        let tree = parse(source);
+        let children = root_children(&tree);
 
-        assert_eq!(result.blocks.len(), 1, "should find one block");
-        assert!(
-            matches!(result.blocks[0].kind, BlockKind::Paragraph),
-            "multiline paragraph"
-        );
+        assert_eq!(children.len(), 1, "should find one block");
+        assert_kind(&tree, children[0], &ElementKind::Paragraph);
     }
 
     // --- Mixed constructs ---
@@ -1765,37 +2170,15 @@ mod tests {
     #[test]
     fn mixed_blocks() {
         let source = "# Heading\n\nParagraph text.\n\n---\n\n```\ncode\n```\n";
-        let result = parse(source);
+        let tree = parse(source);
+        let children = root_children(&tree);
 
-        let kinds: Vec<_> = result.blocks.iter().map(|b| &b.kind).collect();
-        assert!(
-            matches!(kinds[0], BlockKind::AtxHeading { level: 1, .. }),
-            "first block is ATX heading"
-        );
-        assert!(
-            matches!(kinds[1], BlockKind::BlankLine),
-            "second block is blank"
-        );
-        assert!(
-            matches!(kinds[2], BlockKind::Paragraph),
-            "third block is paragraph"
-        );
-        assert!(
-            matches!(kinds[3], BlockKind::BlankLine),
-            "fourth block is blank"
-        );
-        assert!(
-            matches!(kinds[4], BlockKind::ThematicBreak),
-            "fifth block is thematic break"
-        );
-        assert!(
-            matches!(kinds[5], BlockKind::BlankLine),
-            "sixth block is blank"
-        );
-        assert!(
-            matches!(kinds[6], BlockKind::FencedCodeBlock { .. }),
-            "seventh block is code block"
-        );
+        // Blank lines are not nodes.
+        assert_eq!(children.len(), 4, "should find four non-blank blocks");
+        assert_kind(&tree, children[0], &ElementKind::Heading { level: 1 });
+        assert_kind(&tree, children[1], &ElementKind::Paragraph);
+        assert_kind(&tree, children[2], &ElementKind::Rules);
+        assert_kind(&tree, children[3], &ElementKind::CodeBlock);
     }
 
     // --- Tab expansion ---
@@ -1824,13 +2207,11 @@ mod tests {
     #[test]
     fn tab_indented_code_block() {
         let source = "\tcode line\n";
-        let result = parse(source);
+        let tree = parse(source);
+        let children = root_children(&tree);
 
-        assert_eq!(result.blocks.len(), 1, "should find one block");
-        assert!(
-            matches!(result.blocks[0].kind, BlockKind::IndentedCodeBlock),
-            "tab-indented line is indented code block"
-        );
+        assert_eq!(children.len(), 1, "should find one block");
+        assert_kind(&tree, children[0], &ElementKind::CodeBlock);
     }
 
     #[test]
@@ -1839,25 +2220,48 @@ mod tests {
         assert_eq!(expanded, "text\there", "tab inside content is preserved");
     }
 
-    // --- Frontmatter offset ---
+    // --- Frontmatter ---
+
+    #[test]
+    fn frontmatter_is_first_child() {
+        let source = "---\ntitle: test\n---\n# Heading\n";
+        let fm_end = source.find("# Heading").expect("should find heading");
+        let tree = parse_tree(source, Some(Span::new(0, fm_end)));
+        let children = root_children(&tree);
+
+        assert_eq!(children.len(), 2, "should find frontmatter + heading");
+        assert_kind(&tree, children[0], &ElementKind::Frontmatter);
+        assert_kind(&tree, children[1], &ElementKind::Heading { level: 1 });
+
+        assert_eq!(
+            tree.node(children[0]).syntax,
+            Syntax::Yaml,
+            "frontmatter has Yaml syntax"
+        );
+    }
 
     #[test]
     fn body_offset_shifts_spans() {
         let source = "---\ntitle: test\n---\n# Heading\n";
         let body_offset = source.find("# Heading").expect("should find heading");
-        let result = parse_blocks(source, body_offset);
+        let tree = parse_tree(source, Some(Span::new(0, body_offset)));
+        let children = root_children(&tree);
 
-        assert_eq!(result.blocks.len(), 1, "should find one block");
-        match &result.blocks[0].kind {
-            BlockKind::AtxHeading { text_span, .. } => {
-                assert_eq!(
-                    span_text(source, text_span),
-                    "Heading",
-                    "text span in original source with offset"
-                );
-            }
-            other => panic!("expected AtxHeading, got {other:?}"),
-        }
+        let heading_id = children
+            .iter()
+            .find(|&&id| matches!(tree.node(id).kind, ElementKind::Heading { .. }))
+            .expect("should find heading");
+        let node = tree.node(*heading_id);
+        let line = &source[node.span.start..node.span.end]
+            .lines()
+            .next()
+            .expect("should have a line");
+        let (text_span, _) = extract_atx_content(line, node.span.start);
+        assert_eq!(
+            span_text(source, &text_span),
+            "Heading",
+            "text span in original source with offset"
+        );
     }
 
     // --- Span correctness ---
@@ -1865,31 +2269,76 @@ mod tests {
     #[test]
     fn spans_cover_original_source() {
         let source = "# Heading\n\nParagraph\n";
-        let result = parse(source);
+        let tree = parse(source);
 
-        for block in &result.blocks {
-            let text = span_text(source, &block.span);
+        for node in tree.nodes() {
+            let text = span_text(source, &node.span);
             assert!(
-                !text.is_empty() || matches!(block.kind, BlockKind::BlankLine),
-                "block span should reference source text: {block:?}"
+                !text.is_empty() || matches!(node.kind, ElementKind::Document),
+                "node span should reference source text: {:?}",
+                node.kind
             );
         }
     }
 
     #[test]
     fn no_text_copied() {
-        // All spans should be valid substrings of the source
         let source = "## Title\n\n> Quote\n\n```\ncode\n```\n\n---\n";
-        let result = parse(source);
+        let tree = parse(source);
 
-        for block in &result.blocks {
+        for node in tree.nodes() {
             assert!(
-                block.span.start <= block.span.end,
-                "span start <= end: {block:?}"
+                node.span.start <= node.span.end,
+                "span start <= end: {:?}",
+                node.kind
             );
             assert!(
-                block.span.end <= source.len(),
-                "span end <= source length: {block:?}"
+                node.span.end <= source.len(),
+                "span end <= source length: {:?}",
+                node.kind
+            );
+        }
+    }
+
+    // --- Parent/children ---
+
+    #[test]
+    fn parent_children_consistency() {
+        let source = "# Heading\n\nParagraph\n\n> Quote\n";
+        let tree = parse(source);
+
+        for (id, node) in tree.nodes().iter().enumerate() {
+            for &child_id in &node.children {
+                assert_eq!(
+                    tree.node(child_id).parent,
+                    Some(id),
+                    "child {child_id} should have parent {id}"
+                );
+            }
+            if let Some(pid) = node.parent {
+                assert!(
+                    tree.node(pid).children.contains(&id),
+                    "node {id} should be in parent {pid}'s children"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn children_in_document_order() {
+        let source = "# First\n\n## Second\n\nParagraph\n";
+        let tree = parse(source);
+        let children = root_children(&tree);
+
+        assert_eq!(children.len(), 3, "should have three children");
+        for window in children.windows(2) {
+            let a = tree.node(window[0]);
+            let b = tree.node(window[1]);
+            assert!(
+                a.span.start < b.span.start,
+                "children should be in document order: {:?} before {:?}",
+                a.kind,
+                b.kind
             );
         }
     }
@@ -1899,48 +2348,99 @@ mod tests {
     #[test]
     fn html_block_type3_processing_instruction() {
         let source = "<?xml version=\"1.0\"?>\n";
-        let result = parse(source);
+        let tree = parse(source);
+        let children = root_children(&tree);
 
-        assert_eq!(result.blocks.len(), 1, "should find one block");
-        assert!(
-            matches!(result.blocks[0].kind, BlockKind::HtmlBlock),
-            "HTML block type 3 (processing instruction)"
-        );
+        assert_eq!(children.len(), 1, "should find one block");
+        assert_kind(&tree, children[0], &ElementKind::HtmlBlock);
     }
 
     #[test]
     fn html_block_type4_declaration() {
         let source = "<!DOCTYPE html>\n";
-        let result = parse(source);
+        let tree = parse(source);
+        let children = root_children(&tree);
 
-        assert_eq!(result.blocks.len(), 1, "should find one block");
-        assert!(
-            matches!(result.blocks[0].kind, BlockKind::HtmlBlock),
-            "HTML block type 4 (declaration)"
-        );
+        assert_eq!(children.len(), 1, "should find one block");
+        assert_kind(&tree, children[0], &ElementKind::HtmlBlock);
     }
 
     #[test]
     fn html_block_type5_cdata() {
         let source = "<![CDATA[\nsome data\n]]>\n";
-        let result = parse(source);
+        let tree = parse(source);
+        let children = root_children(&tree);
 
-        assert_eq!(result.blocks.len(), 1, "should find one block");
-        assert!(
-            matches!(result.blocks[0].kind, BlockKind::HtmlBlock),
-            "HTML block type 5 (CDATA)"
-        );
+        assert_eq!(children.len(), 1, "should find one block");
+        assert_kind(&tree, children[0], &ElementKind::HtmlBlock);
     }
 
     #[test]
     fn html_block_multiline_comment() {
         let source = "<!-- start\nmiddle\nend -->\n";
-        let result = parse(source);
+        let tree = parse(source);
+        let children = root_children(&tree);
 
-        assert_eq!(result.blocks.len(), 1, "should find one block");
+        assert_eq!(children.len(), 1, "should find one block");
+        assert_kind(&tree, children[0], &ElementKind::HtmlBlock);
+    }
+
+    // --- Blank lines ---
+
+    #[test]
+    fn blank_lines_are_not_nodes() {
+        let source = "\n\n\n";
+        let tree = parse(source);
+        let children = root_children(&tree);
+
         assert!(
-            matches!(result.blocks[0].kind, BlockKind::HtmlBlock),
-            "multiline HTML comment"
+            children.is_empty(),
+            "blank lines should not produce child nodes"
         );
+    }
+
+    // --- Nested block quote tests ---
+
+    #[test]
+    fn nested_block_quotes_produce_nested_containers() {
+        let source = "> > > deeply nested\n";
+        let tree = parse(source);
+        let children = root_children(&tree);
+
+        assert_eq!(children.len(), 1, "one top-level quote");
+        let l1 = children[0];
+        assert_kind(&tree, l1, &ElementKind::QuoteBlock);
+
+        let l1_children = tree.children(l1);
+        assert_eq!(l1_children.len(), 1, "one child at level 1");
+        let l2 = l1_children[0];
+        assert_kind(&tree, l2, &ElementKind::QuoteBlock);
+
+        let l2_children = tree.children(l2);
+        assert_eq!(l2_children.len(), 1, "one child at level 2");
+        let l3 = l2_children[0];
+        assert_kind(&tree, l3, &ElementKind::QuoteBlock);
+
+        let l3_children = tree.children(l3);
+        assert_eq!(l3_children.len(), 1, "leaf content at level 3");
+        assert_kind(&tree, l3_children[0], &ElementKind::Paragraph);
+    }
+
+    #[test]
+    fn every_node_has_span() {
+        let source = "# H\n\n> text\n\n```\ncode\n```\n";
+        let tree = parse(source);
+
+        for node in tree.nodes() {
+            if matches!(node.kind, ElementKind::Document) {
+                assert_eq!(node.span, Span::new(0, source.len()), "document span");
+            } else {
+                assert!(
+                    node.span.start < node.span.end,
+                    "non-document node should have non-empty span: {:?}",
+                    node.kind
+                );
+            }
+        }
     }
 }
