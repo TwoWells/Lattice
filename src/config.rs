@@ -65,6 +65,34 @@ pub enum BarePathPolicy {
     Disabled,
 }
 
+/// Admonition syntax policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AdmonitionPolicy {
+    /// Non-`<div class>` admonition syntax gets a hint suggesting portable equivalent.
+    #[default]
+    Portable,
+    /// GitHub `> [!NOTE]` syntax accepted; other flavors flagged.
+    Github,
+    /// GitLab `:::` syntax accepted; other flavors flagged.
+    Gitlab,
+    /// No admonition diagnostics.
+    Disabled,
+}
+
+/// Code block language tag policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CodeBlockLanguagePolicy {
+    /// Code blocks without language tags get a hint.
+    #[default]
+    Hint,
+    /// Warning severity.
+    Warn,
+    /// Error severity.
+    Deny,
+    /// No diagnostic.
+    Disabled,
+}
+
 /// Slug algorithm for heading-fragment validation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FragmentAlgorithm {
@@ -87,6 +115,10 @@ pub struct Policy {
     pub bare_paths: BarePathPolicy,
     /// Slug algorithm for fragment validation. `None` tries all.
     pub fragments: Option<FragmentAlgorithm>,
+    /// Admonition syntax policy.
+    pub admonitions: AdmonitionPolicy,
+    /// Code block language tag policy.
+    pub code_block_language: CodeBlockLanguagePolicy,
 }
 
 impl Default for Policy {
@@ -96,6 +128,8 @@ impl Default for Policy {
             backlinks: true,
             bare_paths: BarePathPolicy::Warn,
             fragments: None,
+            admonitions: AdmonitionPolicy::default(),
+            code_block_language: CodeBlockLanguagePolicy::default(),
         }
     }
 }
@@ -200,6 +234,26 @@ impl Config {
                         }
                     })?);
             }
+            if let Some(ref value) = policy.admonitions {
+                config.policy.admonitions =
+                    parse_admonition_policy(value).ok_or_else(|| ConfigError::Invalid {
+                        path: path.clone(),
+                        message: format!(
+                            "unknown admonitions policy '{value}': expected 'portable', 'github', 'gitlab', or 'disabled'"
+                        ),
+                    })?;
+            }
+            if let Some(ref value) = policy.code_block_language {
+                config.policy.code_block_language =
+                    parse_code_block_language_policy(value).ok_or_else(|| {
+                        ConfigError::Invalid {
+                            path: path.clone(),
+                            message: format!(
+                                "unknown code_block_language policy '{value}': expected 'hint', 'warn', 'deny', or 'disabled'"
+                            ),
+                        }
+                    })?;
+            }
         }
 
         if let Some(format) = raw.format {
@@ -253,6 +307,8 @@ struct RawPolicy {
     backlinks: Option<bool>,
     bare_paths: Option<String>,
     fragments: Option<String>,
+    admonitions: Option<String>,
+    code_block_language: Option<String>,
 }
 
 // --- Helpers ---
@@ -316,6 +372,26 @@ fn parse_fragment_algorithm(s: &str) -> Option<FragmentAlgorithm> {
         "github" => Some(FragmentAlgorithm::Github),
         "gitlab" => Some(FragmentAlgorithm::Gitlab),
         "vscode" => Some(FragmentAlgorithm::Vscode),
+        _ => None,
+    }
+}
+
+fn parse_admonition_policy(s: &str) -> Option<AdmonitionPolicy> {
+    match s {
+        "portable" => Some(AdmonitionPolicy::Portable),
+        "github" => Some(AdmonitionPolicy::Github),
+        "gitlab" => Some(AdmonitionPolicy::Gitlab),
+        "disabled" => Some(AdmonitionPolicy::Disabled),
+        _ => None,
+    }
+}
+
+fn parse_code_block_language_policy(s: &str) -> Option<CodeBlockLanguagePolicy> {
+    match s {
+        "hint" => Some(CodeBlockLanguagePolicy::Hint),
+        "warn" => Some(CodeBlockLanguagePolicy::Warn),
+        "deny" => Some(CodeBlockLanguagePolicy::Deny),
+        "disabled" => Some(CodeBlockLanguagePolicy::Disabled),
         _ => None,
     }
 }

@@ -467,6 +467,8 @@ pub mod diagnostic_severity {
     pub const WARNING: u32 = 2;
     /// Information.
     pub const INFORMATION: u32 = 3;
+    /// Hint.
+    pub const HINT: u32 = 4;
 }
 
 /// LSP method name constants.

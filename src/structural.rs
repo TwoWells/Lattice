@@ -1,0 +1,1315 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Two Wells <contact@twowells.dev>
+
+//! Structural diagnostics — document quality checks that run unconditionally.
+//!
+//! These diagnostics validate the document as a well-formed markdown/HTML
+//! artifact, independent of Lattice's predicate graph. They run on every
+//! file regardless of whether `.lattice.toml` is present.
+
+use std::collections::HashMap;
+use std::path::Path;
+
+use crate::block::{self, ElementKind, Syntax, Tree};
+use crate::config::{BarePathPolicy, CodeBlockLanguagePolicy, Config};
+use crate::html;
+use crate::span::Span;
+use crate::validation::{Diagnostic, Severity};
+
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
+
+/// Collect all structural diagnostics for a single file.
+///
+/// `rel_path` is the workspace-relative path, used for bare path existence
+/// checks via `file_exists`. `config` controls severity for configurable
+/// diagnostics (code block language, admonitions).
+pub fn collect(
+    tree: &Tree,
+    rel_path: &Path,
+    config: &Config,
+    file_exists: &dyn Fn(&Path) -> bool,
+) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+    let source = tree.source();
+
+    emit_parser_diagnostics(tree, rel_path, &mut diagnostics);
+    emit_heading_diagnostics(tree, rel_path, &mut diagnostics);
+    emit_tree_bare_paths(tree, rel_path, config, file_exists, &mut diagnostics);
+    emit_bare_path_diagnostics(tree, rel_path, file_exists, &mut diagnostics);
+    emit_html_diagnostics(tree, rel_path, &mut diagnostics);
+    check_markdown_in_opaque_html(tree, rel_path, &mut diagnostics);
+    emit_code_block_diagnostics(tree, rel_path, config, &mut diagnostics);
+    emit_image_diagnostics(tree, rel_path, &mut diagnostics);
+    emit_trailing_whitespace_diagnostics(source, rel_path, tree, &mut diagnostics);
+    emit_missing_blank_line_diagnostics(tree, rel_path, &mut diagnostics);
+
+    diagnostics.sort_by(|a, b| a.file.cmp(&b.file).then(a.line.cmp(&b.line)));
+    diagnostics
+}
+
+// ---------------------------------------------------------------------------
+// Parser diagnostics
+// ---------------------------------------------------------------------------
+
+/// Emit diagnostics that the parser already collected (unclosed fenced code
+/// blocks, unclosed HTML tags, unexpected close tags, table cell mismatches,
+/// unused/duplicate reference definitions).
+fn emit_parser_diagnostics(tree: &Tree, rel_path: &Path, out: &mut Vec<Diagnostic>) {
+    let source = tree.source();
+    for diag in tree.diagnostics() {
+        let line = block::byte_offset_to_line(source, diag.span.start);
+        let severity = match diag.level {
+            block::DiagnosticLevel::Error => Severity::Error,
+            block::DiagnosticLevel::Warning => Severity::Warning,
+        };
+        out.push(Diagnostic {
+            file: rel_path.to_path_buf(),
+            line,
+            severity,
+            message: diag.message.clone(),
+        });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bare path diagnostics (from tree)
+// ---------------------------------------------------------------------------
+
+/// Emit diagnostics for bare file paths detected by the tree's `bare_paths()`
+/// scanner. Severity depends on the `bare_paths` policy and file existence.
+fn emit_tree_bare_paths(
+    tree: &Tree,
+    rel_path: &Path,
+    config: &Config,
+    file_exists: &dyn Fn(&Path) -> bool,
+    out: &mut Vec<Diagnostic>,
+) {
+    if config.policy.bare_paths == BarePathPolicy::Disabled {
+        return;
+    }
+
+    let bare_paths = tree.bare_paths();
+    for bare in &bare_paths {
+        let target = resolve_relative(rel_path, &bare.path);
+        let exists = file_exists(&target);
+
+        let severity = match (exists, config.policy.bare_paths) {
+            (true, BarePathPolicy::Deny) => Severity::Error,
+            (true, _) => Severity::Warning,
+            (false, _) => Severity::Hint,
+        };
+
+        out.push(Diagnostic {
+            file: rel_path.to_path_buf(),
+            line: bare.line,
+            severity,
+            message: format!("bare path `{}`: convert to a markdown link", bare.path),
+        });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Heading diagnostics
+// ---------------------------------------------------------------------------
+
+/// Emit heading diagnostics: skipped levels, multiple H1, duplicate text,
+/// empty headings.
+fn emit_heading_diagnostics(tree: &Tree, rel_path: &Path, out: &mut Vec<Diagnostic>) {
+    let source = tree.source();
+    let mut prev_level: Option<u8> = None;
+    let mut h1_count = 0u32;
+    let mut seen_texts: HashMap<String, usize> = HashMap::new();
+
+    for node in tree.nodes() {
+        let ElementKind::Heading { level } = &node.kind else {
+            continue;
+        };
+        let level = *level;
+        let line = block::byte_offset_to_line(source, node.span.start);
+
+        let raw = &source[node.span.start..node.span.end];
+        let text = heading_display_text(raw, node.syntax);
+
+        if text.trim().is_empty() {
+            out.push(Diagnostic {
+                file: rel_path.to_path_buf(),
+                line,
+                severity: Severity::Warning,
+                message: "empty heading".to_string(),
+            });
+            prev_level = Some(level);
+            continue;
+        }
+
+        if level == 1 {
+            h1_count += 1;
+            if h1_count == 2 {
+                out.push(Diagnostic {
+                    file: rel_path.to_path_buf(),
+                    line,
+                    severity: Severity::Warning,
+                    message: "multiple H1 headings".to_string(),
+                });
+            }
+        }
+
+        if let Some(prev) = prev_level
+            && level > prev + 1
+        {
+            out.push(Diagnostic {
+                file: rel_path.to_path_buf(),
+                line,
+                severity: Severity::Warning,
+                message: format!("skipped heading level: H{prev} to H{level}"),
+            });
+        }
+
+        prev_level = Some(level);
+
+        let normalized = text.trim().to_lowercase();
+        if let Some(&first_line) = seen_texts.get(&normalized) {
+            out.push(Diagnostic {
+                file: rel_path.to_path_buf(),
+                line,
+                severity: Severity::Warning,
+                message: format!(
+                    "duplicate heading text `{}` (first at line {first_line})",
+                    text.trim()
+                ),
+            });
+        } else {
+            seen_texts.insert(normalized, line);
+        }
+    }
+}
+
+/// Extract display text from a heading node.
+fn heading_display_text(raw: &str, syntax: Syntax) -> String {
+    if syntax == Syntax::Html {
+        return block::extract_html_heading_text(raw);
+    }
+
+    let trimmed = raw.trim_start();
+    if trimmed.starts_with('#') {
+        let first_line = raw.lines().next().unwrap_or("");
+        let after_hashes = first_line.trim_start_matches('#');
+        let content = after_hashes.trim();
+        let content = content.trim_end_matches('#').trim_end();
+        if let Some(brace) = content.rfind("{#")
+            && content.ends_with('}')
+        {
+            return content[..brace].trim().to_string();
+        }
+        content.to_string()
+    } else {
+        let lines: Vec<&str> = raw.lines().collect();
+        if lines.len() > 1 {
+            lines[..lines.len() - 1].join(" ").trim().to_string()
+        } else {
+            raw.trim().to_string()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bare path / URL / quoted path / backticked path diagnostics
+// ---------------------------------------------------------------------------
+
+/// Emit diagnostics for bare paths, bare URLs, quoted paths, and backticked
+/// paths found in paragraph text.
+fn emit_bare_path_diagnostics(
+    tree: &Tree,
+    rel_path: &Path,
+    file_exists: &dyn Fn(&Path) -> bool,
+    out: &mut Vec<Diagnostic>,
+) {
+    let source = tree.source();
+
+    for node in tree.nodes() {
+        if !matches!(node.kind, ElementKind::Paragraph) {
+            continue;
+        }
+
+        let excluded: Vec<Span> = node
+            .children
+            .iter()
+            .map(|&child| tree.node(child).span)
+            .collect();
+
+        let text = &source[node.span.start..node.span.end];
+        let base = node.span.start;
+
+        scan_text_for_paths(text, base, source, rel_path, file_exists, &excluded, out);
+
+        // Check InlineCode children for backticked paths.
+        for &child_id in &node.children {
+            let child = tree.node(child_id);
+            if matches!(child.kind, ElementKind::InlineCode) {
+                let code_text = &source[child.span.start..child.span.end];
+                // Strip backticks to get inner content.
+                let inner = strip_backtick_delimiters(code_text);
+                if looks_like_path(inner) {
+                    let target = resolve_relative(rel_path, inner);
+                    if file_exists(&target) {
+                        let line = block::byte_offset_to_line(source, child.span.start);
+                        out.push(Diagnostic {
+                            file: rel_path.to_path_buf(),
+                            line,
+                            severity: Severity::Hint,
+                            message: format!(
+                                "backticked path `{inner}` refers to an existing file: consider making it a link"
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Scan a text segment for bare URLs and quoted paths.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "scan context parameters are distinct concerns"
+)]
+fn scan_text_for_paths(
+    text: &str,
+    base: usize,
+    source: &str,
+    rel_path: &Path,
+    file_exists: &dyn Fn(&Path) -> bool,
+    excluded: &[Span],
+    out: &mut Vec<Diagnostic>,
+) {
+    for (line_offset, line_text) in text.split('\n').enumerate() {
+        let line_start = base
+            + text
+                .match_indices('\n')
+                .take(line_offset)
+                .last()
+                .map_or(0, |(i, _)| i + 1);
+        let line_num = block::byte_offset_to_line(source, line_start);
+
+        scan_line_for_bare_urls(line_text, line_start, line_num, rel_path, excluded, out);
+        scan_line_for_quoted_paths(
+            line_text,
+            line_start,
+            line_num,
+            rel_path,
+            file_exists,
+            excluded,
+            out,
+        );
+    }
+}
+
+/// Check if a byte position falls inside any excluded span.
+fn is_excluded(pos: usize, excluded: &[Span]) -> bool {
+    excluded.iter().any(|s| pos >= s.start && pos < s.end)
+}
+
+/// Scan a line for bare URLs (`http://` or `https://`) not inside links.
+fn scan_line_for_bare_urls(
+    line: &str,
+    line_start: usize,
+    line_num: usize,
+    rel_path: &Path,
+    excluded: &[Span],
+    out: &mut Vec<Diagnostic>,
+) {
+    for prefix in &["https://", "http://"] {
+        let mut search_start = 0;
+        while let Some(idx) = line[search_start..].find(prefix) {
+            let abs_pos = line_start + search_start + idx;
+            search_start += idx + prefix.len();
+
+            if is_excluded(abs_pos, excluded) {
+                continue;
+            }
+
+            let rest = &line[search_start - prefix.len() + idx..];
+            let url_end = rest
+                .find(|c: char| c.is_whitespace() || c == ')' || c == ']' || c == '>')
+                .unwrap_or(rest.len());
+            let url = &rest[..url_end];
+
+            if url.len() <= prefix.len() {
+                continue;
+            }
+
+            out.push(Diagnostic {
+                file: rel_path.to_path_buf(),
+                line: line_num,
+                severity: Severity::Warning,
+                message: format!(
+                    "bare URL `{url}`: wrap in angle brackets or make a markdown link"
+                ),
+            });
+        }
+    }
+}
+
+/// Scan a line for quoted paths (`"foo.md"`).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "scan context parameters are distinct concerns"
+)]
+fn scan_line_for_quoted_paths(
+    line: &str,
+    line_start: usize,
+    line_num: usize,
+    rel_path: &Path,
+    file_exists: &dyn Fn(&Path) -> bool,
+    excluded: &[Span],
+    out: &mut Vec<Diagnostic>,
+) {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'"' {
+            let start = i + 1;
+            if let Some(end) = line[start..].find('"') {
+                let inner = &line[start..start + end];
+                let abs_pos = line_start + i;
+
+                if !is_excluded(abs_pos, excluded) && looks_like_path(inner) {
+                    let target = resolve_relative(rel_path, inner);
+                    if file_exists(&target) {
+                        out.push(Diagnostic {
+                            file: rel_path.to_path_buf(),
+                            line: line_num,
+                            severity: Severity::Hint,
+                            message: format!(
+                                "quoted path `\"{inner}\"`: use backticks or make a markdown link"
+                            ),
+                        });
+                    }
+                }
+                i = start + end + 1;
+            } else {
+                i += 1;
+            }
+        } else {
+            i += 1;
+        }
+    }
+}
+
+/// Strip backtick delimiters from a code span (e.g. `` `foo` `` → `foo`).
+fn strip_backtick_delimiters(s: &str) -> &str {
+    let bytes = s.as_bytes();
+    let tick_count = bytes.iter().take_while(|&&b| b == b'`').count();
+    if tick_count == 0 || s.len() < tick_count * 2 {
+        return s;
+    }
+    let end = s.len() - tick_count;
+    &s[tick_count..end]
+}
+
+/// Check if a string looks like a file path (has an extension we recognize).
+fn looks_like_path(s: &str) -> bool {
+    const PATH_EXTENSIONS: &[&str] = &[
+        ".md", ".png", ".jpg", ".svg", ".pdf", ".toml", ".yaml", ".yml", ".json", ".txt", ".xml",
+        ".rs", ".ts", ".js",
+    ];
+    !s.is_empty()
+        && !s.contains(' ')
+        && (s.contains('/') || s.contains('.'))
+        && PATH_EXTENSIONS.iter().any(|ext| s.ends_with(ext))
+}
+
+/// Resolve a relative path against a file's directory.
+fn resolve_relative(file_path: &Path, target: &str) -> std::path::PathBuf {
+    file_path
+        .parent()
+        .map_or_else(|| std::path::PathBuf::from(target), |dir| dir.join(target))
+}
+
+// ---------------------------------------------------------------------------
+// HTML diagnostics
+// ---------------------------------------------------------------------------
+
+/// Emit HTML-specific diagnostics from tree structure.
+fn emit_html_diagnostics(tree: &Tree, rel_path: &Path, out: &mut Vec<Diagnostic>) {
+    let source = tree.source();
+    let mut seen_ids: HashMap<String, usize> = HashMap::new();
+
+    for node in tree.nodes() {
+        // Check both structural HTML nodes (Syntax::Html) and opaque HTML blocks.
+        let is_html_node = node.syntax == Syntax::Html;
+        let is_html_block = matches!(node.kind, ElementKind::HtmlBlock);
+        if !is_html_node && !is_html_block {
+            continue;
+        }
+
+        let raw = &source[node.span.start..node.span.end];
+        let line = block::byte_offset_to_line(source, node.span.start);
+
+        // For HtmlBlock, try the first line's tag.
+        let first_line = if is_html_block {
+            raw.lines().next().unwrap_or("").trim()
+        } else {
+            raw.trim()
+        };
+        let Some(tag) = html::tokenize_tag(first_line, node.span.start) else {
+            continue;
+        };
+
+        match tag {
+            html::HtmlTag::Open {
+                ref name,
+                ref attrs,
+                self_closing,
+                ..
+            } => {
+                if self_closing && !html::VOID_ELEMENTS.contains(name.as_str()) {
+                    out.push(Diagnostic {
+                        file: rel_path.to_path_buf(),
+                        line,
+                        severity: Severity::Warning,
+                        message: format!("self-closing non-void tag `<{name}/>`"),
+                    });
+                }
+
+                if !html::ALL_ELEMENTS.contains(name.as_str()) {
+                    out.push(Diagnostic {
+                        file: rel_path.to_path_buf(),
+                        line,
+                        severity: Severity::Info,
+                        message: format!("unknown HTML element `<{name}>`"),
+                    });
+                }
+
+                for attr in attrs {
+                    if let Some(ref val) = attr.value
+                        && attr.name == "id"
+                        && !val.is_empty()
+                    {
+                        if let Some(&first_line) = seen_ids.get(val) {
+                            out.push(Diagnostic {
+                                file: rel_path.to_path_buf(),
+                                line,
+                                severity: Severity::Error,
+                                message: format!(
+                                    "duplicate `id` attribute `{val}` (first at line {first_line})",
+                                ),
+                            });
+                        } else {
+                            seen_ids.insert(val.clone(), line);
+                        }
+                    }
+                }
+
+                check_required_attrs(name, attrs, rel_path, line, out);
+                check_block_in_inline(tree, node, name, rel_path, line, out);
+                check_invalid_parent(tree, node, name, rel_path, line, out);
+            }
+            html::HtmlTag::Close { .. } | html::HtmlTag::Comment { .. } => {}
+        }
+    }
+}
+
+/// Check for markdown-like content inside opaque HTML blocks.
+///
+/// When HTML block content has no blank lines, markdown syntax won't be
+/// parsed — headings, links, and lists render as literal text.
+fn check_markdown_in_opaque_html(tree: &Tree, rel_path: &Path, out: &mut Vec<Diagnostic>) {
+    let source = tree.source();
+
+    for node in tree.nodes() {
+        if !matches!(node.kind, ElementKind::HtmlBlock) {
+            continue;
+        }
+
+        let raw = &source[node.span.start..node.span.end];
+        let lines: Vec<&str> = raw.lines().collect();
+
+        // Skip if there are blank lines (markdown is parsed after blank lines).
+        if lines.iter().any(|l| l.trim().is_empty()) {
+            continue;
+        }
+
+        // Check non-tag lines for markdown syntax.
+        for (i, line) in lines.iter().enumerate() {
+            let trimmed = line.trim();
+            // Skip the first and last lines (likely HTML tags).
+            if i == 0 || (i == lines.len() - 1 && trimmed.starts_with("</")) {
+                continue;
+            }
+
+            let has_markdown = trimmed.starts_with('#')
+                || trimmed.starts_with("- ")
+                || trimmed.starts_with("* ")
+                || trimmed.contains("](");
+
+            if has_markdown {
+                let line_start = node.span.start
+                    + raw
+                        .match_indices('\n')
+                        .take(i)
+                        .last()
+                        .map_or(0, |(idx, _)| idx + 1);
+                let line_num = block::byte_offset_to_line(source, line_start);
+                out.push(Diagnostic {
+                    file: rel_path.to_path_buf(),
+                    line: line_num,
+                    severity: Severity::Warning,
+                    message:
+                        "markdown syntax inside HTML block without blank lines will not be parsed"
+                            .to_string(),
+                });
+                // One diagnostic per HTML block is enough.
+                break;
+            }
+        }
+    }
+}
+
+/// Check for missing required attributes on HTML elements.
+fn check_required_attrs(
+    tag: &str,
+    attrs: &[html::Attribute],
+    rel_path: &Path,
+    line: usize,
+    out: &mut Vec<Diagnostic>,
+) {
+    let required: &[&str] = match tag {
+        "img" => &["alt"],
+        "a" => &["href"],
+        _ => return,
+    };
+
+    for &attr_name in required {
+        if !attrs.iter().any(|a| a.name == attr_name) {
+            out.push(Diagnostic {
+                file: rel_path.to_path_buf(),
+                line,
+                severity: Severity::Warning,
+                message: format!("`<{tag}>` missing required attribute `{attr_name}`"),
+            });
+        }
+    }
+}
+
+/// Check if a block element is nested inside an inline element context.
+fn check_block_in_inline(
+    tree: &Tree,
+    node: &block::Node,
+    tag: &str,
+    rel_path: &Path,
+    line: usize,
+    out: &mut Vec<Diagnostic>,
+) {
+    if !html::BLOCK_ELEMENTS.contains(tag) {
+        return;
+    }
+
+    let mut current = node.parent;
+    while let Some(pid) = current {
+        let parent = tree.node(pid);
+        if parent.syntax == Syntax::Html {
+            let parent_raw = &tree.source()[parent.span.start..parent.span.end];
+            let parent_trimmed = parent_raw.trim();
+            if let Some(html::HtmlTag::Open { ref name, .. }) =
+                html::tokenize_tag(parent_trimmed, 0)
+                && !html::BLOCK_ELEMENTS.contains(name.as_str())
+                && !html::VOID_ELEMENTS.contains(name.as_str())
+            {
+                out.push(Diagnostic {
+                    file: rel_path.to_path_buf(),
+                    line,
+                    severity: Severity::Error,
+                    message: format!("block element `<{tag}>` inside inline element `<{name}>`"),
+                });
+                return;
+            }
+        }
+        current = parent.parent;
+    }
+}
+
+/// Check if an element has a valid parent (e.g., `<tr>` must be inside `<table>`).
+fn check_invalid_parent(
+    tree: &Tree,
+    node: &block::Node,
+    tag: &str,
+    rel_path: &Path,
+    line: usize,
+    out: &mut Vec<Diagnostic>,
+) {
+    let required_parents: &[&str] = match tag {
+        "tr" | "thead" | "tbody" | "tfoot" | "caption" | "colgroup" | "col" => &["table"],
+        "td" | "th" => &["table", "tr"],
+        "li" => &["ul", "ol", "menu"],
+        "summary" => &["details"],
+        "option" | "optgroup" => &["select", "datalist"],
+        _ => return,
+    };
+
+    let mut current = node.parent;
+    while let Some(pid) = current {
+        let parent = tree.node(pid);
+        if parent.syntax == Syntax::Html {
+            let parent_raw = &tree.source()[parent.span.start..parent.span.end];
+            let parent_trimmed = parent_raw.trim();
+            if let Some(html::HtmlTag::Open { ref name, .. }) =
+                html::tokenize_tag(parent_trimmed, 0)
+                && required_parents.contains(&name.as_str())
+            {
+                return;
+            }
+        }
+        match &parent.kind {
+            ElementKind::Table { .. } if required_parents.contains(&"table") => return,
+            ElementKind::List { ordered: true, .. } if required_parents.contains(&"ol") => return,
+            ElementKind::List { ordered: false, .. } if required_parents.contains(&"ul") => return,
+            ElementKind::Details if required_parents.contains(&"details") => return,
+            _ => {}
+        }
+        current = parent.parent;
+    }
+
+    out.push(Diagnostic {
+        file: rel_path.to_path_buf(),
+        line,
+        severity: Severity::Error,
+        message: format!(
+            "`<{tag}>` requires parent {}",
+            required_parents
+                .iter()
+                .map(|p| format!("`<{p}>`"))
+                .collect::<Vec<_>>()
+                .join(" or ")
+        ),
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Code block diagnostics
+// ---------------------------------------------------------------------------
+
+/// Emit code block language tag diagnostics.
+fn emit_code_block_diagnostics(
+    tree: &Tree,
+    rel_path: &Path,
+    config: &Config,
+    out: &mut Vec<Diagnostic>,
+) {
+    let severity = match config.policy.code_block_language {
+        CodeBlockLanguagePolicy::Disabled => return,
+        CodeBlockLanguagePolicy::Hint => Severity::Hint,
+        CodeBlockLanguagePolicy::Warn => Severity::Warning,
+        CodeBlockLanguagePolicy::Deny => Severity::Error,
+    };
+
+    let source = tree.source();
+
+    for node in tree.nodes() {
+        if !matches!(node.kind, ElementKind::CodeBlock) || node.syntax == Syntax::Html {
+            continue;
+        }
+
+        let raw = &source[node.span.start..node.span.end];
+        let first_line = raw.lines().next().unwrap_or("");
+        let trimmed = first_line.trim();
+
+        let is_fenced = trimmed.starts_with("```") || trimmed.starts_with("~~~");
+        if !is_fenced {
+            continue;
+        }
+
+        let fence_end = trimmed
+            .find(|c: char| c != '`' && c != '~')
+            .unwrap_or(trimmed.len());
+        let info = trimmed[fence_end..].trim();
+
+        if info.is_empty() {
+            let line = block::byte_offset_to_line(source, node.span.start);
+            out.push(Diagnostic {
+                file: rel_path.to_path_buf(),
+                line,
+                severity,
+                message: "code block without language tag".to_string(),
+            });
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Image diagnostics
+// ---------------------------------------------------------------------------
+
+/// Emit diagnostics for images with empty alt text.
+fn emit_image_diagnostics(tree: &Tree, rel_path: &Path, out: &mut Vec<Diagnostic>) {
+    let source = tree.source();
+
+    for node in tree.nodes() {
+        let ElementKind::Image { .. } = &node.kind else {
+            continue;
+        };
+
+        let raw = &source[node.span.start..node.span.end];
+        if node.syntax == Syntax::Markdown
+            && raw.starts_with("![")
+            && let Some(close) = raw.find("](")
+        {
+            let alt = &raw[2..close];
+            if alt.trim().is_empty() {
+                let line = block::byte_offset_to_line(source, node.span.start);
+                out.push(Diagnostic {
+                    file: rel_path.to_path_buf(),
+                    line,
+                    severity: Severity::Warning,
+                    message: "image with empty alt text".to_string(),
+                });
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Trailing whitespace diagnostics
+// ---------------------------------------------------------------------------
+
+/// Emit diagnostics for invalid trailing whitespace (1 or 3+ trailing spaces).
+///
+/// Two trailing spaces is a valid hard line break in `CommonMark`.
+/// Lines inside fenced code blocks and HTML blocks are excluded.
+fn emit_trailing_whitespace_diagnostics(
+    source: &str,
+    rel_path: &Path,
+    tree: &Tree,
+    out: &mut Vec<Diagnostic>,
+) {
+    let excluded: Vec<Span> = tree
+        .nodes()
+        .iter()
+        .filter(|n| {
+            matches!(
+                n.kind,
+                ElementKind::CodeBlock | ElementKind::HtmlBlock | ElementKind::Math
+            )
+        })
+        .map(|n| n.span)
+        .collect();
+
+    for (line_idx, line) in source.lines().enumerate() {
+        let line_num = line_idx + 1;
+        let line_start = source
+            .match_indices('\n')
+            .take(line_idx)
+            .last()
+            .map_or(0, |(i, _)| i + 1);
+
+        if excluded
+            .iter()
+            .any(|s| line_start >= s.start && line_start < s.end)
+        {
+            continue;
+        }
+
+        let trailing = line.len() - line.trim_end_matches(' ').len();
+        if trailing == 1 || trailing >= 3 {
+            out.push(Diagnostic {
+                file: rel_path.to_path_buf(),
+                line: line_num,
+                severity: Severity::Warning,
+                message: format!(
+                    "invalid trailing whitespace ({trailing} spaces): use 2 for hard break or 0"
+                ),
+            });
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Missing blank line diagnostics
+// ---------------------------------------------------------------------------
+
+/// Emit diagnostics for missing blank lines before block elements.
+fn emit_missing_blank_line_diagnostics(tree: &Tree, rel_path: &Path, out: &mut Vec<Diagnostic>) {
+    let source = tree.source();
+
+    for node in tree.nodes() {
+        if !matches!(
+            node.kind,
+            ElementKind::Heading { .. }
+                | ElementKind::CodeBlock
+                | ElementKind::QuoteBlock
+                | ElementKind::Rules
+                | ElementKind::Table { .. }
+                | ElementKind::HtmlBlock
+                | ElementKind::List { .. }
+                | ElementKind::Math
+        ) {
+            continue;
+        }
+
+        let start = node.span.start;
+        if start == 0 {
+            continue;
+        }
+
+        let before = &source[..start];
+        let prev_line_end = before.trim_end_matches('\n').trim_end_matches('\r');
+        if prev_line_end.is_empty() {
+            continue;
+        }
+
+        let prev_line = prev_line_end
+            .rfind('\n')
+            .map_or(prev_line_end, |idx| &prev_line_end[idx + 1..]);
+
+        if !prev_line.trim().is_empty() {
+            // Don't flag after frontmatter closing delimiter.
+            if prev_line.trim() == "---" && start < 100 {
+                continue;
+            }
+
+            let line = block::byte_offset_to_line(source, start);
+            out.push(Diagnostic {
+                file: rel_path.to_path_buf(),
+                line,
+                severity: Severity::Hint,
+                message: "missing blank line before block element".to_string(),
+            });
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::panic,
+    reason = "tests use expect and panic for clarity"
+)]
+mod tests {
+    use std::collections::HashSet;
+
+    use super::*;
+    use crate::block;
+    use crate::config::Config;
+    use crate::yaml;
+
+    fn diagnose(content: &str) -> Vec<Diagnostic> {
+        let fm = yaml::parse_frontmatter_block(content);
+        let fm_span = fm.as_ref().map(|b| b.span);
+        let tree = block::parse_tree(content, fm_span);
+        let config = Config::default();
+        let rel_path = std::path::Path::new("test.md");
+        collect(&tree, rel_path, &config, &|_| false)
+    }
+
+    fn diagnose_with_files(content: &str, existing: &[&str]) -> Vec<Diagnostic> {
+        let fm = yaml::parse_frontmatter_block(content);
+        let fm_span = fm.as_ref().map(|b| b.span);
+        let tree = block::parse_tree(content, fm_span);
+        let config = Config::default();
+        let rel_path = std::path::Path::new("test.md");
+        let existing_set: HashSet<&str> = existing.iter().copied().collect();
+        collect(&tree, rel_path, &config, &|p| {
+            existing_set.contains(p.to_str().unwrap_or(""))
+        })
+    }
+
+    fn count_matching(diags: &[Diagnostic], severity: Severity, substr: &str) -> usize {
+        diags
+            .iter()
+            .filter(|d| d.severity == severity && d.message.contains(substr))
+            .count()
+    }
+
+    fn has_matching(diags: &[Diagnostic], severity: Severity, substr: &str) -> bool {
+        diags
+            .iter()
+            .any(|d| d.severity == severity && d.message.contains(substr))
+    }
+
+    fn has_any(diags: &[Diagnostic], substr: &str) -> bool {
+        diags.iter().any(|d| d.message.contains(substr))
+    }
+
+    // -- Parser diagnostics --
+
+    #[test]
+    fn unclosed_fenced_code_block() {
+        let diags = diagnose("```rust\nfn main() {}\n");
+        assert_eq!(
+            count_matching(&diags, Severity::Error, "unclosed fenced code block"),
+            1,
+            "one error for unclosed code block: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn closed_code_block_no_error() {
+        let diags = diagnose("```rust\nfn main() {}\n```\n");
+        assert!(
+            !has_matching(&diags, Severity::Error, "unclosed"),
+            "no errors for closed code block: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn unclosed_html_tag() {
+        let diags = diagnose("<div>\n\nSome content\n");
+        assert_eq!(
+            count_matching(&diags, Severity::Error, "unclosed"),
+            1,
+            "one error for unclosed div: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn unexpected_close_tag() {
+        let diags = diagnose("</div>\n");
+        assert_eq!(
+            count_matching(&diags, Severity::Error, "unexpected closing tag"),
+            1,
+            "one error for unexpected close: {diags:?}"
+        );
+    }
+
+    // -- Heading diagnostics --
+
+    #[test]
+    fn skipped_heading_level() {
+        let diags = diagnose("# H1\n\n### H3\n");
+        assert_eq!(
+            count_matching(&diags, Severity::Warning, "skipped heading level"),
+            1,
+            "one warning for skipped heading: {diags:?}"
+        );
+        assert!(
+            has_any(&diags, "H1 to H3"),
+            "message mentions levels: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn multiple_h1() {
+        let diags = diagnose("# First\n\n# Second\n");
+        assert_eq!(
+            count_matching(&diags, Severity::Warning, "multiple H1"),
+            1,
+            "one warning for multiple H1: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn duplicate_heading_text() {
+        let diags = diagnose("## Overview\n\n## Overview\n");
+        assert_eq!(
+            count_matching(&diags, Severity::Warning, "duplicate heading text"),
+            1,
+            "one warning for duplicate heading: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn empty_heading() {
+        let diags = diagnose("# \n");
+        assert_eq!(
+            count_matching(&diags, Severity::Warning, "empty heading"),
+            1,
+            "one warning for empty heading: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn sequential_headings_no_warning() {
+        let diags = diagnose("# H1\n\n## H2\n\n### H3\n");
+        assert!(
+            !has_matching(&diags, Severity::Warning, "skipped"),
+            "no warnings for sequential headings: {diags:?}"
+        );
+    }
+
+    // -- Code block language --
+
+    #[test]
+    fn code_block_without_language() {
+        let diags = diagnose("```\ncode\n```\n");
+        assert_eq!(
+            count_matching(&diags, Severity::Hint, "without language tag"),
+            1,
+            "one hint for missing language: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn code_block_with_language_no_diagnostic() {
+        let diags = diagnose("```rust\ncode\n```\n");
+        assert!(
+            !has_any(&diags, "without language tag"),
+            "no hint for code block with language: {diags:?}"
+        );
+    }
+
+    // -- Image --
+
+    #[test]
+    fn image_empty_alt_text() {
+        let diags = diagnose("![](image.png)\n");
+        assert_eq!(
+            count_matching(&diags, Severity::Warning, "empty alt text"),
+            1,
+            "one warning for empty alt: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn image_with_alt_text_no_diagnostic() {
+        let diags = diagnose("![a logo](image.png)\n");
+        assert!(
+            !has_any(&diags, "empty alt text"),
+            "no warning for image with alt: {diags:?}"
+        );
+    }
+
+    // -- Trailing whitespace --
+
+    #[test]
+    fn single_trailing_space() {
+        let diags = diagnose("hello \n");
+        assert_eq!(
+            count_matching(&diags, Severity::Warning, "trailing whitespace"),
+            1,
+            "one warning for 1 trailing space: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn two_trailing_spaces_ok() {
+        let diags = diagnose("hello  \n");
+        assert!(
+            !has_any(&diags, "trailing whitespace"),
+            "no warning for 2 trailing spaces: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn three_trailing_spaces() {
+        let diags = diagnose("hello   \n");
+        assert_eq!(
+            count_matching(&diags, Severity::Warning, "trailing whitespace"),
+            1,
+            "one warning for 3 trailing spaces: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn trailing_whitespace_in_code_block_excluded() {
+        let diags = diagnose("```\nhello   \n```\n");
+        assert!(
+            !has_any(&diags, "trailing whitespace"),
+            "no warning for trailing spaces inside code: {diags:?}"
+        );
+    }
+
+    // -- Bare URL --
+
+    #[test]
+    fn bare_url_in_paragraph() {
+        let diags = diagnose("Visit https://example.com for info.\n");
+        assert_eq!(
+            count_matching(&diags, Severity::Warning, "bare URL"),
+            1,
+            "one warning for bare URL: {diags:?}"
+        );
+    }
+
+    // -- Error recovery --
+
+    #[test]
+    fn unclosed_html_no_cascade_to_valid_content() {
+        let diags = diagnose("<div>\n\n# Valid Heading\n\nSome paragraph.\n");
+        let errors: Vec<_> = diags
+            .iter()
+            .filter(|d| d.severity == Severity::Error)
+            .collect();
+        assert_eq!(errors.len(), 1, "only one error, no cascading: {diags:?}");
+        assert!(
+            errors[0].message.contains("unclosed"),
+            "the error is about unclosed tag: {}",
+            errors[0].message
+        );
+    }
+
+    // -- Quoted path --
+
+    #[test]
+    fn quoted_path_with_existing_file() {
+        let diags = diagnose_with_files("See \"other.md\" for details.\n", &["other.md"]);
+        assert_eq!(
+            count_matching(&diags, Severity::Hint, "quoted path"),
+            1,
+            "one hint for quoted path: {diags:?}"
+        );
+    }
+
+    // -- Backticked path --
+
+    #[test]
+    fn backticked_path_with_existing_file() {
+        let diags = diagnose_with_files("See `other.md` for details.\n", &["other.md"]);
+        assert_eq!(
+            count_matching(&diags, Severity::Hint, "backticked path"),
+            1,
+            "one hint for backticked path: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn backticked_path_no_file() {
+        let diags = diagnose("See `other.md` for details.\n");
+        assert!(
+            !has_any(&diags, "backticked path"),
+            "no hint when file doesn't exist: {diags:?}"
+        );
+    }
+
+    // -- Self-closing non-void --
+
+    #[test]
+    fn self_closing_div() {
+        let diags = diagnose("<div/>\n");
+        assert_eq!(
+            count_matching(&diags, Severity::Warning, "self-closing non-void"),
+            1,
+            "one warning for self-closing div: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn self_closing_void_ok() {
+        let diags = diagnose("<br/>\n");
+        assert!(
+            !has_any(&diags, "self-closing non-void"),
+            "no warning for self-closing void: {diags:?}"
+        );
+    }
+
+    // -- Unknown element --
+
+    #[test]
+    fn unknown_element() {
+        let diags = diagnose("<foo>\n</foo>\n");
+        assert_eq!(
+            count_matching(&diags, Severity::Info, "unknown HTML element"),
+            1,
+            "one info for unknown element: {diags:?}"
+        );
+    }
+
+    // -- Config: code_block_language --
+
+    #[test]
+    fn code_block_language_disabled() {
+        let fm = yaml::parse_frontmatter_block("```\ncode\n```\n");
+        let fm_span = fm.as_ref().map(|b| b.span);
+        let tree = block::parse_tree("```\ncode\n```\n", fm_span);
+        let mut config = Config::default();
+        config.policy.code_block_language = CodeBlockLanguagePolicy::Disabled;
+        let rel_path = std::path::Path::new("test.md");
+        let diags = collect(&tree, rel_path, &config, &|_| false);
+        assert!(
+            !has_any(&diags, "without language tag"),
+            "no diagnostic when disabled: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn code_block_language_deny_is_error() {
+        let fm = yaml::parse_frontmatter_block("```\ncode\n```\n");
+        let fm_span = fm.as_ref().map(|b| b.span);
+        let tree = block::parse_tree("```\ncode\n```\n", fm_span);
+        let mut config = Config::default();
+        config.policy.code_block_language = CodeBlockLanguagePolicy::Deny;
+        let rel_path = std::path::Path::new("test.md");
+        let diags = collect(&tree, rel_path, &config, &|_| false);
+        assert_eq!(
+            count_matching(&diags, Severity::Error, "without language tag"),
+            1,
+            "one error when deny: {diags:?}"
+        );
+    }
+
+    // -- close_block_quotes HTML scope desync --
+
+    #[test]
+    fn html_in_blockquote_closed_on_blank_line() {
+        // An HTML container inside a block quote followed by a blank line
+        // should produce exactly one unclosed-tag diagnostic, not desync
+        // the scope stacks and cascade errors.
+        let diags = diagnose("> <div>\n>\n> text\n\nparagraph\n");
+        assert_eq!(
+            count_matching(&diags, Severity::Error, "unclosed"),
+            1,
+            "one unclosed div error, no cascading: {diags:?}"
+        );
+    }
+
+    // -- Malformed link --
+
+    #[test]
+    fn malformed_link_destination() {
+        let diags = diagnose("[text](\n");
+        assert_eq!(
+            count_matching(&diags, Severity::Error, "malformed link"),
+            1,
+            "one error for malformed link: {diags:?}"
+        );
+    }
+
+    // -- Unused/duplicate ref defs are Warning, not Error --
+
+    #[test]
+    fn unused_ref_def_is_warning() {
+        let diags = diagnose("[label]: https://example.com\n\nSome text.\n");
+        assert_eq!(
+            count_matching(&diags, Severity::Warning, "unused reference definition"),
+            1,
+            "unused ref def should be warning: {diags:?}"
+        );
+        assert!(
+            !has_matching(&diags, Severity::Error, "unused reference definition"),
+            "unused ref def should not be error: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn duplicate_ref_def_is_warning() {
+        let diags = diagnose("[label]: https://a.com\n[label]: https://b.com\n\n[text][label]\n");
+        assert_eq!(
+            count_matching(&diags, Severity::Warning, "duplicate reference definition"),
+            1,
+            "duplicate ref def should be warning: {diags:?}"
+        );
+    }
+
+    // -- Markdown in opaque HTML --
+
+    #[test]
+    fn markdown_in_opaque_html_warns() {
+        // <center> is a type 6 block tag with no structural mapping,
+        // so it falls through to HtmlBlock. Content without blank
+        // lines won't be parsed as markdown.
+        let diags = diagnose("<center>\n# Heading\n</center>\n");
+        assert_eq!(
+            count_matching(
+                &diags,
+                Severity::Warning,
+                "markdown syntax inside HTML block"
+            ),
+            1,
+            "one warning for markdown in opaque HTML: {diags:?}"
+        );
+    }
+}

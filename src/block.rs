@@ -165,11 +165,22 @@ pub struct Node {
     pub children: Vec<NodeId>,
 }
 
+/// Severity level for parser diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiagnosticLevel {
+    /// Fatal issue.
+    Error,
+    /// Non-fatal issue.
+    Warning,
+}
+
 /// A diagnostic emitted during parsing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Diagnostic {
     /// Location of the error in the source.
     pub span: Span,
+    /// Severity level.
+    pub level: DiagnosticLevel,
     /// Human-readable message.
     pub message: String,
 }
@@ -1687,6 +1698,7 @@ impl<'a> TreeBuilder<'a> {
         let Some(idx) = pos else {
             // No match — unexpected close tag.
             self.diagnostics.push(Diagnostic {
+                level: DiagnosticLevel::Error,
                 span: Span::new(span_end.saturating_sub(tag.len() + 3), span_end),
                 message: format!("unexpected closing tag `</{tag}>`"),
             });
@@ -1697,6 +1709,7 @@ impl<'a> TreeBuilder<'a> {
         let above = self.html_stack.split_off(idx + 1);
         for scope in above.iter().rev() {
             self.diagnostics.push(Diagnostic {
+                level: DiagnosticLevel::Error,
                 span: self.nodes[scope.node_id].span,
                 message: format!("unclosed `<{}>` tag", scope.tag),
             });
@@ -1713,6 +1726,7 @@ impl<'a> TreeBuilder<'a> {
     fn close_all_html_scopes(&mut self, pos: usize) {
         while let Some(scope) = self.html_stack.pop() {
             self.diagnostics.push(Diagnostic {
+                level: DiagnosticLevel::Error,
                 span: self.nodes[scope.node_id].span,
                 message: format!("unclosed `<{}>` tag", scope.tag),
             });
@@ -1729,6 +1743,7 @@ impl<'a> TreeBuilder<'a> {
             // unexpected close (but still emits a diagnostic).
             if self.html_stack.is_empty() {
                 self.diagnostics.push(Diagnostic {
+                    level: DiagnosticLevel::Error,
                     span: Span::new(content_start, line_end),
                     message: format!("unexpected closing tag `</{name}>`"),
                 });
@@ -2228,8 +2243,28 @@ impl<'a> TreeBuilder<'a> {
     }
 
     /// Close all open block quote scopes.
+    ///
+    /// Before popping each `QuoteBlock`, closes any HTML container scopes
+    /// that sit above it on the scope stack. This keeps `html_stack` and
+    /// `scope_stack` in sync — same pattern as `close_all_html_scopes` at
+    /// end-of-document.
     fn close_block_quotes(&mut self, pos: usize) {
         while self.quote_depth > 0 {
+            // Close HTML scopes above the QuoteBlock.
+            while self.html_stack.last().is_some_and(|hs| {
+                self.scope_stack
+                    .last()
+                    .is_some_and(|&top| top == hs.node_id)
+            }) {
+                if let Some(scope) = self.html_stack.pop() {
+                    self.diagnostics.push(Diagnostic {
+                        level: DiagnosticLevel::Error,
+                        span: self.nodes[scope.node_id].span,
+                        message: format!("unclosed `<{}>` tag", scope.tag),
+                    });
+                    self.pop_scope(pos);
+                }
+            }
             self.pop_scope(pos);
             self.quote_depth -= 1;
         }
@@ -2331,6 +2366,7 @@ impl<'a> TreeBuilder<'a> {
                     Span::new(open_start, body_offset + *pos),
                 );
                 self.diagnostics.push(Diagnostic {
+                    level: DiagnosticLevel::Error,
                     span: Span::new(open_start, open_raw_end),
                     message: "unclosed fenced code block".to_string(),
                 });
@@ -2359,6 +2395,7 @@ impl<'a> TreeBuilder<'a> {
                         Span::new(open_start, body_offset + *pos),
                     );
                     self.diagnostics.push(Diagnostic {
+                        level: DiagnosticLevel::Error,
                         span: Span::new(open_start, open_raw_end),
                         message: "unclosed fenced code block".to_string(),
                     });
@@ -2435,6 +2472,7 @@ impl<'a> TreeBuilder<'a> {
                 Span::new(open_start, body_offset + *pos),
             );
             self.diagnostics.push(Diagnostic {
+                level: DiagnosticLevel::Error,
                 span: Span::new(open_start, open_raw_end),
                 message: "unclosed block math".to_string(),
             });
@@ -2978,6 +3016,7 @@ impl<'a> TreeBuilder<'a> {
         // Record mismatch diagnostic.
         if actual_count != col_count {
             self.diagnostics.push(Diagnostic {
+                level: DiagnosticLevel::Error,
                 span: Span::new(row_start, row_end),
                 message: format!("table row has {actual_count} cells, expected {col_count}"),
             });
@@ -3395,7 +3434,7 @@ fn html_heading_text_span(raw: &str, base: usize) -> Span {
 }
 
 /// Extract display text from an HTML heading like `<h1>text</h1>`.
-fn extract_html_heading_text(source: &str) -> String {
+pub fn extract_html_heading_text(source: &str) -> String {
     // Strip the opening tag
     let after_open = source.find('>').map_or(source, |i| &source[i + 1..]);
     // Strip the closing tag

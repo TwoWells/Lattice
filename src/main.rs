@@ -17,6 +17,7 @@ mod lint;
 mod lsp;
 mod server;
 mod span;
+mod structural;
 mod validation;
 mod workspace;
 mod yaml;

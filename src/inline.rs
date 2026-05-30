@@ -11,7 +11,9 @@
 
 use std::collections::HashMap;
 
-use crate::block::{Diagnostic, ElementKind, NodeId, Syntax, Tree, normalize_label};
+use crate::block::{
+    Diagnostic, DiagnosticLevel, ElementKind, NodeId, Syntax, Tree, normalize_label,
+};
 use crate::html::{self, HtmlTag};
 use crate::span::Span;
 
@@ -56,6 +58,7 @@ pub fn parse_inlines(tree: &mut Tree) {
             ElementKind::ReferenceDef { label, url, title } => {
                 if ref_defs.contains_key(label) {
                     diagnostics.push(Diagnostic {
+                        level: DiagnosticLevel::Warning,
                         span: node.span,
                         message: format!("duplicate reference definition `{label}`"),
                     });
@@ -74,6 +77,7 @@ pub fn parse_inlines(tree: &mut Tree) {
             ElementKind::FootnoteDef { label } => {
                 if footnote_defs.contains_key(label) {
                     diagnostics.push(Diagnostic {
+                        level: DiagnosticLevel::Warning,
                         span: node.span,
                         message: format!("duplicate footnote definition `{label}`"),
                     });
@@ -105,6 +109,7 @@ pub fn parse_inlines(tree: &mut Tree) {
         if !def.used {
             let span = tree.node(def.node_id).span;
             diagnostics.push(Diagnostic {
+                level: DiagnosticLevel::Warning,
                 span,
                 message: format!("unused reference definition `{label}`"),
             });
@@ -116,6 +121,7 @@ pub fn parse_inlines(tree: &mut Tree) {
         if !used {
             let span = tree.node(node_id).span;
             diagnostics.push(Diagnostic {
+                level: DiagnosticLevel::Warning,
                 span,
                 message: format!("unused footnote definition `{label}`"),
             });
@@ -205,6 +211,7 @@ fn scan_inlines(
                             *used = true;
                         } else {
                             diagnostics.push(Diagnostic {
+                                level: DiagnosticLevel::Error,
                                 span: Span::new(base + i, base + end),
                                 message: format!("undefined footnote `{label}`"),
                             });
@@ -476,7 +483,15 @@ fn try_parse_bracket_element(
 
     if after < bytes.len() && bytes[after] == b'(' {
         // Inline destination: [text](url "title")
-        parse_inline_dest(text, after)
+        let result = parse_inline_dest(text, after);
+        if result.is_none() {
+            diagnostics.push(Diagnostic {
+                level: DiagnosticLevel::Error,
+                span: Span::new(base + bracket_pos, base + after + 1),
+                message: "malformed link: unclosed or invalid destination".to_string(),
+            });
+        }
+        result
     } else if after < bytes.len() && bytes[after] == b'[' {
         if after + 1 < bytes.len() && bytes[after + 1] == b']' {
             // Collapsed reference: [text][]
@@ -487,6 +502,7 @@ fn try_parse_bracket_element(
                 Some((after + 2, def.url.clone(), def.title.clone()))
             } else {
                 diagnostics.push(Diagnostic {
+                    level: DiagnosticLevel::Error,
                     span: Span::new(base + bracket_pos, base + after + 2),
                     message: format!("undefined reference `{label}`"),
                 });
@@ -502,6 +518,7 @@ fn try_parse_bracket_element(
                 Some((ref_close + 1, def.url.clone(), def.title.clone()))
             } else {
                 diagnostics.push(Diagnostic {
+                    level: DiagnosticLevel::Error,
                     span: Span::new(base + bracket_pos, base + ref_close + 1),
                     message: format!("undefined reference `{label}`"),
                 });

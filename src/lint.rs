@@ -11,13 +11,15 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
+use crate::structural;
 use crate::validation::{self, Diagnostic, Severity};
 use crate::workspace::Workspace;
 
 /// Run all validation checks on the workspace rooted at `start`.
 ///
-/// Writes diagnostics to `out` and returns `true` if any error-level
-/// diagnostics were emitted.
+/// Structural diagnostics always run. Graph diagnostics require
+/// `.lattice.toml`. Writes diagnostics to `out` and returns `true`
+/// if any error-level diagnostics were emitted.
 ///
 /// # Errors
 ///
@@ -26,21 +28,47 @@ use crate::workspace::Workspace;
 pub fn run(start: &Path, out: &mut impl Write) -> Result<bool> {
     let workspace = Workspace::scan(start).context("failed to scan workspace")?;
 
-    if !workspace.has_config() {
+    let mut has_errors = false;
+    let mut diagnostics = Vec::new();
+
+    // Structural diagnostics: always run.
+    let config = workspace.config();
+    for (path, file_data) in workspace.files() {
+        let file_exists = |target: &Path| workspace.file(target).is_some();
+        diagnostics.extend(structural::collect(
+            &file_data.tree,
+            path,
+            config,
+            &file_exists,
+        ));
+
+        // Frontmatter parse errors are structural (unconditional).
+        for pd in &file_data.parse_diagnostics {
+            diagnostics.push(Diagnostic {
+                file: path.clone(),
+                line: pd.line,
+                severity: Severity::Error,
+                message: format!("frontmatter error: {}", pd.message),
+            });
+        }
+    }
+
+    // Graph diagnostics: gated by .lattice.toml.
+    if workspace.has_config() {
+        // Config errors are hard failures in CLI mode.
+        if let Some(config_err) = workspace.config_error() {
+            let _ = writeln!(out, ".lattice.toml: error: {config_err}");
+            has_errors = true;
+        }
+        diagnostics.extend(validation::collect_all(&workspace));
+    } else {
         writeln!(
             out,
             "note: no .lattice.toml found, graph validation disabled"
         )?;
-        return Ok(false);
     }
 
-    // Config errors are hard failures in CLI mode.
-    let mut has_errors = workspace.config_error().is_some_and(|config_err| {
-        let _ = writeln!(out, ".lattice.toml: error: {config_err}");
-        true
-    });
-
-    let diagnostics = validation::collect_all(&workspace);
+    diagnostics.sort_by(|a, b| a.file.cmp(&b.file).then(a.line.cmp(&b.line)));
 
     for diag in &diagnostics {
         if diag.severity == Severity::Error {
@@ -58,6 +86,7 @@ fn format_diagnostic(diag: &Diagnostic) -> String {
         Severity::Error => "error",
         Severity::Warning => "warning",
         Severity::Info => "info",
+        Severity::Hint => "hint",
     };
     format!(
         "{}:{}: {}: {}",

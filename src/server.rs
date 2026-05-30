@@ -17,6 +17,7 @@ use lsp_server::{Connection, Message, Notification, Response};
 use crate::block::{ElementKind, Heading, HeadingId, LinkKind, NodeId, Tree, normalize_label};
 use crate::lsp;
 use crate::span::Span;
+use crate::structural;
 use crate::validation::{self, Diagnostic, Severity};
 use crate::workspace::Workspace;
 
@@ -1621,10 +1622,46 @@ fn document_links(workspaces: &Workspaces, uri: &str) -> Vec<lsp::DocumentLink> 
 // Pull diagnostics (ticket 09)
 // ---------------------------------------------------------------------------
 
+/// Collect all diagnostics for a workspace: structural (unconditional) +
+/// graph (gated by `.lattice.toml`).
+fn collect_all_diagnostics(workspace: &Workspace) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+
+    // Structural diagnostics: always run, no config required.
+    let config = workspace.config();
+    for (path, file_data) in workspace.files() {
+        let file_exists = |target: &std::path::Path| workspace.file(target).is_some();
+        diagnostics.extend(structural::collect(
+            &file_data.tree,
+            path,
+            config,
+            &file_exists,
+        ));
+
+        // Frontmatter parse errors are structural (unconditional).
+        for pd in &file_data.parse_diagnostics {
+            diagnostics.push(Diagnostic {
+                file: path.clone(),
+                line: pd.line,
+                severity: Severity::Error,
+                message: format!("frontmatter error: {}", pd.message),
+            });
+        }
+    }
+
+    // Graph diagnostics: only when .lattice.toml is present.
+    if workspace.has_config() {
+        diagnostics.extend(validation::collect_all(workspace));
+    }
+
+    diagnostics.sort_by(|a, b| a.file.cmp(&b.file).then(a.line.cmp(&b.line)));
+    diagnostics
+}
+
 /// Return diagnostics for a single document.
 fn document_diagnostic(workspaces: &Workspaces, uri: &str) -> lsp::FullDocumentDiagnosticReport {
     let items = if let Some((workspace, rel_path)) = workspaces.resolve(uri) {
-        let all = validation::collect_all(workspace);
+        let all = collect_all_diagnostics(workspace);
         all.iter()
             .filter(|d| d.file == rel_path)
             .map(to_lsp_diagnostic)
@@ -1644,7 +1681,7 @@ fn workspace_diagnostic(workspaces: &Workspaces) -> lsp::WorkspaceDiagnosticRepo
     let mut reports = Vec::new();
 
     for (root, workspace) in workspaces.iter() {
-        let all = validation::collect_all(workspace);
+        let all = collect_all_diagnostics(workspace);
         let mut by_file: BTreeMap<PathBuf, Vec<lsp::Diagnostic>> = BTreeMap::new();
 
         for diag in &all {
@@ -2150,7 +2187,7 @@ fn handle_notification(
 /// Publish diagnostics for all files across all workspaces.
 fn publish_all_diagnostics(connection: &Connection, workspaces: &Workspaces) -> Result<()> {
     for (root, workspace) in workspaces.iter() {
-        let all_diagnostics = validation::collect_all(workspace);
+        let all_diagnostics = collect_all_diagnostics(workspace);
 
         let mut by_file: BTreeMap<PathBuf, Vec<lsp::Diagnostic>> = BTreeMap::new();
 
@@ -2190,6 +2227,7 @@ fn to_lsp_diagnostic(diag: &Diagnostic) -> lsp::Diagnostic {
         Severity::Error => lsp::diagnostic_severity::ERROR,
         Severity::Warning => lsp::diagnostic_severity::WARNING,
         Severity::Info => lsp::diagnostic_severity::INFORMATION,
+        Severity::Hint => lsp::diagnostic_severity::HINT,
     };
 
     let line = diag.line.saturating_sub(1) as u32;

@@ -11,7 +11,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use crate::block::{self, HeadingId, LinkKind};
-use crate::config::{BarePathPolicy, Config, FragmentAlgorithm, PredicatePolicy};
+use crate::config::{Config, FragmentAlgorithm, PredicatePolicy};
 use crate::workspace::Workspace;
 
 /// Diagnostic severity level.
@@ -23,6 +23,8 @@ pub enum Severity {
     Warning,
     /// Informational note.
     Info,
+    /// Suggestion — lowest severity.
+    Hint,
 }
 
 /// A diagnostic produced by validation.
@@ -390,36 +392,6 @@ fn check_fragment(
     }
 }
 
-/// Validate bare file paths in prose text across the workspace.
-///
-/// Detects text that looks like a file path but is not inside a markdown link,
-/// fenced code block, or inline code. Returns an empty list when the bare path
-/// policy is `disabled`.
-pub fn validate_bare_paths(workspace: &Workspace) -> Vec<Diagnostic> {
-    let severity = match workspace.config().policy.bare_paths {
-        BarePathPolicy::Disabled => return Vec::new(),
-        BarePathPolicy::Warn => Severity::Warning,
-        BarePathPolicy::Deny => Severity::Error,
-    };
-
-    let mut diagnostics = Vec::new();
-
-    for (file_path, file_data) in workspace.files() {
-        let bare_paths = file_data.tree.bare_paths();
-        for bare in &bare_paths {
-            diagnostics.push(Diagnostic {
-                file: file_path.clone(),
-                line: bare.line,
-                severity,
-                message: format!("bare path `{}`: convert to a markdown link", bare.path),
-            });
-        }
-    }
-
-    diagnostics.sort_by(|a, b| a.file.cmp(&b.file).then(a.line.cmp(&b.line)));
-    diagnostics
-}
-
 /// Collect all diagnostics for the workspace.
 ///
 /// Runs every validation check (forward links, backlinks, bare paths),
@@ -434,7 +406,8 @@ pub fn collect_all(workspace: &Workspace) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
     diagnostics.extend(validate_forward_links(workspace));
     diagnostics.extend(validate_backlinks(workspace));
-    diagnostics.extend(validate_bare_paths(workspace));
+    // Note: bare paths are emitted by the structural diagnostics layer
+    // unconditionally — not duplicated here.
 
     for (path, file_data) in workspace.files() {
         for bd in &file_data.backlink_diagnostics {
@@ -445,15 +418,8 @@ pub fn collect_all(workspace: &Workspace) -> Vec<Diagnostic> {
                 message: format!("unknown inverse predicate `{}`", bd.predicate),
             });
         }
-
-        for pd in &file_data.parse_diagnostics {
-            diagnostics.push(Diagnostic {
-                file: path.clone(),
-                line: pd.line,
-                severity: Severity::Error,
-                message: format!("frontmatter error: {}", pd.message),
-            });
-        }
+        // Note: parse_diagnostics (frontmatter errors) are emitted by the
+        // structural diagnostics layer unconditionally — not duplicated here.
     }
 
     diagnostics.sort_by(|a, b| a.file.cmp(&b.file).then(a.line.cmp(&b.line)));
@@ -1169,134 +1135,6 @@ fragments = \"gitlab\"
     }
 
     // --- Bare path validation ---
-
-    #[test]
-    fn bare_path_in_prose_warns() {
-        let (_dir, ws) = setup_workspace(&[("index.md", "See decisions/26.md for context.\n")]);
-
-        let diags = validate_bare_paths(&ws);
-        let warnings: Vec<_> = diags
-            .iter()
-            .filter(|d| d.severity == Severity::Warning)
-            .collect();
-
-        assert_eq!(warnings.len(), 1, "one warning for bare path");
-        assert!(
-            warnings[0].message.contains("decisions/26.md"),
-            "message includes the bare path: {}",
-            warnings[0].message
-        );
-        assert!(
-            warnings[0].message.contains("convert to a markdown link"),
-            "message suggests conversion: {}",
-            warnings[0].message
-        );
-    }
-
-    #[test]
-    fn bare_path_in_backticks_skipped() {
-        let (_dir, ws) = setup_workspace(&[("index.md", "See `decisions/26.md` for context.\n")]);
-
-        let diags = validate_bare_paths(&ws);
-        assert!(
-            diags.is_empty(),
-            "no diagnostics for path in inline code: {diags:?}"
-        );
-    }
-
-    #[test]
-    fn bare_path_in_fenced_code_block_skipped() {
-        let (_dir, ws) =
-            setup_workspace(&[("index.md", "# Example\n\n```\ndecisions/26.md\n```\n")]);
-
-        let diags = validate_bare_paths(&ws);
-        assert!(
-            diags.is_empty(),
-            "no diagnostics for path in fenced code block: {diags:?}"
-        );
-    }
-
-    #[test]
-    fn bare_path_inside_link_skipped() {
-        let (_dir, ws) = setup_workspace(&[
-            (
-                "index.md",
-                r#"[decisions/26.md](decisions/26.md "references")"#,
-            ),
-            ("decisions/26.md", "# Decision\n"),
-        ]);
-
-        let diags = validate_bare_paths(&ws);
-        assert!(
-            diags.is_empty(),
-            "no diagnostics for path inside a link: {diags:?}"
-        );
-    }
-
-    #[test]
-    fn bare_path_deny_policy_produces_error() {
-        let config_toml = "\
-[policy]
-bare_paths = \"deny\"
-";
-        let (_dir, ws) = setup_workspace(&[
-            (".lattice.toml", config_toml),
-            ("index.md", "See decisions/26.md for context.\n"),
-        ]);
-
-        let diags = validate_bare_paths(&ws);
-        let errors: Vec<_> = diags
-            .iter()
-            .filter(|d| d.severity == Severity::Error)
-            .collect();
-
-        assert_eq!(errors.len(), 1, "one error under deny policy");
-        assert!(
-            errors[0].message.contains("decisions/26.md"),
-            "message includes the bare path: {}",
-            errors[0].message
-        );
-    }
-
-    #[test]
-    fn bare_path_disabled_policy_suppresses() {
-        let config_toml = "\
-[policy]
-bare_paths = \"disabled\"
-";
-        let (_dir, ws) = setup_workspace(&[
-            (".lattice.toml", config_toml),
-            ("index.md", "See decisions/26.md for context.\n"),
-        ]);
-
-        let diags = validate_bare_paths(&ws);
-        assert!(
-            diags.is_empty(),
-            "no diagnostics when bare paths disabled: {diags:?}"
-        );
-    }
-
-    #[test]
-    fn bare_filename_without_slash_skipped() {
-        let (_dir, ws) = setup_workspace(&[("index.md", "See config.toml for settings.\n")]);
-
-        let diags = validate_bare_paths(&ws);
-        assert!(
-            diags.is_empty(),
-            "no diagnostics for bare filename without slash: {diags:?}"
-        );
-    }
-
-    #[test]
-    fn bare_path_with_various_extensions() {
-        let (_dir, ws) = setup_workspace(&[(
-            "index.md",
-            "See arch/diagram.png and docs/spec.pdf and images/logo.svg for details.\n",
-        )]);
-
-        let diags = validate_bare_paths(&ws);
-        assert_eq!(diags.len(), 3, "three bare paths detected: {diags:?}");
-    }
 
     // --- collect_all opt-in gate ---
 
