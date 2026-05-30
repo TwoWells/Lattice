@@ -335,7 +335,9 @@ fn element_symbol_kind(kind: &ElementKind) -> Option<u32> {
     match kind {
         ElementKind::Heading { .. } => Some(lsp::symbol_kind::STRING),
         ElementKind::Link { .. } | ElementKind::Import { .. } => Some(lsp::symbol_kind::FUNCTION),
-        ElementKind::Image { .. } => Some(lsp::symbol_kind::FILE),
+        ElementKind::Image { .. } | ElementKind::Video { .. } | ElementKind::Audio { .. } => {
+            Some(lsp::symbol_kind::FILE)
+        }
         ElementKind::List { ordered: true, .. } => Some(lsp::symbol_kind::ARRAY),
         ElementKind::List { ordered: false, .. } => Some(lsp::symbol_kind::ENUM),
         ElementKind::ListItem { task: Some(_), .. } => Some(lsp::symbol_kind::BOOLEAN),
@@ -344,10 +346,13 @@ fn element_symbol_kind(kind: &ElementKind) -> Option<u32> {
         ElementKind::TableRow { .. } => Some(lsp::symbol_kind::KEY),
         ElementKind::TableCell => Some(lsp::symbol_kind::FIELD),
         ElementKind::CodeBlock | ElementKind::Math => Some(lsp::symbol_kind::OBJECT),
-        ElementKind::QuoteBlock | ElementKind::Details => Some(lsp::symbol_kind::MODULE),
+        ElementKind::QuoteBlock | ElementKind::Admonition { .. } | ElementKind::Details => {
+            Some(lsp::symbol_kind::MODULE)
+        }
         ElementKind::Rules => Some(lsp::symbol_kind::OPERATOR),
         ElementKind::FootnoteDef { .. } => Some(lsp::symbol_kind::CONSTANT),
         ElementKind::Container => Some(lsp::symbol_kind::NAMESPACE),
+        ElementKind::FormControl => Some(lsp::symbol_kind::EVENT),
         // Not emitted: paragraphs, inline code, inline math, footnote refs,
         // document root, frontmatter, HTML blocks, details summary, ref defs.
         ElementKind::Document
@@ -365,7 +370,10 @@ fn element_symbol_kind(kind: &ElementKind) -> Option<u32> {
 /// Whether an element is a scope boundary (headings inside it do not
 /// participate in the document's heading hierarchy).
 fn is_scope_boundary(kind: &ElementKind) -> bool {
-    matches!(kind, ElementKind::QuoteBlock | ElementKind::Details)
+    matches!(
+        kind,
+        ElementKind::QuoteBlock | ElementKind::Admonition { .. } | ElementKind::Details
+    )
 }
 
 /// Generate the symbol name and optional detail for a tree node.
@@ -381,6 +389,14 @@ fn symbol_name(tree: &Tree, node_id: NodeId) -> (String, Option<String>) {
         }
         ElementKind::Link { .. } | ElementKind::Import { .. } => link_symbol_name(&node.kind, raw),
         ElementKind::Image { url, .. } => image_symbol_name(url, raw),
+        ElementKind::Video { url, .. } => {
+            let name = if url.is_empty() { "video" } else { url };
+            (truncate_name(name), Some("video".to_string()))
+        }
+        ElementKind::Audio { url, .. } => {
+            let name = if url.is_empty() { "audio" } else { url };
+            (truncate_name(name), Some("audio".to_string()))
+        }
         ElementKind::CodeBlock | ElementKind::Math => {
             let name = code_block_language(raw)
                 .map_or_else(|| "code".to_string(), |l| format!("code: {l}"));
@@ -415,6 +431,7 @@ fn symbol_name(tree: &Tree, node_id: NodeId) -> (String, Option<String>) {
             };
             (name, None)
         }
+        ElementKind::Admonition { kind } => (kind.clone(), Some("admonition".to_string())),
         ElementKind::Details => {
             let text = details_summary_text(tree, node_id);
             let name = if text.is_empty() {
@@ -426,7 +443,7 @@ fn symbol_name(tree: &Tree, node_id: NodeId) -> (String, Option<String>) {
         }
         ElementKind::FootnoteDef { label } => (format!("[^{label}]"), None),
         ElementKind::Rules => ("---".to_string(), None),
-        ElementKind::Container => (container_tag_name(raw), None),
+        ElementKind::Container | ElementKind::FormControl => (container_tag_name(raw), None),
         _ => (String::new(), None),
     }
 }
@@ -588,19 +605,10 @@ fn table_row_text(tree: &Tree, row_id: NodeId) -> String {
     cells.join(" | ")
 }
 
-/// Extract the first line of a blockquote, preserving the `>` marker.
+/// Extract the first line of a blockquote for use as a symbol name.
 fn blockquote_first_line(raw: &str) -> String {
     let first = raw.lines().next().unwrap_or("");
     let trimmed = first.trim();
-    // Check for GFM admonition: > [!TYPE]
-    if let Some(admonition) = trimmed
-        .strip_prefix('>')
-        .map(str::trim)
-        .and_then(|inner| inner.strip_prefix("[!"))
-        .and_then(|r| r.find(']').map(|e| &r[..e]))
-    {
-        return admonition.to_string();
-    }
     truncate_name(trimmed)
 }
 
@@ -781,6 +789,8 @@ fn build_symbol_tree(
                     | ElementKind::Math
                     | ElementKind::Link { .. }
                     | ElementKind::Image { .. }
+                    | ElementKind::Video { .. }
+                    | ElementKind::Audio { .. }
                     | ElementKind::Import { .. }
             )
         {
@@ -872,7 +882,11 @@ fn collect_floated_links(tree: &Tree, para_id: NodeId) -> Vec<lsp::DocumentSymbo
         if element_symbol_kind(&child.kind).is_some()
             && matches!(
                 child.kind,
-                ElementKind::Link { .. } | ElementKind::Image { .. } | ElementKind::Import { .. }
+                ElementKind::Link { .. }
+                    | ElementKind::Image { .. }
+                    | ElementKind::Video { .. }
+                    | ElementKind::Audio { .. }
+                    | ElementKind::Import { .. }
             )
         {
             let kind = element_symbol_kind(&child.kind).unwrap_or(lsp::symbol_kind::FUNCTION);
@@ -3423,6 +3437,64 @@ mod tests {
         let syms = symbols_for("> quoted text\n");
         let quotes = find_symbols(&syms, &|s| s.kind == lsp::symbol_kind::MODULE);
         assert_eq!(quotes.len(), 1, "should have one blockquote");
+    }
+
+    #[test]
+    fn admonition_emits_module_with_type_name() {
+        let syms = symbols_for("> [!WARNING]\n> Be careful!\n");
+        let modules = find_symbols(&syms, &|s| s.kind == lsp::symbol_kind::MODULE);
+        assert_eq!(modules.len(), 1, "should have one admonition");
+        assert_eq!(
+            modules[0].name, "WARNING",
+            "admonition name should be the type"
+        );
+        assert_eq!(
+            modules[0].detail.as_deref(),
+            Some("admonition"),
+            "detail should be 'admonition'"
+        );
+    }
+
+    #[test]
+    fn html_div_warning_emits_admonition_module() {
+        let syms = symbols_for("<div class=\"warning\">\n\nBe careful!\n\n</div>\n");
+        let modules = find_symbols(&syms, &|s| s.kind == lsp::symbol_kind::MODULE);
+        assert_eq!(modules.len(), 1, "should have one admonition");
+        assert_eq!(
+            modules[0].name, "WARNING",
+            "HTML admonition name should be the type"
+        );
+    }
+
+    #[test]
+    fn html_video_emits_file() {
+        let syms = symbols_for("<video src=\"vid.mp4\"></video>\n");
+        let files = find_symbols(&syms, &|s| s.kind == lsp::symbol_kind::FILE);
+        assert_eq!(files.len(), 1, "video should emit one File symbol");
+        assert_eq!(
+            files[0].detail.as_deref(),
+            Some("video"),
+            "detail should be 'video'"
+        );
+    }
+
+    #[test]
+    fn markdown_video_emits_file() {
+        let syms = symbols_for("![demo](demo.mp4)\n");
+        let files = find_symbols(&syms, &|s| s.kind == lsp::symbol_kind::FILE);
+        assert_eq!(files.len(), 1, "video image should emit one File symbol");
+        assert_eq!(
+            files[0].detail.as_deref(),
+            Some("video"),
+            "detail should be 'video'"
+        );
+    }
+
+    #[test]
+    fn html_form_control_emits_event() {
+        let syms = symbols_for("<input type=\"text\">\n");
+        let events = find_symbols(&syms, &|s| s.kind == lsp::symbol_kind::EVENT);
+        assert_eq!(events.len(), 1, "input should emit one Event symbol");
     }
 
     #[test]

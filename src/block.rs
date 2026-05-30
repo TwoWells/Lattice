@@ -48,6 +48,11 @@ pub enum ElementKind {
     Math,
     /// Block quote container (`>`).
     QuoteBlock,
+    /// GFM admonition (`> [!TYPE]`) or styled container (`<div class="warning">`).
+    Admonition {
+        /// Admonition type (e.g. `NOTE`, `WARNING`, `TIP`).
+        kind: String,
+    },
     /// HTML block (opaque at this stage).
     HtmlBlock,
     /// Link reference definition (`[label]: url "title"`).
@@ -71,11 +76,25 @@ pub enum ElementKind {
         /// Link title / predicate (empty if none).
         title: String,
     },
-    /// Inline or reference-style image.
+    /// Inline or reference-style image (or `<img>` / `<iframe>`).
     Image {
         /// Image source URL.
         url: String,
         /// Image title (empty if none).
+        title: String,
+    },
+    /// Video embed (`<video>` or `![](*.mp4)`).
+    Video {
+        /// Video source URL.
+        url: String,
+        /// Video title (empty if none).
+        title: String,
+    },
+    /// Audio embed (`<audio>` or `![](*.mp3)`).
+    Audio {
+        /// Audio source URL.
+        url: String,
+        /// Audio title (empty if none).
         title: String,
     },
     /// Footnote reference call site (`[^label]`).
@@ -125,6 +144,8 @@ pub enum ElementKind {
     Details,
     /// `<summary>` inside a `<details>`.
     DetailsSummary,
+    /// HTML form control (`<input>`, `<select>`, `<textarea>`).
+    FormControl,
 }
 
 /// Column alignment for a GFM pipe table.
@@ -274,13 +295,17 @@ impl Tree {
         })
     }
 
-    /// Find a `Link` or `Image` node whose span contains the given byte offset.
+    /// Find a `Link`, `Image`, `Video`, or `Audio` node whose span contains
+    /// the given byte offset.
     #[must_use]
     pub fn find_link_at_offset(&self, offset: usize) -> Option<(NodeId, &Node)> {
         self.nodes.iter().enumerate().find(|(_, node)| {
             matches!(
                 node.kind,
-                ElementKind::Link { .. } | ElementKind::Image { .. }
+                ElementKind::Link { .. }
+                    | ElementKind::Image { .. }
+                    | ElementKind::Video { .. }
+                    | ElementKind::Audio { .. }
             ) && node.span.start <= offset
                 && offset < node.span.end
         })
@@ -1430,6 +1455,27 @@ fn is_table_row(line: &str) -> bool {
 // Block quote helpers
 // ---------------------------------------------------------------------------
 
+/// Detect a GFM admonition marker in blockquote content.
+///
+/// Returns the admonition type (e.g. `NOTE`, `WARNING`) if the content
+/// starts with `[!TYPE]`, or `None` otherwise.
+fn detect_admonition(content: &str) -> Option<String> {
+    let trimmed = content.trim();
+    let after = trimmed.strip_prefix("[!")?;
+    let end = after.find(']')?;
+    let kind = &after[..end];
+    if kind.is_empty() || !kind.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+    }
+    // Must be the only content on the line (possibly followed by whitespace).
+    let rest = after[end + 1..].trim();
+    if rest.is_empty() {
+        Some(kind.to_uppercase())
+    } else {
+        None
+    }
+}
+
 /// Strip the leading `> ` or `>` from a block quote line.
 ///
 /// Returns `Some((stripped_bytes, content))` where `stripped_bytes` is how
@@ -1811,9 +1857,16 @@ impl<'a> TreeBuilder<'a> {
                     return true;
                 }
 
-                let Some(kind) = html::tag_to_element_kind(name) else {
+                let Some(mut kind) = html::tag_to_element_kind(name) else {
                     return false;
                 };
+
+                // Promote Container to Admonition if class matches.
+                if matches!(kind, ElementKind::Container)
+                    && let Some(adm) = html::extract_admonition_class(attrs)
+                {
+                    kind = ElementKind::Admonition { kind: adm };
+                }
 
                 // Void elements and self-closing: always leaf.
                 if self_closing || html::VOID_ELEMENTS.contains(name.as_str()) {
@@ -1830,13 +1883,27 @@ impl<'a> TreeBuilder<'a> {
                     return true;
                 }
 
-                // Non-container leaf elements: <p>, <h1>-<h6>.
+                // Non-container leaf elements: <p>, <h1>-<h6>, media.
                 if !html::is_html_container(name) {
                     *pos += first_raw_len;
                     *line_idx += 1;
                     self.consume_html_leaf(lines, pos, line_idx, name);
                     let full_span = Span::new(content_start, body_offset + *pos);
-                    self.add_leaf(kind, Syntax::Html, full_span);
+                    let leaf_kind = match kind {
+                        ElementKind::Image { .. }
+                        | ElementKind::Video { .. }
+                        | ElementKind::Audio { .. } => {
+                            let (url, title) = html::extract_image_attrs(attrs);
+                            // Preserve the variant from tag_to_element_kind.
+                            match &kind {
+                                ElementKind::Video { .. } => ElementKind::Video { url, title },
+                                ElementKind::Audio { .. } => ElementKind::Audio { url, title },
+                                _ => ElementKind::Image { url, title },
+                            }
+                        }
+                        _ => kind,
+                    };
+                    self.add_leaf(leaf_kind, Syntax::Html, full_span);
                     return true;
                 }
 
@@ -2040,7 +2107,16 @@ impl<'a> TreeBuilder<'a> {
             }
 
             // Handle block quote continuation and new block quote opening.
-            let (content, content_start) = self.handle_quote_markers(raw_line, raw_start);
+            let (content, content_start, new_quotes) =
+                self.handle_quote_markers(raw_line, raw_start);
+
+            // Detect GFM admonition on the first line of a new blockquote.
+            if new_quotes > 0
+                && let Some(kind) = detect_admonition(content)
+            {
+                let scope_id = self.current_scope();
+                self.nodes[scope_id].kind = ElementKind::Admonition { kind };
+            }
 
             // Blank content after marker stripping (e.g. `> \n`).
             if content.trim().is_empty() {
@@ -2138,6 +2214,24 @@ impl<'a> TreeBuilder<'a> {
                         raw_len,
                         content,
                     );
+                } else if html_type == 1
+                    && content.trim_start().to_lowercase().starts_with("<textarea")
+                {
+                    self.parse_html_block(
+                        &lines,
+                        &mut pos,
+                        &mut line_idx,
+                        body_offset,
+                        content_start,
+                        raw_len,
+                        content,
+                        html_type,
+                    );
+                    // Upgrade the HtmlBlock that parse_html_block just added.
+                    if let Some(&last_id) = self.nodes[self.current_scope()].children.last() {
+                        self.nodes[last_id].kind = ElementKind::FormControl;
+                        self.nodes[last_id].syntax = Syntax::Html;
+                    }
                 } else {
                     self.parse_html_block(
                         &lines,
@@ -2276,8 +2370,14 @@ impl<'a> TreeBuilder<'a> {
     /// 2. Closes scopes for any unmatched levels.
     /// 3. Opens new `QuoteBlock` scopes for additional `>` markers.
     ///
-    /// Returns `(content, content_start)` after all markers are stripped.
-    fn handle_quote_markers<'b>(&mut self, line: &'b str, line_start: usize) -> (&'b str, usize) {
+    /// Returns `(content, content_start, new_quotes)` after all markers
+    /// are stripped, where `new_quotes` is the number of newly opened
+    /// block quote scopes.
+    fn handle_quote_markers<'b>(
+        &mut self,
+        line: &'b str,
+        line_start: usize,
+    ) -> (&'b str, usize, usize) {
         // Step 1: Strip continuation markers for existing depth.
         let (matched, after_cont) = strip_n_quote_markers(line, self.quote_depth);
         for _ in matched..self.quote_depth {
@@ -2290,6 +2390,7 @@ impl<'a> TreeBuilder<'a> {
         let mut content_start = line_start + marker_bytes;
 
         // Step 2: Open new block quote scopes for additional `>` markers.
+        let mut new_quotes = 0;
         while let Some((ml, inner)) = strip_blockquote_marker(content) {
             self.push_scope(
                 ElementKind::QuoteBlock,
@@ -2297,11 +2398,12 @@ impl<'a> TreeBuilder<'a> {
                 Span::new(content_start, content_start),
             );
             self.quote_depth += 1;
+            new_quotes += 1;
             content_start += ml;
             content = inner;
         }
 
-        (content, content_start)
+        (content, content_start, new_quotes)
     }
 
     /// Strip continuation markers from a line inside a multi-line block.
@@ -3107,6 +3209,32 @@ fn split_url_fragment(url: &str) -> (&str, Option<String>) {
 /// Check whether a path has a `.md` extension.
 fn is_markdown_ext(path: &Path) -> bool {
     path.extension().is_some_and(|ext| ext == "md")
+}
+
+/// Video file extensions.
+static VIDEO_EXTENSIONS: phf::Set<&str> = phf::phf_set! {
+    "mp4", "webm", "ogv", "mov", "avi", "mkv",
+};
+
+/// Audio file extensions.
+static AUDIO_EXTENSIONS: phf::Set<&str> = phf::phf_set! {
+    "mp3", "wav", "ogg", "flac", "aac", "m4a", "opus",
+};
+
+/// Classify an image URL into `Image`, `Video`, or `Audio` based on
+/// file extension. Falls back to `Image` for unknown extensions.
+pub fn classify_media(url: String, title: String) -> ElementKind {
+    let path = url.split(['?', '#']).next().unwrap_or(&url);
+    if let Some(ext) = path.rsplit('.').next() {
+        let ext_lower = ext.to_lowercase();
+        if VIDEO_EXTENSIONS.contains(ext_lower.as_str()) {
+            return ElementKind::Video { url, title };
+        }
+        if AUDIO_EXTENSIONS.contains(ext_lower.as_str()) {
+            return ElementKind::Audio { url, title };
+        }
+    }
+    ElementKind::Image { url, title }
 }
 
 /// Classify a raw link URL and title into a [`Link`].
@@ -4120,6 +4248,81 @@ mod tests {
         let quote_children = tree.children(children[0]);
         assert_eq!(quote_children.len(), 1, "block quote has one child");
         assert_kind(&tree, quote_children[0], &ElementKind::Rules);
+    }
+
+    // --- Admonitions ---
+
+    #[test]
+    fn gfm_admonition_warning() {
+        let source = "> [!WARNING]\n> Be careful!\n";
+        let tree = parse(source);
+        let children = root_children(&tree);
+
+        assert_eq!(children.len(), 1, "should find one block");
+        assert_kind(
+            &tree,
+            children[0],
+            &ElementKind::Admonition {
+                kind: "WARNING".to_string(),
+            },
+        );
+    }
+
+    #[test]
+    fn gfm_admonition_note() {
+        let source = "> [!NOTE]\n> Some note text\n";
+        let tree = parse(source);
+        let children = root_children(&tree);
+
+        assert_eq!(children.len(), 1, "should find one block");
+        assert_kind(
+            &tree,
+            children[0],
+            &ElementKind::Admonition {
+                kind: "NOTE".to_string(),
+            },
+        );
+    }
+
+    #[test]
+    fn gfm_admonition_case_insensitive() {
+        let source = "> [!tip]\n> Some tip\n";
+        let tree = parse(source);
+        let children = root_children(&tree);
+
+        assert_eq!(children.len(), 1, "should find one block");
+        assert_kind(
+            &tree,
+            children[0],
+            &ElementKind::Admonition {
+                kind: "TIP".to_string(),
+            },
+        );
+    }
+
+    #[test]
+    fn plain_blockquote_not_admonition() {
+        let source = "> Just a quote\n";
+        let tree = parse(source);
+        let children = root_children(&tree);
+
+        assert_eq!(children.len(), 1, "should find one block");
+        assert_kind(&tree, children[0], &ElementKind::QuoteBlock);
+    }
+
+    #[test]
+    fn admonition_has_paragraph_children() {
+        let source = "> [!WARNING]\n> Be careful!\n";
+        let tree = parse(source);
+        let children = root_children(&tree);
+        let adm_children = tree.children(children[0]);
+
+        assert!(
+            adm_children
+                .iter()
+                .any(|&c| matches!(tree.node(c).kind, ElementKind::Paragraph)),
+            "admonition should contain paragraph children"
+        );
     }
 
     // --- HTML blocks ---
@@ -5880,6 +6083,146 @@ mod tests {
         let children = root_children(&tree);
         assert_eq!(children.len(), 1, "one container");
         assert_kind(&tree, children[0], &ElementKind::Container);
+    }
+
+    // --- HTML admonition containers ---
+
+    #[test]
+    fn html_div_warning_is_admonition() {
+        let tree = parse("<div class=\"warning\">\n\nBe careful!\n\n</div>\n");
+        let children = root_children(&tree);
+        assert_eq!(children.len(), 1, "one admonition container");
+        assert_kind(
+            &tree,
+            children[0],
+            &ElementKind::Admonition {
+                kind: "WARNING".to_string(),
+            },
+        );
+    }
+
+    #[test]
+    fn html_div_note_is_admonition() {
+        let tree = parse("<div class=\"note\">\n\nNote text.\n\n</div>\n");
+        let children = root_children(&tree);
+        assert_eq!(children.len(), 1, "one admonition container");
+        assert_kind(
+            &tree,
+            children[0],
+            &ElementKind::Admonition {
+                kind: "NOTE".to_string(),
+            },
+        );
+    }
+
+    #[test]
+    fn html_div_plain_is_container() {
+        let tree = parse("<div>\n\ncontent\n\n</div>\n");
+        let children = root_children(&tree);
+        assert_eq!(children.len(), 1, "one container");
+        assert_kind(&tree, children[0], &ElementKind::Container);
+    }
+
+    // --- Media elements ---
+
+    #[test]
+    fn html_video_produces_video() {
+        let tree = parse("<video src=\"vid.mp4\"></video>\n");
+        let children = root_children(&tree);
+        assert_eq!(children.len(), 1, "one media element");
+        let kind = &tree.node(children[0]).kind;
+        assert!(
+            matches!(kind, ElementKind::Video { url, .. } if url == "vid.mp4"),
+            "video should produce Video with src extracted"
+        );
+    }
+
+    #[test]
+    fn html_audio_produces_audio() {
+        let tree = parse("<audio src=\"song.mp3\"></audio>\n");
+        let children = root_children(&tree);
+        assert_eq!(children.len(), 1, "one media element");
+        let kind = &tree.node(children[0]).kind;
+        assert!(
+            matches!(kind, ElementKind::Audio { url, .. } if url == "song.mp3"),
+            "audio should produce Audio with src extracted"
+        );
+    }
+
+    #[test]
+    fn html_iframe_produces_image() {
+        let tree = parse("<iframe src=\"page.html\"></iframe>\n");
+        let children = root_children(&tree);
+        assert_eq!(children.len(), 1, "one media element");
+        let kind = &tree.node(children[0]).kind;
+        assert!(
+            matches!(kind, ElementKind::Image { url, .. } if url == "page.html"),
+            "iframe should produce Image with src extracted"
+        );
+    }
+
+    #[test]
+    fn markdown_image_mp4_produces_video() {
+        let tree = parse("![demo](demo.mp4)\n");
+        let children = root_children(&tree);
+        assert_eq!(children.len(), 1, "one paragraph");
+        let para_children = tree.children(children[0]);
+        let kind = &tree.node(para_children[0]).kind;
+        assert!(
+            matches!(kind, ElementKind::Video { url, .. } if url == "demo.mp4"),
+            "![](*.mp4) should produce Video"
+        );
+    }
+
+    #[test]
+    fn markdown_image_mp3_produces_audio() {
+        let tree = parse("![song](track.mp3)\n");
+        let children = root_children(&tree);
+        assert_eq!(children.len(), 1, "one paragraph");
+        let para_children = tree.children(children[0]);
+        let kind = &tree.node(para_children[0]).kind;
+        assert!(
+            matches!(kind, ElementKind::Audio { url, .. } if url == "track.mp3"),
+            "![](*.mp3) should produce Audio"
+        );
+    }
+
+    #[test]
+    fn markdown_image_png_stays_image() {
+        let tree = parse("![photo](pic.png)\n");
+        let children = root_children(&tree);
+        let para_children = tree.children(children[0]);
+        let kind = &tree.node(para_children[0]).kind;
+        assert!(
+            matches!(kind, ElementKind::Image { url, .. } if url == "pic.png"),
+            "![](*.png) should stay Image"
+        );
+    }
+
+    // --- Form elements ---
+
+    #[test]
+    fn html_input_produces_form_control() {
+        let tree = parse("<input type=\"text\">\n");
+        let children = root_children(&tree);
+        assert_eq!(children.len(), 1, "one form element");
+        assert_kind(&tree, children[0], &ElementKind::FormControl);
+    }
+
+    #[test]
+    fn html_select_produces_form_control() {
+        let tree = parse("<select>\n<option>A</option>\n</select>\n");
+        let children = root_children(&tree);
+        assert_eq!(children.len(), 1, "one form element");
+        assert_kind(&tree, children[0], &ElementKind::FormControl);
+    }
+
+    #[test]
+    fn html_textarea_produces_form_control() {
+        let tree = parse("<textarea>content</textarea>\n");
+        let children = root_children(&tree);
+        assert_eq!(children.len(), 1, "one form element");
+        assert_kind(&tree, children[0], &ElementKind::FormControl);
     }
 
     // --- Table structure (main's table tests) ---

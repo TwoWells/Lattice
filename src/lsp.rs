@@ -448,8 +448,7 @@ pub mod symbol_kind {
     pub const ENUM_MEMBER: u32 = 22;
     /// Struct (tables).
     pub const STRUCT: u32 = 23;
-    /// Event (form elements — currently not emitted).
-    #[allow(dead_code, reason = "reserved for HTML form element symbols")]
+    /// Event (form elements: `<input>`, `<select>`, `<textarea>`).
     pub const EVENT: u32 = 24;
     /// Operator (thematic breaks).
     pub const OPERATOR: u32 = 25;

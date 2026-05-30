@@ -402,10 +402,19 @@ pub fn tag_to_element_kind(name: &str) -> Option<ElementKind> {
         }),
         "tr" => Some(ElementKind::TableRow { header: false }),
         "th" | "td" => Some(ElementKind::TableCell),
-        "img" => Some(ElementKind::Image {
+        "img" | "iframe" => Some(ElementKind::Image {
             url: String::new(),
             title: String::new(),
         }),
+        "video" => Some(ElementKind::Video {
+            url: String::new(),
+            title: String::new(),
+        }),
+        "audio" => Some(ElementKind::Audio {
+            url: String::new(),
+            title: String::new(),
+        }),
+        "input" | "select" | "textarea" => Some(ElementKind::FormControl),
         "details" => Some(ElementKind::Details),
         "summary" => Some(ElementKind::DetailsSummary),
         "div" | "section" | "article" | "aside" | "nav" | "main" | "header" | "footer"
@@ -496,6 +505,30 @@ pub fn extract_image_attrs(attrs: &[Attribute]) -> (String, String) {
         }
     }
     (src, title)
+}
+
+/// Known admonition class names.
+static ADMONITION_CLASSES: phf::Set<&str> = phf::phf_set! {
+    "note", "tip", "warning", "caution", "important",
+};
+
+/// Extract an admonition type from a container element's `class` attribute.
+///
+/// Returns the uppercased admonition type if the class list contains a
+/// known admonition keyword (e.g. `"warning"` → `Some("WARNING")`).
+pub fn extract_admonition_class(attrs: &[Attribute]) -> Option<String> {
+    for attr in attrs {
+        if attr.name == "class"
+            && let Some(value) = &attr.value
+        {
+            for cls in value.split_whitespace() {
+                if ADMONITION_CLASSES.contains(cls) {
+                    return Some(cls.to_uppercase());
+                }
+            }
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -831,6 +864,106 @@ mod tests {
         assert!(!is_html_container("p"), "p is not container");
         assert!(!is_html_container("hr"), "hr is not container");
         assert!(!is_html_container("img"), "img is not container");
+    }
+
+    // --- Media/form element mapping ---
+
+    #[test]
+    fn video_maps_to_video() {
+        assert!(
+            matches!(
+                tag_to_element_kind("video"),
+                Some(ElementKind::Video { .. })
+            ),
+            "video → Video"
+        );
+    }
+
+    #[test]
+    fn audio_maps_to_audio() {
+        assert!(
+            matches!(
+                tag_to_element_kind("audio"),
+                Some(ElementKind::Audio { .. })
+            ),
+            "audio → Audio"
+        );
+    }
+
+    #[test]
+    fn iframe_maps_to_image() {
+        assert!(
+            matches!(
+                tag_to_element_kind("iframe"),
+                Some(ElementKind::Image { .. })
+            ),
+            "iframe → Image"
+        );
+    }
+
+    #[test]
+    fn input_maps_to_form_control() {
+        assert_eq!(
+            tag_to_element_kind("input"),
+            Some(ElementKind::FormControl),
+            "input → FormControl"
+        );
+    }
+
+    #[test]
+    fn select_maps_to_form_control() {
+        assert_eq!(
+            tag_to_element_kind("select"),
+            Some(ElementKind::FormControl),
+            "select → FormControl"
+        );
+    }
+
+    // --- Admonition class extraction ---
+
+    #[test]
+    fn extract_admonition_class_warning() {
+        let attrs = vec![Attribute {
+            name: "class".into(),
+            value: Some("warning".into()),
+            name_span: Span::new(0, 5),
+            value_span: Some(Span::new(7, 14)),
+        }];
+        assert_eq!(
+            extract_admonition_class(&attrs),
+            Some("WARNING".to_string()),
+            "warning class → WARNING"
+        );
+    }
+
+    #[test]
+    fn extract_admonition_class_mixed() {
+        let attrs = vec![Attribute {
+            name: "class".into(),
+            value: Some("custom note extra".into()),
+            name_span: Span::new(0, 5),
+            value_span: Some(Span::new(7, 24)),
+        }];
+        assert_eq!(
+            extract_admonition_class(&attrs),
+            Some("NOTE".to_string()),
+            "note in mixed classes → NOTE"
+        );
+    }
+
+    #[test]
+    fn extract_admonition_class_none() {
+        let attrs = vec![Attribute {
+            name: "class".into(),
+            value: Some("fancy-box".into()),
+            name_span: Span::new(0, 5),
+            value_span: Some(Span::new(7, 16)),
+        }];
+        assert_eq!(
+            extract_admonition_class(&attrs),
+            None,
+            "unknown class → None"
+        );
     }
 
     // --- Link/image attribute extraction ---

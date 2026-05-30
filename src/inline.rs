@@ -195,7 +195,7 @@ fn scan_inlines(
                 {
                     tree.add_child(
                         parent,
-                        ElementKind::Image { url, title },
+                        crate::block::classify_media(url, title),
                         Syntax::Markdown,
                         Span::new(base + i, base + end),
                     );

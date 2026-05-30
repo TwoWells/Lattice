@@ -746,9 +746,12 @@ fn emit_image_diagnostics(tree: &Tree, rel_path: &Path, out: &mut Vec<Diagnostic
     let source = tree.source();
 
     for node in tree.nodes() {
-        let ElementKind::Image { .. } = &node.kind else {
+        if !matches!(
+            &node.kind,
+            ElementKind::Image { .. } | ElementKind::Video { .. } | ElementKind::Audio { .. }
+        ) {
             continue;
-        };
+        }
 
         let raw = &source[node.span.start..node.span.end];
         if node.syntax == Syntax::Markdown
