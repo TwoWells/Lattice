@@ -212,7 +212,7 @@ impl Tree {
     #[allow(
         dead_code,
         clippy::unused_self,
-        reason = "public API for navigation ticket 08"
+        reason = "public API used by tests in other modules"
     )]
     pub fn root(&self) -> NodeId {
         0
@@ -247,9 +247,32 @@ impl Tree {
 
     /// Direct children of a node.
     #[must_use]
-    #[allow(dead_code, reason = "public API for navigation ticket 08")]
+    #[allow(dead_code, reason = "public API used by tests in other modules")]
     pub fn children(&self, id: NodeId) -> &[NodeId] {
         &self.nodes[id].children
+    }
+
+    /// Find the first `ReferenceDef` node matching a normalized label.
+    #[must_use]
+    pub fn find_ref_def(&self, label: &str) -> Option<(NodeId, &Node)> {
+        self.nodes.iter().enumerate().find(|(_, node)| {
+            matches!(
+                &node.kind,
+                ElementKind::ReferenceDef { label: l, .. } if l == label
+            )
+        })
+    }
+
+    /// Find a `Link` or `Image` node whose span contains the given byte offset.
+    #[must_use]
+    pub fn find_link_at_offset(&self, offset: usize) -> Option<(NodeId, &Node)> {
+        self.nodes.iter().enumerate().find(|(_, node)| {
+            matches!(
+                node.kind,
+                ElementKind::Link { .. } | ElementKind::Image { .. }
+            ) && node.span.start <= offset
+                && offset < node.span.end
+        })
     }
 
     /// Add a child node to an existing node (used by the inline parser).
@@ -287,6 +310,8 @@ impl Tree {
 pub struct Link {
     /// 1-based line number in the source.
     pub line: usize,
+    /// Byte span of the link in the source.
+    pub span: Span,
     /// Classification and resolved details.
     pub kind: LinkKind,
 }
@@ -335,6 +360,11 @@ pub struct Heading {
     pub text: String,
     /// Heading anchor ID.
     pub id: HeadingId,
+    /// Byte span of the heading text in the source (for rename support).
+    pub text_span: Span,
+    /// Which syntax produced this heading.
+    #[allow(dead_code, reason = "structural field for future syntax-aware rename")]
+    pub syntax: Syntax,
 }
 
 /// How a heading's anchor ID was determined.
@@ -3041,7 +3071,13 @@ fn is_markdown_ext(path: &Path) -> bool {
 }
 
 /// Classify a raw link URL and title into a [`Link`].
-fn classify_link(url: &str, title: &str, file_path: &Path, line: usize) -> Option<Link> {
+fn classify_link(
+    url: &str,
+    title: &str,
+    file_path: &Path,
+    line: usize,
+    span: Span,
+) -> Option<Link> {
     if url.is_empty() {
         return None;
     }
@@ -3077,11 +3113,11 @@ fn classify_link(url: &str, title: &str, file_path: &Path, line: usize) -> Optio
         }
     };
 
-    Some(Link { line, kind })
+    Some(Link { line, span, kind })
 }
 
 /// Classify an import directive path into a [`Link`].
-fn classify_import(path: &str, file_path: &Path, line: usize) -> Link {
+fn classify_import(path: &str, file_path: &Path, line: usize, span: Span) -> Link {
     let parent = file_path.parent().unwrap_or_else(|| Path::new(""));
     let target = normalize_path(&parent.join(path));
     let kind = if is_markdown_ext(&target) {
@@ -3094,7 +3130,7 @@ fn classify_import(path: &str, file_path: &Path, line: usize) -> Link {
     } else {
         LinkKind::NonMarkdown { target }
     };
-    Link { line, kind }
+    Link { line, span, kind }
 }
 
 // --- Slug algorithms ---
@@ -3282,7 +3318,7 @@ fn scan_bare_paths_in_text(text: &str, base_line: usize, out: &mut Vec<BarePath>
     clippy::naive_bytecount,
     reason = "not worth a dependency for line counting"
 )]
-fn byte_offset_to_line(content: &str, offset: usize) -> usize {
+pub fn byte_offset_to_line(content: &str, offset: usize) -> usize {
     let offset = offset.min(content.len());
     content.as_bytes()[..offset]
         .iter()
@@ -3348,6 +3384,16 @@ fn find_code_span_close(bytes: &[u8], start: usize, count: usize) -> Option<usiz
     None
 }
 
+/// Compute the byte span of the text content inside an HTML heading tag.
+///
+/// Given `<h1>text</h1>` and its `base` offset in the source, returns the
+/// span covering `text`.
+fn html_heading_text_span(raw: &str, base: usize) -> Span {
+    let start = raw.find('>').map_or(0, |i| i + 1);
+    let end = raw.rfind("</").unwrap_or(raw.len());
+    Span::new(base + start, base + end)
+}
+
 /// Extract display text from an HTML heading like `<h1>text</h1>`.
 fn extract_html_heading_text(source: &str) -> String {
     // Strip the opening tag
@@ -3383,13 +3429,13 @@ impl Tree {
             match &node.kind {
                 ElementKind::Link { url, title } => {
                     let line = byte_offset_to_line(&self.source, node.span.start);
-                    if let Some(link) = classify_link(url, title, file_path, line) {
+                    if let Some(link) = classify_link(url, title, file_path, line, node.span) {
                         links.push(link);
                     }
                 }
                 ElementKind::Import { path } => {
                     let line = byte_offset_to_line(&self.source, node.span.start);
-                    links.push(classify_import(path, file_path, line));
+                    links.push(classify_import(path, file_path, line, node.span));
                 }
                 _ => {}
             }
@@ -3410,8 +3456,9 @@ impl Tree {
             };
 
             let line = byte_offset_to_line(&self.source, node.span.start);
-            let (text, explicit_id) = self.heading_content(id);
+            let (text, explicit_id, text_span) = self.heading_content(id);
             let level = *level;
+            let syntax = node.syntax;
 
             let heading_id = explicit_id.map_or_else(
                 || HeadingId::Computed {
@@ -3427,6 +3474,8 @@ impl Tree {
                 level,
                 text,
                 id: heading_id,
+                text_span,
+                syntax,
             });
         }
 
@@ -3448,15 +3497,16 @@ impl Tree {
         bare_paths
     }
 
-    /// Extract heading display text and optional explicit ID.
-    fn heading_content(&self, node_id: NodeId) -> (String, Option<String>) {
+    /// Extract heading display text, optional explicit ID, and text byte span.
+    fn heading_content(&self, node_id: NodeId) -> (String, Option<String>, Span) {
         let node = &self.nodes[node_id];
         let raw = &self.source[node.span.start..node.span.end];
 
         if node.syntax == Syntax::Html {
             let text = extract_html_heading_text(raw);
             let clean = strip_code_spans(&text);
-            return (clean, None);
+            let text_span = html_heading_text_span(raw, node.span.start);
+            return (clean, None, text_span);
         }
 
         // Check if ATX (starts with '#') or setext
@@ -3466,18 +3516,21 @@ impl Tree {
             let (content_span, atx_id) = extract_atx_content(first_line, node.span.start);
             let content = &self.source[content_span.start..content_span.end];
             let clean = strip_code_spans(content);
-            (clean.trim().to_string(), atx_id.map(|a| a.id))
+            (clean.trim().to_string(), atx_id.map(|a| a.id), content_span)
         } else {
-            // Setext: text is all lines except the last (underline)
+            // Setext: text is all lines except the last (underline).
+            // Find the underline line by trimming trailing whitespace and
+            // splitting at the last newline.
+            let trimmed_raw = raw.trim_end();
+            let underline_start = trimmed_raw.rfind('\n').map_or(0, |i| i + 1);
+            let text_raw = &trimmed_raw[..underline_start].trim_end_matches('\n');
+            let leading = raw.len() - raw.trim_start().len();
+            let text_end = leading + text_raw.trim_start().len();
+            let text_span = Span::new(node.span.start + leading, node.span.start + text_end);
             let lines: Vec<&str> = raw.lines().collect();
-            let text_lines = if lines.len() > 1 {
-                &lines[..lines.len() - 1]
-            } else {
-                &lines[..]
-            };
-            let joined = text_lines.join(" ");
+            let joined = lines[..lines.len().saturating_sub(1).max(1)].join(" ");
             let clean = strip_code_spans(&joined);
-            (clean.trim().to_string(), None)
+            (clean.trim().to_string(), None, text_span)
         }
     }
 

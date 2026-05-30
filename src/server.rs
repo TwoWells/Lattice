@@ -14,8 +14,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use lsp_server::{Connection, Message, Notification, Response};
 
-use crate::block::{Heading, HeadingId, LinkKind};
+use crate::block::{ElementKind, Heading, HeadingId, LinkKind, normalize_label};
 use crate::lsp;
+use crate::span::Span;
 use crate::validation::{self, Diagnostic, Severity};
 use crate::workspace::Workspace;
 
@@ -108,6 +109,10 @@ pub fn run() -> Result<()> {
         "workspaceSymbolProvider": true,
         "renameProvider": { "prepareProvider": true },
         "referencesProvider": true,
+        "declarationProvider": true,
+        "definitionProvider": true,
+        "typeDefinitionProvider": true,
+        "implementationProvider": true,
         "typeHierarchyProvider": true,
         "callHierarchyProvider": true,
         "documentLinkProvider": {},
@@ -180,6 +185,10 @@ fn main_loop(connection: &Connection, mut workspaces: Workspaces) -> Result<()> 
 }
 
 /// Dispatch a request.
+#[allow(
+    clippy::too_many_lines,
+    reason = "flat dispatch table, not complex logic"
+)]
 fn handle_request(
     connection: &Connection,
     workspaces: &Workspaces,
@@ -210,6 +219,26 @@ fn handle_request(
             let params: lsp::ReferenceParams = serde_json::from_value(req.params)?;
             let locations = find_references(workspaces, &params);
             Response::new_ok(req.id, locations)
+        }
+        lsp::method::DECLARATION => {
+            let params: lsp::TextDocumentPositionParams = serde_json::from_value(req.params)?;
+            let location = go_to_declaration(workspaces, &params);
+            Response::new_ok(req.id, location)
+        }
+        lsp::method::DEFINITION => {
+            let params: lsp::TextDocumentPositionParams = serde_json::from_value(req.params)?;
+            let location = go_to_definition(workspaces, &params);
+            Response::new_ok(req.id, location)
+        }
+        lsp::method::TYPE_DEFINITION => {
+            let params: lsp::TextDocumentPositionParams = serde_json::from_value(req.params)?;
+            let location = go_to_type_definition(workspaces, &params);
+            Response::new_ok(req.id, location)
+        }
+        lsp::method::IMPLEMENTATION => {
+            let params: lsp::TextDocumentPositionParams = serde_json::from_value(req.params)?;
+            let location = go_to_implementation(workspaces, &params);
+            Response::new_ok(req.id, location)
         }
         lsp::method::PREPARE_TYPE_HIERARCHY => {
             let params: lsp::TextDocumentPositionParams = serde_json::from_value(req.params)?;
@@ -397,10 +426,9 @@ fn workspace_symbols(workspaces: &Workspaces, query: &str) -> Vec<lsp::SymbolInf
 // ---------------------------------------------------------------------------
 
 /// Find the heading at a cursor position, returning its text range.
-#[allow(
-    clippy::cast_possible_truncation,
-    reason = "line numbers in markdown files won't exceed u32::MAX"
-)]
+///
+/// Uses the tree's `text_span` to compute the exact text range, supporting
+/// ATX, setext, and HTML headings without prefix assumptions.
 fn prepare_rename(
     workspaces: &Workspaces,
     params: &lsp::TextDocumentPositionParams,
@@ -410,47 +438,23 @@ fn prepare_rename(
     let headings = file_data.tree.headings();
     let heading = heading_at_line(&headings, params.position.line)?;
 
-    let line = heading.line.saturating_sub(1) as u32;
-    let text_len = heading.text.len() as u32;
-    // Heading text starts after "# " (level hashes + space).
-    let prefix_len = u32::from(heading.level) + 1;
-
-    Some(lsp::Range {
-        start: lsp::Position {
-            line,
-            character: prefix_len,
-        },
-        end: lsp::Position {
-            line,
-            character: prefix_len + text_len,
-        },
-    })
+    Some(span_to_lsp_range(
+        file_data.tree.source(),
+        &heading.text_span,
+    ))
 }
 
 /// Rename a heading's text.
-#[allow(
-    clippy::cast_possible_truncation,
-    reason = "line numbers in markdown files won't exceed u32::MAX"
-)]
+///
+/// Uses the tree's `text_span` for the edit range, supporting ATX, setext,
+/// and HTML headings.
 fn do_rename(workspaces: &Workspaces, params: &lsp::RenameParams) -> Option<lsp::WorkspaceEdit> {
     let (workspace, rel_path) = workspaces.resolve(&params.text_document.uri)?;
     let file_data = workspace.file(&rel_path)?;
     let headings = file_data.tree.headings();
     let heading = heading_at_line(&headings, params.position.line)?;
 
-    let line = heading.line.saturating_sub(1) as u32;
-    let text_len = heading.text.len() as u32;
-    let prefix_len = u32::from(heading.level) + 1;
-    let range = lsp::Range {
-        start: lsp::Position {
-            line,
-            character: prefix_len,
-        },
-        end: lsp::Position {
-            line,
-            character: prefix_len + text_len,
-        },
-    };
+    let range = span_to_lsp_range(file_data.tree.source(), &heading.text_span);
 
     let mut changes = std::collections::HashMap::new();
     changes.insert(
@@ -481,7 +485,8 @@ fn heading_at_line(headings: &[Heading], lsp_line: u32) -> Option<&Heading> {
 // Find references (ticket 05)
 // ---------------------------------------------------------------------------
 
-/// Find all documents that link to the file or heading at the cursor.
+/// Find all documents that link to the file or heading at the cursor,
+/// or all call sites of a reference definition.
 #[allow(
     clippy::cast_possible_truncation,
     reason = "line numbers in markdown files won't exceed u32::MAX"
@@ -490,19 +495,25 @@ fn find_references(workspaces: &Workspaces, params: &lsp::ReferenceParams) -> Ve
     let Some((workspace, rel_path)) = workspaces.resolve(&params.text_document.uri) else {
         return Vec::new();
     };
+    let Some(file_data) = workspace.file(&rel_path) else {
+        return Vec::new();
+    };
+
+    // Check if cursor is on a reference definition — find all call sites.
+    let offset = lsp_position_to_byte_offset(file_data.tree.source(), params.position);
+    if let Some(label) = ref_def_label_at_offset(&file_data.tree, offset) {
+        return find_ref_def_call_sites(workspaces, &params.text_document.uri, &label);
+    }
 
     // Determine if the cursor is on a heading (to filter by fragment).
-    let file_headings = workspace
-        .file(&rel_path)
-        .map(|fd| fd.tree.headings())
-        .unwrap_or_default();
+    let file_headings = file_data.tree.headings();
     let target_heading = heading_at_line(&file_headings, params.position.line);
 
     let mut locations = Vec::new();
 
     for (root, ws) in workspaces.iter() {
-        for (src_path, file_data) in ws.files() {
-            let links = file_data.tree.links(src_path);
+        for (src_path, src_data) in ws.files() {
+            let links = src_data.tree.links(src_path);
             for link in &links {
                 let LinkKind::IntraProject {
                     target, fragment, ..
@@ -538,6 +549,50 @@ fn find_references(workspaces: &Workspaces, params: &lsp::ReferenceParams) -> Ve
     locations
 }
 
+/// Find all reference-style link call sites that use a given label.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "line numbers in markdown files won't exceed u32::MAX"
+)]
+fn find_ref_def_call_sites(workspaces: &Workspaces, uri: &str, label: &str) -> Vec<lsp::Location> {
+    let Some((workspace, rel_path)) = workspaces.resolve(uri) else {
+        return Vec::new();
+    };
+    let Some(file_data) = workspace.file(&rel_path) else {
+        return Vec::new();
+    };
+    let root = workspace.root();
+    let source = file_data.tree.source();
+    let mut locations = Vec::new();
+
+    for node in file_data.tree.nodes() {
+        if !matches!(node.kind, ElementKind::Link { .. }) {
+            continue;
+        }
+        if let Some(ref_label) = link_ref_label(source, &node.span)
+            && ref_label == label
+        {
+            let line = crate::block::byte_offset_to_line(source, node.span.start);
+            let line_lsp = line.saturating_sub(1) as u32;
+            locations.push(lsp::Location {
+                uri: path_to_uri(&root.join(&rel_path)),
+                range: lsp::Range {
+                    start: lsp::Position {
+                        line: line_lsp,
+                        character: 0,
+                    },
+                    end: lsp::Position {
+                        line: line_lsp,
+                        character: 0,
+                    },
+                },
+            });
+        }
+    }
+
+    locations
+}
+
 /// Check whether a fragment matches any of a heading's anchor IDs.
 fn heading_matches_fragment(heading: &Heading, fragment: &str) -> bool {
     match &heading.id {
@@ -548,6 +603,190 @@ fn heading_matches_fragment(heading: &Heading, fragment: &str) -> bool {
             vscode,
         } => fragment == github || fragment == gitlab || fragment == vscode,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Navigation — go to declaration / definition / type definition / implementation
+// ---------------------------------------------------------------------------
+
+/// Go to the declaration of a link.
+///
+/// For reference-style links (`[text][ref]`), goes to the `[ref]: url`
+/// definition line. For inline links, falls through to the target document.
+fn go_to_declaration(
+    workspaces: &Workspaces,
+    params: &lsp::TextDocumentPositionParams,
+) -> Option<lsp::Location> {
+    let (workspace, rel_path) = workspaces.resolve(&params.text_document.uri)?;
+    let file_data = workspace.file(&rel_path)?;
+    let source = file_data.tree.source();
+    let offset = lsp_position_to_byte_offset(source, params.position);
+
+    let (_, node) = file_data.tree.find_link_at_offset(offset)?;
+
+    // If it's a reference-style link, go to the ref def.
+    if let Some(label) = link_ref_label(source, &node.span) {
+        let (_, def_node) = file_data.tree.find_ref_def(&label)?;
+        return Some(lsp::Location {
+            uri: params.text_document.uri.clone(),
+            range: span_to_lsp_range(source, &def_node.span),
+        });
+    }
+
+    // Inline link — fall through to definition (target document).
+    go_to_definition(workspaces, params)
+}
+
+/// Go to the definition (target document) of a link.
+fn go_to_definition(
+    workspaces: &Workspaces,
+    params: &lsp::TextDocumentPositionParams,
+) -> Option<lsp::Location> {
+    let (workspace, rel_path) = workspaces.resolve(&params.text_document.uri)?;
+    let file_data = workspace.file(&rel_path)?;
+    let source = file_data.tree.source();
+    let offset = lsp_position_to_byte_offset(source, params.position);
+
+    let (_, node) = file_data.tree.find_link_at_offset(offset)?;
+    if !matches!(node.kind, ElementKind::Link { .. }) {
+        return None;
+    }
+
+    let link = find_classified_link(&file_data.tree, &rel_path, node.span)?;
+
+    match &link.kind {
+        LinkKind::IntraProject { target, .. } | LinkKind::NonMarkdown { target } => {
+            let root = workspace.root();
+            Some(lsp::Location {
+                uri: path_to_uri(&root.join(target)),
+                range: lsp::Range::default(),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Go to the type definition of a link.
+///
+/// For links with a fragment, goes to the heading in the target document.
+/// Without a fragment, falls through to definition (the document itself).
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "line numbers in markdown files won't exceed u32::MAX"
+)]
+fn go_to_type_definition(
+    workspaces: &Workspaces,
+    params: &lsp::TextDocumentPositionParams,
+) -> Option<lsp::Location> {
+    let (workspace, rel_path) = workspaces.resolve(&params.text_document.uri)?;
+    let file_data = workspace.file(&rel_path)?;
+    let source = file_data.tree.source();
+    let offset = lsp_position_to_byte_offset(source, params.position);
+
+    let (_, node) = file_data.tree.find_link_at_offset(offset)?;
+
+    let link = find_classified_link(&file_data.tree, &rel_path, node.span)?;
+
+    let LinkKind::IntraProject {
+        target, fragment, ..
+    } = &link.kind
+    else {
+        return go_to_definition(workspaces, params);
+    };
+
+    let Some(fragment) = fragment.as_deref() else {
+        // No fragment — fall through to definition (the document itself).
+        return go_to_definition(workspaces, params);
+    };
+
+    let root = workspace.root();
+    let target_data = workspace.file(target)?;
+    let target_headings = target_data.tree.headings();
+    let heading = target_headings
+        .iter()
+        .find(|h| heading_matches_fragment(h, fragment))?;
+
+    let heading_line = heading.line.saturating_sub(1) as u32;
+    Some(lsp::Location {
+        uri: path_to_uri(&root.join(target)),
+        range: lsp::Range {
+            start: lsp::Position {
+                line: heading_line,
+                character: 0,
+            },
+            end: lsp::Position {
+                line: heading_line,
+                character: 0,
+            },
+        },
+    })
+}
+
+/// Go to the implementation (forward link) of a backlink entry in frontmatter.
+///
+/// When the cursor is on a backlink path like `    - decisions/38.md` in the
+/// frontmatter, navigates to the forward link line in the source document.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "line numbers in markdown files won't exceed u32::MAX"
+)]
+fn go_to_implementation(
+    workspaces: &Workspaces,
+    params: &lsp::TextDocumentPositionParams,
+) -> Option<lsp::Location> {
+    let (workspace, rel_path) = workspaces.resolve(&params.text_document.uri)?;
+    let file_data = workspace.file(&rel_path)?;
+    let fm = file_data.frontmatter.as_ref()?;
+
+    // Check cursor is inside frontmatter.
+    let cursor_line_1based = params.position.line as usize + 1;
+    if cursor_line_1based < fm.start_line || cursor_line_1based > fm.end_line {
+        return None;
+    }
+
+    // Extract the backlink path from the cursor line.
+    let source = file_data.tree.source();
+    let line_text = source_line_at(source, params.position.line);
+    let path_text = line_text.trim().strip_prefix("- ")?.trim();
+    if path_text.is_empty() {
+        return None;
+    }
+
+    // Find which inverse predicate this path belongs to.
+    let inverse_predicate = fm.backlinks.iter().find_map(|(pred, paths)| {
+        paths
+            .iter()
+            .any(|p| p == path_text)
+            .then_some(pred.as_str())
+    })?;
+
+    // Map inverse → forward predicate.
+    let forward_predicate = workspace.config().forward_of(inverse_predicate)?;
+
+    // Find the source document and the forward link.
+    let source_path = PathBuf::from(path_text);
+    let source_data = workspace.file(&source_path)?;
+    let source_links = source_data.tree.links(&source_path);
+
+    let forward_link = source_links.iter().find(|l| {
+        let LinkKind::IntraProject {
+            target, predicate, ..
+        } = &l.kind
+        else {
+            return false;
+        };
+        target == &rel_path && predicate == forward_predicate
+    })?;
+
+    let root = workspace.root();
+    let line = forward_link.line.saturating_sub(1) as u32;
+    Some(lsp::Location {
+        uri: path_to_uri(&root.join(&source_path)),
+        range: lsp::Range {
+            start: lsp::Position { line, character: 0 },
+            end: lsp::Position { line, character: 0 },
+        },
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1175,6 +1414,124 @@ fn hierarchy_item_level(item: &lsp::HierarchyItem) -> u8 {
         .unwrap_or(1)
 }
 
+/// Find the classified [`Link`] whose span matches a node span.
+///
+/// Bridges the gap between `find_link_at_offset` (which finds the tree node)
+/// and the classified links from `Tree::links` (which resolve targets).
+fn find_classified_link(
+    tree: &crate::block::Tree,
+    rel_path: &Path,
+    node_span: Span,
+) -> Option<crate::block::Link> {
+    tree.links(rel_path)
+        .into_iter()
+        .find(|l| l.span == node_span)
+}
+
+/// Convert an LSP 0-based position to a byte offset in `source`.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "line numbers in markdown files won't exceed u32::MAX"
+)]
+fn lsp_position_to_byte_offset(source: &str, pos: lsp::Position) -> usize {
+    let mut offset = 0;
+    for (i, line) in source.lines().enumerate() {
+        if i == pos.line as usize {
+            return offset + (pos.character as usize).min(line.len());
+        }
+        offset += line.len() + 1; // +1 for newline
+    }
+    source.len()
+}
+
+/// Convert a byte `Span` to an LSP `Range`.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "line/column values in markdown files won't exceed u32::MAX"
+)]
+fn span_to_lsp_range(source: &str, span: &Span) -> lsp::Range {
+    let start = byte_offset_to_lsp_position(source, span.start);
+    let end = byte_offset_to_lsp_position(source, span.end);
+    lsp::Range { start, end }
+}
+
+/// Convert a byte offset to an LSP 0-based position.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "line/column values in markdown files won't exceed u32::MAX"
+)]
+fn byte_offset_to_lsp_position(source: &str, offset: usize) -> lsp::Position {
+    let offset = offset.min(source.len());
+    let before = &source[..offset];
+    let line = before.bytes().filter(|&b| b == b'\n').count() as u32;
+    let line_start = before.rfind('\n').map_or(0, |i| i + 1);
+    let character = (offset - line_start) as u32;
+    lsp::Position { line, character }
+}
+
+/// Extract the normalized reference label from a link's source text,
+/// if the link uses reference-style syntax.
+///
+/// Reference-style links look like `[text][label]`, `[text][]`, or `[text]`
+/// (shortcut). Inline links contain `(` after the `]`.
+///
+/// Uses [`inline::find_matching_bracket`] for correct handling of nested
+/// brackets, backslash escapes, and backtick spans.
+fn link_ref_label(source: &str, span: &Span) -> Option<String> {
+    let raw = &source[span.start..span.end];
+
+    // Skip image prefix.
+    let text = raw.strip_prefix('!').unwrap_or(raw);
+    if !text.starts_with('[') {
+        return None;
+    }
+
+    // Find the closing `]` for the link text.
+    let text_close = crate::inline::find_matching_bracket(text.as_bytes(), 0)?;
+    let after = &text[text_close + 1..];
+
+    // Inline link: [text](url)
+    if after.starts_with('(') {
+        return None;
+    }
+
+    // Full reference: [text][label]
+    if after.starts_with('[') {
+        let label_start = 1;
+        let label_end = after.find(']').unwrap_or(after.len());
+        let label_text = &after[label_start..label_end];
+        if label_text.is_empty() {
+            // Collapsed reference [text][] — label is the link text
+            let link_text = &text[1..text_close];
+            return Some(normalize_label(link_text));
+        }
+        return Some(normalize_label(label_text));
+    }
+
+    // Shortcut reference: [text] — label is the link text
+    let link_text = &text[1..text_close];
+    Some(normalize_label(link_text))
+}
+
+/// Check if the byte offset falls on a `ReferenceDef` node, returning
+/// its normalized label.
+fn ref_def_label_at_offset(tree: &crate::block::Tree, offset: usize) -> Option<String> {
+    for node in tree.nodes() {
+        if let ElementKind::ReferenceDef { label, .. } = &node.kind
+            && node.span.start <= offset
+            && offset < node.span.end
+        {
+            return Some(label.clone());
+        }
+    }
+    None
+}
+
+/// Get the text of a 0-based line in the source.
+fn source_line_at(source: &str, lsp_line: u32) -> &str {
+    source.lines().nth(lsp_line as usize).unwrap_or("")
+}
+
 // ---------------------------------------------------------------------------
 // Notifications
 // ---------------------------------------------------------------------------
@@ -1299,11 +1656,24 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::block::HeadingId;
+    use crate::block::{HeadingId, Syntax};
+    use crate::span::Span;
 
     // -----------------------------------------------------------------------
     // Test helpers
     // -----------------------------------------------------------------------
+
+    /// Build a test heading with default `text_span` and `syntax` fields.
+    fn test_heading(line: usize, level: u8, text: &str, id: HeadingId) -> Heading {
+        Heading {
+            line,
+            level,
+            text: text.to_string(),
+            id,
+            text_span: Span::new(0, 0),
+            syntax: Syntax::Markdown,
+        }
+    }
 
     /// Create a temp directory with `.git` marker and the given files.
     fn workspace_with_files(files: &[(&str, &str)]) -> tempfile::TempDir {
@@ -1395,36 +1765,36 @@ mod tests {
     #[test]
     fn heading_symbols_nest_by_level() {
         let headings = vec![
-            Heading {
-                line: 1,
-                level: 1,
-                text: "Title".to_string(),
-                id: HeadingId::Computed {
+            test_heading(
+                1,
+                1,
+                "Title",
+                HeadingId::Computed {
                     github: "title".to_string(),
                     gitlab: "title".to_string(),
                     vscode: "title".to_string(),
                 },
-            },
-            Heading {
-                line: 3,
-                level: 2,
-                text: "Section".to_string(),
-                id: HeadingId::Computed {
+            ),
+            test_heading(
+                3,
+                2,
+                "Section",
+                HeadingId::Computed {
                     github: "section".to_string(),
                     gitlab: "section".to_string(),
                     vscode: "section".to_string(),
                 },
-            },
-            Heading {
-                line: 5,
-                level: 2,
-                text: "Another".to_string(),
-                id: HeadingId::Computed {
+            ),
+            test_heading(
+                5,
+                2,
+                "Another",
+                HeadingId::Computed {
                     github: "another".to_string(),
                     gitlab: "another".to_string(),
                     vscode: "another".to_string(),
                 },
-            },
+            ),
         ];
 
         let symbols = build_heading_symbols(&headings);
@@ -1468,26 +1838,26 @@ mod tests {
     #[test]
     fn heading_at_line_finds_match() {
         let headings = vec![
-            Heading {
-                line: 1,
-                level: 1,
-                text: "Title".to_string(),
-                id: HeadingId::Computed {
+            test_heading(
+                1,
+                1,
+                "Title",
+                HeadingId::Computed {
                     github: "title".to_string(),
                     gitlab: "title".to_string(),
                     vscode: "title".to_string(),
                 },
-            },
-            Heading {
-                line: 5,
-                level: 2,
-                text: "Section".to_string(),
-                id: HeadingId::Computed {
+            ),
+            test_heading(
+                5,
+                2,
+                "Section",
+                HeadingId::Computed {
                     github: "section".to_string(),
                     gitlab: "section".to_string(),
                     vscode: "section".to_string(),
                 },
-            },
+            ),
         ];
 
         let h = heading_at_line(&headings, 0);
@@ -1512,12 +1882,7 @@ mod tests {
 
     #[test]
     fn heading_matches_explicit_fragment() {
-        let heading = Heading {
-            line: 1,
-            level: 1,
-            text: "Custom ID".to_string(),
-            id: HeadingId::Explicit("my-id".to_string()),
-        };
+        let heading = test_heading(1, 1, "Custom ID", HeadingId::Explicit("my-id".to_string()));
         assert!(
             heading_matches_fragment(&heading, "my-id"),
             "explicit ID should match"
@@ -1530,16 +1895,16 @@ mod tests {
 
     #[test]
     fn heading_matches_computed_fragments() {
-        let heading = Heading {
-            line: 1,
-            level: 2,
-            text: "Hello World!".to_string(),
-            id: HeadingId::Computed {
+        let heading = test_heading(
+            1,
+            2,
+            "Hello World!",
+            HeadingId::Computed {
                 github: "hello-world".to_string(),
                 gitlab: "hello-world-1".to_string(),
                 vscode: "hello-world-2".to_string(),
             },
-        };
+        );
         assert!(
             heading_matches_fragment(&heading, "hello-world"),
             "github slug should match"
@@ -1561,18 +1926,8 @@ mod tests {
     #[test]
     fn enclosing_heading_finds_nearest_above() {
         let headings = vec![
-            Heading {
-                line: 1,
-                level: 1,
-                text: "Title".to_string(),
-                id: HeadingId::Explicit("title".to_string()),
-            },
-            Heading {
-                line: 5,
-                level: 2,
-                text: "Section".to_string(),
-                id: HeadingId::Explicit("section".to_string()),
-            },
+            test_heading(1, 1, "Title", HeadingId::Explicit("title".to_string())),
+            test_heading(5, 2, "Section", HeadingId::Explicit("section".to_string())),
         ];
 
         assert!(
@@ -1840,19 +2195,17 @@ mod tests {
         let workspaces = scan_workspaces(&dir);
 
         // Start from the H3.
-        let h3_item = heading_to_hierarchy_item(
-            &Heading {
-                line: 5,
-                level: 3,
-                text: "Sub".to_string(),
-                id: HeadingId::Computed {
-                    github: "sub".to_string(),
-                    gitlab: "sub".to_string(),
-                    vscode: "sub".to_string(),
-                },
+        let h3 = test_heading(
+            5,
+            3,
+            "Sub",
+            HeadingId::Computed {
+                github: "sub".to_string(),
+                gitlab: "sub".to_string(),
+                vscode: "sub".to_string(),
             },
-            &dir.path().join("a.md"),
         );
+        let h3_item = heading_to_hierarchy_item(&h3, &dir.path().join("a.md"));
         let parents =
             type_hierarchy_supertypes(&workspaces, &h3_item).expect("should return parents");
         assert_eq!(parents.len(), 1, "H3 should have one parent");
@@ -1865,19 +2218,17 @@ mod tests {
         let workspaces = scan_workspaces(&dir);
 
         // Start from the H1.
-        let h1_item = heading_to_hierarchy_item(
-            &Heading {
-                line: 1,
-                level: 1,
-                text: "Title".to_string(),
-                id: HeadingId::Computed {
-                    github: "title".to_string(),
-                    gitlab: "title".to_string(),
-                    vscode: "title".to_string(),
-                },
+        let h1 = test_heading(
+            1,
+            1,
+            "Title",
+            HeadingId::Computed {
+                github: "title".to_string(),
+                gitlab: "title".to_string(),
+                vscode: "title".to_string(),
             },
-            &dir.path().join("a.md"),
         );
+        let h1_item = heading_to_hierarchy_item(&h1, &dir.path().join("a.md"));
         let children =
             type_hierarchy_subtypes(&workspaces, &h1_item).expect("should return children");
         let names: Vec<&str> = children.iter().map(|c| c.name.as_str()).collect();
@@ -1889,19 +2240,17 @@ mod tests {
         let dir = workspace_with_files(&[("a.md", "# Title\n")]);
         let workspaces = scan_workspaces(&dir);
 
-        let h1_item = heading_to_hierarchy_item(
-            &Heading {
-                line: 1,
-                level: 1,
-                text: "Title".to_string(),
-                id: HeadingId::Computed {
-                    github: "title".to_string(),
-                    gitlab: "title".to_string(),
-                    vscode: "title".to_string(),
-                },
+        let h1 = test_heading(
+            1,
+            1,
+            "Title",
+            HeadingId::Computed {
+                github: "title".to_string(),
+                gitlab: "title".to_string(),
+                vscode: "title".to_string(),
             },
-            &dir.path().join("a.md"),
         );
+        let h1_item = heading_to_hierarchy_item(&h1, &dir.path().join("a.md"));
         let parents =
             type_hierarchy_supertypes(&workspaces, &h1_item).expect("should return empty");
         assert!(parents.is_empty(), "H1 should have no supertypes");
@@ -1919,19 +2268,17 @@ mod tests {
         ]);
         let workspaces = scan_workspaces(&dir);
 
-        let h1_item = heading_to_hierarchy_item(
-            &Heading {
-                line: 1,
-                level: 1,
-                text: "A".to_string(),
-                id: HeadingId::Computed {
-                    github: "a".to_string(),
-                    gitlab: "a".to_string(),
-                    vscode: "a".to_string(),
-                },
+        let h1 = test_heading(
+            1,
+            1,
+            "A",
+            HeadingId::Computed {
+                github: "a".to_string(),
+                gitlab: "a".to_string(),
+                vscode: "a".to_string(),
             },
-            &dir.path().join("a.md"),
         );
+        let h1_item = heading_to_hierarchy_item(&h1, &dir.path().join("a.md"));
         let calls = call_hierarchy_outgoing(&workspaces, &h1_item);
         assert_eq!(calls.len(), 1, "should have one outgoing call");
         assert_eq!(calls[0].to.name, "B", "outgoing call should target B");
@@ -1945,19 +2292,17 @@ mod tests {
         ]);
         let workspaces = scan_workspaces(&dir);
 
-        let b_item = heading_to_hierarchy_item(
-            &Heading {
-                line: 1,
-                level: 1,
-                text: "B".to_string(),
-                id: HeadingId::Computed {
-                    github: "b".to_string(),
-                    gitlab: "b".to_string(),
-                    vscode: "b".to_string(),
-                },
+        let b = test_heading(
+            1,
+            1,
+            "B",
+            HeadingId::Computed {
+                github: "b".to_string(),
+                gitlab: "b".to_string(),
+                vscode: "b".to_string(),
             },
-            &dir.path().join("b.md"),
         );
+        let b_item = heading_to_hierarchy_item(&b, &dir.path().join("b.md"));
         let calls = call_hierarchy_incoming(&workspaces, &b_item);
         assert_eq!(calls.len(), 1, "should have one incoming call");
         assert_eq!(
@@ -1979,19 +2324,17 @@ mod tests {
         let workspaces = scan_workspaces(&dir);
 
         // Ask for outgoing calls from S1 only.
-        let s1_item = heading_to_hierarchy_item(
-            &Heading {
-                line: 3,
-                level: 2,
-                text: "S1".to_string(),
-                id: HeadingId::Computed {
-                    github: "s1".to_string(),
-                    gitlab: "s1".to_string(),
-                    vscode: "s1".to_string(),
-                },
+        let s1 = test_heading(
+            3,
+            2,
+            "S1",
+            HeadingId::Computed {
+                github: "s1".to_string(),
+                gitlab: "s1".to_string(),
+                vscode: "s1".to_string(),
             },
-            &dir.path().join("a.md"),
         );
+        let s1_item = heading_to_hierarchy_item(&s1, &dir.path().join("a.md"));
         let calls = call_hierarchy_outgoing(&workspaces, &s1_item);
         assert_eq!(calls.len(), 1, "S1 should have one outgoing call");
         assert_eq!(calls[0].to.name, "B", "S1's link goes to B, not C");
@@ -2006,19 +2349,17 @@ mod tests {
         ]);
         let workspaces = scan_workspaces(&dir);
 
-        let b_item = heading_to_hierarchy_item(
-            &Heading {
-                line: 1,
-                level: 1,
-                text: "B".to_string(),
-                id: HeadingId::Computed {
-                    github: "b".to_string(),
-                    gitlab: "b".to_string(),
-                    vscode: "b".to_string(),
-                },
+        let b = test_heading(
+            1,
+            1,
+            "B",
+            HeadingId::Computed {
+                github: "b".to_string(),
+                gitlab: "b".to_string(),
+                vscode: "b".to_string(),
             },
-            &dir.path().join("b.md"),
         );
+        let b_item = heading_to_hierarchy_item(&b, &dir.path().join("b.md"));
         let calls = call_hierarchy_incoming(&workspaces, &b_item);
         assert_eq!(calls.len(), 1, "should have one incoming call");
         assert_eq!(
@@ -2276,6 +2617,369 @@ mod tests {
         assert!(
             format_document(&workspaces, &file_uri(&dir, "a.md")).is_none(),
             "no frontmatter should mean no formatting edits"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Navigation — declaration (ticket 08)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn declaration_reference_link_goes_to_def() {
+        let dir = workspace_with_files(&[(
+            "a.md",
+            "# A\n\n[see B][ref]\n\n[ref]: b.md \"references\"\n",
+        )]);
+        let workspaces = scan_workspaces(&dir);
+
+        let params = lsp::TextDocumentPositionParams {
+            text_document: lsp::TextDocumentIdentifier {
+                uri: file_uri(&dir, "a.md"),
+            },
+            position: lsp::Position {
+                line: 2,
+                character: 5,
+            },
+        };
+        let loc = go_to_declaration(&workspaces, &params).expect("should find declaration");
+        assert!(
+            loc.uri.ends_with("a.md"),
+            "declaration should be in the same file"
+        );
+        assert_eq!(
+            loc.range.start.line, 4,
+            "declaration should point to the ref def line"
+        );
+    }
+
+    #[test]
+    fn declaration_inline_link_falls_through_to_target() {
+        let dir = workspace_with_files(&[
+            ("a.md", "# A\n\n[see B](b.md \"references\")\n"),
+            ("b.md", "# B\n"),
+        ]);
+        let workspaces = scan_workspaces(&dir);
+
+        let params = lsp::TextDocumentPositionParams {
+            text_document: lsp::TextDocumentIdentifier {
+                uri: file_uri(&dir, "a.md"),
+            },
+            position: lsp::Position {
+                line: 2,
+                character: 5,
+            },
+        };
+        let loc = go_to_declaration(&workspaces, &params).expect("should fall through to target");
+        assert!(
+            loc.uri.ends_with("b.md"),
+            "inline link declaration should go to target document"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Navigation — definition (ticket 08)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn definition_link_goes_to_target() {
+        let dir = workspace_with_files(&[
+            ("a.md", "# A\n\n[see B](b.md \"references\")\n"),
+            ("b.md", "# B\n"),
+        ]);
+        let workspaces = scan_workspaces(&dir);
+
+        let params = lsp::TextDocumentPositionParams {
+            text_document: lsp::TextDocumentIdentifier {
+                uri: file_uri(&dir, "a.md"),
+            },
+            position: lsp::Position {
+                line: 2,
+                character: 5,
+            },
+        };
+        let loc = go_to_definition(&workspaces, &params).expect("should find definition");
+        assert!(
+            loc.uri.ends_with("b.md"),
+            "definition should go to target document"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Navigation — type definition (ticket 08)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn type_definition_with_fragment_goes_to_heading() {
+        let dir = workspace_with_files(&[
+            ("a.md", "# A\n\n[details](b.md#details \"references\")\n"),
+            ("b.md", "# B\n\n## Details\n"),
+        ]);
+        let workspaces = scan_workspaces(&dir);
+
+        let params = lsp::TextDocumentPositionParams {
+            text_document: lsp::TextDocumentIdentifier {
+                uri: file_uri(&dir, "a.md"),
+            },
+            position: lsp::Position {
+                line: 2,
+                character: 5,
+            },
+        };
+        let loc = go_to_type_definition(&workspaces, &params).expect("should find heading");
+        assert!(
+            loc.uri.ends_with("b.md"),
+            "type definition should go to target"
+        );
+        assert_eq!(
+            loc.range.start.line, 2,
+            "type definition should go to the heading line"
+        );
+    }
+
+    #[test]
+    fn type_definition_without_fragment_goes_to_document() {
+        let dir = workspace_with_files(&[
+            ("a.md", "# A\n\n[see B](b.md \"references\")\n"),
+            ("b.md", "# B\n"),
+        ]);
+        let workspaces = scan_workspaces(&dir);
+
+        let params = lsp::TextDocumentPositionParams {
+            text_document: lsp::TextDocumentIdentifier {
+                uri: file_uri(&dir, "a.md"),
+            },
+            position: lsp::Position {
+                line: 2,
+                character: 5,
+            },
+        };
+        // Without fragment, type definition falls through to definition.
+        let loc = go_to_type_definition(&workspaces, &params)
+            .expect("should fall through to target document");
+        assert!(
+            loc.uri.ends_with("b.md"),
+            "type definition without fragment should go to target document"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Navigation — implementation (ticket 08)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn implementation_backlink_goes_to_forward_link() {
+        let dir = workspace_with_files(&[
+            (".lattice.toml", ""),
+            ("a.md", "# A\n\n[see B](b.md \"supersedes\")\n"),
+            (
+                "b.md",
+                "---\nbacklinks:\n  superseded_by:\n    - a.md\n---\n\n# B\n",
+            ),
+        ]);
+        let workspaces = scan_workspaces(&dir);
+
+        // Cursor on the backlink path "    - a.md" (line 3, 0-based).
+        let params = lsp::TextDocumentPositionParams {
+            text_document: lsp::TextDocumentIdentifier {
+                uri: file_uri(&dir, "b.md"),
+            },
+            position: lsp::Position {
+                line: 3,
+                character: 6,
+            },
+        };
+        let loc = go_to_implementation(&workspaces, &params).expect("should find forward link");
+        assert!(
+            loc.uri.ends_with("a.md"),
+            "implementation should go to the source document"
+        );
+        assert_eq!(
+            loc.range.start.line, 2,
+            "implementation should point to the forward link line"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Find references from ref def (ticket 08)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn find_references_from_ref_def() {
+        let dir = workspace_with_files(&[(
+            "a.md",
+            "# A\n\n[first][ref]\n\n[second][ref]\n\n[ref]: b.md \"references\"\n",
+        )]);
+        let workspaces = scan_workspaces(&dir);
+
+        // Cursor on the ref def line (line 6, 0-based).
+        let params = lsp::ReferenceParams {
+            text_document: lsp::TextDocumentIdentifier {
+                uri: file_uri(&dir, "a.md"),
+            },
+            position: lsp::Position {
+                line: 6,
+                character: 0,
+            },
+        };
+        let locations = find_references(&workspaces, &params);
+        assert_eq!(locations.len(), 2, "ref def should have two call sites");
+    }
+
+    // -----------------------------------------------------------------------
+    // Rename with tree spans (ticket 08)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn rename_setext_heading() {
+        let dir = workspace_with_files(&[("a.md", "Title\n=====\n")]);
+        let workspaces = scan_workspaces(&dir);
+        let uri = file_uri(&dir, "a.md");
+
+        let params = lsp::TextDocumentPositionParams {
+            text_document: lsp::TextDocumentIdentifier { uri: uri.clone() },
+            position: lsp::Position {
+                line: 0,
+                character: 0,
+            },
+        };
+        let range = prepare_rename(&workspaces, &params).expect("should find setext heading");
+        assert_eq!(range.start.line, 0, "setext heading is on line 0");
+        assert_eq!(range.start.character, 0, "setext heading text starts at 0");
+        assert_eq!(
+            range.end.character, 5,
+            "setext heading text ends at len('Title')"
+        );
+
+        let rename_params = lsp::RenameParams {
+            text_document: lsp::TextDocumentIdentifier { uri },
+            position: lsp::Position {
+                line: 0,
+                character: 0,
+            },
+            new_name: "New Title".to_string(),
+        };
+        let edit = do_rename(&workspaces, &rename_params).expect("should produce edit");
+        let changes = edit.changes.expect("should have changes");
+        assert!(!changes.is_empty(), "should have changes for the file");
+    }
+
+    #[test]
+    fn rename_html_heading() {
+        let dir = workspace_with_files(&[("a.md", "<h1>Title</h1>\n")]);
+        let workspaces = scan_workspaces(&dir);
+        let uri = file_uri(&dir, "a.md");
+
+        let params = lsp::TextDocumentPositionParams {
+            text_document: lsp::TextDocumentIdentifier { uri },
+            position: lsp::Position {
+                line: 0,
+                character: 0,
+            },
+        };
+        let range = prepare_rename(&workspaces, &params).expect("should find HTML heading");
+        assert_eq!(
+            range.start.character, 4,
+            "HTML heading text starts after <h1>"
+        );
+        assert_eq!(
+            range.end.character, 9,
+            "HTML heading text ends before </h1>"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Helper unit tests (ticket 08)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn lsp_position_to_byte_offset_basic() {
+        let source = "line1\nline2\nline3\n";
+        assert_eq!(
+            lsp_position_to_byte_offset(
+                source,
+                lsp::Position {
+                    line: 0,
+                    character: 0
+                }
+            ),
+            0,
+            "start of first line"
+        );
+        assert_eq!(
+            lsp_position_to_byte_offset(
+                source,
+                lsp::Position {
+                    line: 1,
+                    character: 0
+                }
+            ),
+            6,
+            "start of second line"
+        );
+        assert_eq!(
+            lsp_position_to_byte_offset(
+                source,
+                lsp::Position {
+                    line: 1,
+                    character: 3
+                }
+            ),
+            9,
+            "middle of second line"
+        );
+    }
+
+    #[test]
+    fn span_to_lsp_range_basic() {
+        let source = "# Title\n\nContent\n";
+        let span = Span::new(2, 7); // "Title"
+        let range = span_to_lsp_range(source, &span);
+        assert_eq!(range.start.line, 0, "span starts on line 0");
+        assert_eq!(range.start.character, 2, "span starts at character 2");
+        assert_eq!(range.end.line, 0, "span ends on line 0");
+        assert_eq!(range.end.character, 7, "span ends at character 7");
+    }
+
+    #[test]
+    fn link_ref_label_inline() {
+        let source = "[text](url \"title\")";
+        let span = Span::new(0, source.len());
+        assert!(
+            link_ref_label(source, &span).is_none(),
+            "inline link should not have a ref label"
+        );
+    }
+
+    #[test]
+    fn link_ref_label_full_reference() {
+        let source = "[text][my-ref]";
+        let span = Span::new(0, source.len());
+        assert_eq!(
+            link_ref_label(source, &span).as_deref(),
+            Some("my-ref"),
+            "full reference label"
+        );
+    }
+
+    #[test]
+    fn link_ref_label_collapsed() {
+        let source = "[My Ref][]";
+        let span = Span::new(0, source.len());
+        assert_eq!(
+            link_ref_label(source, &span).as_deref(),
+            Some("my ref"),
+            "collapsed reference uses link text as label"
+        );
+    }
+
+    #[test]
+    fn link_ref_label_shortcut() {
+        let source = "[shortcut]";
+        let span = Span::new(0, source.len());
+        assert_eq!(
+            link_ref_label(source, &span).as_deref(),
+            Some("shortcut"),
+            "shortcut reference uses link text as label"
         );
     }
 }

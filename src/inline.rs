@@ -328,12 +328,12 @@ fn is_word_boundary(bytes: &[u8], i: usize) -> bool {
 // ---------------------------------------------------------------------------
 
 /// Count consecutive occurrences of `ch` starting at `pos`.
-fn count_char(bytes: &[u8], pos: usize, ch: u8) -> usize {
+pub fn count_char(bytes: &[u8], pos: usize, ch: u8) -> usize {
     bytes[pos..].iter().take_while(|&&b| b == ch).count()
 }
 
 /// Find closing backtick sequence of exactly `count` backticks.
-fn find_closing_backticks(bytes: &[u8], start: usize, count: usize) -> Option<usize> {
+pub fn find_closing_backticks(bytes: &[u8], start: usize, count: usize) -> Option<usize> {
     let mut i = start;
     while i < bytes.len() {
         if bytes[i] == b'`' {
@@ -356,7 +356,7 @@ fn find_closing_backticks(bytes: &[u8], start: usize, count: usize) -> Option<us
 /// Find the `]` that matches the `[` at `start`.
 ///
 /// Handles nested brackets, backslash escapes, and backtick spans.
-fn find_matching_bracket(bytes: &[u8], start: usize) -> Option<usize> {
+pub fn find_matching_bracket(bytes: &[u8], start: usize) -> Option<usize> {
     let mut i = start + 1;
     let mut depth: usize = 1;
 

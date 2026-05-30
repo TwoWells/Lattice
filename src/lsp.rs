@@ -460,6 +460,14 @@ pub mod method {
     pub const RENAME: &str = "textDocument/rename";
     /// `textDocument/references`.
     pub const REFERENCES: &str = "textDocument/references";
+    /// `textDocument/declaration`.
+    pub const DECLARATION: &str = "textDocument/declaration";
+    /// `textDocument/definition`.
+    pub const DEFINITION: &str = "textDocument/definition";
+    /// `textDocument/typeDefinition`.
+    pub const TYPE_DEFINITION: &str = "textDocument/typeDefinition";
+    /// `textDocument/implementation`.
+    pub const IMPLEMENTATION: &str = "textDocument/implementation";
     /// `textDocument/prepareTypeHierarchy`.
     pub const PREPARE_TYPE_HIERARCHY: &str = "textDocument/prepareTypeHierarchy";
     /// `typeHierarchy/supertypes`.

@@ -223,6 +223,14 @@ impl Config {
     pub fn inverse_of(&self, forward: &str) -> Option<&str> {
         self.predicates.get(forward).map(String::as_str)
     }
+
+    /// Returns the forward predicate for an inverse predicate.
+    pub fn forward_of(&self, inverse: &str) -> Option<&str> {
+        self.predicates
+            .iter()
+            .find(|(_, v)| v.as_str() == inverse)
+            .map(|(k, _)| k.as_str())
+    }
 }
 
 // --- Raw deserialization types ---
