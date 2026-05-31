@@ -1144,11 +1144,16 @@ fn html_block_end(line: &str, html_type: u8) -> bool {
 /// the opening tag. `open_len` is the byte length of the opening tag
 /// (from [`HtmlTag::Open::len`]).
 fn has_close_on_same_line(line: &str, tag_name: &str, open_len: usize) -> bool {
-    if open_len >= line.len() {
-        return false;
+    let mut rest = &line[open_len..];
+    while let Some(idx) = rest.find("</") {
+        if let Some(HtmlTag::Close { ref name, .. }) = html::tokenize_tag(&rest[idx..], 0)
+            && name == tag_name
+        {
+            return true;
+        }
+        rest = &rest[idx + 2..];
     }
-    let rest = line[open_len..].to_lowercase();
-    rest.contains(&format!("</{tag_name}>"))
+    false
 }
 
 /// Check if a line opens a `<pre><code>` block (case-insensitive).
