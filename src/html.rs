@@ -415,6 +415,9 @@ pub fn tag_to_element_kind(name: &str) -> Option<ElementKind> {
             title: String::new(),
         }),
         "input" | "select" | "textarea" => Some(ElementKind::FormControl),
+        "dl" => Some(ElementKind::DefinitionList),
+        "dt" => Some(ElementKind::DefinitionTerm),
+        "dd" => Some(ElementKind::DefinitionDesc),
         "details" => Some(ElementKind::Details),
         "summary" => Some(ElementKind::DetailsSummary),
         "div" | "section" | "article" | "aside" | "nav" | "main" | "header" | "footer"
@@ -458,8 +461,6 @@ pub fn is_html_container(name: &str) -> bool {
             | "address"
             | "hgroup"
             | "dl"
-            | "dd"
-            | "dt"
     )
 }
 

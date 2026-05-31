@@ -158,6 +158,12 @@ pub enum ElementKind {
     DetailsSummary,
     /// HTML form control (`<input>`, `<select>`, `<textarea>`).
     FormControl,
+    /// Definition list container (`<dl>` or Pandoc/PHP Extra syntax).
+    DefinitionList,
+    /// Term in a definition list (`<dt>` or plain text before `: `).
+    DefinitionTerm,
+    /// Description in a definition list (`<dd>` or `: ` content).
+    DefinitionDesc,
 }
 
 /// Column alignment for a GFM pipe table.

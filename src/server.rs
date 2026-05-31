@@ -340,7 +340,11 @@ fn element_symbol_kind(kind: &ElementKind) -> Option<u32> {
         ElementKind::Image { .. } | ElementKind::Video { .. } | ElementKind::Audio { .. } => {
             Some(lsp::symbol_kind::FILE)
         }
-        ElementKind::List { .. } | ElementKind::Table { .. } => Some(lsp::symbol_kind::STRUCT),
+        ElementKind::List { .. }
+        | ElementKind::Table { .. }
+        | ElementKind::DefinitionList
+        | ElementKind::Frontmatter
+        | ElementKind::FrontmatterMap { .. } => Some(lsp::symbol_kind::STRUCT),
         ElementKind::CodeBlock | ElementKind::Math => Some(lsp::symbol_kind::OBJECT),
         ElementKind::QuoteBlock
         | ElementKind::Admonition { .. }
@@ -349,9 +353,6 @@ fn element_symbol_kind(kind: &ElementKind) -> Option<u32> {
         ElementKind::Rules => Some(lsp::symbol_kind::OPERATOR),
         ElementKind::FootnoteDef { .. } => Some(lsp::symbol_kind::CONSTANT),
         ElementKind::FormControl => Some(lsp::symbol_kind::EVENT),
-        ElementKind::Frontmatter | ElementKind::FrontmatterMap { .. } => {
-            Some(lsp::symbol_kind::STRUCT)
-        }
         ElementKind::FrontmatterKey { .. } => Some(lsp::symbol_kind::FIELD),
         // Not emitted: leaf content nodes, structural internals.
         ElementKind::Document
@@ -364,7 +365,9 @@ fn element_symbol_kind(kind: &ElementKind) -> Option<u32> {
         | ElementKind::DetailsSummary
         | ElementKind::ListItem { .. }
         | ElementKind::TableRow { .. }
-        | ElementKind::TableCell => None,
+        | ElementKind::TableCell
+        | ElementKind::DefinitionTerm
+        | ElementKind::DefinitionDesc => None,
     }
 }
 
@@ -454,6 +457,14 @@ fn symbol_name(tree: &Tree, node_id: NodeId) -> (String, Option<String>) {
                 .filter(|&&c| matches!(tree.node(c).kind, ElementKind::TableRow { header: false }))
                 .count();
             ("Table".to_string(), Some(data_rows.to_string()))
+        }
+        ElementKind::DefinitionList => {
+            let term_count = node
+                .children
+                .iter()
+                .filter(|&&c| matches!(tree.node(c).kind, ElementKind::DefinitionTerm))
+                .count();
+            ("Definitions".to_string(), Some(term_count.to_string()))
         }
         ElementKind::List { ordered, .. } => {
             let item_count = node
@@ -792,6 +803,15 @@ fn build_symbol_tree(
                     Some(nested)
                 }
             }
+            // Definition lists: emit Field children from terms.
+            ElementKind::DefinitionList => {
+                let fields = build_definition_list_children(tree, node_id);
+                if fields.is_empty() {
+                    None
+                } else {
+                    Some(fields)
+                }
+            }
             // Opaque content blocks and leaf elements: no children.
             ElementKind::CodeBlock
             | ElementKind::Math
@@ -949,6 +969,38 @@ fn build_table_field_children(tree: &Tree, table_id: NodeId) -> Vec<lsp::Documen
                 });
             }
             break;
+        }
+    }
+    fields
+}
+
+/// Build `Field` children from a definition list's term nodes.
+fn build_definition_list_children(tree: &Tree, dl_id: NodeId) -> Vec<lsp::DocumentSymbol> {
+    let dl = tree.node(dl_id);
+    let source = tree.source();
+    let mut fields = Vec::new();
+
+    for &child_id in &dl.children {
+        let child = tree.node(child_id);
+        if matches!(child.kind, ElementKind::DefinitionTerm) {
+            let text = source[child.span.start..child.span.end].trim();
+            // Strip <dt> and </dt> tags if present (HTML syntax).
+            let text = text
+                .strip_prefix("<dt>")
+                .unwrap_or(text)
+                .strip_suffix("</dt>")
+                .unwrap_or(text)
+                .trim();
+            let name = format!("Field: {}", truncate_name(text));
+            let range = node_range(tree, child_id);
+            fields.push(lsp::DocumentSymbol {
+                name,
+                detail: None,
+                kind: lsp::symbol_kind::FIELD,
+                range,
+                selection_range: range,
+                children: None,
+            });
         }
     }
     fields
@@ -4544,6 +4596,89 @@ mod tests {
             fields[0].detail.as_deref(),
             Some("3"),
             "flow sequence should count all items"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Definition list symbols
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn definition_list_emits_struct_with_field_children() {
+        // Blank line after <dl> triggers markdown mode so nested tags are parsed.
+        let syms = symbols_for(concat!(
+            "<dl>\n\n",
+            "<dt>API</dt>\n\n",
+            "<dd>The public interface</dd>\n\n",
+            "<dt>SDK</dt>\n\n",
+            "<dd>Client libraries</dd>\n\n",
+            "<dt>CLI</dt>\n\n",
+            "<dd>Command-line tool</dd>\n\n",
+            "</dl>\n",
+        ));
+        let defs = find_symbols(&syms, &|s| {
+            s.kind == lsp::symbol_kind::STRUCT && s.name == "Definitions"
+        });
+        assert_eq!(defs.len(), 1, "should have one definition list");
+        assert_eq!(
+            defs[0].detail.as_deref(),
+            Some("3"),
+            "detail should be term count"
+        );
+        let children = defs[0]
+            .children
+            .as_ref()
+            .expect("definition list should have Field children");
+        assert_eq!(children.len(), 3, "should have three Field children");
+        assert_eq!(children[0].name, "Field: API", "first term");
+        assert_eq!(children[1].name, "Field: SDK", "second term");
+        assert_eq!(children[2].name, "Field: CLI", "third term");
+        assert!(
+            children.iter().all(|c| c.kind == lsp::symbol_kind::FIELD),
+            "all children should be Field kind"
+        );
+    }
+
+    #[test]
+    fn definition_list_descriptions_not_in_symbols() {
+        let syms = symbols_for(concat!(
+            "<dl>\n\n",
+            "<dt>Term</dt>\n\n",
+            "<dd>Description</dd>\n\n",
+            "</dl>\n",
+        ));
+        let descs = find_symbols(&syms, &|s| {
+            s.name.contains("Description") && s.kind != lsp::symbol_kind::FIELD
+        });
+        assert!(
+            descs.is_empty(),
+            "descriptions should not appear as standalone symbols"
+        );
+    }
+
+    #[test]
+    fn definition_list_workspace_symbols_include_container() {
+        let dir = workspace_with_files(&[("a.md", "<dl>\n\n<dt>X</dt>\n\n<dd>Y</dd>\n\n</dl>\n")]);
+        let workspaces = scan_workspaces(&dir);
+        let syms = workspace_symbols(&workspaces, "");
+        assert!(
+            syms.iter()
+                .any(|s| s.kind == lsp::symbol_kind::STRUCT && s.name == "Definitions"),
+            "workspace symbols should include definition list container"
+        );
+    }
+
+    #[test]
+    fn definition_list_terms_not_in_workspace_symbols() {
+        let dir = workspace_with_files(&[(
+            "a.md",
+            "<dl>\n\n<dt>API</dt>\n\n<dd>Interface</dd>\n\n</dl>\n",
+        )]);
+        let workspaces = scan_workspaces(&dir);
+        let syms = workspace_symbols(&workspaces, "");
+        assert!(
+            !syms.iter().any(|s| s.name.contains("API")),
+            "terms should not appear in workspace symbols"
         );
     }
 }
