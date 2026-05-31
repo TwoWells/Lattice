@@ -255,7 +255,8 @@ fn parse_content(content: &str, rel_path: &Path, config: &Config) -> FileData {
 
     // Build the tree (block structure + inline elements).
     let frontmatter_span = fm_block.as_ref().map(|b| b.span);
-    let tree = block::parse_tree(content, frontmatter_span);
+    let frontmatter_entries = fm_block.as_ref().map(|b| b.entries.as_slice());
+    let tree = block::parse_tree_with_entries(content, frontmatter_span, frontmatter_entries);
 
     // Extract frontmatter data.
     let mut frontmatter = None;

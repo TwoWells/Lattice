@@ -14,7 +14,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use lsp_server::{Connection, Message, Notification, Response};
 
-use crate::block::{ElementKind, Heading, HeadingId, LinkKind, NodeId, Tree, normalize_label};
+use crate::block::{
+    ElementKind, Heading, HeadingId, LinkKind, NodeId, Syntax, Tree, normalize_label,
+};
 use crate::lsp;
 use crate::span::Span;
 use crate::structural;
@@ -347,9 +349,12 @@ fn element_symbol_kind(kind: &ElementKind) -> Option<u32> {
         ElementKind::Rules => Some(lsp::symbol_kind::OPERATOR),
         ElementKind::FootnoteDef { .. } => Some(lsp::symbol_kind::CONSTANT),
         ElementKind::FormControl => Some(lsp::symbol_kind::EVENT),
+        ElementKind::Frontmatter | ElementKind::FrontmatterMap { .. } => {
+            Some(lsp::symbol_kind::STRUCT)
+        }
+        ElementKind::FrontmatterKey { .. } => Some(lsp::symbol_kind::FIELD),
         // Not emitted: leaf content nodes, structural internals.
         ElementKind::Document
-        | ElementKind::Frontmatter
         | ElementKind::Paragraph
         | ElementKind::HtmlBlock
         | ElementKind::InlineCode
@@ -376,6 +381,10 @@ fn is_scope_boundary(kind: &ElementKind) -> bool {
 }
 
 /// Generate the symbol name and optional detail for a tree node.
+#[allow(
+    clippy::too_many_lines,
+    reason = "single match over all ElementKind variants"
+)]
 fn symbol_name(tree: &Tree, node_id: NodeId) -> (String, Option<String>) {
     let node = tree.node(node_id);
     let source = tree.source();
@@ -475,8 +484,66 @@ fn symbol_name(tree: &Tree, node_id: NodeId) -> (String, Option<String>) {
             let tag = container_tag_name(raw);
             (format!("Form: {tag}"), None)
         }
+        ElementKind::Frontmatter => {
+            let syntax_label = match node.syntax {
+                Syntax::Yaml => "YAML",
+                Syntax::Html => "HTML",
+                Syntax::Markdown => "Markdown",
+            };
+            let key_count = node
+                .children
+                .iter()
+                .filter(|&&c| {
+                    matches!(
+                        tree.node(c).kind,
+                        ElementKind::FrontmatterKey { .. } | ElementKind::FrontmatterMap { .. }
+                    )
+                })
+                .count();
+            let detail = if key_count > 0 {
+                Some(key_count.to_string())
+            } else {
+                None
+            };
+            (format!("Frontmatter: {syntax_label}"), detail)
+        }
+        ElementKind::FrontmatterMap { key } => {
+            let child_count = node.children.len();
+            let detail = if child_count > 0 {
+                Some(child_count.to_string())
+            } else {
+                None
+            };
+            (key.clone(), detail)
+        }
+        ElementKind::FrontmatterKey { key, .. } => {
+            let detail = frontmatter_key_detail(tree, node_id);
+            (format!("Field: {key}"), detail)
+        }
         _ => (String::new(), None),
     }
+}
+
+/// Compute detail for a `FrontmatterKey` node.
+///
+/// If the key has a non-zero leaf count (sequence items), returns the count
+/// as detail. This covers both block sequences and flow sequences.
+fn frontmatter_key_detail(tree: &Tree, node_id: NodeId) -> Option<String> {
+    let node = tree.node(node_id);
+
+    // Only show detail when the parent is a FrontmatterMap (nested key).
+    let parent_id = node.parent?;
+    let parent = tree.node(parent_id);
+    if !matches!(parent.kind, ElementKind::FrontmatterMap { .. }) {
+        return None;
+    }
+
+    if let ElementKind::FrontmatterKey { leaf_count, .. } = &node.kind
+        && *leaf_count > 0
+    {
+        return Some(leaf_count.to_string());
+    }
+    None
 }
 
 /// Extract the display text from a markdown link like `[text](url)`.
@@ -732,7 +799,8 @@ fn build_symbol_tree(
             | ElementKind::Image { .. }
             | ElementKind::Video { .. }
             | ElementKind::Audio { .. }
-            | ElementKind::Import { .. } => None,
+            | ElementKind::Import { .. }
+            | ElementKind::FrontmatterKey { .. } => None,
             // Scope containers: recurse normally.
             _ => {
                 let node_children = &tree.node(node_id).children;
@@ -992,6 +1060,14 @@ fn collect_workspace_symbols(
                 .parent
                 .is_some_and(|p| matches!(tree.node(p).kind, ElementKind::ListItem { .. }))
         {
+            continue;
+        }
+
+        // Skip frontmatter children — only the top-level container in workspace.
+        if matches!(
+            node.kind,
+            ElementKind::FrontmatterKey { .. } | ElementKind::FrontmatterMap { .. }
+        ) {
             continue;
         }
 
@@ -4286,6 +4362,188 @@ mod tests {
             link_ref_label(source, &span).as_deref(),
             Some("shortcut"),
             "shortcut reference uses link text as label"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Frontmatter symbols (ticket 13)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn frontmatter_emits_struct_with_field_children() {
+        let content = "---\ntitle: Doc\ndate: 2026-05-24\n---\n\n# Heading\n";
+        let syms = symbols_for(content);
+        let fm = find_symbols(&syms, &|s| {
+            s.kind == lsp::symbol_kind::STRUCT && s.name.starts_with("Frontmatter:")
+        });
+        assert_eq!(fm.len(), 1, "should have one frontmatter symbol");
+        assert_eq!(
+            fm[0].name, "Frontmatter: YAML",
+            "frontmatter name includes syntax"
+        );
+        assert_eq!(
+            fm[0].detail.as_deref(),
+            Some("2"),
+            "detail is top-level key count"
+        );
+        let children = fm[0]
+            .children
+            .as_ref()
+            .expect("frontmatter should have children");
+        assert_eq!(children.len(), 2, "should have two Field children");
+        assert_eq!(
+            children[0].name, "Field: title",
+            "first field should be title"
+        );
+        assert_eq!(
+            children[1].name, "Field: date",
+            "second field should be date"
+        );
+        assert!(
+            children.iter().all(|c| c.kind == lsp::symbol_kind::FIELD),
+            "all children should be Field kind"
+        );
+    }
+
+    #[test]
+    fn frontmatter_nested_map_emits_struct_children() {
+        let content = "---\nbacklinks:\n  superseded_by:\n    - decisions/38.md\n  amended_by:\n    - decisions/38.md\n    - tickets/14h.md\n---\n";
+        let syms = symbols_for(content);
+        let fm = find_symbols(&syms, &|s| {
+            s.kind == lsp::symbol_kind::STRUCT && s.name == "Frontmatter: YAML"
+        });
+        assert_eq!(fm.len(), 1, "should have one frontmatter");
+        let children = fm[0]
+            .children
+            .as_ref()
+            .expect("frontmatter should have children");
+        assert_eq!(children.len(), 1, "should have one child (backlinks map)");
+        assert_eq!(
+            children[0].name, "backlinks",
+            "map child should be named by key"
+        );
+        assert_eq!(
+            children[0].kind,
+            lsp::symbol_kind::STRUCT,
+            "map child should be Struct"
+        );
+        assert_eq!(
+            children[0].detail.as_deref(),
+            Some("2"),
+            "map detail is child count"
+        );
+    }
+
+    #[test]
+    fn frontmatter_backlinks_predicates_show_source_count() {
+        let content = "---\nbacklinks:\n  superseded_by:\n    - decisions/38.md\n  amended_by:\n    - decisions/38.md\n    - tickets/14h.md\n---\n";
+        let syms = symbols_for(content);
+        let predicates = find_symbols(&syms, &|s| {
+            s.kind == lsp::symbol_kind::FIELD && s.name.starts_with("Field: ")
+        });
+        let superseded = predicates
+            .iter()
+            .find(|s| s.name == "Field: superseded_by")
+            .expect("should find superseded_by");
+        assert_eq!(
+            superseded.detail.as_deref(),
+            Some("1"),
+            "superseded_by has 1 source"
+        );
+        let amended = predicates
+            .iter()
+            .find(|s| s.name == "Field: amended_by")
+            .expect("should find amended_by");
+        assert_eq!(
+            amended.detail.as_deref(),
+            Some("2"),
+            "amended_by has 2 sources"
+        );
+    }
+
+    #[test]
+    fn frontmatter_leaf_values_not_in_outline() {
+        let content = "---\ntitle: \"Hooks Primary Capture\"\ndate: 2026-05-24\nbacklinks:\n  superseded_by:\n    - decisions/38.md\n---\n";
+        let syms = symbols_for(content);
+        let all = find_symbols(&syms, &|_| true);
+        // Values like "Hooks Primary Capture", "2026-05-24", "decisions/38.md"
+        // should never appear as symbol names.
+        for sym in &all {
+            assert!(
+                !sym.name.contains("Hooks Primary Capture"),
+                "leaf values should not appear in outline"
+            );
+            assert!(
+                !sym.name.contains("2026-05-24"),
+                "date values should not appear in outline"
+            );
+            assert!(
+                !sym.name.contains("decisions/38.md"),
+                "path values should not appear in outline"
+            );
+        }
+    }
+
+    #[test]
+    fn frontmatter_selection_range_is_precise() {
+        let content = "---\ntitle: Doc\ndate: 2026-05-24\n---\n\n# Heading\n";
+        let syms = symbols_for(content);
+        let fields = find_symbols(&syms, &|s| {
+            s.kind == lsp::symbol_kind::FIELD && s.name.starts_with("Field:")
+        });
+        let fm = find_symbols(&syms, &|s| s.name == "Frontmatter: YAML");
+        let fm_range = &fm[0].range;
+        // Each field's selection_range should NOT equal the full frontmatter range.
+        for field in &fields {
+            assert_ne!(
+                field.selection_range, *fm_range,
+                "field selection_range should not be the full frontmatter block"
+            );
+        }
+    }
+
+    #[test]
+    fn frontmatter_workspace_symbols_top_level_only() {
+        let dir = workspace_with_files(&[(
+            "a.md",
+            "---\ntitle: Doc\nbacklinks:\n  superseded_by:\n    - b.md\n---\n\n# H\n",
+        )]);
+        let workspaces = scan_workspaces(&dir);
+        let ws_syms = workspace_symbols(&workspaces, "");
+        let fm_count = ws_syms
+            .iter()
+            .filter(|s| s.name.starts_with("Frontmatter:"))
+            .count();
+        assert_eq!(fm_count, 1, "workspace should have one frontmatter symbol");
+        // Backlink predicates should NOT appear in workspace symbols.
+        assert!(
+            !ws_syms.iter().any(|s| s.name.contains("superseded_by")),
+            "predicate keys should not appear in workspace symbols"
+        );
+    }
+
+    #[test]
+    fn frontmatter_top_level_scalar_has_no_detail() {
+        let content = "---\ntitle: Doc\n---\n\n# Heading\n";
+        let syms = symbols_for(content);
+        let fields = find_symbols(&syms, &|s| s.name == "Field: title");
+        assert_eq!(fields.len(), 1, "should have title field");
+        assert_eq!(
+            fields[0].detail, None,
+            "top-level scalar key should have no detail"
+        );
+    }
+
+    #[test]
+    fn frontmatter_flow_sequence_counts_items() {
+        let content = "---\nbacklinks:\n  referenced_by: [a.md, b.md, c.md]\n---\n";
+        let syms = symbols_for(content);
+        let fields = find_symbols(&syms, &|s| s.name == "Field: referenced_by");
+        assert_eq!(fields.len(), 1, "should find referenced_by field");
+        assert_eq!(
+            fields[0].detail.as_deref(),
+            Some("3"),
+            "flow sequence should count all items"
         );
     }
 }

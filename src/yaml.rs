@@ -43,7 +43,6 @@ pub enum YamlNode {
         /// The mapping value.
         value: YamlValue,
         /// Span covering the full key-value pair.
-        #[allow(dead_code, reason = "used by tree construction ticket 06a")]
         span: Span,
     },
     /// A sequence item (`- value`).
