@@ -200,9 +200,18 @@ fn workspace_symbol_returns_headings() {
         .as_array()
         .expect("result should be an array");
     let names: Vec<&str> = result.iter().filter_map(|s| s["name"].as_str()).collect();
-    assert!(names.contains(&"Alpha"), "should contain Alpha: {names:?}");
-    assert!(names.contains(&"Beta"), "should contain Beta: {names:?}");
-    assert!(names.contains(&"Gamma"), "should contain Gamma: {names:?}");
+    assert!(
+        names.contains(&"H1: Alpha"),
+        "should contain H1: Alpha: {names:?}"
+    );
+    assert!(
+        names.contains(&"H2: Beta"),
+        "should contain H2: Beta: {names:?}"
+    );
+    assert!(
+        names.contains(&"H1: Gamma"),
+        "should contain H1: Gamma: {names:?}"
+    );
 
     shutdown_server(stdin, &mut stdout, child);
 }

@@ -333,28 +333,21 @@ fn truncate_name(s: &str) -> String {
 /// should not be emitted as a symbol.
 fn element_symbol_kind(kind: &ElementKind) -> Option<u32> {
     match kind {
-        ElementKind::Heading { .. } => Some(lsp::symbol_kind::STRING),
+        ElementKind::Heading { .. } => Some(lsp::symbol_kind::CLASS),
         ElementKind::Link { .. } | ElementKind::Import { .. } => Some(lsp::symbol_kind::FUNCTION),
         ElementKind::Image { .. } | ElementKind::Video { .. } | ElementKind::Audio { .. } => {
             Some(lsp::symbol_kind::FILE)
         }
-        ElementKind::List { ordered: true, .. } => Some(lsp::symbol_kind::ARRAY),
-        ElementKind::List { ordered: false, .. } => Some(lsp::symbol_kind::ENUM),
-        ElementKind::ListItem { task: Some(_), .. } => Some(lsp::symbol_kind::BOOLEAN),
-        ElementKind::ListItem { task: None, .. } => Some(lsp::symbol_kind::ENUM_MEMBER),
-        ElementKind::Table { .. } => Some(lsp::symbol_kind::STRUCT),
-        ElementKind::TableRow { .. } => Some(lsp::symbol_kind::KEY),
-        ElementKind::TableCell => Some(lsp::symbol_kind::FIELD),
+        ElementKind::List { .. } | ElementKind::Table { .. } => Some(lsp::symbol_kind::STRUCT),
         ElementKind::CodeBlock | ElementKind::Math => Some(lsp::symbol_kind::OBJECT),
-        ElementKind::QuoteBlock | ElementKind::Admonition { .. } | ElementKind::Details => {
-            Some(lsp::symbol_kind::MODULE)
-        }
+        ElementKind::QuoteBlock
+        | ElementKind::Admonition { .. }
+        | ElementKind::Details
+        | ElementKind::Container => Some(lsp::symbol_kind::MODULE),
         ElementKind::Rules => Some(lsp::symbol_kind::OPERATOR),
         ElementKind::FootnoteDef { .. } => Some(lsp::symbol_kind::CONSTANT),
-        ElementKind::Container => Some(lsp::symbol_kind::NAMESPACE),
         ElementKind::FormControl => Some(lsp::symbol_kind::EVENT),
-        // Not emitted: paragraphs, inline code, inline math, footnote refs,
-        // document root, frontmatter, HTML blocks, details summary, ref defs.
+        // Not emitted: leaf content nodes, structural internals.
         ElementKind::Document
         | ElementKind::Frontmatter
         | ElementKind::Paragraph
@@ -363,7 +356,10 @@ fn element_symbol_kind(kind: &ElementKind) -> Option<u32> {
         | ElementKind::InlineMath
         | ElementKind::FootnoteRef { .. }
         | ElementKind::ReferenceDef { .. }
-        | ElementKind::DetailsSummary => None,
+        | ElementKind::DetailsSummary
+        | ElementKind::ListItem { .. }
+        | ElementKind::TableRow { .. }
+        | ElementKind::TableCell => None,
     }
 }
 
@@ -372,7 +368,10 @@ fn element_symbol_kind(kind: &ElementKind) -> Option<u32> {
 fn is_scope_boundary(kind: &ElementKind) -> bool {
     matches!(
         kind,
-        ElementKind::QuoteBlock | ElementKind::Admonition { .. } | ElementKind::Details
+        ElementKind::QuoteBlock
+            | ElementKind::Admonition { .. }
+            | ElementKind::Details
+            | ElementKind::Container
     )
 }
 
@@ -383,129 +382,101 @@ fn symbol_name(tree: &Tree, node_id: NodeId) -> (String, Option<String>) {
     let raw = &source[node.span.start..node.span.end];
 
     match &node.kind {
-        ElementKind::Heading { .. } => {
+        ElementKind::Heading { level } => {
             let (text, _, _) = tree.heading_content(node_id);
-            (text, None)
+            (format!("H{level}: {text}"), None)
         }
-        ElementKind::Link { .. } | ElementKind::Import { .. } => link_symbol_name(&node.kind, raw),
-        ElementKind::Image { url, .. } => image_symbol_name(url, raw),
+        ElementKind::Link { url, title } => {
+            let predicate = if title.is_empty() {
+                "references"
+            } else {
+                title
+            };
+            let name = format!("Link: {predicate}({url})");
+            let display = link_display_text(raw);
+            let detail = if display.is_empty() {
+                None
+            } else {
+                Some(display)
+            };
+            (truncate_name(&name), detail)
+        }
+        ElementKind::Import { path } => (truncate_name(&format!("Link: import({path})")), None),
+        ElementKind::Image { url, .. } => {
+            let detail_type = if raw.trim_start().starts_with("<iframe") {
+                "iframe"
+            } else {
+                "image"
+            };
+            let name = if url.is_empty() {
+                format!("File: {detail_type}")
+            } else {
+                format!("File: {url}")
+            };
+            (truncate_name(&name), Some(detail_type.to_string()))
+        }
         ElementKind::Video { url, .. } => {
-            let name = if url.is_empty() { "video" } else { url };
-            (truncate_name(name), Some("video".to_string()))
+            let name = if url.is_empty() {
+                "File: video".to_string()
+            } else {
+                format!("File: {url}")
+            };
+            (truncate_name(&name), Some("video".to_string()))
         }
         ElementKind::Audio { url, .. } => {
-            let name = if url.is_empty() { "audio" } else { url };
-            (truncate_name(name), Some("audio".to_string()))
-        }
-        ElementKind::CodeBlock | ElementKind::Math => {
-            let name = code_block_language(raw)
-                .map_or_else(|| "code".to_string(), |l| format!("code: {l}"));
-            (name, None)
-        }
-        ElementKind::Table { alignments } => table_symbol_name(tree, node_id, node, alignments),
-        ElementKind::TableRow { header } => {
-            let text = table_row_text(tree, node_id);
-            let name = if text.is_empty() {
-                if *header { "header" } else { "row" }.to_string()
+            let name = if url.is_empty() {
+                "File: audio".to_string()
             } else {
-                truncate_name(&text)
+                format!("File: {url}")
             };
-            (name, None)
+            (truncate_name(&name), Some("audio".to_string()))
         }
-        ElementKind::TableCell => {
-            let clean = raw.trim().trim_matches('|').trim();
-            (truncate_name(clean), None)
+        ElementKind::CodeBlock => {
+            let lang = code_block_language(raw);
+            let title = code_block_title(raw);
+            let name = lang.map_or_else(|| "CodeBlock".to_string(), |l| format!("CodeBlock: {l}"));
+            (name, title)
         }
-        ElementKind::ListItem { task } => {
-            let text = list_item_text(tree, node_id);
-            let detail = task.map(|c| if c { "checked" } else { "unchecked" }.to_string());
-            (truncate_name(&text), detail)
+        ElementKind::Math => ("Math".to_string(), None),
+        ElementKind::Table { .. } => {
+            let data_rows = node
+                .children
+                .iter()
+                .filter(|&&c| matches!(tree.node(c).kind, ElementKind::TableRow { header: false }))
+                .count();
+            ("Table".to_string(), Some(data_rows.to_string()))
         }
-        ElementKind::List { .. } => ("list".to_string(), None),
-        ElementKind::QuoteBlock => {
-            let text = blockquote_first_line(raw);
-            let name = if text.is_empty() {
-                "blockquote".to_string()
-            } else {
-                truncate_name(&text)
-            };
-            (name, None)
+        ElementKind::List { ordered, .. } => {
+            let item_count = node
+                .children
+                .iter()
+                .filter(|&&c| matches!(tree.node(c).kind, ElementKind::ListItem { .. }))
+                .count();
+            let name = if *ordered { "Ordered List" } else { "List" };
+            (name.to_string(), Some(item_count.to_string()))
         }
-        ElementKind::Admonition { kind } => (kind.clone(), Some("admonition".to_string())),
+        ElementKind::QuoteBlock => ("Blockquote".to_string(), None),
+        ElementKind::Admonition { kind } => (format!("Admonition: {kind}"), None),
         ElementKind::Details => {
             let text = details_summary_text(tree, node_id);
-            let name = if text.is_empty() {
-                "details".to_string()
+            if text.is_empty() {
+                ("Details".to_string(), None)
             } else {
-                truncate_name(&text)
-            };
-            (name, None)
+                (format!("Details: {}", truncate_name(&text)), None)
+            }
         }
-        ElementKind::FootnoteDef { label } => (format!("[^{label}]"), None),
-        ElementKind::Rules => ("---".to_string(), None),
-        ElementKind::Container | ElementKind::FormControl => (container_tag_name(raw), None),
+        ElementKind::FootnoteDef { label } => (format!("Footnote: [^{label}]"), None),
+        ElementKind::Rules => ("Break".to_string(), None),
+        ElementKind::Container => {
+            let tag = container_tag_name(raw);
+            (format!("Container: {tag}"), None)
+        }
+        ElementKind::FormControl => {
+            let tag = container_tag_name(raw);
+            (format!("Form: {tag}"), None)
+        }
         _ => (String::new(), None),
     }
-}
-
-/// Build symbol name for a link or import node.
-fn link_symbol_name(kind: &ElementKind, raw: &str) -> (String, Option<String>) {
-    let (url, title) = match kind {
-        ElementKind::Import { path } => (path.as_str(), "import"),
-        ElementKind::Link { url, title } => (url.as_str(), title.as_str()),
-        _ => ("", ""),
-    };
-    let predicate = if title.is_empty() {
-        "references"
-    } else {
-        title
-    };
-    let name = format!("{predicate}({url})");
-    let display = link_display_text(raw);
-    let detail = if display.is_empty() {
-        None
-    } else {
-        Some(display)
-    };
-    (truncate_name(&name), detail)
-}
-
-/// Build symbol name for an image node.
-fn image_symbol_name(url: &str, raw: &str) -> (String, Option<String>) {
-    let alt = image_alt_text(raw);
-    let name = if alt.is_empty() {
-        "image".to_string()
-    } else {
-        truncate_name(&alt)
-    };
-    let detail = if url.is_empty() {
-        None
-    } else {
-        Some(url.to_string())
-    };
-    (name, detail)
-}
-
-/// Build symbol name for a table node.
-fn table_symbol_name(
-    tree: &Tree,
-    node_id: NodeId,
-    node: &crate::block::Node,
-    alignments: &[crate::block::TableAlignment],
-) -> (String, Option<String>) {
-    let header = table_header_text(tree, node_id);
-    let name = if header.is_empty() {
-        "table".to_string()
-    } else {
-        truncate_name(&header)
-    };
-    let rows = node
-        .children
-        .iter()
-        .filter(|&&c| matches!(tree.node(c).kind, ElementKind::TableRow { .. }))
-        .count();
-    let cols = alignments.len();
-    (name, Some(format!("{rows}×{cols}")))
 }
 
 /// Extract the display text from a markdown link like `[text](url)`.
@@ -536,22 +507,6 @@ fn link_display_text(raw: &str) -> String {
     String::new()
 }
 
-/// Extract alt text from a markdown image `![alt](src)`.
-fn image_alt_text(raw: &str) -> String {
-    if let Some(end) = raw.strip_prefix("![").and_then(|r| r.find("](")) {
-        return raw[2..end + 2].trim().to_string();
-    }
-    // HTML <img>: extract alt attribute
-    if let Some(alt) = raw
-        .find("alt=\"")
-        .map(|i| &raw[i + 4..])
-        .and_then(|rest| rest.find('"').map(|end| &rest[..end]))
-    {
-        return alt.to_string();
-    }
-    String::new()
-}
-
 /// Extract the language tag from a fenced code block.
 fn code_block_language(raw: &str) -> Option<String> {
     let first_line = raw.lines().next().unwrap_or("");
@@ -575,41 +530,25 @@ fn code_block_language(raw: &str) -> Option<String> {
     None
 }
 
-/// Extract the first header row text from a table.
-fn table_header_text(tree: &Tree, table_id: NodeId) -> String {
-    let table = tree.node(table_id);
-    for &child_id in &table.children {
-        let child = tree.node(child_id);
-        if matches!(child.kind, ElementKind::TableRow { header: true }) {
-            return table_row_text(tree, child_id);
+/// Extract the title (info string after the language) from a fenced code block.
+fn code_block_title(raw: &str) -> Option<String> {
+    let first_line = raw.lines().next().unwrap_or("");
+    let trimmed = first_line.trim();
+    if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+        let fence_char = trimmed.chars().next().unwrap_or('`');
+        let after_fence = trimmed.trim_start_matches(fence_char);
+        let info = after_fence.trim();
+        // Split into language and rest of info string
+        let mut parts = info.splitn(2, char::is_whitespace);
+        let _lang = parts.next();
+        if let Some(rest) = parts.next() {
+            let rest = rest.trim();
+            if !rest.is_empty() {
+                return Some(rest.to_string());
+            }
         }
     }
-    String::new()
-}
-
-/// Extract cell texts from a table row, joined by ` | `.
-fn table_row_text(tree: &Tree, row_id: NodeId) -> String {
-    let row = tree.node(row_id);
-    let source = tree.source();
-    let cells: Vec<&str> = row
-        .children
-        .iter()
-        .map(|&c| {
-            let cell = tree.node(c);
-            source[cell.span.start..cell.span.end]
-                .trim()
-                .trim_matches('|')
-                .trim()
-        })
-        .collect();
-    cells.join(" | ")
-}
-
-/// Extract the first line of a blockquote for use as a symbol name.
-fn blockquote_first_line(raw: &str) -> String {
-    let first = raw.lines().next().unwrap_or("");
-    let trimmed = first.trim();
-    truncate_name(trimmed)
+    None
 }
 
 /// Extract the `<summary>` text from a `<details>` node.
@@ -620,10 +559,12 @@ fn details_summary_text(tree: &Tree, details_id: NodeId) -> String {
         let child = tree.node(child_id);
         if matches!(child.kind, ElementKind::DetailsSummary) {
             let text = &source[child.span.start..child.span.end];
-            // Strip <summary> tags
-            let inner = text.trim().strip_prefix("<summary>").unwrap_or(text).trim();
-            let inner = inner.strip_suffix("</summary>").unwrap_or(inner).trim();
-            return inner.to_string();
+            // Strip <summary> tags — the span may extend past </summary>.
+            let inner = text.trim().strip_prefix("<summary>").unwrap_or(text);
+            return inner.find("</summary>").map_or_else(
+                || inner.trim().to_string(),
+                |end| inner[..end].trim().to_string(),
+            );
         }
     }
     String::new()
@@ -764,42 +705,50 @@ fn build_symbol_tree(
         let (name, detail) = symbol_name(tree, node_id);
         let range = node_range(tree, node_id);
 
-        // Code blocks get a Property child for the language tag.
-        let mut sym_children = if matches!(node.kind, ElementKind::CodeBlock | ElementKind::Math) {
-            let lang = code_block_language(&tree.source()[node.span.start..node.span.end]);
-            let child_name = lang.map_or_else(|| "code".to_string(), |l| format!("code: {l}"));
-            Some(vec![lsp::DocumentSymbol {
-                name: child_name,
-                detail: None,
-                kind: lsp::symbol_kind::PROPERTY,
-                range,
-                selection_range: range,
-                children: None,
-            }])
-        } else {
-            None
-        };
-
-        // Recurse into container elements.
-        let node_children = &tree.node(node_id).children;
-        if !node_children.is_empty()
-            && !matches!(
-                node.kind,
-                ElementKind::CodeBlock
-                    | ElementKind::Math
-                    | ElementKind::Link { .. }
-                    | ElementKind::Image { .. }
-                    | ElementKind::Video { .. }
-                    | ElementKind::Audio { .. }
-                    | ElementKind::Import { .. }
-            )
-        {
-            let in_scope = inside_scope || is_scope_boundary(&node.kind);
-            let child_syms = build_symbol_tree(tree, node_children, in_scope);
-            if !child_syms.is_empty() {
-                sym_children.get_or_insert_with(Vec::new).extend(child_syms);
+        // Build children based on element type.
+        let sym_children = match &node.kind {
+            // Tables: emit Field children from header row cells only.
+            ElementKind::Table { .. } => {
+                let fields = build_table_field_children(tree, node_id);
+                if fields.is_empty() {
+                    None
+                } else {
+                    Some(fields)
+                }
             }
-        }
+            // Lists: emit nested sub-list children only.
+            ElementKind::List { .. } => {
+                let nested = build_nested_list_children(tree, node_id);
+                if nested.is_empty() {
+                    None
+                } else {
+                    Some(nested)
+                }
+            }
+            // Opaque content blocks and leaf elements: no children.
+            ElementKind::CodeBlock
+            | ElementKind::Math
+            | ElementKind::Link { .. }
+            | ElementKind::Image { .. }
+            | ElementKind::Video { .. }
+            | ElementKind::Audio { .. }
+            | ElementKind::Import { .. } => None,
+            // Scope containers: recurse normally.
+            _ => {
+                let node_children = &tree.node(node_id).children;
+                if node_children.is_empty() {
+                    None
+                } else {
+                    let in_scope = inside_scope || is_scope_boundary(&node.kind);
+                    let child_syms = build_symbol_tree(tree, node_children, in_scope);
+                    if child_syms.is_empty() {
+                        None
+                    } else {
+                        Some(child_syms)
+                    }
+                }
+            }
+        };
 
         tagged.push(TaggedSymbol {
             level: heading_level,
@@ -905,6 +854,94 @@ fn collect_floated_links(tree: &Tree, para_id: NodeId) -> Vec<lsp::DocumentSymbo
     links
 }
 
+/// Build `Field` children from a table's header row cells.
+fn build_table_field_children(tree: &Tree, table_id: NodeId) -> Vec<lsp::DocumentSymbol> {
+    let table = tree.node(table_id);
+    let source = tree.source();
+    let mut fields = Vec::new();
+
+    for &child_id in &table.children {
+        let child = tree.node(child_id);
+        if matches!(child.kind, ElementKind::TableRow { header: true }) {
+            for &cell_id in &child.children {
+                let cell = tree.node(cell_id);
+                let text = source[cell.span.start..cell.span.end]
+                    .trim()
+                    .trim_matches('|')
+                    .trim();
+                let name = format!("Field: {}", truncate_name(text));
+                let range = node_range(tree, cell_id);
+                fields.push(lsp::DocumentSymbol {
+                    name,
+                    detail: None,
+                    kind: lsp::symbol_kind::FIELD,
+                    range,
+                    selection_range: range,
+                    children: None,
+                });
+            }
+            break;
+        }
+    }
+    fields
+}
+
+/// Build `Struct` children for nested sub-lists within a list.
+///
+/// For each `ListItem` that contains a child `List`, emits a `Struct`
+/// symbol named by the parent item's text. Items without sub-lists
+/// are not emitted.
+fn build_nested_list_children(tree: &Tree, list_id: NodeId) -> Vec<lsp::DocumentSymbol> {
+    let list = tree.node(list_id);
+    let mut children = Vec::new();
+
+    for &item_id in &list.children {
+        let item = tree.node(item_id);
+        if !matches!(item.kind, ElementKind::ListItem { .. }) {
+            continue;
+        }
+
+        for &sub_id in &item.children {
+            let sub = tree.node(sub_id);
+            if let ElementKind::List { ordered, .. } = &sub.kind {
+                let item_text = list_item_text(tree, item_id);
+                let prefix = if *ordered { "Ordered List" } else { "List" };
+                let name = if item_text.is_empty() {
+                    prefix.to_string()
+                } else {
+                    format!("{prefix}: {}", truncate_name(&item_text))
+                };
+
+                let sub_item_count = sub
+                    .children
+                    .iter()
+                    .filter(|&&c| matches!(tree.node(c).kind, ElementKind::ListItem { .. }))
+                    .count();
+
+                let range = node_range(tree, sub_id);
+
+                // Recurse for deeper nesting.
+                let nested = build_nested_list_children(tree, sub_id);
+                let nested_children = if nested.is_empty() {
+                    None
+                } else {
+                    Some(nested)
+                };
+
+                children.push(lsp::DocumentSymbol {
+                    name,
+                    detail: Some(sub_item_count.to_string()),
+                    kind: lsp::symbol_kind::STRUCT,
+                    range,
+                    selection_range: range,
+                    children: nested_children,
+                });
+            }
+        }
+    }
+    children
+}
+
 // ---------------------------------------------------------------------------
 // Workspace symbols
 // ---------------------------------------------------------------------------
@@ -949,12 +986,12 @@ fn collect_workspace_symbols(
             continue;
         };
 
-        // Skip paragraphs (already filtered by element_symbol_kind returning
-        // None), but also skip table cells/rows for workspace — too granular.
-        if matches!(
-            node.kind,
-            ElementKind::TableRow { .. } | ElementKind::TableCell
-        ) {
+        // Skip nested lists — only top-level data containers in workspace.
+        if matches!(node.kind, ElementKind::List { .. })
+            && node
+                .parent
+                .is_some_and(|p| matches!(tree.node(p).kind, ElementKind::ListItem { .. }))
+        {
             continue;
         }
 
@@ -1985,7 +2022,7 @@ fn heading_to_hierarchy_item(heading: &Heading, abs_path: &Path) -> lsp::Hierarc
 
     lsp::HierarchyItem {
         name: heading.text.clone(),
-        kind: lsp::symbol_kind::STRING,
+        kind: lsp::symbol_kind::CLASS,
         uri: path_to_uri(abs_path),
         range,
         selection_range: range,
@@ -2379,7 +2416,7 @@ mod tests {
                 symbol: lsp::DocumentSymbol {
                     name: "Title".to_string(),
                     detail: None,
-                    kind: lsp::symbol_kind::STRING,
+                    kind: lsp::symbol_kind::CLASS,
                     range: lsp::Range::default(),
                     selection_range: lsp::Range::default(),
                     children: None,
@@ -2390,7 +2427,7 @@ mod tests {
                 symbol: lsp::DocumentSymbol {
                     name: "Section".to_string(),
                     detail: None,
-                    kind: lsp::symbol_kind::STRING,
+                    kind: lsp::symbol_kind::CLASS,
                     range: lsp::Range::default(),
                     selection_range: lsp::Range::default(),
                     children: None,
@@ -2401,7 +2438,7 @@ mod tests {
                 symbol: lsp::DocumentSymbol {
                     name: "Another".to_string(),
                     detail: None,
-                    kind: lsp::symbol_kind::STRING,
+                    kind: lsp::symbol_kind::CLASS,
                     range: lsp::Range::default(),
                     selection_range: lsp::Range::default(),
                     children: None,
@@ -2562,7 +2599,7 @@ mod tests {
     fn hierarchy_item_level_parses_detail() {
         let item = lsp::HierarchyItem {
             name: String::new(),
-            kind: lsp::symbol_kind::STRING,
+            kind: lsp::symbol_kind::CLASS,
             uri: String::new(),
             range: lsp::Range::default(),
             selection_range: lsp::Range::default(),
@@ -2593,9 +2630,9 @@ mod tests {
 
         let symbols = workspace_symbols(&workspaces, "");
         let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
-        assert!(names.contains(&"Alpha"), "should contain Alpha");
-        assert!(names.contains(&"Beta"), "should contain Beta");
-        assert!(names.contains(&"Gamma"), "should contain Gamma");
+        assert!(names.contains(&"H1: Alpha"), "should contain H1: Alpha");
+        assert!(names.contains(&"H2: Beta"), "should contain H2: Beta");
+        assert!(names.contains(&"H1: Gamma"), "should contain H1: Gamma");
         assert_eq!(symbols.len(), 3, "should return all 3 headings");
     }
 
@@ -2606,7 +2643,10 @@ mod tests {
 
         let symbols = workspace_symbols(&workspaces, "alph");
         assert_eq!(symbols.len(), 1, "should match only Alpha");
-        assert_eq!(symbols[0].name, "Alpha", "should be case-insensitive match");
+        assert_eq!(
+            symbols[0].name, "H1: Alpha",
+            "should be case-insensitive match"
+        );
     }
 
     #[test]
@@ -3293,15 +3333,25 @@ mod tests {
     }
 
     #[test]
-    fn heading_emits_string_kind() {
+    fn heading_emits_class_kind() {
         let syms = symbols_for("# Title\n\n## Section\n");
         assert_eq!(syms.len(), 1, "should have one top-level heading");
         assert_eq!(
             syms[0].kind,
-            lsp::symbol_kind::STRING,
-            "heading should be STRING"
+            lsp::symbol_kind::CLASS,
+            "heading should be CLASS"
         );
-        assert_eq!(syms[0].name, "Title", "heading name should be the text");
+        assert_eq!(syms[0].name, "H1: Title", "heading name should embed level");
+    }
+
+    #[test]
+    fn heading_nested_levels_in_name() {
+        let syms = symbols_for("# Top\n\n## Mid\n\n### Deep\n");
+        let all = find_symbols(&syms, &|s| s.kind == lsp::symbol_kind::CLASS);
+        assert_eq!(all.len(), 3, "should have three headings");
+        assert_eq!(all[0].name, "H1: Top", "H1 should have level in name");
+        assert_eq!(all[1].name, "H2: Mid", "H2 should have level in name");
+        assert_eq!(all[2].name, "H3: Deep", "H3 should have level in name");
     }
 
     #[test]
@@ -3310,8 +3360,8 @@ mod tests {
         let links = find_symbols(&syms, &|s| s.kind == lsp::symbol_kind::FUNCTION);
         assert_eq!(links.len(), 1, "should have one link symbol");
         assert_eq!(
-            links[0].name, "references(other.md)",
-            "link name should be predicate(target)"
+            links[0].name, "Link: references(other.md)",
+            "link name should have Link: prefix"
         );
         assert_eq!(
             links[0].detail.as_deref(),
@@ -3326,7 +3376,7 @@ mod tests {
         let links = find_symbols(&syms, &|s| s.kind == lsp::symbol_kind::FUNCTION);
         assert_eq!(links.len(), 1, "should have one link");
         assert!(
-            links[0].name.starts_with("references("),
+            links[0].name.starts_with("Link: references("),
             "should default to references predicate"
         );
     }
@@ -3336,88 +3386,182 @@ mod tests {
         let syms = symbols_for("![alt text](image.png)\n");
         let images = find_symbols(&syms, &|s| s.kind == lsp::symbol_kind::FILE);
         assert_eq!(images.len(), 1, "should have one image symbol");
-        assert_eq!(images[0].name, "alt text", "image name should be alt text");
+        assert_eq!(
+            images[0].name, "File: image.png",
+            "image name should be File: url"
+        );
         assert_eq!(
             images[0].detail.as_deref(),
-            Some("image.png"),
-            "image detail should be the path"
+            Some("image"),
+            "image detail should be 'image'"
         );
     }
 
     #[test]
-    fn ordered_list_emits_array() {
+    fn ordered_list_emits_struct() {
         let syms = symbols_for("1. first\n2. second\n");
-        let lists = find_symbols(&syms, &|s| s.kind == lsp::symbol_kind::ARRAY);
+        let lists = find_symbols(&syms, &|s| {
+            s.kind == lsp::symbol_kind::STRUCT && s.name.starts_with("Ordered List")
+        });
         assert_eq!(lists.len(), 1, "should have one ordered list");
+        assert_eq!(
+            lists[0].name, "Ordered List",
+            "ordered list name should be 'Ordered List'"
+        );
+        assert_eq!(
+            lists[0].detail.as_deref(),
+            Some("2"),
+            "ordered list detail should be item count"
+        );
     }
 
     #[test]
-    fn unordered_list_emits_enum() {
+    fn unordered_list_emits_struct() {
         let syms = symbols_for("- alpha\n- beta\n");
-        let lists = find_symbols(&syms, &|s| s.kind == lsp::symbol_kind::ENUM);
+        let lists = find_symbols(&syms, &|s| {
+            s.kind == lsp::symbol_kind::STRUCT && s.name == "List"
+        });
         assert_eq!(lists.len(), 1, "should have one unordered list");
-    }
-
-    #[test]
-    fn list_item_emits_enum_member() {
-        let syms = symbols_for("- hello world\n");
-        let items = find_symbols(&syms, &|s| s.kind == lsp::symbol_kind::ENUM_MEMBER);
-        assert_eq!(items.len(), 1, "should have one list item");
         assert_eq!(
-            items[0].name, "hello world",
-            "list item name should be the text"
+            lists[0].detail.as_deref(),
+            Some("2"),
+            "list detail should be item count"
         );
     }
 
     #[test]
-    fn task_item_emits_boolean() {
-        let syms = symbols_for("- [x] done\n- [ ] todo\n");
-        let tasks = find_symbols(&syms, &|s| s.kind == lsp::symbol_kind::BOOLEAN);
-        assert_eq!(tasks.len(), 2, "should have two task items");
-        assert_eq!(
-            tasks[0].detail.as_deref(),
-            Some("checked"),
-            "checked task should have checked detail"
-        );
-        assert_eq!(
-            tasks[1].detail.as_deref(),
-            Some("unchecked"),
-            "unchecked task should have unchecked detail"
-        );
-    }
-
-    #[test]
-    fn table_emits_struct() {
-        let syms = symbols_for("| A | B |\n|---|---|\n| 1 | 2 |\n");
-        let tables = find_symbols(&syms, &|s| s.kind == lsp::symbol_kind::STRUCT);
-        assert_eq!(tables.len(), 1, "should have one table");
+    fn flat_list_has_no_children() {
+        let syms = symbols_for("- alpha\n- beta\n- gamma\n");
+        let lists = find_symbols(&syms, &|s| {
+            s.kind == lsp::symbol_kind::STRUCT && s.name == "List"
+        });
+        assert_eq!(lists.len(), 1, "should have one list");
         assert!(
-            tables[0].detail.as_ref().is_some_and(|d| d.contains('×')),
-            "table detail should have dimensions"
+            lists[0].children.is_none(),
+            "flat list should have no children"
+        );
+        assert_eq!(
+            lists[0].detail.as_deref(),
+            Some("3"),
+            "detail should be item count"
         );
     }
 
     #[test]
-    fn code_block_emits_object_with_property_child() {
+    fn nested_list_emits_struct_children() {
+        let syms = symbols_for("- parent\n  - child\n");
+        let top = find_symbols(&syms, &|s| {
+            s.kind == lsp::symbol_kind::STRUCT && s.name == "List"
+        });
+        assert_eq!(top.len(), 1, "should have one top-level list");
+        assert_eq!(top[0].detail.as_deref(), Some("1"), "top list has 1 item");
+        let children = top[0]
+            .children
+            .as_ref()
+            .expect("nested list should have children");
+        let sub_list = children
+            .iter()
+            .find(|c| c.name == "List: parent")
+            .expect("should have sub-list named by parent item");
+        assert_eq!(
+            sub_list.kind,
+            lsp::symbol_kind::STRUCT,
+            "sub-list should be Struct"
+        );
+        assert_eq!(
+            sub_list.detail.as_deref(),
+            Some("1"),
+            "sub-list should have item count"
+        );
+    }
+
+    #[test]
+    fn deeply_nested_lists_preserve_hierarchy() {
+        let syms = symbols_for("- A\n  - B\n    - C\n");
+        let top = find_symbols(&syms, &|s| {
+            s.kind == lsp::symbol_kind::STRUCT && s.name == "List"
+        });
+        assert_eq!(top.len(), 1, "should have one top-level list");
+        let level1 = top[0]
+            .children
+            .as_ref()
+            .expect("should have nested children");
+        assert_eq!(level1.len(), 1, "one sub-list under A");
+        assert_eq!(level1[0].name, "List: A", "sub-list named by parent A");
+        let level2 = level1[0]
+            .children
+            .as_ref()
+            .expect("should have deeper nesting");
+        assert_eq!(level2.len(), 1, "one sub-sub-list under B");
+        assert_eq!(level2[0].name, "List: B", "sub-sub-list named by parent B");
+        assert_eq!(
+            level2[0].detail.as_deref(),
+            Some("1"),
+            "deepest list has 1 item"
+        );
+    }
+
+    #[test]
+    fn table_emits_struct_with_field_children() {
+        let syms = symbols_for(
+            "| status | issue |\n|--------|-------|\n| open | bug |\n| closed | fix |\n",
+        );
+        let tables = find_symbols(&syms, &|s| {
+            s.kind == lsp::symbol_kind::STRUCT && s.name == "Table"
+        });
+        assert_eq!(tables.len(), 1, "should have one table");
+        assert_eq!(
+            tables[0].detail.as_deref(),
+            Some("2"),
+            "table detail should be data row count"
+        );
+        let children = tables[0]
+            .children
+            .as_ref()
+            .expect("table should have Field children");
+        assert_eq!(children.len(), 2, "should have two Field children");
+        assert_eq!(
+            children[0].name, "Field: status",
+            "first field should be status"
+        );
+        assert_eq!(
+            children[1].name, "Field: issue",
+            "second field should be issue"
+        );
+        assert!(
+            children.iter().all(|c| c.kind == lsp::symbol_kind::FIELD),
+            "all children should be Field kind"
+        );
+    }
+
+    #[test]
+    fn code_block_emits_object_no_property_child() {
         let syms = symbols_for("```rust\nfn main() {}\n```\n");
         let blocks = find_symbols(&syms, &|s| s.kind == lsp::symbol_kind::OBJECT);
         assert_eq!(blocks.len(), 1, "should have one code block");
         assert_eq!(
-            blocks[0].name, "code: rust",
+            blocks[0].name, "CodeBlock: rust",
             "code block name should include language"
         );
-        let children = blocks[0]
-            .children
-            .as_ref()
-            .expect("code block should have children");
-        let props: Vec<_> = children
-            .iter()
-            .filter(|c| c.kind == lsp::symbol_kind::PROPERTY)
-            .collect();
-        assert_eq!(props.len(), 1, "code block should have one Property child");
+        assert!(
+            blocks[0].children.is_none(),
+            "code block should have no children"
+        );
+    }
+
+    #[test]
+    fn code_block_with_title_in_detail() {
+        let syms = symbols_for("```rust title=config.toml\nlet x = 1;\n```\n");
+        let blocks = find_symbols(&syms, &|s| s.kind == lsp::symbol_kind::OBJECT);
+        assert_eq!(blocks.len(), 1, "should have one code block");
         assert_eq!(
-            props[0].name, "code: rust",
-            "property child should name the language"
+            blocks[0].name, "CodeBlock: rust",
+            "code block name should include language"
+        );
+        assert_eq!(
+            blocks[0].detail.as_deref(),
+            Some("title=config.toml"),
+            "code block detail should be the title"
         );
     }
 
@@ -3427,31 +3571,34 @@ mod tests {
         let blocks = find_symbols(&syms, &|s| s.kind == lsp::symbol_kind::OBJECT);
         assert_eq!(blocks.len(), 1, "should have one code block");
         assert_eq!(
-            blocks[0].name, "code",
-            "unnamed code block should be 'code'"
+            blocks[0].name, "CodeBlock",
+            "unnamed code block should be 'CodeBlock'"
         );
     }
 
     #[test]
-    fn blockquote_emits_module() {
+    fn blockquote_emits_module_named_blockquote() {
         let syms = symbols_for("> quoted text\n");
         let quotes = find_symbols(&syms, &|s| s.kind == lsp::symbol_kind::MODULE);
         assert_eq!(quotes.len(), 1, "should have one blockquote");
+        assert_eq!(
+            quotes[0].name, "Blockquote",
+            "blockquote name should be 'Blockquote'"
+        );
     }
 
     #[test]
-    fn admonition_emits_module_with_type_name() {
+    fn admonition_emits_module_with_prefix() {
         let syms = symbols_for("> [!WARNING]\n> Be careful!\n");
         let modules = find_symbols(&syms, &|s| s.kind == lsp::symbol_kind::MODULE);
         assert_eq!(modules.len(), 1, "should have one admonition");
         assert_eq!(
-            modules[0].name, "WARNING",
-            "admonition name should be the type"
+            modules[0].name, "Admonition: WARNING",
+            "admonition name should have prefix"
         );
-        assert_eq!(
-            modules[0].detail.as_deref(),
-            Some("admonition"),
-            "detail should be 'admonition'"
+        assert!(
+            modules[0].detail.is_none(),
+            "admonition should have no detail"
         );
     }
 
@@ -3461,7 +3608,7 @@ mod tests {
         let modules = find_symbols(&syms, &|s| s.kind == lsp::symbol_kind::MODULE);
         assert_eq!(modules.len(), 1, "should have one admonition");
         assert_eq!(
-            modules[0].name, "WARNING",
+            modules[0].name, "Admonition: WARNING",
             "HTML admonition name should be the type"
         );
     }
@@ -3471,6 +3618,10 @@ mod tests {
         let syms = symbols_for("<video src=\"vid.mp4\"></video>\n");
         let files = find_symbols(&syms, &|s| s.kind == lsp::symbol_kind::FILE);
         assert_eq!(files.len(), 1, "video should emit one File symbol");
+        assert_eq!(
+            files[0].name, "File: vid.mp4",
+            "video name should be File: url"
+        );
         assert_eq!(
             files[0].detail.as_deref(),
             Some("video"),
@@ -3484,6 +3635,10 @@ mod tests {
         let files = find_symbols(&syms, &|s| s.kind == lsp::symbol_kind::FILE);
         assert_eq!(files.len(), 1, "video image should emit one File symbol");
         assert_eq!(
+            files[0].name, "File: demo.mp4",
+            "video name should be File: url"
+        );
+        assert_eq!(
             files[0].detail.as_deref(),
             Some("video"),
             "detail should be 'video'"
@@ -3495,6 +3650,10 @@ mod tests {
         let syms = symbols_for("<input type=\"text\">\n");
         let events = find_symbols(&syms, &|s| s.kind == lsp::symbol_kind::EVENT);
         assert_eq!(events.len(), 1, "input should emit one Event symbol");
+        assert_eq!(
+            events[0].name, "Form: input",
+            "form control name should have Form: prefix"
+        );
     }
 
     #[test]
@@ -3502,7 +3661,10 @@ mod tests {
         let syms = symbols_for("---\n");
         let breaks = find_symbols(&syms, &|s| s.kind == lsp::symbol_kind::OPERATOR);
         assert_eq!(breaks.len(), 1, "should have one thematic break");
-        assert_eq!(breaks[0].name, "---", "thematic break name should be ---");
+        assert_eq!(
+            breaks[0].name, "Break",
+            "thematic break name should be Break"
+        );
     }
 
     #[test]
@@ -3531,11 +3693,11 @@ mod tests {
 
         let after = top_children
             .iter()
-            .find(|s| s.name == "After")
-            .expect("'After' should be a child of 'Top'");
+            .find(|s| s.name == "H2: After")
+            .expect("'H2: After' should be a child of 'Top'");
         assert_eq!(
             after.kind,
-            lsp::symbol_kind::STRING,
+            lsp::symbol_kind::CLASS,
             "After should be a heading"
         );
 
@@ -3544,7 +3706,7 @@ mod tests {
             .find(|s| s.kind == lsp::symbol_kind::MODULE)
             .expect("blockquote should be a child of Top");
         let inner_headings = find_symbols(quote.children.as_deref().unwrap_or(&[]), &|s| {
-            s.kind == lsp::symbol_kind::STRING
+            s.kind == lsp::symbol_kind::CLASS
         });
         assert_eq!(
             inner_headings.len(),
@@ -3561,7 +3723,7 @@ mod tests {
                 symbol: lsp::DocumentSymbol {
                     name: "Title".to_string(),
                     detail: None,
-                    kind: lsp::symbol_kind::STRING,
+                    kind: lsp::symbol_kind::CLASS,
                     range: lsp::Range::default(),
                     selection_range: lsp::Range::default(),
                     children: None,
@@ -3610,7 +3772,10 @@ mod tests {
         let workspaces = scan_workspaces(&dir);
         let syms = workspace_symbols(&workspaces, "Section");
         assert_eq!(syms.len(), 1, "query should filter to matching symbols");
-        assert_eq!(syms[0].name, "Section", "should match the section heading");
+        assert_eq!(
+            syms[0].name, "H2: Section",
+            "should match the section heading"
+        );
     }
 
     #[test]
@@ -3619,8 +3784,8 @@ mod tests {
         let footnotes = find_symbols(&syms, &|s| s.kind == lsp::symbol_kind::CONSTANT);
         assert_eq!(footnotes.len(), 1, "should have one footnote definition");
         assert_eq!(
-            footnotes[0].name, "[^1]",
-            "footnote name should include the label"
+            footnotes[0].name, "Footnote: [^1]",
+            "footnote name should have prefix and label"
         );
     }
 
@@ -3632,7 +3797,7 @@ mod tests {
                 symbol: lsp::DocumentSymbol {
                     name: "H1".to_string(),
                     detail: None,
-                    kind: lsp::symbol_kind::STRING,
+                    kind: lsp::symbol_kind::CLASS,
                     range: lsp::Range::default(),
                     selection_range: lsp::Range::default(),
                     children: None,
@@ -3643,7 +3808,7 @@ mod tests {
                 symbol: lsp::DocumentSymbol {
                     name: "H2".to_string(),
                     detail: None,
-                    kind: lsp::symbol_kind::STRING,
+                    kind: lsp::symbol_kind::CLASS,
                     range: lsp::Range::default(),
                     selection_range: lsp::Range::default(),
                     children: None,
@@ -3654,7 +3819,7 @@ mod tests {
                 symbol: lsp::DocumentSymbol {
                     name: "H3".to_string(),
                     detail: None,
-                    kind: lsp::symbol_kind::STRING,
+                    kind: lsp::symbol_kind::CLASS,
                     range: lsp::Range::default(),
                     selection_range: lsp::Range::default(),
                     children: None,
@@ -3671,14 +3836,121 @@ mod tests {
     }
 
     #[test]
-    fn interface_not_used_in_symbols() {
-        // The LSP SymbolKind for Interface is 11 — verify it's never emitted.
-        let content = "# Title\n\n[link](a.md)\n\n- item\n\n```rust\ncode\n```\n\n---\n\n> quote\n";
+    fn no_freed_symbol_kinds_emitted() {
+        // Verify freed kinds (String=15, Key=20, Array=18, Enum=10,
+        // EnumMember=22, Boolean=17, Property=7, Namespace=3) are never used.
+        let content = "# Title\n\n[link](a.md)\n\n- item\n  - sub\n\n| A |\n|---|\n| 1 |\n\n```rust\ncode\n```\n\n---\n\n> quote\n";
         let syms = symbols_for(content);
         let all = find_symbols(&syms, &|_| true);
+        let freed = [3, 7, 10, 15, 17, 18, 20, 22];
+        for sym in &all {
+            assert!(
+                !freed.contains(&sym.kind),
+                "freed SymbolKind {} should not be emitted (symbol: {})",
+                sym.kind,
+                sym.name,
+            );
+        }
+    }
+
+    #[test]
+    fn blockquote_children_show_internal_structure() {
+        let syms = symbols_for("> # Inner heading\n>\n> [link](a.md)\n");
+        let quotes = find_symbols(&syms, &|s| s.kind == lsp::symbol_kind::MODULE);
+        assert_eq!(quotes.len(), 1, "should have one blockquote");
+        let children = quotes[0]
+            .children
+            .as_ref()
+            .expect("blockquote should have children");
         assert!(
-            all.iter().all(|s| s.kind != 11),
-            "Interface (kind 11) should never be emitted"
+            children.iter().any(|c| c.kind == lsp::symbol_kind::CLASS),
+            "blockquote should contain heading"
+        );
+    }
+
+    #[test]
+    fn generic_container_emits_module() {
+        let syms = symbols_for("<div>\n\nContent inside.\n\n</div>\n");
+        let modules = find_symbols(&syms, &|s| {
+            s.kind == lsp::symbol_kind::MODULE && s.name.starts_with("Container:")
+        });
+        assert_eq!(modules.len(), 1, "should have one container");
+        assert_eq!(
+            modules[0].name, "Container: div",
+            "container name should include tag"
+        );
+    }
+
+    #[test]
+    fn details_emits_module_with_summary() {
+        // Blank line after <details> triggers parsed container mode.
+        let syms = symbols_for(
+            "<details>\n\n<summary>Click here</summary>\n\nHidden content.\n\n</details>\n",
+        );
+        let modules = find_symbols(&syms, &|s| {
+            s.kind == lsp::symbol_kind::MODULE && s.name.starts_with("Details")
+        });
+        assert_eq!(modules.len(), 1, "should have one details");
+        assert_eq!(
+            modules[0].name, "Details: Click here",
+            "details name should include summary"
+        );
+    }
+
+    #[test]
+    fn ordered_list_name_distinguishes() {
+        let syms = symbols_for("1. a\n2. b\n3. c\n");
+        let lists = find_symbols(&syms, &|s| s.kind == lsp::symbol_kind::STRUCT);
+        assert_eq!(lists.len(), 1, "should have one list");
+        assert_eq!(
+            lists[0].name, "Ordered List",
+            "ordered list uses 'Ordered List'"
+        );
+    }
+
+    #[test]
+    fn workspace_symbols_skip_nested_lists() {
+        let dir = workspace_with_files(&[("a.md", "- top\n  - nested\n")]);
+        let workspaces = scan_workspaces(&dir);
+        let syms = workspace_symbols(&workspaces, "");
+        let list_count = syms
+            .iter()
+            .filter(|s| s.kind == lsp::symbol_kind::STRUCT)
+            .count();
+        assert_eq!(
+            list_count, 1,
+            "workspace should only include top-level list"
+        );
+    }
+
+    #[test]
+    fn workspace_symbols_include_tables() {
+        let dir = workspace_with_files(&[("a.md", "| A |\n|---|\n| 1 |\n")]);
+        let workspaces = scan_workspaces(&dir);
+        let syms = workspace_symbols(&workspaces, "");
+        assert!(
+            syms.iter()
+                .any(|s| s.kind == lsp::symbol_kind::STRUCT && s.name == "Table"),
+            "workspace should include tables"
+        );
+    }
+
+    #[test]
+    fn math_emits_object() {
+        let syms = symbols_for("$$\nx^2 + y^2 = z^2\n$$\n");
+        let blocks = find_symbols(&syms, &|s| s.kind == lsp::symbol_kind::OBJECT);
+        assert_eq!(blocks.len(), 1, "should have one math block");
+        assert_eq!(blocks[0].name, "Math", "math block name should be 'Math'");
+    }
+
+    #[test]
+    fn import_emits_function() {
+        let syms = symbols_for("@./other.md\n");
+        let links = find_symbols(&syms, &|s| s.kind == lsp::symbol_kind::FUNCTION);
+        assert_eq!(links.len(), 1, "should have one import");
+        assert_eq!(
+            links[0].name, "Link: import(./other.md)",
+            "import name should have Link: import prefix"
         );
     }
 

@@ -422,40 +422,26 @@ pub struct CallHierarchyOutgoingCall {
 
 /// LSP `SymbolKind` constants (subset).
 pub mod symbol_kind {
-    /// File (images, media).
+    /// File (media embeds: image, video, audio, iframe).
     pub const FILE: u32 = 1;
-    /// Module (block quotes, admonitions, details).
+    /// Module (scope containers: blockquote, admonition, details, generic containers).
     pub const MODULE: u32 = 2;
-    /// Namespace (generic containers: div, section, article, etc.).
-    pub const NAMESPACE: u32 = 3;
-    /// Function (links).
+    /// Class (headings — type definitions in the document hierarchy).
+    pub const CLASS: u32 = 5;
+    /// Field (table column headers).
+    pub const FIELD: u32 = 8;
+    /// Function (links — graph edges).
     pub const FUNCTION: u32 = 12;
     /// Constant (footnote definitions).
     pub const CONSTANT: u32 = 14;
-    /// String (headings).
-    pub const STRING: u32 = 15;
-    /// Boolean (task list items).
-    pub const BOOLEAN: u32 = 17;
-    /// Array (ordered lists).
-    pub const ARRAY: u32 = 18;
-    /// Object (code blocks).
+    /// Object (opaque content blocks: code blocks, math).
     pub const OBJECT: u32 = 19;
-    /// Key (table rows).
-    pub const KEY: u32 = 20;
-    /// Enum (unordered lists).
-    pub const ENUM: u32 = 10;
-    /// `EnumMember` (list items).
-    pub const ENUM_MEMBER: u32 = 22;
-    /// Struct (tables).
+    /// Struct (data containers: tables, lists).
     pub const STRUCT: u32 = 23;
     /// Event (form elements: `<input>`, `<select>`, `<textarea>`).
     pub const EVENT: u32 = 24;
     /// Operator (thematic breaks).
     pub const OPERATOR: u32 = 25;
-    /// Property (code block language tag).
-    pub const PROPERTY: u32 = 7;
-    /// Field (table column headers — th).
-    pub const FIELD: u32 = 8;
 }
 
 /// LSP `DiagnosticSeverity` constants.
