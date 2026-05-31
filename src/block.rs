@@ -1140,6 +1140,17 @@ fn html_block_end(line: &str, html_type: u8) -> bool {
     }
 }
 
+/// Whether the closing tag for `tag_name` appears on the same line after
+/// the opening tag. `open_len` is the byte length of the opening tag
+/// (from [`HtmlTag::Open::len`]).
+fn has_close_on_same_line(line: &str, tag_name: &str, open_len: usize) -> bool {
+    if open_len >= line.len() {
+        return false;
+    }
+    let rest = line[open_len..].to_lowercase();
+    rest.contains(&format!("</{tag_name}>"))
+}
+
 /// Check if a line opens a `<pre><code>` block (case-insensitive).
 fn is_pre_code_open(line: &str) -> bool {
     let lower = line.trim().to_lowercase();
@@ -1930,7 +1941,7 @@ impl<'a> TreeBuilder<'a> {
                 ref name,
                 ref attrs,
                 self_closing,
-                ..
+                len: tag_len,
             } => {
                 let line_end = body_offset + *pos + first_raw_len;
                 let span = Span::new(content_start, line_end);
@@ -1940,7 +1951,9 @@ impl<'a> TreeBuilder<'a> {
                     let (href, title) = html::extract_link_attrs(attrs);
                     *pos += first_raw_len;
                     *line_idx += 1;
-                    self.consume_html_leaf(lines, pos, line_idx, name);
+                    if !has_close_on_same_line(trimmed, name, tag_len) {
+                        self.consume_html_leaf(lines, pos, line_idx, name);
+                    }
                     let full_span = Span::new(content_start, body_offset + *pos);
                     self.add_leaf(
                         ElementKind::Link { url: href, title },
@@ -1976,11 +1989,13 @@ impl<'a> TreeBuilder<'a> {
                     return true;
                 }
 
-                // Non-container leaf elements: <p>, <h1>-<h6>, media.
+                // Non-container leaf elements: <p>, <h1>-<h6>, media, <dt>, <dd>.
                 if !html::is_html_container(name) {
                     *pos += first_raw_len;
                     *line_idx += 1;
-                    self.consume_html_leaf(lines, pos, line_idx, name);
+                    if !has_close_on_same_line(trimmed, name, tag_len) {
+                        self.consume_html_leaf(lines, pos, line_idx, name);
+                    }
                     let full_span = Span::new(content_start, body_offset + *pos);
                     let leaf_kind = match kind {
                         ElementKind::Image { .. }
@@ -2006,10 +2021,16 @@ impl<'a> TreeBuilder<'a> {
 
                 self.push_html_scope(name, kind, span);
 
-                // Check if next line (after stripping continuation markers)
-                // is non-blank. If blank, content is parsed as markdown
-                // (scope stays on stack, main loop continues). If non-blank,
-                // consume raw content until blank or close.
+                // If the close tag is on the same line as the open tag
+                // (e.g. `<summary>Title</summary>`), close immediately.
+                if has_close_on_same_line(trimmed, name, tag_len) {
+                    self.handle_html_close_tag(name, body_offset + *pos);
+                    return true;
+                }
+
+                // When the next line is non-blank, process content in
+                // HTML mode — dispatching nested HTML tags while treating
+                // non-HTML lines as opaque content.
                 let next_is_nonblank = *line_idx < lines.len() && {
                     let next = lines[*line_idx];
                     let content = self
@@ -2027,7 +2048,11 @@ impl<'a> TreeBuilder<'a> {
         }
     }
 
-    /// Consume lines until matching close tag or blank line (raw HTML content mode).
+    /// Consume lines inside an HTML container scope.
+    ///
+    /// Dispatches nested HTML open/close tags while treating non-HTML
+    /// lines as opaque content. Stops at a blank line (switching to
+    /// markdown mode) or the matching close tag.
     fn consume_html_raw(
         &mut self,
         lines: &[&str],
@@ -2041,9 +2066,9 @@ impl<'a> TreeBuilder<'a> {
             let inner_start = body_offset + *pos;
 
             // Strip continuation markers (quotes + list indent).
-            let content = self
+            let (content, content_start) = self
                 .strip_continuation(line, inner_start)
-                .map_or(line, |(c, _)| c);
+                .unwrap_or((line, inner_start));
 
             if content.trim().is_empty() {
                 // Blank line: switch to markdown mode (stop consuming raw).
@@ -2051,16 +2076,40 @@ impl<'a> TreeBuilder<'a> {
             }
 
             let trimmed = content.trim();
-            if let Some(HtmlTag::Close { ref name, .. }) = html::tokenize_tag(trimmed, 0)
-                && name == tag
-            {
-                // Matching close: pop scope.
+
+            // 1. Check for the container's own close tag.
+            if let Some(HtmlTag::Close { ref name, .. }) = html::tokenize_tag(trimmed, 0) {
+                if name == tag {
+                    *pos += line.len();
+                    *line_idx += 1;
+                    self.handle_html_close_tag(tag, body_offset + *pos);
+                    return;
+                }
+                // Nested close tag — dispatch to close handler.
                 *pos += line.len();
                 *line_idx += 1;
-                self.handle_html_close_tag(tag, body_offset + *pos);
-                return;
+                self.handle_html_close_tag(name, body_offset + *pos);
+                continue;
             }
 
+            // 2. Check for nested HTML open tags.
+            let raw_len = line.len();
+            if html_block_start(&content.trim_start().to_lowercase())
+                .is_some_and(|ht| ht == 6 || ht == 7)
+                && self.handle_html_open(
+                    lines,
+                    pos,
+                    line_idx,
+                    body_offset,
+                    content,
+                    content_start,
+                    raw_len,
+                )
+            {
+                continue;
+            }
+
+            // 3. Opaque content — skip line.
             *pos += line.len();
             *line_idx += 1;
         }
@@ -6380,6 +6429,172 @@ mod tests {
         assert!(
             matches!(&tree.node(children[0]).kind, ElementKind::Table { .. }),
             "single dash is valid delimiter"
+        );
+    }
+
+    // --- Nested HTML containers without blank lines (ticket 15) ---
+
+    #[test]
+    fn compact_dl_produces_children() {
+        // <dl> with <dt>/<dd> on separate lines, no blank lines.
+        let source = "<dl>\n<dt>API</dt>\n<dd>Description</dd>\n</dl>\n";
+        let tree = parse(source);
+        let children = root_children(&tree);
+        assert_eq!(children.len(), 1, "one definition list");
+        assert_kind(&tree, children[0], &ElementKind::DefinitionList);
+
+        let dl_children = tree.children(children[0]);
+        assert_eq!(dl_children.len(), 2, "dt and dd children");
+        assert_kind(&tree, dl_children[0], &ElementKind::DefinitionTerm);
+        assert_kind(&tree, dl_children[1], &ElementKind::DefinitionDesc);
+
+        assert!(
+            tree.diagnostics()
+                .iter()
+                .all(|d| !d.message.contains("unclosed")),
+            "no unclosed diagnostics: {:?}",
+            tree.diagnostics()
+        );
+    }
+
+    #[test]
+    fn compact_details_summary() {
+        let source = "<details>\n<summary>Title</summary>\n<p>content</p>\n</details>\n";
+        let tree = parse(source);
+        let children = root_children(&tree);
+        assert_eq!(children.len(), 1, "one details container");
+        assert_kind(&tree, children[0], &ElementKind::Details);
+
+        let inner = tree.children(children[0]);
+        assert!(
+            inner
+                .iter()
+                .any(|&id| tree.node(id).kind == ElementKind::DetailsSummary),
+            "has DetailsSummary child: {inner:?}"
+        );
+        assert!(
+            inner
+                .iter()
+                .any(|&id| tree.node(id).kind == ElementKind::Paragraph),
+            "has Paragraph child: {inner:?}"
+        );
+
+        assert!(
+            tree.diagnostics()
+                .iter()
+                .all(|d| !d.message.contains("unclosed")),
+            "no unclosed diagnostics: {:?}",
+            tree.diagnostics()
+        );
+    }
+
+    #[test]
+    fn compact_ul_with_li_children() {
+        let source = "<ul>\n<li>item 1</li>\n<li>item 2</li>\n</ul>\n";
+        let tree = parse(source);
+        let children = root_children(&tree);
+        assert_eq!(children.len(), 1, "one list");
+        assert!(
+            matches!(&tree.node(children[0]).kind, ElementKind::List { .. }),
+            "kind is List"
+        );
+
+        let list_children = tree.children(children[0]);
+        assert_eq!(list_children.len(), 2, "two list items");
+        assert!(
+            matches!(
+                &tree.node(list_children[0]).kind,
+                ElementKind::ListItem { .. }
+            ),
+            "first child is ListItem"
+        );
+        assert!(
+            matches!(
+                &tree.node(list_children[1]).kind,
+                ElementKind::ListItem { .. }
+            ),
+            "second child is ListItem"
+        );
+
+        assert!(
+            tree.diagnostics()
+                .iter()
+                .all(|d| !d.message.contains("unclosed")),
+            "no unclosed diagnostics: {:?}",
+            tree.diagnostics()
+        );
+    }
+
+    #[test]
+    fn compact_html_mixed_with_blank_lines() {
+        // Some content with blank lines, some without.
+        let source = "<dl>\n<dt>Term 1</dt>\n\nSome markdown\n\n<dd>Desc</dd>\n</dl>\n";
+        let tree = parse(source);
+        let children = root_children(&tree);
+        assert_eq!(children.len(), 1, "one definition list");
+        assert_kind(&tree, children[0], &ElementKind::DefinitionList);
+
+        let dl_children = tree.children(children[0]);
+        assert!(
+            dl_children
+                .iter()
+                .any(|&id| tree.node(id).kind == ElementKind::DefinitionTerm),
+            "has DefinitionTerm child"
+        );
+        assert!(
+            dl_children
+                .iter()
+                .any(|&id| tree.node(id).kind == ElementKind::DefinitionDesc),
+            "has DefinitionDesc child"
+        );
+    }
+
+    #[test]
+    fn compact_html_preserves_raw_non_html() {
+        // Non-HTML content without blank lines is still opaque.
+        let source = "<div>\n## Not a heading\n<p>also raw</p>\n</div>\n";
+        let tree = parse(source);
+        let children = root_children(&tree);
+        assert_eq!(children.len(), 1, "one container");
+        let inner = tree.children(children[0]);
+        // The ## line is opaque, but <p> IS dispatched as a child.
+        assert!(
+            !inner
+                .iter()
+                .any(|&id| matches!(tree.node(id).kind, ElementKind::Heading { .. })),
+            "heading is raw, not parsed"
+        );
+        assert!(
+            inner
+                .iter()
+                .any(|&id| tree.node(id).kind == ElementKind::Paragraph),
+            "<p> dispatched as Paragraph child"
+        );
+    }
+
+    #[test]
+    fn compact_nested_close_tag() {
+        // Close tag for inner container dispatched from raw mode.
+        let source = "<div>\n<section>\n<p>text</p>\n</section>\n</div>\n";
+        let tree = parse(source);
+        let children = root_children(&tree);
+        assert_eq!(children.len(), 1, "one root container");
+        assert_kind(&tree, children[0], &ElementKind::Container);
+
+        let div_children = tree.children(children[0]);
+        assert!(
+            div_children
+                .iter()
+                .any(|&id| tree.node(id).kind == ElementKind::Container),
+            "section child dispatched inside div"
+        );
+
+        assert!(
+            tree.diagnostics()
+                .iter()
+                .all(|d| !d.message.contains("unclosed")),
+            "no unclosed diagnostics: {:?}",
+            tree.diagnostics()
         );
     }
 }
