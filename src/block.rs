@@ -182,6 +182,8 @@ pub enum TableAlignment {
 pub enum Syntax {
     /// YAML frontmatter.
     Yaml,
+    /// TOML frontmatter.
+    Toml,
     /// Markdown structural syntax.
     Markdown,
     /// Raw HTML.
@@ -1534,36 +1536,37 @@ fn strip_blockquote_marker(line: &str) -> Option<(usize, &str)> {
 // Frontmatter tree expansion
 // ---------------------------------------------------------------------------
 
-/// Expand YAML entries into `FrontmatterKey` and `FrontmatterMap` child nodes.
+/// Expand frontmatter entries into `FrontmatterKey` and `FrontmatterMap` child nodes.
 fn expand_frontmatter_entries(
     builder: &mut TreeBuilder<'_>,
     parent_id: NodeId,
-    entries: &[crate::yaml::YamlNode],
+    syntax: Syntax,
+    entries: &[crate::fm::FmNode],
 ) {
     for entry in entries {
-        let crate::yaml::YamlNode::Mapping { key, value, span } = entry else {
+        let crate::fm::FmNode::Mapping { key, value, span } = entry else {
             continue;
         };
 
         match value {
-            crate::yaml::YamlValue::Mapping(children) => {
+            crate::fm::FmValue::Mapping(children) => {
                 let map_id = builder.add_node(
                     ElementKind::FrontmatterMap {
                         key: key.text.clone(),
                     },
-                    Syntax::Yaml,
+                    syntax,
                     *span,
                     Some(parent_id),
                 );
-                expand_frontmatter_entries(builder, map_id, children);
+                expand_frontmatter_entries(builder, map_id, syntax, children);
             }
             _ => {
                 builder.add_node(
                     ElementKind::FrontmatterKey {
                         key: key.text.clone(),
-                        leaf_count: yaml_leaf_count(value),
+                        leaf_count: fm_leaf_count(value),
                     },
-                    Syntax::Yaml,
+                    syntax,
                     *span,
                     Some(parent_id),
                 );
@@ -1572,14 +1575,14 @@ fn expand_frontmatter_entries(
     }
 }
 
-/// Count the number of leaf items in a YAML value.
+/// Count the number of leaf items in a frontmatter value.
 ///
 /// Block sequences and flow sequences return their item count.
 /// Scalars and other values return 0 (no list structure).
-fn yaml_leaf_count(value: &crate::yaml::YamlValue) -> usize {
+fn fm_leaf_count(value: &crate::fm::FmValue) -> usize {
     match value {
-        crate::yaml::YamlValue::Sequence(items) => items.len(),
-        crate::yaml::YamlValue::FlowSequence { items, .. } => items.len(),
+        crate::fm::FmValue::Sequence(items) => items.len(),
+        crate::fm::FmValue::FlowSequence { items, .. } => items.len(),
         _ => 0,
     }
 }
@@ -1599,15 +1602,16 @@ fn yaml_leaf_count(value: &crate::yaml::YamlValue) -> usize {
 /// expose frontmatter structure.
 #[allow(dead_code, reason = "public API used by tests in other modules")]
 pub fn parse_tree(source: &str, frontmatter_span: Option<Span>) -> Tree {
-    parse_tree_with_entries(source, frontmatter_span, None)
+    parse_tree_with_entries(source, frontmatter_span, Syntax::Yaml, None)
 }
 
-/// Extended variant of [`parse_tree`] that accepts parsed YAML entries
-/// for frontmatter child expansion.
+/// Extended variant of [`parse_tree`] that accepts parsed frontmatter entries
+/// for child expansion.
 pub fn parse_tree_with_entries(
     source: &str,
     frontmatter_span: Option<Span>,
-    frontmatter_entries: Option<&[crate::yaml::YamlNode]>,
+    frontmatter_syntax: Syntax,
+    frontmatter_entries: Option<&[crate::fm::FmNode]>,
 ) -> Tree {
     let mut builder = TreeBuilder::new(source);
 
@@ -1624,14 +1628,14 @@ pub fn parse_tree_with_entries(
     let body_offset = frontmatter_span.map_or(0, |fm_span| {
         let fm_id = builder.add_node(
             ElementKind::Frontmatter,
-            Syntax::Yaml,
+            frontmatter_syntax,
             fm_span,
             Some(doc_id),
         );
 
         // Expand frontmatter entries into child nodes.
         if let Some(entries) = frontmatter_entries {
-            expand_frontmatter_entries(&mut builder, fm_id, entries);
+            expand_frontmatter_entries(&mut builder, fm_id, frontmatter_syntax, entries);
         }
 
         fm_span.end

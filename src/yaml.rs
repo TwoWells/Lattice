@@ -4,7 +4,7 @@
 //! Span-aware YAML frontmatter parser.
 //!
 //! Parses the YAML subset used in markdown frontmatter, producing a tree of
-//! [`YamlNode`] values where every node carries a [`Span`] back into the
+//! [`FmNode`] values where every node carries a [`Span`] back into the
 //! original source text. This replaces `serde_yaml_ng` for frontmatter
 //! parsing.
 //!
@@ -13,127 +13,8 @@
 //! block literal, block folded), and comments. It rejects anchors, aliases,
 //! tags, directives, and complex keys with diagnostics.
 
+use crate::fm::{self, FmDiagnostic, FmNode, FmSeverity, FmValue, FrontmatterBlock, ScalarSpan};
 use crate::span::Span;
-
-// ---------------------------------------------------------------------------
-// Public types
-// ---------------------------------------------------------------------------
-
-/// Parsed frontmatter block with span information.
-#[derive(Debug)]
-pub struct FrontmatterBlock {
-    /// Full range including `---` delimiters.
-    pub span: Span,
-    /// YAML content between delimiters.
-    #[allow(dead_code, reason = "used by tree construction ticket 06a")]
-    pub content_span: Span,
-    /// Top-level YAML entries.
-    pub entries: Vec<YamlNode>,
-    /// Parse diagnostics (errors and warnings).
-    pub diagnostics: Vec<YamlDiagnostic>,
-}
-
-/// A node in the YAML tree.
-#[derive(Debug)]
-pub enum YamlNode {
-    /// A key-value mapping entry.
-    Mapping {
-        /// The mapping key.
-        key: ScalarSpan,
-        /// The mapping value.
-        value: YamlValue,
-        /// Span covering the full key-value pair.
-        span: Span,
-    },
-    /// A sequence item (`- value`).
-    SequenceItem {
-        /// The item value.
-        value: YamlValue,
-        /// Span covering the `- value` line(s).
-        #[allow(dead_code, reason = "used by tree construction ticket 06a")]
-        span: Span,
-    },
-}
-
-/// A YAML value.
-#[derive(Debug)]
-pub enum YamlValue {
-    /// A scalar value (plain, quoted, or null).
-    Scalar(ScalarSpan),
-    /// A block sequence (list of `YamlNode::SequenceItem`).
-    Sequence(Vec<YamlNode>),
-    /// A block mapping (list of `YamlNode::Mapping`).
-    Mapping(Vec<YamlNode>),
-    /// An inline flow sequence (`[a, b, c]`).
-    FlowSequence {
-        /// Span of the entire flow sequence including brackets.
-        #[allow(dead_code, reason = "used by tree construction ticket 06a")]
-        span: Span,
-        /// Scalar items.
-        items: Vec<ScalarSpan>,
-    },
-    /// An inline flow mapping (`{a: b, c: d}`).
-    FlowMapping {
-        /// Span of the entire flow mapping including braces.
-        #[allow(dead_code, reason = "used by tree construction ticket 06a")]
-        span: Span,
-        /// Key-value pairs.
-        #[allow(dead_code, reason = "used by tree construction ticket 06a")]
-        entries: Vec<(ScalarSpan, ScalarSpan)>,
-    },
-    /// A block scalar (literal `|` or folded `>`).
-    BlockScalar {
-        /// Span of the entire block scalar content.
-        #[allow(dead_code, reason = "used by tree construction ticket 06a")]
-        span: Span,
-    },
-}
-
-/// A scalar with its source span and resolved text.
-#[derive(Debug)]
-pub struct ScalarSpan {
-    /// Byte range in the original source.
-    pub span: Span,
-    /// Resolved text content.
-    pub text: String,
-}
-
-/// Severity of a YAML diagnostic.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum YamlSeverity {
-    /// A hard parse error.
-    Error,
-    /// A warning (e.g. unsupported feature that was skipped).
-    #[allow(dead_code, reason = "used by structural diagnostics ticket 07")]
-    Warning,
-}
-
-/// A diagnostic emitted during YAML parsing.
-#[derive(Debug)]
-pub struct YamlDiagnostic {
-    /// Location in the source.
-    pub span: Span,
-    /// Severity level.
-    pub severity: YamlSeverity,
-    /// Human-readable message.
-    pub message: String,
-}
-
-// ---------------------------------------------------------------------------
-// BOM stripping
-// ---------------------------------------------------------------------------
-
-/// UTF-8 byte order mark.
-const BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
-
-/// Strip a UTF-8 BOM at byte 0, returning the remainder and the byte offset.
-fn strip_bom(source: &str) -> (&str, usize) {
-    if source.as_bytes().starts_with(BOM) {
-        (&source[3..], 3)
-    } else {
-        (source, 0)
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Delimiter detection
@@ -195,7 +76,7 @@ struct Parser<'a> {
     /// Base offset to add to all spans (accounts for BOM + opening delimiter).
     base: usize,
     /// Collected diagnostics.
-    diagnostics: Vec<YamlDiagnostic>,
+    diagnostics: Vec<FmDiagnostic>,
 }
 
 impl<'a> Parser<'a> {
@@ -233,8 +114,8 @@ impl<'a> Parser<'a> {
         self.base + self.pos
     }
 
-    fn emit(&mut self, span: Span, severity: YamlSeverity, message: String) {
-        self.diagnostics.push(YamlDiagnostic {
+    fn emit(&mut self, span: Span, severity: FmSeverity, message: String) {
+        self.diagnostics.push(FmDiagnostic {
             span,
             severity,
             message,
@@ -254,7 +135,7 @@ impl<'a> Parser<'a> {
                     let span = Span::new(self.abs(), self.abs() + 1);
                     self.emit(
                         span,
-                        YamlSeverity::Error,
+                        FmSeverity::Error,
                         "tab character in indentation is not allowed in YAML".into(),
                     );
                     self.pos += 1;
@@ -355,7 +236,7 @@ impl<'a> Parser<'a> {
                 self.skip_to_eol();
                 self.emit(
                     Span::new(start, self.abs()),
-                    YamlSeverity::Error,
+                    FmSeverity::Error,
                     "YAML anchors are not supported in frontmatter".into(),
                 );
                 true
@@ -365,7 +246,7 @@ impl<'a> Parser<'a> {
                 self.skip_to_eol();
                 self.emit(
                     Span::new(start, self.abs()),
-                    YamlSeverity::Error,
+                    FmSeverity::Error,
                     "YAML aliases are not supported in frontmatter".into(),
                 );
                 true
@@ -375,7 +256,7 @@ impl<'a> Parser<'a> {
                 self.skip_to_eol();
                 self.emit(
                     Span::new(start, self.abs()),
-                    YamlSeverity::Error,
+                    FmSeverity::Error,
                     "YAML tags are not supported in frontmatter".into(),
                 );
                 true
@@ -385,7 +266,7 @@ impl<'a> Parser<'a> {
                 self.skip_to_eol();
                 self.emit(
                     Span::new(start, self.abs()),
-                    YamlSeverity::Error,
+                    FmSeverity::Error,
                     "YAML directives are not supported in frontmatter".into(),
                 );
                 true
@@ -442,7 +323,7 @@ impl<'a> Parser<'a> {
                 None => {
                     self.emit(
                         Span::new(abs_start, self.abs()),
-                        YamlSeverity::Error,
+                        FmSeverity::Error,
                         "unclosed single-quoted scalar".into(),
                     );
                     break;
@@ -484,7 +365,7 @@ impl<'a> Parser<'a> {
                 None => {
                     self.emit(
                         Span::new(abs_start, self.abs()),
-                        YamlSeverity::Error,
+                        FmSeverity::Error,
                         "unclosed double-quoted scalar".into(),
                     );
                     break;
@@ -538,7 +419,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Parse a block scalar (literal `|` or folded `>`).
-    fn parse_block_scalar(&mut self) -> YamlValue {
+    fn parse_block_scalar(&mut self) -> FmValue {
         let abs_start = self.abs();
         self.pos += 1; // skip `|` or `>`
 
@@ -591,7 +472,7 @@ impl<'a> Parser<'a> {
             self.skip_newline();
         }
 
-        YamlValue::BlockScalar {
+        FmValue::BlockScalar {
             span: Span::new(abs_start, self.abs()),
         }
     }
@@ -618,7 +499,7 @@ impl<'a> Parser<'a> {
     // -- Flow collections -------------------------------------------------
 
     /// Parse a flow sequence (`[a, b, c]`).
-    fn parse_flow_sequence(&mut self) -> YamlValue {
+    fn parse_flow_sequence(&mut self) -> FmValue {
         let abs_start = self.abs();
         self.pos += 1; // skip '['
 
@@ -631,7 +512,7 @@ impl<'a> Parser<'a> {
                 None => {
                     self.emit(
                         Span::new(abs_start, self.abs()),
-                        YamlSeverity::Error,
+                        FmSeverity::Error,
                         "unclosed flow sequence".into(),
                     );
                     break;
@@ -652,14 +533,14 @@ impl<'a> Parser<'a> {
             }
         }
 
-        YamlValue::FlowSequence {
+        FmValue::FlowSequence {
             span: Span::new(abs_start, self.abs()),
             items,
         }
     }
 
     /// Parse a flow mapping (`{a: b, c: d}`).
-    fn parse_flow_mapping(&mut self) -> YamlValue {
+    fn parse_flow_mapping(&mut self) -> FmValue {
         let abs_start = self.abs();
         self.pos += 1; // skip '{'
 
@@ -672,7 +553,7 @@ impl<'a> Parser<'a> {
                 None => {
                     self.emit(
                         Span::new(abs_start, self.abs()),
-                        YamlSeverity::Error,
+                        FmSeverity::Error,
                         "unclosed flow mapping".into(),
                     );
                     break;
@@ -706,7 +587,7 @@ impl<'a> Parser<'a> {
             }
         }
 
-        YamlValue::FlowMapping {
+        FmValue::FlowMapping {
             span: Span::new(abs_start, self.abs()),
             entries,
         }
@@ -736,11 +617,11 @@ impl<'a> Parser<'a> {
     // -- Value parsing ----------------------------------------------------
 
     /// Parse a value that starts on the same line as the key (after `: `).
-    fn parse_inline_value(&mut self, parent_indent: usize) -> YamlValue {
+    fn parse_inline_value(&mut self, parent_indent: usize) -> FmValue {
         // Check for unsupported features first.
         if self.check_unsupported() {
             self.skip_newline();
-            return YamlValue::Scalar(ScalarSpan {
+            return FmValue::Scalar(ScalarSpan {
                 span: Span::new(self.abs(), self.abs()),
                 text: String::new(),
             });
@@ -772,28 +653,28 @@ impl<'a> Parser<'a> {
             Some(b'\'') => {
                 let s = self.parse_single_quoted();
                 self.skip_trailing();
-                YamlValue::Scalar(s)
+                FmValue::Scalar(s)
             }
             Some(b'"') => {
                 let s = self.parse_double_quoted();
                 self.skip_trailing();
-                YamlValue::Scalar(s)
+                FmValue::Scalar(s)
             }
             _ => {
                 let s = self.parse_plain_scalar(false);
                 self.skip_trailing();
-                YamlValue::Scalar(s)
+                FmValue::Scalar(s)
             }
         }
     }
 
     /// Parse a block value (nested mapping or sequence) that appears on
     /// subsequent lines after a key.
-    fn parse_block_value(&mut self, parent_indent: usize) -> YamlValue {
+    fn parse_block_value(&mut self, parent_indent: usize) -> FmValue {
         self.skip_blanks_and_comments();
 
         if self.at_end() {
-            return YamlValue::Scalar(ScalarSpan {
+            return FmValue::Scalar(ScalarSpan {
                 span: Span::new(self.abs(), self.abs()),
                 text: String::new(),
             });
@@ -802,7 +683,7 @@ impl<'a> Parser<'a> {
         let child_indent = self.line_indent();
         if child_indent <= parent_indent {
             // No deeper content — this is a null/empty value.
-            return YamlValue::Scalar(ScalarSpan {
+            return FmValue::Scalar(ScalarSpan {
                 span: Span::new(self.abs(), self.abs()),
                 text: String::new(),
             });
@@ -819,11 +700,11 @@ impl<'a> Parser<'a> {
         {
             // Block sequence.
             let items = self.parse_block_sequence(child_indent);
-            YamlValue::Sequence(items)
+            FmValue::Sequence(items)
         } else {
             // Block mapping.
             let entries = self.parse_entries(child_indent);
-            YamlValue::Mapping(entries)
+            FmValue::Mapping(entries)
         }
     }
 
@@ -840,7 +721,7 @@ impl<'a> Parser<'a> {
     // -- Block structure --------------------------------------------------
 
     /// Parse block mapping entries at a given indentation level.
-    fn parse_entries(&mut self, indent: usize) -> Vec<YamlNode> {
+    fn parse_entries(&mut self, indent: usize) -> Vec<FmNode> {
         let mut entries = Vec::new();
 
         loop {
@@ -860,7 +741,7 @@ impl<'a> Parser<'a> {
                 self.skip_to_eol();
                 self.emit(
                     Span::new(abs_start, self.abs()),
-                    YamlSeverity::Error,
+                    FmSeverity::Error,
                     "unexpected indentation".into(),
                 );
                 self.skip_newline();
@@ -898,7 +779,7 @@ impl<'a> Parser<'a> {
                 self.skip_to_eol();
                 self.emit(
                     Span::new(err_start, self.abs()),
-                    YamlSeverity::Error,
+                    FmSeverity::Error,
                     "expected mapping key".into(),
                 );
                 self.skip_newline();
@@ -908,7 +789,7 @@ impl<'a> Parser<'a> {
             // Expect `:`.
             if self.peek() != Some(b':') {
                 let span = Span::new(self.abs(), self.abs() + 1);
-                self.emit(span, YamlSeverity::Error, "expected ':'".into());
+                self.emit(span, FmSeverity::Error, "expected ':'".into());
                 self.skip_to_eol();
                 self.skip_newline();
                 continue;
@@ -921,7 +802,7 @@ impl<'a> Parser<'a> {
             let value = self.parse_inline_value(indent);
 
             let entry_end = self.abs();
-            entries.push(YamlNode::Mapping {
+            entries.push(FmNode::Mapping {
                 key,
                 value,
                 span: Span::new(entry_start, entry_end),
@@ -940,7 +821,7 @@ impl<'a> Parser<'a> {
                 let start = self.abs();
                 self.emit(
                     Span::new(start, start + 1),
-                    YamlSeverity::Error,
+                    FmSeverity::Error,
                     "complex keys are not supported in frontmatter".into(),
                 );
                 None
@@ -977,7 +858,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Parse a block sequence at a given indentation level.
-    fn parse_block_sequence(&mut self, indent: usize) -> Vec<YamlNode> {
+    fn parse_block_sequence(&mut self, indent: usize) -> Vec<FmNode> {
         let mut items = Vec::new();
 
         loop {
@@ -1019,7 +900,7 @@ impl<'a> Parser<'a> {
             } else if self.peek() == Some(b'#') {
                 self.skip_comment();
                 self.skip_newline();
-                YamlValue::Scalar(ScalarSpan {
+                FmValue::Scalar(ScalarSpan {
                     span: Span::new(self.abs(), self.abs()),
                     text: String::new(),
                 })
@@ -1030,7 +911,7 @@ impl<'a> Parser<'a> {
             };
 
             let item_end = self.abs();
-            items.push(YamlNode::SequenceItem {
+            items.push(FmNode::SequenceItem {
                 value,
                 span: Span::new(item_start, item_end),
             });
@@ -1052,7 +933,7 @@ impl<'a> Parser<'a> {
 ///
 /// UTF-8 BOM at byte 0 is stripped transparently.
 pub fn parse_frontmatter_block(source: &str) -> Option<FrontmatterBlock> {
-    let (stripped, bom_offset) = strip_bom(source);
+    let (stripped, bom_offset) = fm::strip_bom(source);
 
     let opener_len = find_opening(stripped)?;
     let content_start = bom_offset + opener_len;
@@ -1086,112 +967,6 @@ pub fn parse_frontmatter_block(source: &str) -> Option<FrontmatterBlock> {
 }
 
 // ---------------------------------------------------------------------------
-// Backlink extraction helper
-// ---------------------------------------------------------------------------
-
-/// Extract backlinks from a parsed frontmatter block.
-///
-/// Walks the YAML tree looking for a top-level `backlinks` key whose value
-/// is a mapping of predicate → list of paths. Returns the backlinks map
-/// and any entries that don't match the expected shape.
-pub fn extract_backlinks(
-    block: &FrontmatterBlock,
-    source: &str,
-) -> std::collections::HashMap<String, Vec<String>> {
-    let mut backlinks = std::collections::HashMap::new();
-
-    for entry in &block.entries {
-        if let YamlNode::Mapping { key, value, .. } = entry {
-            if key.text != "backlinks" {
-                continue;
-            }
-
-            let YamlValue::Mapping(predicates) = value else {
-                break;
-            };
-
-            for pred_entry in predicates {
-                let YamlNode::Mapping {
-                    key: pred_key,
-                    value: pred_value,
-                    ..
-                } = pred_entry
-                else {
-                    continue;
-                };
-
-                let mut paths = Vec::new();
-
-                match pred_value {
-                    YamlValue::Sequence(items) => {
-                        for item in items {
-                            if let YamlNode::SequenceItem {
-                                value: YamlValue::Scalar(s),
-                                ..
-                            } = item
-                            {
-                                paths.push(s.text.clone());
-                            }
-                        }
-                    }
-                    YamlValue::FlowSequence { items, .. } => {
-                        for item in items {
-                            paths.push(item.text.clone());
-                        }
-                    }
-                    _ => {}
-                }
-
-                backlinks.insert(pred_key.text.clone(), paths);
-            }
-
-            break;
-        }
-    }
-
-    let _ = source; // reserved for future span-based extraction
-    backlinks
-}
-
-/// Find the 1-based line number for a top-level key in the frontmatter.
-///
-/// Searches for the `backlinks` → predicate key and returns its line
-/// number in the original source.
-pub fn find_predicate_line(block: &FrontmatterBlock, predicate: &str, source: &str) -> usize {
-    for entry in &block.entries {
-        if let YamlNode::Mapping { key, value, .. } = entry {
-            if key.text != "backlinks" {
-                continue;
-            }
-
-            let YamlValue::Mapping(predicates) = value else {
-                break;
-            };
-
-            for pred_entry in predicates {
-                if let YamlNode::Mapping { key: pred_key, .. } = pred_entry
-                    && pred_key.text == predicate
-                {
-                    return byte_offset_to_line(source, pred_key.span.start);
-                }
-            }
-        }
-    }
-
-    // Fallback: line 1 (the opening `---`).
-    1
-}
-
-/// Convert a byte offset to a 1-based line number.
-fn byte_offset_to_line(source: &str, offset: usize) -> usize {
-    source[..offset.min(source.len())]
-        .bytes()
-        .filter(|&b| b == b'\n')
-        .count()
-        + 1
-}
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1200,6 +975,7 @@ fn byte_offset_to_line(source: &str, offset: usize) -> usize {
 #[allow(clippy::panic, reason = "tests use panic for unreachable match arms")]
 mod tests {
     use super::*;
+    use crate::fm::{extract_backlinks, find_predicate_line};
 
     // -- BOM stripping ----------------------------------------------------
 
@@ -1271,9 +1047,9 @@ mod tests {
         let block = parse_frontmatter_block(source).expect("should parse");
         assert_eq!(block.entries.len(), 2, "should have two entries");
 
-        if let YamlNode::Mapping { key, value, .. } = &block.entries[0] {
+        if let FmNode::Mapping { key, value, .. } = &block.entries[0] {
             assert_eq!(key.text, "title", "first key should be title");
-            if let YamlValue::Scalar(s) = value {
+            if let FmValue::Scalar(s) = value {
                 assert_eq!(s.text, "My Document", "title value should match");
             } else {
                 panic!("title value should be a scalar");
@@ -1290,9 +1066,9 @@ mod tests {
         assert_eq!(block.entries.len(), 3, "should have three entries");
 
         // First key has empty value (next line is another key at same indent).
-        if let YamlNode::Mapping { key, value, .. } = &block.entries[0] {
+        if let FmNode::Mapping { key, value, .. } = &block.entries[0] {
             assert_eq!(key.text, "empty", "first key");
-            if let YamlValue::Scalar(s) = value {
+            if let FmValue::Scalar(s) = value {
                 assert!(s.text.is_empty(), "empty key should have empty value");
             } else {
                 panic!("should be scalar");
@@ -1310,9 +1086,9 @@ mod tests {
         let block = parse_frontmatter_block(source).expect("should parse");
         assert_eq!(block.entries.len(), 1, "one top-level entry");
 
-        if let YamlNode::Mapping { key, value, .. } = &block.entries[0] {
+        if let FmNode::Mapping { key, value, .. } = &block.entries[0] {
             assert_eq!(key.text, "backlinks", "top key");
-            if let YamlValue::Mapping(preds) = value {
+            if let FmValue::Mapping(preds) = value {
                 assert_eq!(preds.len(), 2, "two predicates");
             } else {
                 panic!("backlinks value should be a mapping");
@@ -1329,11 +1105,11 @@ mod tests {
         let source = "---\ntags:\n  - rust\n  - lsp\n  - markdown\n---\n";
         let block = parse_frontmatter_block(source).expect("should parse");
 
-        if let YamlNode::Mapping { value, .. } = &block.entries[0] {
-            if let YamlValue::Sequence(items) = value {
+        if let FmNode::Mapping { value, .. } = &block.entries[0] {
+            if let FmValue::Sequence(items) = value {
                 assert_eq!(items.len(), 3, "should have three items");
-                if let YamlNode::SequenceItem {
-                    value: YamlValue::Scalar(s),
+                if let FmNode::SequenceItem {
+                    value: FmValue::Scalar(s),
                     ..
                 } = &items[0]
                 {
@@ -1356,8 +1132,8 @@ mod tests {
         let source = "---\ntags: [rust, lsp, markdown]\n---\n";
         let block = parse_frontmatter_block(source).expect("should parse");
 
-        if let YamlNode::Mapping { value, .. } = &block.entries[0] {
-            if let YamlValue::FlowSequence { items, .. } = value {
+        if let FmNode::Mapping { value, .. } = &block.entries[0] {
+            if let FmValue::FlowSequence { items, .. } = value {
                 assert_eq!(items.len(), 3, "should have three items");
                 assert_eq!(items[0].text, "rust", "first item");
                 assert_eq!(items[1].text, "lsp", "second item");
@@ -1375,8 +1151,8 @@ mod tests {
         let source = "---\ntags: []\n---\n";
         let block = parse_frontmatter_block(source).expect("should parse");
 
-        if let YamlNode::Mapping { value, .. } = &block.entries[0] {
-            if let YamlValue::FlowSequence { items, .. } = value {
+        if let FmNode::Mapping { value, .. } = &block.entries[0] {
+            if let FmValue::FlowSequence { items, .. } = value {
                 assert!(items.is_empty(), "should be empty");
             } else {
                 panic!("value should be flow sequence");
@@ -1393,8 +1169,8 @@ mod tests {
         let source = "---\nmeta: {a: b, c: d}\n---\n";
         let block = parse_frontmatter_block(source).expect("should parse");
 
-        if let YamlNode::Mapping { value, .. } = &block.entries[0] {
-            if let YamlValue::FlowMapping { entries, .. } = value {
+        if let FmNode::Mapping { value, .. } = &block.entries[0] {
+            if let FmValue::FlowMapping { entries, .. } = value {
                 assert_eq!(entries.len(), 2, "should have two entries");
                 assert_eq!(entries[0].0.text, "a", "first key");
                 assert_eq!(entries[0].1.text, "b", "first value");
@@ -1413,8 +1189,8 @@ mod tests {
         let source = "---\ntitle: 'Hello World'\n---\n";
         let block = parse_frontmatter_block(source).expect("should parse");
 
-        if let YamlNode::Mapping { value, .. } = &block.entries[0] {
-            if let YamlValue::Scalar(s) = value {
+        if let FmNode::Mapping { value, .. } = &block.entries[0] {
+            if let FmValue::Scalar(s) = value {
                 assert_eq!(s.text, "Hello World", "single-quoted value");
             } else {
                 panic!("should be scalar");
@@ -1429,8 +1205,8 @@ mod tests {
         let source = "---\ntitle: 'it''s a test'\n---\n";
         let block = parse_frontmatter_block(source).expect("should parse");
 
-        if let YamlNode::Mapping { value, .. } = &block.entries[0] {
-            if let YamlValue::Scalar(s) = value {
+        if let FmNode::Mapping { value, .. } = &block.entries[0] {
+            if let FmValue::Scalar(s) = value {
                 assert_eq!(s.text, "it's a test", "escaped single quote");
             } else {
                 panic!("should be scalar");
@@ -1445,8 +1221,8 @@ mod tests {
         let source = "---\ntitle: \"Hello World\"\n---\n";
         let block = parse_frontmatter_block(source).expect("should parse");
 
-        if let YamlNode::Mapping { value, .. } = &block.entries[0] {
-            if let YamlValue::Scalar(s) = value {
+        if let FmNode::Mapping { value, .. } = &block.entries[0] {
+            if let FmValue::Scalar(s) = value {
                 assert_eq!(s.text, "Hello World", "double-quoted value");
             } else {
                 panic!("should be scalar");
@@ -1461,8 +1237,8 @@ mod tests {
         let source = "---\npath: \"line1\\nline2\\ttab\"\n---\n";
         let block = parse_frontmatter_block(source).expect("should parse");
 
-        if let YamlNode::Mapping { value, .. } = &block.entries[0] {
-            if let YamlValue::Scalar(s) = value {
+        if let FmNode::Mapping { value, .. } = &block.entries[0] {
+            if let FmValue::Scalar(s) = value {
                 assert_eq!(s.text, "line1\nline2\ttab", "escape sequences");
             } else {
                 panic!("should be scalar");
@@ -1479,9 +1255,9 @@ mod tests {
         let source = "---\ndesc: |\n  line one\n  line two\n---\n";
         let block = parse_frontmatter_block(source).expect("should parse");
 
-        if let YamlNode::Mapping { value, .. } = &block.entries[0] {
+        if let FmNode::Mapping { value, .. } = &block.entries[0] {
             assert!(
-                matches!(value, YamlValue::BlockScalar { .. }),
+                matches!(value, FmValue::BlockScalar { .. }),
                 "should be block scalar"
             );
         } else {
@@ -1494,9 +1270,9 @@ mod tests {
         let source = "---\ndesc: >\n  line one\n  line two\n---\n";
         let block = parse_frontmatter_block(source).expect("should parse");
 
-        if let YamlNode::Mapping { value, .. } = &block.entries[0] {
+        if let FmNode::Mapping { value, .. } = &block.entries[0] {
             assert!(
-                matches!(value, YamlValue::BlockScalar { .. }),
+                matches!(value, FmValue::BlockScalar { .. }),
                 "should be block scalar"
             );
         } else {
@@ -1512,8 +1288,8 @@ mod tests {
         let block = parse_frontmatter_block(source).expect("should parse");
         assert_eq!(block.entries.len(), 2, "should have two entries");
 
-        if let YamlNode::Mapping { value, .. } = &block.entries[0] {
-            if let YamlValue::Scalar(s) = value {
+        if let FmNode::Mapping { value, .. } = &block.entries[0] {
+            if let FmValue::Scalar(s) = value {
                 assert_eq!(s.text, "test", "comment should be stripped");
             } else {
                 panic!("should be scalar");
@@ -1619,7 +1395,7 @@ mod tests {
             "content span is between delimiters"
         );
 
-        if let YamlNode::Mapping { key, .. } = &block.entries[0] {
+        if let FmNode::Mapping { key, .. } = &block.entries[0] {
             assert_eq!(key.span, Span::new(4, 9), "key span");
             assert_eq!(
                 &source[key.span.start..key.span.end],
@@ -1639,7 +1415,7 @@ mod tests {
         // BOM is 3 bytes.
         assert_eq!(block.span.start, 3, "block span starts after BOM");
 
-        if let YamlNode::Mapping { key, .. } = &block.entries[0] {
+        if let FmNode::Mapping { key, .. } = &block.entries[0] {
             assert_eq!(
                 &source[key.span.start..key.span.end],
                 "title",
@@ -1795,8 +1571,8 @@ mod tests {
         let source = "---\ndesc: \"line one \\\n  continued\"\n---\n";
         let block = parse_frontmatter_block(source).expect("should parse");
 
-        if let YamlNode::Mapping { value, .. } = &block.entries[0] {
-            if let YamlValue::Scalar(s) = value {
+        if let FmNode::Mapping { value, .. } = &block.entries[0] {
+            if let FmValue::Scalar(s) = value {
                 assert_eq!(s.text, "line one continued", "line continuation");
             } else {
                 panic!("should be scalar");

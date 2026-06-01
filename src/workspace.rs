@@ -13,8 +13,10 @@ use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
-use crate::block::{self, Tree};
+use crate::block::{self, Syntax, Tree};
 use crate::config::{Config, ConfigError};
+use crate::fm;
+use crate::toml;
 use crate::yaml;
 
 /// Errors that can occur during workspace operations.
@@ -250,13 +252,20 @@ fn parse_file(
 /// Always succeeds — YAML parse errors become diagnostics instead of
 /// hard failures, enabling partial frontmatter recovery.
 fn parse_content(content: &str, rel_path: &Path, config: &Config) -> FileData {
-    // Parse YAML frontmatter block.
-    let fm_block = yaml::parse_frontmatter_block(content);
+    // Try YAML (`---`) then TOML (`+++`) frontmatter.
+    let (fm_block, fm_syntax) = yaml::parse_frontmatter_block(content).map_or_else(
+        || {
+            toml::parse_frontmatter_block(content)
+                .map_or((None, Syntax::Yaml), |block| (Some(block), Syntax::Toml))
+        },
+        |block| (Some(block), Syntax::Yaml),
+    );
 
     // Build the tree (block structure + inline elements).
     let frontmatter_span = fm_block.as_ref().map(|b| b.span);
     let frontmatter_entries = fm_block.as_ref().map(|b| b.entries.as_slice());
-    let tree = block::parse_tree_with_entries(content, frontmatter_span, frontmatter_entries);
+    let tree =
+        block::parse_tree_with_entries(content, frontmatter_span, fm_syntax, frontmatter_entries);
 
     // Extract frontmatter data.
     let mut frontmatter = None;
@@ -264,9 +273,9 @@ fn parse_content(content: &str, rel_path: &Path, config: &Config) -> FileData {
     let mut parse_diagnostics = Vec::new();
 
     if let Some(block) = &fm_block {
-        // Collect YAML parse errors as diagnostics (partial recovery).
+        // Collect parse errors as diagnostics (partial recovery).
         for diag in &block.diagnostics {
-            if diag.severity == yaml::YamlSeverity::Error {
+            if diag.severity == fm::FmSeverity::Error {
                 let line = byte_offset_to_line(content, diag.span.start);
                 parse_diagnostics.push(ParseDiagnostic {
                     line,
@@ -285,12 +294,12 @@ fn parse_content(content: &str, rel_path: &Path, config: &Config) -> FileData {
         let end_line =
             newline_count + usize::from(!content[..end_byte.min(content.len())].ends_with('\n'));
 
-        let backlinks = yaml::extract_backlinks(block, content);
+        let backlinks = fm::extract_backlinks(block, content);
 
         // Validate inverse predicates.
         for predicate in backlinks.keys() {
             if !config.is_known_inverse(predicate) {
-                let line = yaml::find_predicate_line(block, predicate, content);
+                let line = fm::find_predicate_line(block, predicate, content);
                 backlink_diagnostics.push(BacklinkDiagnostic {
                     line,
                     predicate: predicate.clone(),
