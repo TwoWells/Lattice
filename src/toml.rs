@@ -674,7 +674,7 @@ impl<'a> Parser<'a> {
                     let value = self.parse_value_or_collection();
                     let entry_end = self.abs();
 
-                    let node = self.build_dotted_entry(&parts, value, entry_start, entry_end);
+                    let node = build_dotted_entry(&parts, value, entry_start, entry_end);
                     entries.push(node);
                 }
             }
@@ -693,63 +693,6 @@ impl<'a> Parser<'a> {
                 let scalar = self.parse_value();
                 FmValue::Scalar(scalar)
             }
-        }
-    }
-
-    // -- Dotted key expansion ---------------------------------------------
-
-    /// Build nested `FmNode::Mapping` entries for a dotted key like `a.b.c = val`.
-    #[allow(
-        clippy::unused_self,
-        reason = "method for consistency with other parser methods"
-    )]
-    fn build_dotted_entry(
-        &self,
-        parts: &[ScalarSpan],
-        value: FmValue,
-        entry_start: usize,
-        entry_end: usize,
-    ) -> FmNode {
-        if parts.len() == 1 {
-            return FmNode::Mapping {
-                key: ScalarSpan {
-                    span: parts[0].span,
-                    text: parts[0].text.clone(),
-                },
-                value,
-                span: Span::new(entry_start, entry_end),
-            };
-        }
-
-        // Build from right to left: innermost value wraps outward.
-        let last = &parts[parts.len() - 1];
-        let mut current = FmNode::Mapping {
-            key: ScalarSpan {
-                span: last.span,
-                text: last.text.clone(),
-            },
-            value,
-            span: Span::new(last.span.start, entry_end),
-        };
-
-        for part in parts[1..parts.len() - 1].iter().rev() {
-            current = FmNode::Mapping {
-                key: ScalarSpan {
-                    span: part.span,
-                    text: part.text.clone(),
-                },
-                value: FmValue::Mapping(vec![current]),
-                span: Span::new(part.span.start, entry_end),
-            };
-        }
-
-        FmNode::Mapping {
-            key: ScalarSpan {
-                span: parts[0].span,
-                text: parts[0].text.clone(),
-            },
-            value: FmValue::Mapping(vec![current]),
-            span: Span::new(entry_start, entry_end),
         }
     }
 
@@ -862,7 +805,7 @@ impl<'a> Parser<'a> {
 
             let entry_end = self.abs();
 
-            let node = self.build_dotted_entry(&parts, value, entry_start, entry_end);
+            let node = build_dotted_entry(&parts, value, entry_start, entry_end);
             entries.push(node);
         }
 
@@ -897,8 +840,7 @@ impl<'a> Parser<'a> {
                 }
 
                 let header_end = self.abs();
-                let table_node =
-                    self.build_array_table_entry(&parts, body, header_start, header_end);
+                let table_node = build_array_table_entry(&parts, body, header_start, header_end);
                 self.merge_array_table(table_node);
             } else {
                 // Standard table `[section]`.
@@ -910,125 +852,9 @@ impl<'a> Parser<'a> {
                 }
 
                 let header_end = self.abs();
-                let table_node = self.build_table_entry(&parts, body, header_start, header_end);
+                let table_node = build_table_entry(&parts, body, header_start, header_end);
                 self.check_duplicate_and_push(table_node);
             }
-        }
-    }
-
-    /// Build a table entry from a header path and body entries.
-    #[allow(
-        clippy::unused_self,
-        reason = "method for consistency with other parser methods"
-    )]
-    fn build_table_entry(
-        &self,
-        parts: &[ScalarSpan],
-        body: Vec<FmNode>,
-        entry_start: usize,
-        entry_end: usize,
-    ) -> FmNode {
-        if parts.len() == 1 {
-            return FmNode::Mapping {
-                key: ScalarSpan {
-                    span: parts[0].span,
-                    text: parts[0].text.clone(),
-                },
-                value: FmValue::Mapping(body),
-                span: Span::new(entry_start, entry_end),
-            };
-        }
-
-        // Nest from right to left.
-        let last = &parts[parts.len() - 1];
-        let mut current = FmNode::Mapping {
-            key: ScalarSpan {
-                span: last.span,
-                text: last.text.clone(),
-            },
-            value: FmValue::Mapping(body),
-            span: Span::new(last.span.start, entry_end),
-        };
-
-        for part in parts[1..parts.len() - 1].iter().rev() {
-            current = FmNode::Mapping {
-                key: ScalarSpan {
-                    span: part.span,
-                    text: part.text.clone(),
-                },
-                value: FmValue::Mapping(vec![current]),
-                span: Span::new(part.span.start, entry_end),
-            };
-        }
-
-        FmNode::Mapping {
-            key: ScalarSpan {
-                span: parts[0].span,
-                text: parts[0].text.clone(),
-            },
-            value: FmValue::Mapping(vec![current]),
-            span: Span::new(entry_start, entry_end),
-        }
-    }
-
-    /// Build an array-of-tables entry (one element of the sequence).
-    #[allow(
-        clippy::unused_self,
-        reason = "method for consistency with other parser methods"
-    )]
-    fn build_array_table_entry(
-        &self,
-        parts: &[ScalarSpan],
-        body: Vec<FmNode>,
-        entry_start: usize,
-        entry_end: usize,
-    ) -> FmNode {
-        // The innermost part is the array — its value is a sequence item
-        // containing a mapping of the body entries.
-        let item = FmNode::SequenceItem {
-            value: FmValue::Mapping(body),
-            span: Span::new(entry_start, entry_end),
-        };
-
-        if parts.len() == 1 {
-            return FmNode::Mapping {
-                key: ScalarSpan {
-                    span: parts[0].span,
-                    text: parts[0].text.clone(),
-                },
-                value: FmValue::Sequence(vec![item]),
-                span: Span::new(entry_start, entry_end),
-            };
-        }
-
-        let last = &parts[parts.len() - 1];
-        let mut current = FmNode::Mapping {
-            key: ScalarSpan {
-                span: last.span,
-                text: last.text.clone(),
-            },
-            value: FmValue::Sequence(vec![item]),
-            span: Span::new(last.span.start, entry_end),
-        };
-
-        for part in parts[1..parts.len() - 1].iter().rev() {
-            current = FmNode::Mapping {
-                key: ScalarSpan {
-                    span: part.span,
-                    text: part.text.clone(),
-                },
-                value: FmValue::Mapping(vec![current]),
-                span: Span::new(part.span.start, entry_end),
-            };
-        }
-
-        FmNode::Mapping {
-            key: ScalarSpan {
-                span: parts[0].span,
-                text: parts[0].text.clone(),
-            },
-            value: FmValue::Mapping(vec![current]),
-            span: Span::new(entry_start, entry_end),
         }
     }
 
@@ -1093,6 +919,162 @@ impl<'a> Parser<'a> {
 /// Check if a byte is a valid bare key character (alphanumeric, `-`, `_`).
 fn is_bare_key_char(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'-' || b == b'_'
+}
+
+/// Build nested `FmNode::Mapping` entries for a dotted key like `a.b.c = val`.
+fn build_dotted_entry(
+    parts: &[ScalarSpan],
+    value: FmValue,
+    entry_start: usize,
+    entry_end: usize,
+) -> FmNode {
+    if parts.len() == 1 {
+        return FmNode::Mapping {
+            key: ScalarSpan {
+                span: parts[0].span,
+                text: parts[0].text.clone(),
+            },
+            value,
+            span: Span::new(entry_start, entry_end),
+        };
+    }
+
+    // Build from right to left: innermost value wraps outward.
+    let last = &parts[parts.len() - 1];
+    let mut current = FmNode::Mapping {
+        key: ScalarSpan {
+            span: last.span,
+            text: last.text.clone(),
+        },
+        value,
+        span: Span::new(last.span.start, entry_end),
+    };
+
+    for part in parts[1..parts.len() - 1].iter().rev() {
+        current = FmNode::Mapping {
+            key: ScalarSpan {
+                span: part.span,
+                text: part.text.clone(),
+            },
+            value: FmValue::Mapping(vec![current]),
+            span: Span::new(part.span.start, entry_end),
+        };
+    }
+
+    FmNode::Mapping {
+        key: ScalarSpan {
+            span: parts[0].span,
+            text: parts[0].text.clone(),
+        },
+        value: FmValue::Mapping(vec![current]),
+        span: Span::new(entry_start, entry_end),
+    }
+}
+
+/// Build a table entry from a header path and body entries.
+fn build_table_entry(
+    parts: &[ScalarSpan],
+    body: Vec<FmNode>,
+    entry_start: usize,
+    entry_end: usize,
+) -> FmNode {
+    if parts.len() == 1 {
+        return FmNode::Mapping {
+            key: ScalarSpan {
+                span: parts[0].span,
+                text: parts[0].text.clone(),
+            },
+            value: FmValue::Mapping(body),
+            span: Span::new(entry_start, entry_end),
+        };
+    }
+
+    // Nest from right to left.
+    let last = &parts[parts.len() - 1];
+    let mut current = FmNode::Mapping {
+        key: ScalarSpan {
+            span: last.span,
+            text: last.text.clone(),
+        },
+        value: FmValue::Mapping(body),
+        span: Span::new(last.span.start, entry_end),
+    };
+
+    for part in parts[1..parts.len() - 1].iter().rev() {
+        current = FmNode::Mapping {
+            key: ScalarSpan {
+                span: part.span,
+                text: part.text.clone(),
+            },
+            value: FmValue::Mapping(vec![current]),
+            span: Span::new(part.span.start, entry_end),
+        };
+    }
+
+    FmNode::Mapping {
+        key: ScalarSpan {
+            span: parts[0].span,
+            text: parts[0].text.clone(),
+        },
+        value: FmValue::Mapping(vec![current]),
+        span: Span::new(entry_start, entry_end),
+    }
+}
+
+/// Build an array-of-tables entry (one element of the sequence).
+fn build_array_table_entry(
+    parts: &[ScalarSpan],
+    body: Vec<FmNode>,
+    entry_start: usize,
+    entry_end: usize,
+) -> FmNode {
+    // The innermost part is the array — its value is a sequence item
+    // containing a mapping of the body entries.
+    let item = FmNode::SequenceItem {
+        value: FmValue::Mapping(body),
+        span: Span::new(entry_start, entry_end),
+    };
+
+    if parts.len() == 1 {
+        return FmNode::Mapping {
+            key: ScalarSpan {
+                span: parts[0].span,
+                text: parts[0].text.clone(),
+            },
+            value: FmValue::Sequence(vec![item]),
+            span: Span::new(entry_start, entry_end),
+        };
+    }
+
+    let last = &parts[parts.len() - 1];
+    let mut current = FmNode::Mapping {
+        key: ScalarSpan {
+            span: last.span,
+            text: last.text.clone(),
+        },
+        value: FmValue::Sequence(vec![item]),
+        span: Span::new(last.span.start, entry_end),
+    };
+
+    for part in parts[1..parts.len() - 1].iter().rev() {
+        current = FmNode::Mapping {
+            key: ScalarSpan {
+                span: part.span,
+                text: part.text.clone(),
+            },
+            value: FmValue::Mapping(vec![current]),
+            span: Span::new(part.span.start, entry_end),
+        };
+    }
+
+    FmNode::Mapping {
+        key: ScalarSpan {
+            span: parts[0].span,
+            text: parts[0].text.clone(),
+        },
+        value: FmValue::Mapping(vec![current]),
+        span: Span::new(entry_start, entry_end),
+    }
 }
 
 // ---------------------------------------------------------------------------
