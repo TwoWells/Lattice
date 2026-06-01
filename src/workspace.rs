@@ -49,7 +49,7 @@ pub struct FileData {
     pub frontmatter: Option<Frontmatter>,
     /// Diagnostics from frontmatter parsing (unknown inverse predicates).
     pub backlink_diagnostics: Vec<BacklinkDiagnostic>,
-    /// YAML parse errors (partial recovery — file is still indexed).
+    /// Frontmatter parse diagnostics (partial recovery — file is still indexed).
     pub parse_diagnostics: Vec<ParseDiagnostic>,
 }
 
@@ -75,11 +75,13 @@ pub struct BacklinkDiagnostic {
     pub predicate: String,
 }
 
-/// A YAML parse error from frontmatter.
+/// A parse diagnostic from frontmatter.
 #[derive(Debug)]
 pub struct ParseDiagnostic {
     /// 1-based line number.
     pub line: usize,
+    /// Severity level.
+    pub severity: fm::FmSeverity,
     /// Human-readable message.
     pub message: String,
 }
@@ -279,15 +281,14 @@ fn parse_content(content: &str, rel_path: &Path, config: &Config) -> FileData {
     let mut parse_diagnostics = Vec::new();
 
     if let Some(block) = &fm_block {
-        // Collect parse errors as diagnostics (partial recovery).
+        // Collect parse diagnostics (partial recovery).
         for diag in &block.diagnostics {
-            if diag.severity == fm::FmSeverity::Error {
-                let line = byte_offset_to_line(content, diag.span.start);
-                parse_diagnostics.push(ParseDiagnostic {
-                    line,
-                    message: diag.message.clone(),
-                });
-            }
+            let line = byte_offset_to_line(content, diag.span.start);
+            parse_diagnostics.push(ParseDiagnostic {
+                line,
+                severity: diag.severity,
+                message: diag.message.clone(),
+            });
         }
 
         let byte_range: Range<usize> = block.span.into();

@@ -1819,13 +1819,17 @@ fn collect_all_diagnostics(workspace: &Workspace) -> Vec<Diagnostic> {
             &file_exists,
         ));
 
-        // Frontmatter parse errors are structural (unconditional).
+        // Frontmatter parse diagnostics are structural (unconditional).
         for pd in &file_data.parse_diagnostics {
+            let severity = match pd.severity {
+                crate::fm::FmSeverity::Error => Severity::Error,
+                crate::fm::FmSeverity::Warning => Severity::Warning,
+            };
             diagnostics.push(Diagnostic {
                 file: path.clone(),
                 line: pd.line,
-                severity: Severity::Error,
-                message: format!("frontmatter error: {}", pd.message),
+                severity,
+                message: format!("frontmatter: {}", pd.message),
             });
         }
     }

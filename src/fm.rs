@@ -4,8 +4,8 @@
 //! Format-neutral frontmatter types and helpers.
 //!
 //! Defines the shared types consumed by tree construction, backlink
-//! extraction, and predicate validation. Both the YAML and TOML
-//! frontmatter parsers produce these types.
+//! extraction, and predicate validation. The YAML, TOML, and JSON
+//! frontmatter parsers all produce these types.
 
 use crate::span::Span;
 
@@ -16,7 +16,7 @@ use crate::span::Span;
 /// Parsed frontmatter block with span information.
 #[derive(Debug)]
 pub struct FrontmatterBlock {
-    /// Full range including delimiters (`---` or `+++`).
+    /// Full range including delimiters (`---`, `+++`, or `{`...`}`).
     pub span: Span,
     /// Content between delimiters.
     #[allow(dead_code, reason = "used by tree construction ticket 06a")]
