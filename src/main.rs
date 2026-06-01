@@ -14,6 +14,7 @@ mod config;
 mod fm;
 mod html;
 mod inline;
+mod json;
 mod lint;
 mod lsp;
 mod server;

@@ -184,6 +184,8 @@ pub enum Syntax {
     Yaml,
     /// TOML frontmatter.
     Toml,
+    /// JSON frontmatter.
+    Json,
     /// Markdown structural syntax.
     Markdown,
     /// Raw HTML.

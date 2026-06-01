@@ -499,6 +499,7 @@ fn symbol_name(tree: &Tree, node_id: NodeId) -> (String, Option<String>) {
             let syntax_label = match node.syntax {
                 Syntax::Yaml => "YAML",
                 Syntax::Toml => "TOML",
+                Syntax::Json => "JSON",
                 Syntax::Html => "HTML",
                 Syntax::Markdown => "Markdown",
             };

@@ -16,6 +16,7 @@ use thiserror::Error;
 use crate::block::{self, Syntax, Tree};
 use crate::config::{Config, ConfigError};
 use crate::fm;
+use crate::json;
 use crate::toml;
 use crate::yaml;
 
@@ -252,11 +253,16 @@ fn parse_file(
 /// Always succeeds — YAML parse errors become diagnostics instead of
 /// hard failures, enabling partial frontmatter recovery.
 fn parse_content(content: &str, rel_path: &Path, config: &Config) -> FileData {
-    // Try YAML (`---`) then TOML (`+++`) frontmatter.
+    // Try YAML (`---`), then TOML (`+++`), then JSON (`{`) frontmatter.
     let (fm_block, fm_syntax) = yaml::parse_frontmatter_block(content).map_or_else(
         || {
-            toml::parse_frontmatter_block(content)
-                .map_or((None, Syntax::Yaml), |block| (Some(block), Syntax::Toml))
+            toml::parse_frontmatter_block(content).map_or_else(
+                || {
+                    json::parse_frontmatter_block(content)
+                        .map_or((None, Syntax::Yaml), |block| (Some(block), Syntax::Json))
+                },
+                |block| (Some(block), Syntax::Toml),
+            )
         },
         |block| (Some(block), Syntax::Yaml),
     );
