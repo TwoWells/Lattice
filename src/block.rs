@@ -6608,4 +6608,8 @@ mod tests {
             tree.diagnostics()
         );
     }
+
+    mod commonmark_spec {
+        include!("commonmark_spec_tests.rs");
+    }
 }
