@@ -841,15 +841,22 @@ pub fn extract_atx_content(original_line: &str, line_start: usize) -> (Span, Opt
 
 /// Check if a line is a thematic break.
 ///
-/// Three or more `*`, `-`, or `_` characters (optionally with spaces
-/// between them), with no other characters, and at most 3 leading spaces.
+/// Three or more matching `*`, `-`, or `_` characters, each optionally
+/// separated by spaces or tabs, with no other characters, and at most 3
+/// leading spaces. A trailing line ending does not affect the result, so
+/// callers may pass raw lines (including the `\n`) directly.
 fn is_thematic_break(line: &str) -> bool {
     let trimmed = line.trim_start_matches(' ');
     if line.len() - trimmed.len() > 3 {
         return false;
     }
 
-    let stripped: String = trimmed.chars().filter(|c| *c != ' ').collect();
+    // Spaces and tabs between markers, and any trailing line ending, are
+    // not part of the break sequence.
+    let stripped: String = trimmed
+        .chars()
+        .filter(|c| !matches!(c, ' ' | '\t' | '\n' | '\r'))
+        .collect();
     if stripped.len() < 3 {
         return false;
     }
@@ -3314,51 +3321,55 @@ impl<'a> TreeBuilder<'a> {
             let next_start = body_offset + *pos;
             let next_len = next_line.len();
 
-            // Strip continuation markers, with lazy fallback.
-            let content = if let Some((c, _)) = self.strip_continuation(next_line, next_start) {
-                c
-            } else {
-                // Lazy continuation: line without proper markers/indent
-                // that is not a block-starting construct can continue a
-                // paragraph inside a block quote or list item.
-                //
-                // Two paths: (1) the line has no markers at all — direct
-                // lazy continuation, (2) the line has partial quote
-                // markers (outer but not inner) — lazy continuation
-                // through partial stripping.
-                let (lazy_expanded, _) = expand_leading_tabs(next_line);
-                if (self.quote_depth > 0 || !self.list_stack.is_empty())
-                    && strip_blockquote_marker(next_line).is_none()
-                    && !is_thematic_break(next_line)
-                    && atx_heading_level(next_line).is_none()
-                    && fenced_code_open(next_line).is_none()
-                    && html_block_start(next_line).is_none()
-                    && recognize_list_marker(&lazy_expanded).is_none()
-                {
-                    next_line
-                } else if self.quote_depth > 0 {
-                    // Partial quote match: strip as many outer quote
-                    // markers as possible and check if the remaining
-                    // content can lazily continue.
-                    let (matched, partial) = strip_n_quote_markers(next_line, self.quote_depth);
-                    let (pe, _) = expand_leading_tabs(partial);
-                    if matched > 0
-                        && !partial.trim().is_empty()
-                        && strip_blockquote_marker(partial).is_none()
-                        && !is_thematic_break(partial)
-                        && atx_heading_level(partial).is_none()
-                        && fenced_code_open(partial).is_none()
-                        && html_block_start(partial).is_none()
-                        && recognize_list_marker(&pe).is_none()
+            // Strip continuation markers, with lazy fallback. `lazy` marks
+            // a line that continues the paragraph without proper markers or
+            // indentation (inside a block quote or list item) — such lines
+            // cannot form a setext heading underline.
+            let (content, lazy) =
+                if let Some((c, _)) = self.strip_continuation(next_line, next_start) {
+                    (c, false)
+                } else {
+                    // Lazy continuation: line without proper markers/indent
+                    // that is not a block-starting construct can continue a
+                    // paragraph inside a block quote or list item.
+                    //
+                    // Two paths: (1) the line has no markers at all — direct
+                    // lazy continuation, (2) the line has partial quote
+                    // markers (outer but not inner) — lazy continuation
+                    // through partial stripping.
+                    let (lazy_expanded, _) = expand_leading_tabs(next_line);
+                    if (self.quote_depth > 0 || !self.list_stack.is_empty())
+                        && strip_blockquote_marker(next_line).is_none()
+                        && !is_thematic_break(next_line)
+                        && atx_heading_level(next_line).is_none()
+                        && fenced_code_open(next_line).is_none()
+                        && html_block_start(next_line).is_none()
+                        && recognize_list_marker(&lazy_expanded).is_none()
                     {
-                        partial
+                        (next_line, true)
+                    } else if self.quote_depth > 0 {
+                        // Partial quote match: strip as many outer quote
+                        // markers as possible and check if the remaining
+                        // content can lazily continue.
+                        let (matched, partial) = strip_n_quote_markers(next_line, self.quote_depth);
+                        let (pe, _) = expand_leading_tabs(partial);
+                        if matched > 0
+                            && !partial.trim().is_empty()
+                            && strip_blockquote_marker(partial).is_none()
+                            && !is_thematic_break(partial)
+                            && atx_heading_level(partial).is_none()
+                            && fenced_code_open(partial).is_none()
+                            && html_block_start(partial).is_none()
+                            && recognize_list_marker(&pe).is_none()
+                        {
+                            (partial, true)
+                        } else {
+                            break;
+                        }
                     } else {
                         break;
                     }
-                } else {
-                    break;
-                }
-            };
+                };
 
             let (next_expanded, _) = expand_leading_tabs(content);
 
@@ -3367,8 +3378,13 @@ impl<'a> TreeBuilder<'a> {
                 break;
             }
 
-            // Setext heading underline
-            if let Some(level) = setext_level(&next_expanded) {
+            // Setext heading underline. A lazy continuation line cannot be
+            // a setext underline: CommonMark requires the underline to
+            // belong to the same block as the paragraph it underlines, so a
+            // `===`/`---` line lazily continuing a block quote or list
+            // paragraph stays paragraph text (or, for `---`, falls through
+            // to the thematic break check below).
+            if !lazy && let Some(level) = setext_level(&next_expanded) {
                 *pos += next_len;
                 *line_idx += 1;
 
@@ -3380,8 +3396,10 @@ impl<'a> TreeBuilder<'a> {
                 return;
             }
 
-            // Thematic break ends paragraph (only `***` and `___` reach
-            // here — `---` was caught above as setext heading)
+            // Thematic break ends paragraph. For non-lazy lines only `***`
+            // and `___` reach here (`---` was caught above as a setext
+            // heading); on a lazy line `---`/`-----` reaches here too and
+            // correctly terminates the paragraph.
             if is_thematic_break(&next_expanded) {
                 break;
             }

@@ -471,26 +471,6 @@ fn skip_unknown_html(html: &str, pos: usize) -> Option<usize> {
 /// Each entry is `(example_number, reason)`. Grouped by root cause.
 const DEVIATIONS: &[(u32, &str)] = &[
     // -----------------------------------------------------------------
-    // Thematic break interaction: Lattice does not always interrupt a
-    // paragraph or list when a thematic break appears on a continuation
-    // line.
-    // -----------------------------------------------------------------
-    (11, "thematic break with tab separators"),
-    (57, "thematic break does not interrupt list"),
-    (58, "thematic break does not interrupt paragraph"),
-    (60, "thematic break does not interrupt list"),
-    (105, "thematic break does not interrupt paragraph"),
-    // -----------------------------------------------------------------
-    // Setext heading edge cases: interactions between setext underlines
-    // and block quotes, lists, and thematic break patterns.
-    // -----------------------------------------------------------------
-    (88, "setext underline with internal spaces"),
-    (92, "setext underline after blockquote (should be thematic break)"),
-    (93, "setext underline after blockquote with lazy continuation"),
-    (94, "setext underline after blockquote with lazy continuation"),
-    (99, "setext underline after list item (should be thematic break)"),
-    (101, "setext underline after blockquote (should be thematic break)"),
-    // -----------------------------------------------------------------
     // HTML container modeling: Lattice models known HTML container tags
     // (<div>, <table>, <nav>, etc.) as structured Container/Table nodes
     // with rich symbol support, rather than opaque HtmlBlock nodes. This
