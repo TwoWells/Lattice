@@ -471,60 +471,6 @@ fn skip_unknown_html(html: &str, pos: usize) -> Option<usize> {
 /// Each entry is `(example_number, reason)`. Grouped by root cause.
 const DEVIATIONS: &[(u32, &str)] = &[
     // -----------------------------------------------------------------
-    // List continuation: Lattice's list parser handles single-line items
-    // but does not track content-column alignment for continuation lines.
-    // Multi-line items, blank-line separations within items, and indented
-    // continuations are not captured as part of the list item scope.
-    // -----------------------------------------------------------------
-    (4, "list continuation (tab indent)"),
-    (5, "list continuation (tab indent)"),
-    (7, "list continuation (tab indent)"),
-    (9, "list continuation (nested, tab indent)"),
-    (108, "list continuation (blank line within item)"),
-    (109, "list continuation (blank line within item)"),
-    (253, "list continuation (indented code in item)"),
-    (254, "list continuation (indented code in item)"),
-    (256, "list continuation (content-column alignment)"),
-    (258, "list continuation (content-column alignment)"),
-    (259, "list continuation (content-column alignment)"),
-    (262, "list continuation (sub-items with indent)"),
-    (263, "list continuation (sub-items with indent)"),
-    (264, "list continuation (nested blockquote in item)"),
-    (270, "list continuation (content-column alignment)"),
-    (271, "list continuation (content-column alignment)"),
-    (272, "list continuation (ordered, content column)"),
-    (273, "list continuation (ordered, content column)"),
-    (274, "list continuation (ordered, indented code)"),
-    (277, "list continuation (blank line within item)"),
-    (278, "list continuation (empty marker, content next line)"),
-    (280, "list continuation (empty marker, blank, content)"),
-    (281, "list continuation (empty marker between items)"),
-    (283, "list continuation (empty ordered marker)"),
-    (284, "list continuation (bare marker without trailing space)"),
-    (286, "list continuation (multi-paragraph item)"),
-    (287, "list continuation (multi-paragraph item, 2-space indent)"),
-    (288, "list continuation (multi-paragraph item, 3-space indent)"),
-    (290, "list continuation (lazy continuation in item)"),
-    (292, "list continuation (lazy continuation in nested blockquote)"),
-    (293, "list continuation (lazy continuation in nested blockquote)"),
-    (295, "list continuation (sub-list after blank)"),
-    (298, "list continuation (sub-list continuation)"),
-    (299, "list continuation (blockquote in item)"),
-    (307, "list continuation (loose detection across items)"),
-    (310, "list continuation (loose detection, trailing blank)"),
-    (311, "list continuation (loose detection, trailing blank)"),
-    (312, "list continuation (loose detection, nested list)"),
-    (313, "list continuation (loose detection, nested list blank)"),
-    (315, "list continuation (loose detection, nested items)"),
-    (316, "list continuation (loose detection, deep nesting)"),
-    (317, "list continuation (loose detection, deep nesting)"),
-    (319, "list continuation (ordered list loose)"),
-    (320, "list continuation (ordered list loose)"),
-    (321, "list continuation (ordered list loose)"),
-    (324, "list continuation (multi-paragraph items)"),
-    (325, "list continuation (code block in item)"),
-    (326, "list continuation (items with sub-structures)"),
-    // -----------------------------------------------------------------
     // Thematic break interaction: Lattice does not always interrupt a
     // paragraph or list when a thematic break appears on a continuation
     // line.

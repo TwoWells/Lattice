@@ -499,6 +499,36 @@ fn expand_leading_tabs(line: &str) -> (String, Vec<TabMapping>) {
     (result, mappings)
 }
 
+/// Expand ALL tabs to spaces (not just leading ones).
+///
+/// Used for list marker recognition where tabs may appear after the
+/// marker character (e.g. `-\t\tfoo`).
+fn expand_all_tabs(line: &str) -> (String, Vec<TabMapping>) {
+    let mut result = String::with_capacity(line.len());
+    let mut mappings = Vec::new();
+    let mut col = 0;
+
+    for (byte_idx, ch) in line.char_indices() {
+        if ch == '\t' {
+            let spaces = 4 - (col % 4);
+            mappings.push(TabMapping {
+                original_byte: byte_idx,
+                expanded_col: col,
+                num_spaces: spaces,
+            });
+            for _ in 0..spaces {
+                result.push(' ');
+            }
+            col += spaces;
+        } else {
+            result.push(ch);
+            col += 1;
+        }
+    }
+
+    (result, mappings)
+}
+
 /// Mapping from a tab character to its expansion.
 #[derive(Debug)]
 struct TabMapping {
@@ -549,14 +579,6 @@ fn expanded_to_raw(expanded_offset: usize, raw_line: &str, mappings: &[TabMappin
 /// Count leading spaces in a string (after tab expansion).
 fn count_indent(line: &str) -> usize {
     line.bytes().take_while(|&b| b == b' ').count()
-}
-
-/// Strip up to `n` leading spaces from a string.
-///
-/// If the string has fewer than `n` leading spaces, strips all of them.
-fn strip_n_spaces(line: &str, n: usize) -> &str {
-    let count = line.bytes().take(n).take_while(|&b| b == b' ').count();
-    &line[count..]
 }
 
 /// Strip a trailing `\n` or `\r\n` from a byte offset into source.
@@ -1212,24 +1234,33 @@ fn recognize_list_marker(line: &str) -> Option<ListMarkerInfo> {
     let first = trimmed.as_bytes()[0];
 
     if matches!(first, b'-' | b'*' | b'+') {
-        // Unordered: marker char + at least one space.
         let after_marker = &trimmed[1..];
-        if after_marker.is_empty() || !after_marker.starts_with(' ') {
+        // Bare marker (nothing or only whitespace/newline after).
+        if after_marker.is_empty() || after_marker.trim_end().is_empty() {
+            return Some(ListMarkerInfo {
+                ordered: false,
+                marker_char: first,
+                start: 0,
+                marker_indent: indent,
+                content_column: indent + 2,
+                content_offset: line.len(),
+            });
+        }
+        // Normal case: marker char + at least one space + content.
+        if !after_marker.starts_with(' ') {
             return None;
         }
         let spaces_after = after_marker.len() - after_marker.trim_start_matches(' ').len();
-        let content_column = indent + 1 + spaces_after;
-        let content_offset = content_column;
-        // If rest is blank, content column = marker pos + 2
-        let content_column = if after_marker.trim().is_empty() {
-            indent + 2
+        // If rest is blank, content column = marker pos + 2.
+        // If > 4 spaces after marker with content, cap to marker + 1
+        // (excess spaces become indented code within the item).
+        let (content_column, content_offset) = if after_marker.trim().is_empty() {
+            (indent + 2, line.len())
+        } else if spaces_after > 4 {
+            (indent + 2, indent + 2)
         } else {
-            content_column
-        };
-        let content_offset = if after_marker.trim().is_empty() {
-            line.len()
-        } else {
-            content_offset
+            let cc = indent + 1 + spaces_after;
+            (cc, cc)
         };
         Some(ListMarkerInfo {
             ordered: false,
@@ -1254,23 +1285,35 @@ fn recognize_list_marker(line: &str) -> Option<ListMarkerInfo> {
             return None;
         }
         let after_delim = &after_digits[1..];
-        if after_delim.is_empty() || !after_delim.starts_with(' ') {
+        let start: u32 = trimmed[..digit_count].parse().ok()?;
+        let marker_width = digit_count + 1; // digits + delimiter
+        // Bare ordered marker (nothing or only whitespace/newline after delimiter).
+        if after_delim.is_empty() || after_delim.trim_end().is_empty() {
+            return Some(ListMarkerInfo {
+                ordered: true,
+                marker_char: delimiter,
+                start,
+                marker_indent: indent,
+                content_column: indent + marker_width + 1,
+                content_offset: line.len(),
+            });
+        }
+        // Normal case: delimiter + at least one space + content.
+        if !after_delim.starts_with(' ') {
             return None;
         }
-        let start: u32 = trimmed[..digit_count].parse().ok()?;
         let spaces_after = after_delim.len() - after_delim.trim_start_matches(' ').len();
-        let marker_width = digit_count + 1; // digits + delimiter
-        let content_column = indent + marker_width + spaces_after;
-        let content_offset = content_column;
-        let content_column = if after_delim.trim().is_empty() {
-            indent + marker_width + 1
+        // If rest is blank, content column = marker + 1.
+        // If > 4 spaces after delimiter with content, cap to marker + 1
+        // (excess spaces become indented code within the item).
+        let (content_column, content_offset) = if after_delim.trim().is_empty() {
+            (indent + marker_width + 1, line.len())
+        } else if spaces_after > 4 {
+            let cc = indent + marker_width + 1;
+            (cc, cc)
         } else {
-            content_column
-        };
-        let content_offset = if after_delim.trim().is_empty() {
-            line.len()
-        } else {
-            content_offset
+            let cc = indent + marker_width + spaces_after;
+            (cc, cc)
         };
         Some(ListMarkerInfo {
             ordered: true,
@@ -1308,10 +1351,11 @@ struct ListContext {
     marker_char: u8,
     /// Whether this is an ordered list.
     ordered: bool,
-    /// Column where the marker starts.
-    marker_indent: usize,
-    /// Column where item content starts.
+    /// Column where item content starts (in stripped coordinates).
     content_column: usize,
+    /// Cumulative indent from parent lists / blockquotes.
+    /// The real marker indent in raw coordinates is `base_indent + marker_indent`.
+    base_indent: usize,
     /// A blank line was seen in the current item.
     saw_blank: bool,
     /// Any blank line appeared between items (list is loose).
@@ -1698,6 +1742,8 @@ struct TreeBuilder<'a> {
     list_stack: Vec<ListContext>,
     /// Stack of open HTML container tags (for close-tag matching).
     html_stack: Vec<HtmlScope>,
+    /// A blank line preceded the current line (for indented code detection).
+    blank_before: bool,
 }
 
 impl<'a> TreeBuilder<'a> {
@@ -1710,6 +1756,7 @@ impl<'a> TreeBuilder<'a> {
             quote_depth: 0,
             list_stack: Vec::new(),
             html_stack: Vec::new(),
+            blank_before: false,
         }
     }
 
@@ -1795,21 +1842,150 @@ impl<'a> TreeBuilder<'a> {
             Syntax::Markdown,
             Span::new(span_start, span_start),
         );
+        // Base indent: sum of parent lists' content columns (so we can
+        // compare marker indents in raw coordinates).
+        let base_indent = self
+            .list_stack
+            .last()
+            .map_or(0, |ctx| ctx.base_indent + ctx.content_column);
         self.list_stack.push(ListContext {
             list_node,
             item_node,
             marker_char: marker.marker_char,
             ordered: marker.ordered,
-            marker_indent: marker.marker_indent,
             content_column: marker.content_column,
+            base_indent,
             saw_blank: false,
             loose: false,
         });
     }
 
-    /// Close the current list item (pop `ListItem` scope).
+    /// Classify content after a list marker on the same line.
+    ///
+    /// Handles fenced code, block math, ATX headings, nested list markers,
+    /// blockquote markers, indented code, and paragraphs. Nested list and
+    /// blockquote markers are detected recursively.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "line context parameters are distinct concerns"
+    )]
+    fn classify_item_content(
+        &mut self,
+        lines: &[&str],
+        pos: &mut usize,
+        line_idx: &mut usize,
+        body_offset: usize,
+        item_start: usize,
+        raw_start: usize,
+        raw_len: usize,
+        after: &str,
+    ) {
+        let (after_expanded, after_tab_maps) = expand_all_tabs(after);
+        if let Some((fc, fl, fi)) = fenced_code_open(&after_expanded) {
+            *pos += raw_len;
+            *line_idx += 1;
+            self.parse_fenced_code(
+                lines,
+                pos,
+                line_idx,
+                body_offset,
+                item_start,
+                raw_start + raw_len,
+                fc,
+                fl,
+                fi.as_ref(),
+            );
+        } else if block_math_open(&after_expanded) {
+            *pos += raw_len;
+            *line_idx += 1;
+            self.parse_block_math(
+                lines,
+                pos,
+                line_idx,
+                body_offset,
+                item_start,
+                raw_start + raw_len,
+            );
+        } else if let Some(level) = atx_heading_level(&after_expanded) {
+            self.add_leaf(
+                ElementKind::Heading { level },
+                Syntax::Markdown,
+                Span::new(item_start, raw_start + raw_len),
+            );
+            *pos += raw_len;
+            *line_idx += 1;
+        } else if let Some(inner_marker) = recognize_list_marker(&after_expanded) {
+            // Nested list marker on the same line — recurse.
+            let inner_offset = expanded_to_raw(inner_marker.content_offset, after, &after_tab_maps);
+            let inner_after = &after[inner_offset..];
+            let inner_task = if inner_marker.ordered {
+                None
+            } else {
+                recognize_task(inner_after)
+            };
+            self.open_list(&inner_marker, item_start, inner_task);
+            let inner_start = item_start + inner_offset;
+            if inner_after.trim().is_empty() {
+                *pos += raw_len;
+                *line_idx += 1;
+            } else {
+                self.classify_item_content(
+                    lines,
+                    pos,
+                    line_idx,
+                    body_offset,
+                    inner_start,
+                    raw_start,
+                    raw_len,
+                    inner_after,
+                );
+            }
+        } else if let Some((ml, _)) = strip_blockquote_marker(&after_expanded) {
+            // Blockquote inside the list item.
+            self.push_scope(
+                ElementKind::QuoteBlock,
+                Syntax::Markdown,
+                Span::new(item_start, item_start),
+            );
+            self.quote_depth += 1;
+            let bq_offset = expanded_to_raw(ml, after, &after_tab_maps);
+            let bq_content = &after[bq_offset..];
+            let bq_start = item_start + bq_offset;
+            if bq_content.trim().is_empty() {
+                *pos += raw_len;
+                *line_idx += 1;
+            } else {
+                self.parse_paragraph(lines, pos, line_idx, body_offset, bq_start, raw_len);
+            }
+        } else if count_indent(&after_expanded) >= 4 {
+            self.parse_indented_code(lines, pos, line_idx, body_offset, item_start, raw_len);
+        } else {
+            self.parse_paragraph(lines, pos, line_idx, body_offset, item_start, raw_len);
+        }
+    }
+
+    /// Close the current list item, popping any intervening scopes
+    /// (blockquotes, HTML containers) that were opened inside the item.
     fn close_list_item(&mut self, pos: usize) {
-        self.pop_scope(pos);
+        if let Some(ctx) = self.list_stack.last() {
+            let target = ctx.item_node;
+            // Pop scopes above the list item.
+            while self.scope_stack.last().is_some_and(|&top| top != target) {
+                let top = *self.scope_stack.last().unwrap_or(&0);
+                if matches!(
+                    self.nodes[top].kind,
+                    ElementKind::QuoteBlock | ElementKind::Admonition { .. }
+                ) {
+                    self.quote_depth = self.quote_depth.saturating_sub(1);
+                }
+                if self.html_stack.last().is_some_and(|hs| hs.node_id == top) {
+                    self.html_stack.pop();
+                }
+                self.pop_scope(pos);
+            }
+            // Pop the list item itself.
+            self.pop_scope(pos);
+        }
     }
 
     /// Close the current list: finalize tight/loose, pop scopes.
@@ -1818,6 +1994,14 @@ impl<'a> TreeBuilder<'a> {
             // Update the List node's tight flag.
             if let ElementKind::List { ref mut tight, .. } = self.nodes[ctx.list_node].kind {
                 *tight = !ctx.loose;
+            }
+            // Pop any scopes between the current top and the List node.
+            while self
+                .scope_stack
+                .last()
+                .is_some_and(|&top| top != ctx.list_node)
+            {
+                self.pop_scope(pos);
             }
             self.pop_scope(pos); // pop the List scope
         }
@@ -2167,29 +2351,45 @@ impl<'a> TreeBuilder<'a> {
             return (line, line_start);
         }
 
-        let (expanded, tab_mappings) = expand_leading_tabs(line);
+        let (expanded, tab_mappings) = expand_all_tabs(line);
         let indent = count_indent(&expanded);
 
         while let Some(ctx) = self.list_stack.last() {
+            // Raw content column: the absolute column in the original line
+            // where this list item's content starts.
+            let raw_cc = ctx.base_indent + ctx.content_column;
+
             // Case 1: line continues the current item (sufficient indent).
-            if indent >= ctx.content_column {
-                let col = ctx.content_column;
-                // A continuation line means any prior blank was within
-                // the item, not between items — reset the flag.
+            if indent >= raw_cc {
+                // Empty items followed by a blank line cannot continue —
+                // a list item can begin with at most one blank line.
+                let item_empty = self.nodes[ctx.item_node].children.is_empty();
+                if ctx.saw_blank && item_empty {
+                    self.close_list_item(line_start);
+                    self.close_list(line_start);
+                    continue;
+                }
+                // A blank within an item makes the list loose.
                 if let Some(ctx) = self.list_stack.last_mut() {
+                    if ctx.saw_blank {
+                        ctx.loose = true;
+                    }
                     ctx.saw_blank = false;
                 }
-                // Strip content_column worth of leading spaces.
-                let stripped = strip_n_spaces(line, col);
-                let byte_offset = line.len() - stripped.len();
-                return (stripped, line_start + byte_offset);
+                // Strip raw_cc worth of indent (tab-aware).
+                let raw_offset = expanded_to_raw(raw_cc, line, &tab_mappings);
+                let stripped = &line[raw_offset..];
+                return (stripped, line_start + raw_offset);
             }
 
-            // Case 2: new item in the same list (matching marker at same indent).
+            // Case 2: new item in the same list.
+            // A marker matches if it has the same type/character and its
+            // raw indent falls within the list's marker level (base_indent + 0..=3).
             if let Some(marker) = recognize_list_marker(&expanded)
-                && marker.marker_indent == ctx.marker_indent
                 && marker.ordered == ctx.ordered
                 && marker.marker_char == ctx.marker_char
+                && marker.marker_indent >= ctx.base_indent
+                && marker.marker_indent <= ctx.base_indent + 3
             {
                 // Blank between items → list is loose.
                 let make_loose = ctx.saw_blank;
@@ -2223,8 +2423,14 @@ impl<'a> TreeBuilder<'a> {
             }
 
             // Case 3: line breaks this list level.
+            // Propagate blank flag to parent list so blank lines between
+            // nested structures and continuation content are detected.
+            let child_saw_blank = ctx.saw_blank;
             self.close_list_item(line_start);
             self.close_list(line_start);
+            if child_saw_blank && let Some(parent) = self.list_stack.last_mut() {
+                parent.saw_blank = true;
+            }
         }
 
         (line, line_start)
@@ -2254,6 +2460,7 @@ impl<'a> TreeBuilder<'a> {
             if raw_line.trim().is_empty() {
                 self.close_block_quotes(raw_start);
                 self.mark_list_blank();
+                self.blank_before = true;
                 pos += raw_len;
                 line_idx += 1;
                 continue;
@@ -2273,17 +2480,82 @@ impl<'a> TreeBuilder<'a> {
 
             // Blank content after marker stripping (e.g. `> \n`).
             if content.trim().is_empty() {
+                // Mark list blank only when the list is inside the quotes
+                // (the blank is at the list level). When a blockquote is
+                // inside a list item, a blank at the blockquote level
+                // should not affect the list's tight/loose state.
+                let list_inside_quotes = self.list_stack.last().is_some_and(|ctx| {
+                    self.scope_stack
+                        .iter()
+                        .position(|&id| id == ctx.item_node)
+                        .is_some_and(|ip| {
+                            self.scope_stack[..ip].iter().any(|&id| {
+                                matches!(
+                                    self.nodes[id].kind,
+                                    ElementKind::QuoteBlock | ElementKind::Admonition { .. }
+                                )
+                            })
+                        })
+                });
+                if list_inside_quotes || self.quote_depth == 0 {
+                    self.mark_list_blank();
+                    self.blank_before = true;
+                }
                 pos += raw_len;
                 line_idx += 1;
                 continue;
             }
 
             // Handle list continuation, new items, or list closure.
-            let (content, content_start) = self.handle_list_continuation(content, content_start);
+            // Skip when new blockquote scopes were opened — the blockquote
+            // is inside the list item and its content is not at the list level.
+            let (content, content_start) = if new_quotes > 0 {
+                (content, content_start)
+            } else {
+                self.handle_list_continuation(content, content_start)
+            };
 
-            // Classify the content.
-            let (expanded, tab_mappings) = expand_leading_tabs(content);
+            // A bare list marker (new item with no content) leaves nothing
+            // to classify — just advance past the line.
+            if content.trim().is_empty() && !self.list_stack.is_empty() {
+                pos += raw_len;
+                line_idx += 1;
+                continue;
+            }
+
+            // Detect blockquote markers revealed after list indent stripping.
+            // This handles blockquotes nested inside list items where the `>`
+            // was hidden behind the list's content-column indentation.
+            let (content, content_start) = {
+                let mut c = content;
+                let mut cs = content_start;
+                while let Some((ml, inner)) = strip_blockquote_marker(c) {
+                    self.push_scope(ElementKind::QuoteBlock, Syntax::Markdown, Span::new(cs, cs));
+                    self.quote_depth += 1;
+                    // Check for admonition on the first line of the new blockquote.
+                    if let Some(kind) = detect_admonition(inner) {
+                        let scope_id = self.current_scope();
+                        self.nodes[scope_id].kind = ElementKind::Admonition { kind };
+                    }
+                    cs += ml;
+                    c = inner;
+                }
+                (c, cs)
+            };
+
+            // Blank content after all stripping.
+            if content.trim().is_empty() {
+                pos += raw_len;
+                line_idx += 1;
+                continue;
+            }
+
+            // Classify the content. Use full tab expansion so list markers
+            // with tabs after them (e.g. `-\t\tfoo`) are recognized.
+            let (expanded, tab_mappings) = expand_all_tabs(content);
             let indent = count_indent(&expanded);
+            let blank_before = self.blank_before;
+            self.blank_before = false;
 
             if let Some((fence_char, fence_len, info)) = fenced_code_open(&expanded) {
                 pos += raw_len;
@@ -2419,55 +2691,18 @@ impl<'a> TreeBuilder<'a> {
                     pos += raw_len;
                     line_idx += 1;
                 } else {
-                    // Classify content after the marker through the
-                    // block-level chain (it could be a fenced code
-                    // opener, heading, etc. — not always a paragraph).
-                    let (after_expanded, _) = expand_leading_tabs(after);
-                    if let Some((fc, fl, fi)) = fenced_code_open(&after_expanded) {
-                        pos += raw_len;
-                        line_idx += 1;
-                        self.parse_fenced_code(
-                            &lines,
-                            &mut pos,
-                            &mut line_idx,
-                            body_offset,
-                            item_start,
-                            raw_start + raw_len,
-                            fc,
-                            fl,
-                            fi.as_ref(),
-                        );
-                    } else if block_math_open(&after_expanded) {
-                        pos += raw_len;
-                        line_idx += 1;
-                        self.parse_block_math(
-                            &lines,
-                            &mut pos,
-                            &mut line_idx,
-                            body_offset,
-                            item_start,
-                            raw_start + raw_len,
-                        );
-                    } else if let Some(level) = atx_heading_level(&after_expanded) {
-                        self.add_leaf(
-                            ElementKind::Heading { level },
-                            Syntax::Markdown,
-                            Span::new(item_start, raw_start + raw_len),
-                        );
-                        pos += raw_len;
-                        line_idx += 1;
-                    } else {
-                        self.parse_paragraph(
-                            &lines,
-                            &mut pos,
-                            &mut line_idx,
-                            body_offset,
-                            item_start,
-                            raw_len,
-                        );
-                    }
+                    self.classify_item_content(
+                        &lines,
+                        &mut pos,
+                        &mut line_idx,
+                        body_offset,
+                        item_start,
+                        raw_start,
+                        raw_len,
+                        after,
+                    );
                 }
-            } else if indent >= 4 && !self.last_child_is_paragraph() {
+            } else if indent >= 4 && (!self.last_child_is_paragraph() || blank_before) {
                 self.parse_indented_code(
                     &lines,
                     &mut pos,
@@ -2583,14 +2818,25 @@ impl<'a> TreeBuilder<'a> {
         // indent to continue the list item, return None so callers
         // break out of their continuation loops.
         if let Some(ctx) = self.list_stack.last() {
-            let (expanded, _) = expand_leading_tabs(content);
+            let (expanded, tab_mappings) = expand_leading_tabs(content);
             let indent = count_indent(&expanded);
-            if indent < ctx.content_column && !content.trim().is_empty() {
+            // After quote stripping, the remaining indent must reach the
+            // list item's content column. For nested lists the stored
+            // content_column is relative, so add base_indent for lines
+            // that still carry parent indentation. However, if quotes
+            // were stripped, the parent list indent was consumed with
+            // them, so use content_column directly.
+            let effective_cc = if self.quote_depth > 0 {
+                ctx.content_column
+            } else {
+                ctx.base_indent + ctx.content_column
+            };
+            if indent < effective_cc && !content.trim().is_empty() {
                 return None;
             }
-            let stripped = strip_n_spaces(content, ctx.content_column);
-            let byte_offset = content.len() - stripped.len();
-            Some((stripped, content_start + byte_offset))
+            let raw_offset = expanded_to_raw(effective_cc, content, &tab_mappings);
+            let stripped = &content[raw_offset..];
+            Some((stripped, content_start + raw_offset))
         } else {
             Some((content, content_start))
         }
@@ -3025,6 +3271,10 @@ impl<'a> TreeBuilder<'a> {
     /// Handles block quote continuation markers on each continuation line,
     /// with lazy continuation fallback (lines without `>` markers can
     /// continue a paragraph inside a block quote).
+    #[allow(
+        clippy::too_many_lines,
+        reason = "continuation logic with lazy fallback and multiple break conditions"
+    )]
     fn parse_paragraph(
         &mut self,
         lines: &[&str],
@@ -3071,6 +3321,11 @@ impl<'a> TreeBuilder<'a> {
                 // Lazy continuation: line without proper markers/indent
                 // that is not a block-starting construct can continue a
                 // paragraph inside a block quote or list item.
+                //
+                // Two paths: (1) the line has no markers at all — direct
+                // lazy continuation, (2) the line has partial quote
+                // markers (outer but not inner) — lazy continuation
+                // through partial stripping.
                 let (lazy_expanded, _) = expand_leading_tabs(next_line);
                 if (self.quote_depth > 0 || !self.list_stack.is_empty())
                     && strip_blockquote_marker(next_line).is_none()
@@ -3081,6 +3336,25 @@ impl<'a> TreeBuilder<'a> {
                     && recognize_list_marker(&lazy_expanded).is_none()
                 {
                     next_line
+                } else if self.quote_depth > 0 {
+                    // Partial quote match: strip as many outer quote
+                    // markers as possible and check if the remaining
+                    // content can lazily continue.
+                    let (matched, partial) = strip_n_quote_markers(next_line, self.quote_depth);
+                    let (pe, _) = expand_leading_tabs(partial);
+                    if matched > 0
+                        && !partial.trim().is_empty()
+                        && strip_blockquote_marker(partial).is_none()
+                        && !is_thematic_break(partial)
+                        && atx_heading_level(partial).is_none()
+                        && fenced_code_open(partial).is_none()
+                        && html_block_start(partial).is_none()
+                        && recognize_list_marker(&pe).is_none()
+                    {
+                        partial
+                    } else {
+                        break;
+                    }
                 } else {
                     break;
                 }
@@ -3139,9 +3413,10 @@ impl<'a> TreeBuilder<'a> {
             }
 
             // List marker ends paragraph (ordered with start != 1 cannot
-            // interrupt a paragraph per CommonMark)
+            // interrupt, and empty list items cannot interrupt, per CommonMark)
             if let Some(marker) = recognize_list_marker(&next_expanded)
                 && (!marker.ordered || marker.start == 1)
+                && marker.content_offset < next_expanded.len()
             {
                 break;
             }
@@ -5223,24 +5498,17 @@ mod tests {
     }
 
     #[test]
-    fn blank_within_item_not_loose() {
+    fn blank_within_item_makes_loose() {
         let source = "- a\n\n  b\n- c\n";
         let tree = parse(source);
         let children = root_children(&tree);
         let list = tree.node(children[0]);
 
-        // The blank is within the first item (between paragraphs),
-        // but the next item follows without a blank → still tight
-        // at the list level (blank between items makes it loose).
-        // Actually per CommonMark, a blank within an item that has
-        // a subsequent item with blank between them → loose.
-        // Here: "- a\n\n  b\n- c\n" → blank after item 1's first
-        // paragraph, continuation "  b" at content column, then
-        // item 2 "- c". The blank is within item 1, not between
-        // items, so the list is tight.
+        // Per CommonMark, a blank line within any list item makes
+        // the entire list loose — all items get paragraph wrappers.
         assert!(
-            matches!(list.kind, ElementKind::List { tight: true, .. }),
-            "blank within item does not make list loose"
+            matches!(list.kind, ElementKind::List { tight: false, .. }),
+            "blank within item makes list loose"
         );
     }
 
