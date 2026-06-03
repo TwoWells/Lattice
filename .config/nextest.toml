@@ -1,0 +1,23 @@
+# Nextest configuration. Docs: https://nexte.st/docs/configuration/
+
+[profile.default]
+# Hang backstop. Normal tests finish in well under a second; a test still
+# running after 120s is a runaway — e.g. a parser that fails to make forward
+# progress on pathological input. Mark it slow at 60s and terminate it at
+# 120s so an infinite loop fails the run instead of hanging it (or, without
+# the memory cap in the Makefile, exhausting RAM).
+slow-timeout = { period = "60s", terminate-after = 2 }
+
+# No silent retries. The property tests (proptest) draw fresh random inputs
+# each run, but every discovered failure is persisted under
+# proptest-regressions/ and replayed first on the next run — so a failure is
+# a real, reproducible bug, not a flake. Retrying must never turn it green.
+retries = 0
+
+[profile.hardening]
+# For deliberate extended runs that can legitimately take minutes, e.g.
+#   make test PROFILE=hardening PROPTEST_CASES=200000
+#   PROPTEST_FORK=true make test PROFILE=hardening T=property_tests
+# Generous timeout so a long-but-finite run is not mistaken for a hang.
+slow-timeout = { period = "120s", terminate-after = 30 }
+retries = 0

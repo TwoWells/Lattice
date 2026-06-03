@@ -31,6 +31,14 @@
 //! 256, the floor required by ticket 19's acceptance criteria). Set the
 //! `PROPTEST_CASES` environment variable to raise it for local hardening
 //! runs, e.g. `PROPTEST_CASES=20000 make test T=property`.
+//!
+//! ## Failures are not flakes
+//!
+//! Inputs are random, but failures are deterministic on replay: `proptest`
+//! saves the failing seed to `proptest-regressions/` and replays it first
+//! on every subsequent run, and `nextest` retries are off. A red property
+//! test is a real, reproducible bug with a shrunk counterexample — fix the
+//! parser; do not re-run to make it pass.
 
 #![allow(
     clippy::wildcard_imports,

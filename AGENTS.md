@@ -43,6 +43,7 @@ Single crate. The `lattice` binary serves as both the LSP server and the CLI (`l
   ```
 - **Documentation:** All public APIs must have documentation comments.
 - **Testing:** All new features must include tests.
+- **Property tests are not flaky.** The `proptest` suite (`src/property_tests.rs`) draws fresh random inputs each run, but every discovered failure is saved to `proptest-regressions/` and replayed first on subsequent runs, and `nextest` retries are disabled. A property-test failure is therefore a real, reproducible bug with a shrunk counterexample — fix the parser. **Never** re-run to make it pass or treat it as a flake. `make test` also kills any test that hangs past 120s (see `.config/nextest.toml`).
 
 ## Setup
 

@@ -97,11 +97,12 @@ machete:
 mutants:
 	@cargo mutants --timeout 60
 
-# Run tests. Pass T= to filter, N= to repeat.
+# Run tests. Pass T= to filter, N= to repeat, PROFILE= to select a nextest
+# profile (e.g. PROFILE=hardening for extended PROPTEST_CASES / fork runs).
 CLEAN_T = $(subst \,,$(subst !,,$(T)))
 test:
 	@if [ "$(MEMLIMIT_KB)" != unlimited ]; then ulimit -v $(MEMLIMIT_KB); fi; \
-	 cargo nextest run --status-level fail --final-status-level slow --cargo-quiet $(if $(N),--stress-count $(N),) $(if $(T),$(if $(findstring !,$(T)),-E 'not test($(CLEAN_T))',-E 'test($(T))'),)
+	 cargo nextest run $(if $(PROFILE),--profile $(PROFILE),) --status-level fail --final-status-level slow --cargo-quiet $(if $(N),--stress-count $(N),) $(if $(T),$(if $(findstring !,$(T)),-E 'not test($(CLEAN_T))',-E 'test($(T))'),)
 
 # --- Release ---
 
