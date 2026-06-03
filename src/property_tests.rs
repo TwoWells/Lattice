@@ -254,6 +254,46 @@ fn assert_block_wellformed(block: &FrontmatterBlock, source: &str) {
     }
 }
 
+/// Collect every scalar (mapping keys and scalar values, recursively) in a
+/// parsed frontmatter block — the leaves whose resolved `text` must stay
+/// faithful to the source bytes.
+fn collect_scalars(block: &FrontmatterBlock) -> Vec<&fm::ScalarSpan> {
+    let mut out = Vec::new();
+    for entry in &block.entries {
+        collect_node_scalars(entry, &mut out);
+    }
+    out
+}
+
+fn collect_node_scalars<'a>(node: &'a fm::FmNode, out: &mut Vec<&'a fm::ScalarSpan>) {
+    match node {
+        fm::FmNode::Mapping { key, value, .. } => {
+            out.push(key);
+            collect_value_scalars(value, out);
+        }
+        fm::FmNode::SequenceItem { value, .. } => collect_value_scalars(value, out),
+    }
+}
+
+fn collect_value_scalars<'a>(value: &'a fm::FmValue, out: &mut Vec<&'a fm::ScalarSpan>) {
+    match value {
+        fm::FmValue::Scalar(s) => out.push(s),
+        fm::FmValue::Sequence(items) | fm::FmValue::Mapping(items) => {
+            for item in items {
+                collect_node_scalars(item, out);
+            }
+        }
+        fm::FmValue::FlowSequence { items, .. } => out.extend(items.iter()),
+        fm::FmValue::FlowMapping { entries, .. } => {
+            for (k, v) in entries {
+                out.push(k);
+                out.push(v);
+            }
+        }
+        fm::FmValue::BlockScalar { .. } => {}
+    }
+}
+
 /// Assert a tokenized HTML tag reports lengths and spans within `text`.
 fn assert_html_tag_in_bounds(tag: &HtmlTag, text: &str) {
     let len = text.len();
@@ -649,6 +689,65 @@ fn json_frontmatter() -> impl Strategy<Value = String> {
         })
 }
 
+/// A scalar of fidelity-safe characters: ASCII letters plus 2-, 3-, and
+/// 4-byte samples, and never a quote, backslash, colon, or newline — so it is
+/// a valid key/value in all three formats and its resolved text must equal the
+/// raw source slice (no escape decoding involved).
+fn fidelity_text() -> impl Strategy<Value = String> {
+    proptest::collection::vec(
+        prop_oneof![
+            6 => (b'a'..=b'z').prop_map(char::from),
+            1 => prop_oneof![Just('é'), Just('日'), Just('🎉')],
+        ],
+        1..12,
+    )
+    .prop_map(|cs| cs.into_iter().collect())
+}
+
+/// Frontmatter (YAML / TOML / JSON) carrying multi-byte characters in both the
+/// key and the value, for the content-fidelity property. TOML and JSON quote
+/// the key so a multi-byte key is legal.
+fn multibyte_frontmatter() -> impl Strategy<Value = String> {
+    (fidelity_text(), fidelity_text(), 0u8..4).prop_map(|(k, v, fmt)| match fmt {
+        0 => format!("---\n{k}: {v}\n---\n"),          // YAML plain
+        1 => format!("---\n{k}: \"{v}\"\n---\n"),      // YAML double-quoted
+        2 => format!("+++\n\"{k}\" = \"{v}\"\n+++\n"), // TOML quoted key + basic string
+        _ => format!("{{\"{k}\": \"{v}\"}}\n"),        // JSON
+    })
+}
+
+/// Rewrite a generated (LF-only) document into a chosen line-ending style and
+/// optionally prepend a UTF-8 BOM, so every structural shape can be tested
+/// under `\n`, `\r\n`, bare `\r`, and a per-line mix.
+///
+/// The mixed style keeps the first line `\n`-terminated, so a frontmatter
+/// opener stays recognizable while later lines exercise bare `\r` — the exact
+/// combination that once hung the YAML/TOML scanners.
+fn line_ending_variant(doc: String, style: u8, bom: bool) -> String {
+    let body = match style {
+        0 => doc,
+        1 => doc.replace('\n', "\r\n"),
+        2 => doc.replace('\n', "\r"),
+        _ => {
+            let mut out = String::new();
+            for (i, line) in doc.split_inclusive('\n').enumerate() {
+                if let Some(stripped) = line.strip_suffix('\n') {
+                    out.push_str(stripped);
+                    out.push_str(match i % 3 {
+                        0 => "\n",
+                        1 => "\r\n",
+                        _ => "\r",
+                    });
+                } else {
+                    out.push_str(line);
+                }
+            }
+            out
+        }
+    };
+    if bom { format!("\u{feff}{body}") } else { body }
+}
+
 /// Corrupt a generated string in one of several structural ways, to drive
 /// the parsers' error-recovery paths.
 fn corrupt(source: String, mode: u8, pos: usize) -> String {
@@ -809,6 +908,74 @@ proptest! {
 }
 
 // ---------------------------------------------------------------------------
+// Properties — encoding (line endings, BOM, content fidelity)
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #![proptest_config(config())]
+
+    /// Every structural shape parses to a well-formed tree under any
+    /// line-ending style (`\n`, `\r\n`, bare `\r`, mixed) and with or without
+    /// a leading BOM. Catches lost lines, miscomputed spans, and — via the
+    /// hang timeout — non-terminating scanners on bare `\r`.
+    #[test]
+    fn tree_wellformed_under_any_line_ending(
+        doc in prop_oneof![
+            markdown_document(),
+            yaml_frontmatter(),
+            toml_frontmatter(),
+            json_frontmatter(),
+        ],
+        style in 0u8..4,
+        bom in any::<bool>(),
+    ) {
+        let variant = line_ending_variant(doc, style, bom);
+        assert_tree_wellformed(&parse_full(&variant));
+    }
+
+    /// Every resolved frontmatter scalar (key or value) stays faithful to its
+    /// source bytes: its text occurs verbatim in its (escape-free, single-line)
+    /// source slice. Catches byte-as-char decoding that mangles multi-byte
+    /// keys/values into Latin-1 mojibake.
+    #[test]
+    fn frontmatter_scalar_text_occurs_in_source(
+        doc in prop_oneof![
+            multibyte_frontmatter(),
+            yaml_frontmatter(),
+            toml_frontmatter(),
+            json_frontmatter(),
+        ]
+    ) {
+        let (block, _) = detect_frontmatter(&doc);
+        if let Some(block) = block {
+            for sc in collect_scalars(&block) {
+                prop_assert!(
+                    sc.span.end <= doc.len()
+                        && doc.is_char_boundary(sc.span.start)
+                        && doc.is_char_boundary(sc.span.end),
+                    "scalar span {:?} out of bounds / off a char boundary (len {})",
+                    sc.span,
+                    doc.len()
+                );
+                let sliced = &doc[sc.span.start..sc.span.end];
+                // Escape-decoded or folded multi-line scalars legitimately
+                // differ from their raw slice; skip those.
+                if sliced.contains('\\') || sliced.contains('\n') || sliced.contains('\r') {
+                    continue;
+                }
+                prop_assert!(
+                    sliced.contains(sc.text.as_str()),
+                    "resolved scalar text {:?} does not occur in its source slice {:?} \
+                     — encoding corruption",
+                    sc.text,
+                    sliced
+                );
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Properties — HTML tokenizer
 // ---------------------------------------------------------------------------
 
@@ -889,6 +1056,53 @@ fn frontmatter_blocks_wellformed_on_known_inputs() {
         Some(2),
         "expected two referenced_by paths"
     );
+}
+
+#[test]
+fn multibyte_frontmatter_text_not_corrupted() {
+    // Regression: the TOML/JSON quoted-string parsers once pushed each byte as
+    // a `char`, mangling multi-byte keys and values into Latin-1 mojibake.
+    // YAML used `from_utf8_lossy` and was correct; all three must agree now.
+    let cases = [
+        "+++\n\"日本語\" = \"café 🎉\"\n+++\n",
+        "{\"日本語\": \"café 🎉\"}\n",
+        "---\n日本語: café 🎉\n---\n",
+    ];
+    for case in cases {
+        let (block, _) = detect_frontmatter(case);
+        let block = block.expect("frontmatter should parse");
+        for sc in collect_scalars(&block) {
+            let sliced = &case[sc.span.start..sc.span.end];
+            assert!(
+                sliced.contains(sc.text.as_str()),
+                "resolved scalar {:?} absent from source slice {:?} in {case:?}",
+                sc.text,
+                sliced
+            );
+        }
+    }
+}
+
+#[test]
+fn frontmatter_and_body_survive_mixed_line_endings() {
+    // Regression: a bare `\r` inside otherwise-LF frontmatter once spun the
+    // YAML and TOML `skip_blanks` scanners forever. Each ending style (incl.
+    // the per-line mix that keeps a recognizable opener) must terminate with a
+    // well-formed tree.
+    let docs = [
+        "---\ntitle: a\nx: b\n---\nbody\n",
+        "+++\ntitle = \"a\"\nx = \"b\"\n+++\nbody\n",
+        "{\"a\": \"1\", \"b\": \"2\"}\nbody\n",
+        "# Heading\n\nA paragraph.\n\n- one\n- two\n",
+    ];
+    for doc in docs {
+        for style in 0u8..4 {
+            for bom in [false, true] {
+                let variant = line_ending_variant((*doc).to_string(), style, bom);
+                assert_tree_wellformed(&parse_full(&variant));
+            }
+        }
+    }
 }
 
 #[test]

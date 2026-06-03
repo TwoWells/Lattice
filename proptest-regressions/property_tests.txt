@@ -6,3 +6,6 @@
 # everyone who runs the test benefits from these saved cases.
 cc 330d9c4bceeef18d5069b02cd690197c0a9abc0e8c9c1af3fc7e5118a0eac60c # shrinks to source = "---\ntitle: { !    \ndate: swZ9U]JF\n---\nP%k≈GARBAGE≈@F\n"
 cc 1c76518e4191d70781c4556f4b84a4cb6709dbd3f69ab737070ae3a7bd441641 # shrinks to source = "{\"tags\":≈GARBAGE≈ \"]######\"}\n語>LWn語C;\".\n"
+cc 02265369e589f6afe57f7b0e8a592c467a4310f990a75b52d97d339735467aab # shrinks to doc = "+++\n\"a\" = \"é\"\n+++\n"
+cc d866da87cda4343b59bea49c9dbc96fceb281bd4742b95a811f62ab20e1ac78e # shrinks to doc = "---\ntitle: \"é\"\n---\n\n"
+cc 246996c7da59a7ff12114209cd2f26694475f69805bc0f77e3bb74233f2b28a8 # shrinks to doc = "---\ntitle: 'é'\n---\n\n"

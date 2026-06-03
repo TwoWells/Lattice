@@ -546,6 +546,31 @@ fn yaml_cjk_key_span() {
 }
 
 #[test]
+fn yaml_double_quoted_multibyte_value() {
+    // Regression: the YAML double-quoted scalar parser built text byte-by-byte
+    // (`b as char`), mangling multi-byte values into mojibake — unlike plain
+    // and single-quoted scalars, which slice the source.
+    let block =
+        yaml::parse_frontmatter_block("---\nkey: \"café 🎉\"\n---\n").expect("YAML should parse");
+    assert_eq!(
+        first_scalar_value(&block),
+        "café 🎉",
+        "a double-quoted multi-byte value is decoded intact"
+    );
+}
+
+#[test]
+fn yaml_single_quoted_multibyte_value() {
+    let block =
+        yaml::parse_frontmatter_block("---\nkey: 'café 日本'\n---\n").expect("YAML should parse");
+    assert_eq!(
+        first_scalar_value(&block),
+        "café 日本",
+        "a single-quoted multi-byte value is decoded intact"
+    );
+}
+
+#[test]
 fn yaml_bare_cr_makes_forward_progress() {
     // Mixed endings inside YAML frontmatter: a bare CR separates two entries.
     // Before the fix this spun forever in `skip_blanks_and_comments`.

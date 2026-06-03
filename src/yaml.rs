@@ -172,6 +172,13 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Append the whole UTF-8 character whose lead byte `advance` just consumed
+    /// (now at `self.pos - 1`), advancing past its continuation bytes so a
+    /// multi-byte character is stored intact rather than as per-byte mojibake.
+    fn push_char(&mut self, text: &mut String) {
+        self.pos = fm::push_utf8_char(text, self.src, self.pos - 1);
+    }
+
     /// Skip to end of line (excluding the newline itself).
     fn skip_to_eol(&mut self) {
         while let Some(b) = self.peek() {
@@ -353,9 +360,7 @@ impl<'a> Parser<'a> {
                     self.pos += 1;
                     text.push('\n');
                 }
-                Some(b) => {
-                    text.push(b as char);
-                }
+                Some(_) => self.push_char(&mut text),
             }
         }
 
@@ -406,10 +411,11 @@ impl<'a> Parser<'a> {
                                 self.pos += 1;
                             }
                         }
-                        Some(other) => {
-                            // Unknown escape — pass through.
+                        Some(_) => {
+                            // Unknown escape — pass the backslash and the
+                            // (possibly multi-byte) character through unchanged.
                             text.push('\\');
-                            text.push(other as char);
+                            self.push_char(&mut text);
                         }
                     }
                 }
@@ -417,9 +423,7 @@ impl<'a> Parser<'a> {
                     self.pos += 1;
                     text.push('\n');
                 }
-                Some(b) => {
-                    text.push(b as char);
-                }
+                Some(_) => self.push_char(&mut text),
             }
         }
 
