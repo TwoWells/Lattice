@@ -83,15 +83,14 @@ fn config() -> ProptestConfig {
 // ---------------------------------------------------------------------------
 
 /// Run the full parse pipeline the way `workspace::parse_content` does:
-/// detect frontmatter (YAML, then TOML, then JSON), build the block tree,
-/// then run the inline pass.
+/// detect frontmatter (YAML, then TOML, then JSON), then build the block
+/// tree. The inline pass runs inside `parse_tree_with_entries`; calling it
+/// again here would re-scan every host and duplicate its inline children.
 fn parse_full(source: &str) -> Tree {
     let (fm_block, fm_syntax) = detect_frontmatter(source);
     let fm_span = fm_block.as_ref().map(|b| b.span);
     let fm_entries = fm_block.as_ref().map(|b| b.entries.as_slice());
-    let mut tree = block::parse_tree_with_entries(source, fm_span, fm_syntax, fm_entries);
-    inline::parse_inlines(&mut tree);
-    tree
+    block::parse_tree_with_entries(source, fm_span, fm_syntax, fm_entries)
 }
 
 /// Detect frontmatter using the same precedence as the workspace loader.
