@@ -80,6 +80,10 @@ struct Parser<'a> {
     base: usize,
     /// Collected diagnostics.
     diagnostics: Vec<FmDiagnostic>,
+    /// Current object/array nesting depth (for the depth limit).
+    depth: usize,
+    /// Whether the nesting-depth diagnostic has already been emitted.
+    depth_limit_hit: bool,
 }
 
 impl<'a> Parser<'a> {
@@ -89,6 +93,8 @@ impl<'a> Parser<'a> {
             pos: 0,
             base,
             diagnostics: Vec::new(),
+            depth: 0,
+            depth_limit_hit: false,
         }
     }
 
@@ -281,8 +287,8 @@ impl<'a> Parser<'a> {
                 let scalar = self.parse_string();
                 Some(FmValue::Scalar(scalar))
             }
-            Some(b'{') => Some(self.parse_object()),
-            Some(b'[') => Some(self.parse_array()),
+            Some(b'{') => Some(self.parse_nested(Self::parse_object)),
+            Some(b'[') => Some(self.parse_nested(Self::parse_array)),
             Some(b't') => Some(self.parse_literal("true")),
             Some(b'f') => Some(self.parse_literal("false")),
             Some(b'n') => Some(self.parse_literal("null")),
@@ -298,6 +304,87 @@ impl<'a> Parser<'a> {
                 None
             }
             None => None,
+        }
+    }
+
+    /// Run a nested object/array parser under the depth limit.
+    ///
+    /// Position is at the opening `{` or `[`. Below the limit, depth is
+    /// incremented around `parse` so nested values are tracked. At the limit
+    /// the collection is skipped as opaque (its bytes are consumed so the
+    /// position stays synchronized) and a single diagnostic is emitted, so
+    /// adversarial nesting can neither overflow the stack nor desync parsing.
+    fn parse_nested(&mut self, parse: fn(&mut Self) -> FmValue) -> FmValue {
+        if self.depth >= crate::limits::MAX_FRONTMATTER_NESTING {
+            self.note_depth_limit();
+            let start = self.abs();
+            self.skip_balanced();
+            return FmValue::Scalar(ScalarSpan {
+                span: Span::new(start, self.abs()),
+                text: String::new(),
+            });
+        }
+        self.depth += 1;
+        let value = parse(self);
+        self.depth -= 1;
+        value
+    }
+
+    /// Emit the nesting-depth diagnostic at most once.
+    fn note_depth_limit(&mut self) {
+        if !self.depth_limit_hit {
+            self.depth_limit_hit = true;
+            let pos = self.abs();
+            self.emit(
+                Span::new(pos, pos),
+                FmSeverity::Warning,
+                format!(
+                    "JSON nesting exceeds the limit of {}; deeper structure is flattened",
+                    crate::limits::MAX_FRONTMATTER_NESTING
+                ),
+            );
+        }
+    }
+
+    /// Consume a brace/bracket-balanced region starting at the current `{`
+    /// or `[`, skipping string contents. Used to discard over-deep structure
+    /// without recursing. Always makes forward progress.
+    fn skip_balanced(&mut self) {
+        let mut depth = 0usize;
+        while let Some(b) = self.peek() {
+            match b {
+                b'"' => self.skip_string_raw(),
+                b'{' | b'[' => {
+                    depth += 1;
+                    self.pos += 1;
+                }
+                b'}' | b']' => {
+                    self.pos += 1;
+                    depth -= 1;
+                    if depth == 0 {
+                        return;
+                    }
+                }
+                _ => self.pos += 1,
+            }
+        }
+    }
+
+    /// Skip a JSON string starting at the opening `"`, honoring `\` escapes.
+    fn skip_string_raw(&mut self) {
+        self.pos += 1; // opening quote
+        while let Some(b) = self.peek() {
+            match b {
+                b'\\' => {
+                    self.pos = (self.pos + 2).min(self.src.len());
+                }
+                b'"' => {
+                    self.pos += 1;
+                    return;
+                }
+                b'\n' | b'\r' => return,
+                _ => self.pos += 1,
+            }
         }
     }
 
@@ -605,16 +692,6 @@ pub fn parse_frontmatter_block(source: &str) -> Option<FrontmatterBlock> {
     let content_start = bom_offset;
     let content_end = bom_offset + closing_pos + 1;
 
-    // Parse.
-    let mut parser = Parser::new(json_content, content_start);
-    let entries = parser.parse_top_level();
-    let diagnostics = parser.diagnostics;
-
-    // If we found no valid entries and had errors, discard the block.
-    if entries.is_empty() && diagnostics.iter().any(|d| d.severity == FmSeverity::Error) {
-        return None;
-    }
-
     // Block span covers from `{` through the line after `}`.
     // Find end of the closing brace's line.
     let after_brace = closing_pos + 1;
@@ -628,6 +705,34 @@ pub fn parse_frontmatter_block(source: &str) -> Option<FrontmatterBlock> {
         } else {
             after_brace // `}` at EOF
         };
+
+    // Size limit: an enormous block is treated as opaque and skipped, so the
+    // parser never walks a multi-megabyte frontmatter region.
+    if json_content.len() > crate::limits::MAX_FRONTMATTER_BYTES {
+        return Some(FrontmatterBlock {
+            span: Span::new(bom_offset, block_end),
+            content_span: Span::new(content_start, content_end),
+            entries: Vec::new(),
+            diagnostics: vec![FmDiagnostic {
+                span: Span::new(content_start, content_start),
+                severity: FmSeverity::Warning,
+                message: format!(
+                    "frontmatter exceeds the {}-byte limit; skipped",
+                    crate::limits::MAX_FRONTMATTER_BYTES
+                ),
+            }],
+        });
+    }
+
+    // Parse.
+    let mut parser = Parser::new(json_content, content_start);
+    let entries = parser.parse_top_level();
+    let diagnostics = parser.diagnostics;
+
+    // If we found no valid entries and had errors, discard the block.
+    if entries.is_empty() && diagnostics.iter().any(|d| d.severity == FmSeverity::Error) {
+        return None;
+    }
 
     Some(FrontmatterBlock {
         span: Span::new(bom_offset, block_end),
@@ -1237,6 +1342,58 @@ mod tests {
         assert!(
             parse_frontmatter_block(source).is_none(),
             "completely malformed JSON should be discarded"
+        );
+    }
+
+    // -- Pathological input limits (ticket 20) ----------------------------
+
+    #[test]
+    fn deeply_nested_arrays_hit_limit() {
+        // Nested arrays recurse through `parse_value` -> `parse_array`; the
+        // depth cap prevents stack overflow on `[[[[...]]]]`.
+        let source = format!("{{\"k\":{}{}}}\n", "[".repeat(2_000), "]".repeat(2_000));
+        let block = parse_frontmatter_block(&source).expect("frontmatter should parse");
+        assert!(
+            block
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("JSON nesting exceeds")),
+            "expected a JSON nesting diagnostic: {:?}",
+            block.diagnostics
+        );
+    }
+
+    #[test]
+    fn deeply_nested_objects_hit_limit() {
+        // Nested objects `{"a":{"a":{...}}}` recurse through `parse_object`.
+        let source = format!("{}1{}\n", "{\"a\":".repeat(2_000), "}".repeat(2_000));
+        let block = parse_frontmatter_block(&source).expect("frontmatter should parse");
+        assert!(
+            block
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("JSON nesting exceeds")),
+            "expected a JSON nesting diagnostic: {:?}",
+            block.diagnostics
+        );
+    }
+
+    #[test]
+    fn oversize_frontmatter_is_skipped() {
+        let big = "a".repeat(crate::limits::MAX_FRONTMATTER_BYTES + 100);
+        let source = format!("{{\"k\":\"{big}\"}}\n");
+        let block = parse_frontmatter_block(&source).expect("frontmatter block returned");
+        assert!(
+            block.entries.is_empty(),
+            "oversize frontmatter is not parsed"
+        );
+        assert!(
+            block
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("exceeds the")),
+            "expected an oversize diagnostic: {:?}",
+            block.diagnostics
         );
     }
 }

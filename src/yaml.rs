@@ -77,6 +77,10 @@ struct Parser<'a> {
     base: usize,
     /// Collected diagnostics.
     diagnostics: Vec<FmDiagnostic>,
+    /// Current block mapping/sequence nesting depth (for the depth limit).
+    depth: usize,
+    /// Whether the nesting-depth diagnostic has already been emitted.
+    depth_limit_hit: bool,
 }
 
 impl<'a> Parser<'a> {
@@ -86,6 +90,8 @@ impl<'a> Parser<'a> {
             pos: 0,
             base,
             diagnostics: Vec::new(),
+            depth: 0,
+            depth_limit_hit: false,
         }
     }
 
@@ -704,22 +710,71 @@ impl<'a> Parser<'a> {
             });
         }
 
+        // Depth limit. Block mappings and sequences recurse through this
+        // function, so the depth guard caps recursion and prevents stack
+        // overflow. Beyond the limit the deeper block is skipped (flattened
+        // to an empty scalar) and a single diagnostic is emitted.
+        if self.depth >= crate::limits::MAX_FRONTMATTER_NESTING {
+            self.note_depth_limit();
+            let start = self.abs();
+            self.skip_indented_block(parent_indent);
+            return FmValue::Scalar(ScalarSpan {
+                span: Span::new(start, self.abs()),
+                text: String::new(),
+            });
+        }
+
         // Peek at the first non-whitespace character to determine structure.
         let first_content = self.src.get(self.pos + child_indent).copied();
 
-        if first_content == Some(b'-')
+        self.depth += 1;
+        let value = if first_content == Some(b'-')
             && matches!(
                 self.src.get(self.pos + child_indent + 1),
                 Some(b' ' | b'\n' | b'\r') | None
-            )
-        {
+            ) {
             // Block sequence.
-            let items = self.parse_block_sequence(child_indent);
-            FmValue::Sequence(items)
+            FmValue::Sequence(self.parse_block_sequence(child_indent))
         } else {
             // Block mapping.
-            let entries = self.parse_entries(child_indent);
-            FmValue::Mapping(entries)
+            FmValue::Mapping(self.parse_entries(child_indent))
+        };
+        self.depth -= 1;
+        value
+    }
+
+    /// Emit the nesting-depth diagnostic at most once.
+    fn note_depth_limit(&mut self) {
+        if !self.depth_limit_hit {
+            self.depth_limit_hit = true;
+            let pos = self.abs();
+            self.emit(
+                Span::new(pos, pos),
+                FmSeverity::Warning,
+                format!(
+                    "YAML nesting exceeds the limit of {}; deeper structure is flattened",
+                    crate::limits::MAX_FRONTMATTER_NESTING
+                ),
+            );
+        }
+    }
+
+    /// Consume all subsequent lines more indented than `parent_indent`,
+    /// discarding the over-deep block. Always makes forward progress.
+    fn skip_indented_block(&mut self, parent_indent: usize) {
+        loop {
+            self.skip_blanks_and_comments();
+            if self.at_end() {
+                return;
+            }
+            if self.line_indent() <= parent_indent {
+                return;
+            }
+            self.skip_inline_whitespace();
+            self.skip_to_eol();
+            if !self.skip_newline() {
+                return;
+            }
         }
     }
 
@@ -968,6 +1023,24 @@ pub fn parse_frontmatter_block(source: &str) -> Option<FrontmatterBlock> {
     };
 
     let block_end = content_end + closing_line_len;
+
+    // Size limit: an enormous block is treated as opaque and skipped, so the
+    // parser never walks a multi-megabyte frontmatter region.
+    if yaml_content.len() > crate::limits::MAX_FRONTMATTER_BYTES {
+        return Some(FrontmatterBlock {
+            span: Span::new(bom_offset, block_end),
+            content_span: Span::new(content_start, content_end),
+            entries: Vec::new(),
+            diagnostics: vec![FmDiagnostic {
+                span: Span::new(content_start, content_start),
+                severity: FmSeverity::Warning,
+                message: format!(
+                    "frontmatter exceeds the {}-byte limit; skipped",
+                    crate::limits::MAX_FRONTMATTER_BYTES
+                ),
+            }],
+        });
+    }
 
     let mut parser = Parser::new(yaml_content, content_start);
     let entries = parser.parse_entries(0);
@@ -1595,5 +1668,49 @@ mod tests {
         } else {
             panic!("should be mapping");
         }
+    }
+
+    // -- Pathological input limits (ticket 20) ----------------------------
+
+    #[test]
+    fn deeply_nested_mapping_hits_limit() {
+        // Each level indents one more space. Far beyond the nesting cap, this
+        // would otherwise recurse unboundedly through `parse_block_value`.
+        let mut content = String::from("---\n");
+        for depth in 0..300 {
+            content.push_str(&" ".repeat(depth));
+            content.push_str("k:\n");
+        }
+        content.push_str(&" ".repeat(300));
+        content.push_str("leaf: value\n---\n");
+
+        let block = parse_frontmatter_block(&content).expect("frontmatter should parse");
+        assert!(
+            block
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("YAML nesting exceeds")),
+            "expected a YAML nesting diagnostic: {:?}",
+            block.diagnostics
+        );
+    }
+
+    #[test]
+    fn oversize_frontmatter_is_skipped() {
+        let big = "a: 1\n".repeat(crate::limits::MAX_FRONTMATTER_BYTES / 5 + 10);
+        let source = format!("---\n{big}---\n");
+        let block = parse_frontmatter_block(&source).expect("frontmatter block returned");
+        assert!(
+            block.entries.is_empty(),
+            "oversize frontmatter is not parsed"
+        );
+        assert!(
+            block
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("exceeds the")),
+            "expected an oversize diagnostic: {:?}",
+            block.diagnostics
+        );
     }
 }

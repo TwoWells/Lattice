@@ -157,8 +157,39 @@ fn scan_inlines(
     let base = host_span.start;
     let mut i = 0;
 
+    // Precompute `[` -> matching `]` in a single pass so the scanner never
+    // re-scans for a closing bracket. Without this, a degenerate run like
+    // `[[[[...` drives quadratic backtracking through `find_matching_bracket`.
+    let bracket_matches = precompute_bracket_matches(bytes);
+
+    // Start byte (within `bytes`) of the line currently being scanned, used
+    // to bound per-line inline work.
+    let mut line_start = 0;
+
     while i < bytes.len() {
+        // Per-line inline-scan cap: bytes past the limit on a single line are
+        // treated as plain text. A degenerate line (e.g. unmatched `$` runs)
+        // cannot drive quadratic inline scanning. Block structure was already
+        // recognized at line start, so only inline detection is affected.
+        if i - line_start >= crate::limits::MAX_INLINE_LINE_BYTES {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            // Consume the line ending and reset the line so the next line is
+            // scanned from its start. Without resetting `line_start` the cap
+            // would stay tripped and the loop would spin on the newline.
+            if i < bytes.len() {
+                line_start = i + 1;
+                i += 1;
+            }
+            continue;
+        }
+
         match bytes[i] {
+            b'\n' => {
+                line_start = i + 1;
+                i += 1;
+            }
             b'\\' if i + 1 < bytes.len() && bytes[i + 1].is_ascii_punctuation() => {
                 i += 2;
             }
@@ -190,9 +221,15 @@ fn scan_inlines(
                 }
             }
             b'!' if i + 1 < bytes.len() && bytes[i + 1] == b'[' => {
-                if let Some((end, url, title)) =
-                    try_parse_bracket_element(text, bytes, i + 1, ref_defs, diagnostics, base)
-                {
+                if let Some((end, url, title)) = try_parse_bracket_element(
+                    text,
+                    bytes,
+                    i + 1,
+                    &bracket_matches,
+                    ref_defs,
+                    diagnostics,
+                    base,
+                ) {
                     tree.add_child(
                         parent,
                         crate::block::classify_media(url, title),
@@ -226,9 +263,15 @@ fn scan_inlines(
                     } else {
                         i += 1;
                     }
-                } else if let Some((end, url, title)) =
-                    try_parse_bracket_element(text, bytes, i, ref_defs, diagnostics, base)
-                {
+                } else if let Some((end, url, title)) = try_parse_bracket_element(
+                    text,
+                    bytes,
+                    i,
+                    &bracket_matches,
+                    ref_defs,
+                    diagnostics,
+                    base,
+                ) {
                     tree.add_child(
                         parent,
                         ElementKind::Link { url, title },
@@ -360,6 +403,53 @@ pub fn find_closing_backticks(bytes: &[u8], start: usize, count: usize) -> Optio
 // Bracket matching
 // ---------------------------------------------------------------------------
 
+/// Precompute, for every `[` in `bytes`, the index of its matching `]`.
+///
+/// One left-to-right pass using a stack, with the same backslash-escape and
+/// backtick-span skipping rules as [`find_matching_bracket`]. The result for
+/// any given `[` is identical to calling `find_matching_bracket` at that
+/// position, but the whole table is built in O(n) so the inline scanner never
+/// re-scans — eliminating quadratic backtracking on inputs like `[[[[...`.
+///
+/// Entries are `None` for byte positions that are not an unmatched-then-closed
+/// `[` (including non-`[` bytes and `[` with no matching `]`).
+fn precompute_bracket_matches(bytes: &[u8]) -> Vec<Option<usize>> {
+    let mut matches = vec![None; bytes.len()];
+    let mut stack: Vec<usize> = Vec::new();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' if i + 1 < bytes.len() => {
+                i += 2;
+            }
+            b'`' => {
+                let ticks = count_char(bytes, i, b'`');
+                if let Some(end) = find_closing_backticks(bytes, i + ticks, ticks) {
+                    i = end;
+                } else {
+                    i += ticks;
+                }
+            }
+            b'[' => {
+                stack.push(i);
+                i += 1;
+            }
+            b']' => {
+                if let Some(open) = stack.pop() {
+                    matches[open] = Some(i);
+                }
+                i += 1;
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+
+    matches
+}
+
 /// Find the `]` that matches the `[` at `start`.
 ///
 /// Handles nested brackets, backslash escapes, and backtick spans.
@@ -474,11 +564,12 @@ fn try_parse_bracket_element(
     text: &str,
     bytes: &[u8],
     bracket_pos: usize,
+    bracket_matches: &[Option<usize>],
     ref_defs: &mut HashMap<String, RefDef>,
     diagnostics: &mut Vec<Diagnostic>,
     base: usize,
 ) -> Option<(usize, String, String)> {
-    let close = find_matching_bracket(bytes, bracket_pos)?;
+    let close = bracket_matches[bracket_pos]?;
     let after = close + 1;
 
     if after < bytes.len() && bytes[after] == b'(' {
@@ -510,7 +601,7 @@ fn try_parse_bracket_element(
             }
         } else {
             // Full reference: [text][label]
-            let ref_close = find_matching_bracket(bytes, after)?;
+            let ref_close = bracket_matches[after]?;
             let label_text = &text[after + 1..ref_close];
             let label = normalize_label(label_text);
             if let Some(def) = ref_defs.get_mut(&label) {
@@ -1458,5 +1549,110 @@ mod tests {
         let children = root_children(&tree);
         assert_eq!(children.len(), 1, "one paragraph");
         assert_kind(&tree, children[0], &ElementKind::Paragraph);
+    }
+
+    // --- Pathological inline input (ticket 20) ---
+
+    /// Generous wall-clock bound: catches quadratic backtracking without
+    /// being flaky under CI load.
+    const INLINE_SLOW_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+
+    #[test]
+    fn unclosed_bracket_run_is_not_quadratic() {
+        // `[[[[...` with no closing bracket. Each `[` previously triggered an
+        // O(n) forward scan; the precomputed match table makes the whole scan
+        // linear.
+        let source = format!("{}\n", "[".repeat(200_000));
+        let start = std::time::Instant::now();
+        let tree = parse(&source);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < INLINE_SLOW_BOUND,
+            "unclosed bracket run must scan linearly, took {elapsed:?}"
+        );
+        let links = find_nodes(&tree, |k| matches!(k, ElementKind::Link { .. }));
+        assert!(links.is_empty(), "unclosed brackets are not links");
+    }
+
+    #[test]
+    fn open_brackets_then_single_close_is_not_quadratic() {
+        // `[[[[...]` — one closing bracket at the end. Depth-counting bracket
+        // matching from each `[` would be O(n^2); the precompute keeps it
+        // linear.
+        let source = format!("{}]\n", "[".repeat(200_000));
+        let start = std::time::Instant::now();
+        let _tree = parse(&source);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < INLINE_SLOW_BOUND,
+            "bracket run with one close must scan linearly, took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn long_backtick_run_is_not_quadratic() {
+        // A long run of backticks with no matching closer.
+        let source = format!("{}\n", "`".repeat(200_000));
+        let start = std::time::Instant::now();
+        let _tree = parse(&source);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < INLINE_SLOW_BOUND,
+            "long backtick run must scan linearly, took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn unmatched_dollar_run_is_not_quadratic() {
+        // `$a $a $a ...` — each unmatched `$` would scan to end of line; the
+        // per-line inline cap bounds the work.
+        let source = format!("{}\n", "$a ".repeat(100_000));
+        let start = std::time::Instant::now();
+        let _tree = parse(&source);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < INLINE_SLOW_BOUND,
+            "unmatched dollar run must not be quadratic, took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn brackets_still_match_after_precompute() {
+        // The precompute must preserve normal link detection, including nested
+        // brackets in the link text.
+        let tree = parse("[a [nested] b](url \"references\")\n");
+        let links = find_nodes(&tree, |k| matches!(k, ElementKind::Link { .. }));
+        assert_eq!(links.len(), 1, "nested-bracket link text still parses");
+        match &tree.node(links[0]).kind {
+            ElementKind::Link { url, title } => {
+                assert_eq!(url, "url", "link url preserved");
+                assert_eq!(title, "references", "link title preserved");
+            }
+            other => panic!("expected Link, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn overlong_line_truncates_inline_scan() {
+        // A link past the per-line inline cap is treated as plain text, but a
+        // link near the line start is still detected.
+        let filler = "x".repeat(crate::limits::MAX_INLINE_LINE_BYTES + 100);
+        let source = format!("[early](a.md) {filler}[late](b.md)\n");
+        let tree = parse(&source);
+        let urls: Vec<String> = find_nodes(&tree, |k| matches!(k, ElementKind::Link { .. }))
+            .iter()
+            .filter_map(|&id| match &tree.node(id).kind {
+                ElementKind::Link { url, .. } => Some(url.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            urls.iter().any(|u| u == "a.md"),
+            "link before the cap is detected: {urls:?}"
+        );
+        assert!(
+            urls.iter().all(|u| u != "b.md"),
+            "link past the cap is treated as text: {urls:?}"
+        );
     }
 }

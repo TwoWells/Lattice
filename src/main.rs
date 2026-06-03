@@ -15,6 +15,7 @@ mod fm;
 mod html;
 mod inline;
 mod json;
+mod limits;
 mod lint;
 mod lsp;
 #[cfg(test)]

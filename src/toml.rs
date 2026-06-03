@@ -76,6 +76,10 @@ struct Parser<'a> {
     root: Vec<FmNode>,
     /// Seen top-level keys for duplicate detection.
     seen_keys: HashSet<String>,
+    /// Current inline array/table nesting depth (for the depth limit).
+    depth: usize,
+    /// Whether the nesting-depth diagnostic has already been emitted.
+    depth_limit_hit: bool,
 }
 
 impl<'a> Parser<'a> {
@@ -87,6 +91,8 @@ impl<'a> Parser<'a> {
             diagnostics: Vec::new(),
             root: Vec::new(),
             seen_keys: HashSet::new(),
+            depth: 0,
+            depth_limit_hit: false,
         }
     }
 
@@ -560,6 +566,20 @@ impl<'a> Parser<'a> {
     /// Parse an inline array (`[1, 2, "three"]`).
     fn parse_inline_array(&mut self) -> FmValue {
         let abs_start = self.abs();
+
+        // Depth limit. Inline arrays and tables nest recursively, so the
+        // guard caps recursion and prevents stack overflow. Beyond the limit
+        // the collection is skipped as opaque (its bytes are consumed) and a
+        // single diagnostic is emitted.
+        if self.depth >= crate::limits::MAX_FRONTMATTER_NESTING {
+            self.note_depth_limit();
+            self.skip_balanced();
+            return FmValue::FlowSequence {
+                span: Span::new(abs_start, self.abs()),
+                items: Vec::new(),
+            };
+        }
+        self.depth += 1;
         self.pos += 1; // skip '['
 
         let mut items = Vec::new();
@@ -616,6 +636,7 @@ impl<'a> Parser<'a> {
             }
         }
 
+        self.depth -= 1;
         FmValue::FlowSequence {
             span: Span::new(abs_start, self.abs()),
             items,
@@ -639,6 +660,14 @@ impl<'a> Parser<'a> {
     /// Parse an inline table (`{ key = "val", other = "val" }`).
     fn parse_inline_table(&mut self) -> FmValue {
         let abs_start = self.abs();
+
+        // Depth limit (see `parse_inline_array`).
+        if self.depth >= crate::limits::MAX_FRONTMATTER_NESTING {
+            self.note_depth_limit();
+            self.skip_balanced();
+            return FmValue::Mapping(Vec::new());
+        }
+        self.depth += 1;
         self.pos += 1; // skip '{'
 
         let mut entries = Vec::new();
@@ -686,7 +715,69 @@ impl<'a> Parser<'a> {
             }
         }
 
+        self.depth -= 1;
         FmValue::Mapping(entries)
+    }
+
+    /// Emit the nesting-depth diagnostic at most once.
+    fn note_depth_limit(&mut self) {
+        if !self.depth_limit_hit {
+            self.depth_limit_hit = true;
+            let pos = self.abs();
+            self.emit(
+                Span::new(pos, pos),
+                FmSeverity::Warning,
+                format!(
+                    "TOML nesting exceeds the limit of {}; deeper structure is flattened",
+                    crate::limits::MAX_FRONTMATTER_NESTING
+                ),
+            );
+        }
+    }
+
+    /// Consume a bracket/brace-balanced region starting at the current `[`
+    /// or `{`, skipping quoted strings. Used to discard over-deep structure
+    /// without recursing. Always makes forward progress.
+    fn skip_balanced(&mut self) {
+        let mut depth = 0usize;
+        while let Some(b) = self.peek() {
+            match b {
+                b'"' | b'\'' => self.skip_string_raw(b),
+                b'[' | b'{' => {
+                    depth += 1;
+                    self.pos += 1;
+                }
+                b']' | b'}' => {
+                    self.pos += 1;
+                    depth -= 1;
+                    if depth == 0 {
+                        return;
+                    }
+                }
+                _ => self.pos += 1,
+            }
+        }
+    }
+
+    /// Skip a quoted string starting at the opening quote `quote`. Basic
+    /// strings honor `\` escapes; literal strings do not. Stops at a newline
+    /// for recovery.
+    fn skip_string_raw(&mut self, quote: u8) {
+        self.pos += 1; // opening quote
+        while let Some(b) = self.peek() {
+            if b == quote {
+                self.pos += 1;
+                return;
+            }
+            if b == b'\n' || b == b'\r' {
+                return;
+            }
+            if b == b'\\' && quote == b'"' {
+                self.pos = (self.pos + 2).min(self.src.len());
+            } else {
+                self.pos += 1;
+            }
+        }
     }
 
     /// Parse a value that could be a scalar, inline array, or inline table.
@@ -1115,6 +1206,24 @@ pub fn parse_frontmatter_block(source: &str) -> Option<FrontmatterBlock> {
     };
 
     let block_end = content_end + closing_line_len;
+
+    // Size limit: an enormous block is treated as opaque and skipped, so the
+    // parser never walks a multi-megabyte frontmatter region.
+    if toml_content.len() > crate::limits::MAX_FRONTMATTER_BYTES {
+        return Some(FrontmatterBlock {
+            span: Span::new(bom_offset, block_end),
+            content_span: Span::new(content_start, content_end),
+            entries: Vec::new(),
+            diagnostics: vec![FmDiagnostic {
+                span: Span::new(content_start, content_start),
+                severity: FmSeverity::Warning,
+                message: format!(
+                    "frontmatter exceeds the {}-byte limit; skipped",
+                    crate::limits::MAX_FRONTMATTER_BYTES
+                ),
+            }],
+        });
+    }
 
     let mut parser = Parser::new(toml_content, content_start);
     parser.parse();
@@ -1774,5 +1883,62 @@ mod tests {
                 "child should be FrontmatterKey"
             );
         }
+    }
+
+    // -- Pathological input limits (ticket 20) ----------------------------
+
+    #[test]
+    fn deeply_nested_inline_arrays_hit_limit() {
+        // Nested inline arrays recurse through `parse_inline_array`; the depth
+        // cap prevents stack overflow on `[[[[...`.
+        let source = format!("+++\nx = {}{}\n+++\n", "[".repeat(2_000), "]".repeat(2_000));
+        let block = parse_frontmatter_block(&source).expect("frontmatter should parse");
+        assert!(
+            block
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("TOML nesting exceeds")),
+            "expected a TOML nesting diagnostic: {:?}",
+            block.diagnostics
+        );
+    }
+
+    #[test]
+    fn deeply_nested_inline_tables_hit_limit() {
+        // Nested inline tables `{a={a={...}}}` recurse through
+        // `parse_inline_table`.
+        let source = format!(
+            "+++\nx = {}1{}\n+++\n",
+            "{ a = ".repeat(2_000),
+            " }".repeat(2_000)
+        );
+        let block = parse_frontmatter_block(&source).expect("frontmatter should parse");
+        assert!(
+            block
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("TOML nesting exceeds")),
+            "expected a TOML nesting diagnostic: {:?}",
+            block.diagnostics
+        );
+    }
+
+    #[test]
+    fn oversize_frontmatter_is_skipped() {
+        let big = "a = 1\n".repeat(crate::limits::MAX_FRONTMATTER_BYTES / 6 + 10);
+        let source = format!("+++\n{big}+++\n");
+        let block = parse_frontmatter_block(&source).expect("frontmatter block returned");
+        assert!(
+            block.entries.is_empty(),
+            "oversize frontmatter is not parsed"
+        );
+        assert!(
+            block
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("exceeds the")),
+            "expected an oversize diagnostic: {:?}",
+            block.diagnostics
+        );
     }
 }

@@ -240,6 +240,9 @@ pub struct Tree {
     nodes: Vec<Node>,
     /// Diagnostics emitted during parsing.
     diagnostics: Vec<Diagnostic>,
+    /// Whether the node-count limit diagnostic has been emitted. Carried
+    /// from the builder so the inline pass does not duplicate it.
+    node_limit_emitted: bool,
 }
 
 impl Tree {
@@ -334,6 +337,10 @@ impl Tree {
     }
 
     /// Add a child node to an existing node (used by the inline parser).
+    ///
+    /// Honors the tree node-count limit: once reached, no node is created and
+    /// the parent id is returned. The first call to hit the limit during the
+    /// inline pass emits the (single) node-limit diagnostic.
     pub fn add_child(
         &mut self,
         parent: NodeId,
@@ -341,6 +348,20 @@ impl Tree {
         syntax: Syntax,
         span: Span,
     ) -> NodeId {
+        if self.nodes.len() >= crate::limits::MAX_NODES {
+            if !self.node_limit_emitted {
+                self.node_limit_emitted = true;
+                self.diagnostics.push(Diagnostic {
+                    level: DiagnosticLevel::Warning,
+                    span,
+                    message: format!(
+                        "document exceeds the {}-node limit; remaining structure is not indexed",
+                        crate::limits::MAX_NODES
+                    ),
+                });
+            }
+            return parent;
+        }
         let id = self.nodes.len();
         self.nodes.push(Node {
             kind,
@@ -1878,6 +1899,7 @@ pub fn parse_tree_with_entries(
         source: source.to_string(),
         nodes: builder.nodes,
         diagnostics: builder.diagnostics,
+        node_limit_emitted: builder.limits_hit.nodes,
     };
 
     // Second pass: parse inline elements in Paragraph and Heading nodes.
@@ -1912,6 +1934,24 @@ struct TreeBuilder<'a> {
     html_stack: Vec<HtmlScope>,
     /// A blank line preceded the current line (for indented code detection).
     blank_before: bool,
+    /// Whether each resource limit has already emitted its one diagnostic.
+    /// Limits degrade silently after the first hit so a pathological
+    /// document does not produce thousands of identical diagnostics.
+    limits_hit: LimitFlags,
+}
+
+/// Tracks which resource limits have emitted their (single) diagnostic.
+#[derive(Default)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent one-shot latches, one per resource limit; not a state machine"
+)]
+struct LimitFlags {
+    quote: bool,
+    list: bool,
+    html: bool,
+    scope: bool,
+    nodes: bool,
 }
 
 impl<'a> TreeBuilder<'a> {
@@ -1925,6 +1965,7 @@ impl<'a> TreeBuilder<'a> {
             list_stack: Vec::new(),
             html_stack: Vec::new(),
             blank_before: false,
+            limits_hit: LimitFlags::default(),
         }
     }
 
@@ -1937,6 +1978,25 @@ impl<'a> TreeBuilder<'a> {
         span: Span,
         parent: Option<NodeId>,
     ) -> NodeId {
+        // Tree node count limit. Once reached, stop creating nodes so an
+        // adversarial document cannot exhaust memory. Reuse the parent (or
+        // the Document root) as the returned id so callers that record it
+        // still reference a live node; the structure below this point is
+        // simply not indexed.
+        if self.nodes.len() >= crate::limits::MAX_NODES {
+            if !self.limits_hit.nodes {
+                self.limits_hit.nodes = true;
+                self.diagnostics.push(Diagnostic {
+                    level: DiagnosticLevel::Warning,
+                    span,
+                    message: format!(
+                        "document exceeds the {}-node limit; remaining structure is not indexed",
+                        crate::limits::MAX_NODES
+                    ),
+                });
+            }
+            return parent.unwrap_or(0);
+        }
         let id = self.nodes.len();
         self.nodes.push(Node {
             kind,
@@ -1958,11 +2018,97 @@ impl<'a> TreeBuilder<'a> {
     }
 
     /// Push a new container scope.
+    ///
+    /// The scope stack is hard-limited: once [`crate::limits::MAX_SCOPE_DEPTH`]
+    /// open scopes are reached the node is still created (as a child of the
+    /// current scope) but is not pushed, flattening any deeper nesting. This
+    /// is the cross-container backstop behind the per-structure depth caps.
     fn push_scope(&mut self, kind: ElementKind, syntax: Syntax, span: Span) -> NodeId {
         let parent = self.current_scope();
         let id = self.add_node(kind, syntax, span, Some(parent));
-        self.scope_stack.push(id);
+        if self.scope_stack.len() < crate::limits::MAX_SCOPE_DEPTH {
+            self.scope_stack.push(id);
+        } else if !self.limits_hit.scope {
+            self.limits_hit.scope = true;
+            self.diagnostics.push(Diagnostic {
+                level: DiagnosticLevel::Warning,
+                span,
+                message: format!(
+                    "nesting exceeds the maximum scope depth of {}; deeper structure is flattened",
+                    crate::limits::MAX_SCOPE_DEPTH
+                ),
+            });
+        }
         id
+    }
+
+    /// Attempt to open a new block quote scope, respecting the nesting cap.
+    ///
+    /// Returns `true` when a `QuoteBlock` scope was opened. At the cap the
+    /// `>` marker is left for the caller to treat as text and a single
+    /// diagnostic is emitted.
+    fn try_open_quote(&mut self, span_start: usize) -> bool {
+        if self.quote_depth >= crate::limits::MAX_QUOTE_NESTING {
+            self.note_quote_limit(span_start);
+            return false;
+        }
+        self.push_scope(
+            ElementKind::QuoteBlock,
+            Syntax::Markdown,
+            Span::new(span_start, span_start),
+        );
+        self.quote_depth += 1;
+        true
+    }
+
+    /// Emit the block-quote nesting diagnostic at most once.
+    fn note_quote_limit(&mut self, span_start: usize) {
+        if !self.limits_hit.quote {
+            self.limits_hit.quote = true;
+            self.diagnostics.push(Diagnostic {
+                level: DiagnosticLevel::Warning,
+                span: Span::new(span_start, span_start),
+                message: format!(
+                    "block quote nesting exceeds the limit of {}; deeper `>` markers are treated as text",
+                    crate::limits::MAX_QUOTE_NESTING
+                ),
+            });
+        }
+    }
+
+    /// Emit the list nesting diagnostic at most once.
+    fn note_list_limit(&mut self, span_start: usize) {
+        if !self.limits_hit.list {
+            self.limits_hit.list = true;
+            self.diagnostics.push(Diagnostic {
+                level: DiagnosticLevel::Warning,
+                span: Span::new(span_start, span_start),
+                message: format!(
+                    "list nesting exceeds the limit of {}; deeper markers are treated as text",
+                    crate::limits::MAX_LIST_NESTING
+                ),
+            });
+        }
+    }
+
+    /// Emit the HTML container nesting diagnostic at most once.
+    fn note_html_limit(&mut self, span_start: usize) {
+        if !self.limits_hit.html {
+            self.limits_hit.html = true;
+            self.diagnostics.push(Diagnostic {
+                level: DiagnosticLevel::Warning,
+                span: Span::new(span_start, span_start),
+                message: format!(
+                    "HTML container nesting exceeds the limit of {}; deeper tags are not opened as scopes",
+                    crate::limits::MAX_HTML_NESTING
+                ),
+            });
+        }
+    }
+
+    /// Whether opening another list level would exceed the nesting cap.
+    fn list_nesting_full(&self) -> bool {
+        self.list_stack.len() >= crate::limits::MAX_LIST_NESTING
     }
 
     /// Pop the current scope, finalizing its span.
@@ -2089,7 +2235,14 @@ impl<'a> TreeBuilder<'a> {
             *pos += raw_len;
             *line_idx += 1;
         } else if let Some(inner_marker) = recognize_list_marker(&after_expanded) {
-            // Nested list marker on the same line — recurse.
+            // Nested list marker on the same line — recurse. Recursion depth
+            // equals list nesting depth, so cap it to avoid stack overflow on
+            // pathological `- - - - ...` input.
+            if self.list_nesting_full() {
+                self.note_list_limit(item_start);
+                self.parse_paragraph(lines, pos, line_idx, body_offset, item_start, raw_len);
+                return;
+            }
             let inner_offset = expanded_to_raw(inner_marker.content_offset, after, &after_tab_maps);
             let inner_after = &after[inner_offset..];
             let inner_task = if inner_marker.ordered {
@@ -2116,12 +2269,11 @@ impl<'a> TreeBuilder<'a> {
             }
         } else if let Some((ml, _)) = strip_blockquote_marker(&after_expanded) {
             // Blockquote inside the list item.
-            self.push_scope(
-                ElementKind::QuoteBlock,
-                Syntax::Markdown,
-                Span::new(item_start, item_start),
-            );
-            self.quote_depth += 1;
+            if !self.try_open_quote(item_start) {
+                // At the nesting cap — treat the `>` content as a paragraph.
+                self.parse_paragraph(lines, pos, line_idx, body_offset, item_start, raw_len);
+                return;
+            }
             let bq_offset = expanded_to_raw(ml, after, &after_tab_maps);
             let bq_content = &after[bq_offset..];
             let bq_start = item_start + bq_offset;
@@ -2394,6 +2546,17 @@ impl<'a> TreeBuilder<'a> {
                 // Container element: push scope.
                 *pos += first_raw_len;
                 *line_idx += 1;
+
+                // HTML container nesting cap. Nested containers are parsed
+                // recursively (`consume_html_raw` -> `handle_html_open`), so
+                // the cap bounds recursion depth and prevents stack overflow.
+                // Beyond it, the tag is recorded as a flat leaf and its
+                // content is not entered as a scope.
+                if self.html_stack.len() >= crate::limits::MAX_HTML_NESTING {
+                    self.note_html_limit(content_start);
+                    self.add_leaf(kind, Syntax::Html, span);
+                    return true;
+                }
 
                 self.push_html_scope(name, kind, span);
 
@@ -2711,8 +2874,10 @@ impl<'a> TreeBuilder<'a> {
                 let mut c = content;
                 let mut cs = content_start;
                 while let Some((ml, inner)) = strip_blockquote_marker(c) {
-                    self.push_scope(ElementKind::QuoteBlock, Syntax::Markdown, Span::new(cs, cs));
-                    self.quote_depth += 1;
+                    if !self.try_open_quote(cs) {
+                        // At the nesting cap — leave the remaining `>` as text.
+                        break;
+                    }
                     // Check for admonition on the first line of the new blockquote.
                     if let Some(kind) = detect_admonition(inner) {
                         let scope_id = self.current_scope();
@@ -2856,7 +3021,9 @@ impl<'a> TreeBuilder<'a> {
                 );
                 pos += raw_len;
                 line_idx += 1;
-            } else if let Some(marker) = recognize_list_marker(&expanded) {
+            } else if let Some(marker) = recognize_list_marker(&expanded)
+                && !self.list_nesting_full()
+            {
                 let raw_offset = expanded_to_raw(marker.content_offset, content, &tab_mappings);
                 let after = &content[raw_offset..];
                 let task = if marker.ordered {
@@ -2881,6 +3048,18 @@ impl<'a> TreeBuilder<'a> {
                         after,
                     );
                 }
+            } else if recognize_list_marker(&expanded).is_some() {
+                // List marker present but the nesting cap is reached — emit a
+                // single diagnostic and fall back to paragraph handling.
+                self.note_list_limit(content_start);
+                self.parse_paragraph(
+                    &lines,
+                    &mut pos,
+                    &mut line_idx,
+                    body_offset,
+                    content_start,
+                    raw_len,
+                );
             } else if indent >= 4 && (!self.last_child_is_paragraph() || blank_before) {
                 self.parse_indented_code(
                     &lines,
@@ -2981,12 +3160,10 @@ impl<'a> TreeBuilder<'a> {
         // Step 2: Open new block quote scopes for additional `>` markers.
         let mut new_quotes = 0;
         while let Some((ml, inner)) = strip_blockquote_marker(content) {
-            self.push_scope(
-                ElementKind::QuoteBlock,
-                Syntax::Markdown,
-                Span::new(content_start, content_start),
-            );
-            self.quote_depth += 1;
+            if !self.try_open_quote(content_start) {
+                // At the nesting cap — leave the remaining `>` as text.
+                break;
+            }
             new_quotes += 1;
             content_start += ml;
             content = inner;
@@ -3318,6 +3495,15 @@ impl<'a> TreeBuilder<'a> {
         first_content_start: usize,
         first_raw_len: usize,
     ) -> bool {
+        // The look-ahead is capped: a reference definition spans only a few
+        // lines (label, destination, and title, each of which may sit on its
+        // own line). Without a cap, a long contiguous block of stacked
+        // definitions — each parsed one line at a time — would re-collect the
+        // whole tail on every line, which is quadratic. Only the first
+        // definition is ever consumed; the extra lines are look-ahead to spot
+        // a destination or title on a following line.
+        const REFDEF_MAX_PROBE_LINES: usize = 32;
+
         // Cheap gate: bail before any allocation unless the first line could
         // open a reference-definition label. This filters ordinary bracketed
         // text (`[text][ref]`, `[link](url)`, shortcut refs) while still
@@ -3334,7 +3520,7 @@ impl<'a> TreeBuilder<'a> {
         let mut text = String::from(first_content);
         let mut probe_pos = *pos + first_raw_len;
         let mut probe_idx = *line_idx + 1;
-        while probe_idx < lines.len() {
+        while probe_idx < lines.len() && run.len() < REFDEF_MAX_PROBE_LINES {
             let raw = lines[probe_idx];
             let raw_start = body_offset + probe_pos;
             let Some((content, content_start)) = self.strip_continuation(raw, raw_start) else {
@@ -7157,6 +7343,228 @@ mod tests {
             "no unclosed diagnostics: {:?}",
             tree.diagnostics()
         );
+    }
+
+    // --- Pathological input limits (ticket 20) ---
+
+    use crate::limits;
+    use std::time::Instant;
+
+    /// Parsing must always terminate quickly; this generous bound catches
+    /// quadratic or runaway behavior without being flaky under CI load.
+    const SLOW_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
+
+    #[test]
+    fn deeply_nested_block_quotes_hit_limit() {
+        // 10,000 `>` markers on one line. Block quotes are parsed iteratively,
+        // but the nesting cap must still fire so node growth is bounded.
+        let source = format!("{} text\n", ">".repeat(10_000));
+        let start = Instant::now();
+        let tree = parse(&source);
+        assert!(
+            start.elapsed() < SLOW_BOUND,
+            "block quote nesting must not hang"
+        );
+
+        let quotes = tree
+            .nodes()
+            .iter()
+            .filter(|n| matches!(n.kind, ElementKind::QuoteBlock))
+            .count();
+        assert!(
+            quotes <= limits::MAX_QUOTE_NESTING,
+            "quote nesting capped at {}, got {quotes}",
+            limits::MAX_QUOTE_NESTING
+        );
+        assert!(
+            tree.diagnostics()
+                .iter()
+                .any(|d| d.message.contains("block quote nesting exceeds")),
+            "expected a block quote nesting diagnostic: {:?}",
+            tree.diagnostics()
+        );
+    }
+
+    #[test]
+    fn same_line_nested_list_markers_hit_limit() {
+        // `- - - - ... x` recurses through `classify_item_content`; without a
+        // cap this overflows the stack.
+        let source = format!("{}x\n", "- ".repeat(10_000));
+        let start = Instant::now();
+        let tree = parse(&source);
+        assert!(
+            start.elapsed() < SLOW_BOUND,
+            "list marker recursion must not hang"
+        );
+
+        let lists = tree
+            .nodes()
+            .iter()
+            .filter(|n| matches!(n.kind, ElementKind::List { .. }))
+            .count();
+        assert!(
+            lists <= limits::MAX_LIST_NESTING,
+            "list nesting capped at {}, got {lists}",
+            limits::MAX_LIST_NESTING
+        );
+        assert!(
+            tree.diagnostics()
+                .iter()
+                .any(|d| d.message.contains("list nesting exceeds")),
+            "expected a list nesting diagnostic: {:?}",
+            tree.diagnostics()
+        );
+    }
+
+    #[test]
+    fn deeply_nested_lists_across_lines_hit_limit() {
+        // Each line indents two more spaces, opening a new nested list level.
+        let mut source = String::new();
+        for depth in 0..2_000 {
+            source.push_str(&" ".repeat(depth * 2));
+            source.push_str("- item\n");
+        }
+        let start = Instant::now();
+        let tree = parse(&source);
+        assert!(start.elapsed() < SLOW_BOUND, "nested lists must not hang");
+
+        let lists = tree
+            .nodes()
+            .iter()
+            .filter(|n| matches!(n.kind, ElementKind::List { .. }))
+            .count();
+        assert!(
+            lists <= limits::MAX_LIST_NESTING,
+            "list nesting capped at {}, got {lists}",
+            limits::MAX_LIST_NESTING
+        );
+        assert!(
+            tree.diagnostics()
+                .iter()
+                .any(|d| d.message.contains("list nesting exceeds")),
+            "expected a list nesting diagnostic: {:?}",
+            tree.diagnostics()
+        );
+    }
+
+    #[test]
+    fn deeply_nested_html_containers_hit_limit() {
+        // Nested `<div>` containers are parsed recursively
+        // (`consume_html_raw` -> `handle_html_open`); the cap bounds recursion
+        // depth and prevents stack overflow.
+        let source = "<div>\n".repeat(10_000);
+        let start = Instant::now();
+        let tree = parse(&source);
+        assert!(start.elapsed() < SLOW_BOUND, "nested HTML must not hang");
+
+        assert!(
+            tree.diagnostics()
+                .iter()
+                .any(|d| d.message.contains("HTML container nesting exceeds")),
+            "expected an HTML nesting diagnostic: {:?}",
+            tree.diagnostics()
+        );
+    }
+
+    #[test]
+    fn scope_stack_depth_is_hard_limited() {
+        // 90 block quotes (under the quote cap) then a deep same-line list.
+        // Each list level adds two scopes (List + ListItem), so the scope
+        // stack reaches its hard cap before the list cap — exercising the
+        // cross-container backstop.
+        let source = format!("{}{}x\n", "> ".repeat(90), "- ".repeat(100));
+        let start = Instant::now();
+        let tree = parse(&source);
+        assert!(
+            start.elapsed() < SLOW_BOUND,
+            "mixed deep nesting must not hang"
+        );
+        assert!(
+            tree.diagnostics()
+                .iter()
+                .any(|d| d.message.contains("maximum scope depth")),
+            "expected a scope-depth diagnostic: {:?}",
+            tree.diagnostics()
+        );
+    }
+
+    #[test]
+    fn node_count_limit_is_enforced() {
+        // More headings than the node cap; the parser must stop allocating
+        // nodes, emit a diagnostic, and still return a tree.
+        let source = "# h\n".repeat(limits::MAX_NODES + 100);
+        let tree = parse(&source);
+        assert!(
+            tree.len() <= limits::MAX_NODES,
+            "tree node count capped at {}, got {}",
+            limits::MAX_NODES,
+            tree.len()
+        );
+        assert!(
+            tree.diagnostics()
+                .iter()
+                .any(|d| d.message.contains("-node limit")),
+            "expected a node-count diagnostic: {:?}",
+            tree.diagnostics()
+        );
+    }
+
+    #[test]
+    fn table_row_with_many_pipes_is_linear() {
+        // A 10,000-cell row must split linearly.
+        let header = format!("{}|\n", "|a".repeat(10_000));
+        let delim = format!("{}|\n", "|-".repeat(10_000));
+        let row = format!("{}|\n", "|b".repeat(10_000));
+        let source = format!("{header}{delim}{row}");
+        let start = Instant::now();
+        let tree = parse(&source);
+        assert!(
+            start.elapsed() < SLOW_BOUND,
+            "table cell splitting must be linear"
+        );
+        assert!(
+            tree.nodes()
+                .iter()
+                .any(|n| matches!(n.kind, ElementKind::Table { .. })),
+            "a table should be recognized"
+        );
+    }
+
+    #[test]
+    fn many_reference_definitions_are_bounded() {
+        // Thousands of reference definitions: label normalization and lookup
+        // must stay near-linear.
+        use std::fmt::Write as _;
+        let mut source = String::new();
+        for i in 0..10_000 {
+            let _ = writeln!(source, "[ref{i}]: https://example.com/{i}");
+        }
+        let start = Instant::now();
+        let _tree = parse(&source);
+        assert!(
+            start.elapsed() < SLOW_BOUND,
+            "reference definitions must not be quadratic"
+        );
+    }
+
+    #[test]
+    fn large_mixed_document_parses_quickly() {
+        // ~1 MB of mixed structure parses well within the bound.
+        let unit = "# Heading\n\nSome [text](./target.md \"references\") and `code`.\n\n\
+                    - item one\n- item two\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n\
+                    > a quote\n\n```rust\nlet x = 1;\n```\n\n";
+        let mut source = String::with_capacity(1_100_000);
+        while source.len() < 1_000_000 {
+            source.push_str(unit);
+        }
+        let start = Instant::now();
+        let tree = parse(&source);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < SLOW_BOUND,
+            "1 MB document should parse quickly, took {elapsed:?}"
+        );
+        assert!(tree.len() > 1, "tree should contain structure");
     }
 
     mod commonmark_spec {
