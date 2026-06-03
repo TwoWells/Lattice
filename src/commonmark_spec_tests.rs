@@ -495,24 +495,6 @@ const DEVIATIONS: &[(u32, &str)] = &[
     (186, "HTML container modeling (<div>, blockquote)"),
     (190, "HTML container modeling (<table>, blank lines)"),
     (191, "HTML container modeling (<div>, blank line split)"),
-    // -----------------------------------------------------------------
-    // Link reference definition continuation: multi-line definitions
-    // spanning continuation lines are not fully parsed.
-    // -----------------------------------------------------------------
-    (193, "multi-line link reference definition"),
-    (195, "multi-line link reference definition (angle bracket dest)"),
-    (196, "multi-line link reference definition (multi-line title)"),
-    (198, "multi-line link reference definition (dest on next line)"),
-    (201, "link reference definition with angle bracket dest"),
-    (202, "link reference definition with backslash escapes"),
-    // -----------------------------------------------------------------
-    // Block quote lazy continuation: lines that omit the `>` marker but
-    // belong to a blockquote paragraph are not captured.
-    // -----------------------------------------------------------------
-    (234, "blockquote lazy continuation"),
-    (235, "blockquote lazy continuation"),
-    (246, "blockquote lazy continuation with list"),
-    (251, "blockquote lazy continuation with nested quote"),
 ];
 
 fn is_deviation(example: u32) -> bool {

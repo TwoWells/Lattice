@@ -609,107 +609,216 @@ pub fn normalize_label(label: &str) -> String {
         .to_lowercase()
 }
 
-/// Try to parse a link reference definition from a line.
-///
-/// Returns `Some((label, url, title))` if the line is a reference definition.
-/// Labels are normalized (case-folded, whitespace-collapsed).
-fn parse_reference_def(line: &str) -> Option<(String, String, String)> {
-    let trimmed = line.trim_start_matches(' ');
-    let indent = line.len() - trimmed.len();
-    if indent > 3 {
-        return None;
+/// Skip ASCII spaces and tabs (not line endings) from `i`.
+const fn skip_inline_ws(bytes: &[u8], mut i: usize) -> usize {
+    while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
+        i += 1;
     }
-
-    let rest = trimmed.strip_prefix('[')?;
-
-    // Must not start with `^` (that is a footnote definition)
-    if rest.starts_with('^') {
-        return None;
-    }
-
-    let bracket_end = rest.find("]:")?;
-    let label_text = &rest[..bracket_end];
-
-    if label_text.is_empty() || label_text.trim().is_empty() || label_text.len() > 999 {
-        return None;
-    }
-
-    // No unescaped `[` in label
-    if label_text.contains('[') {
-        return None;
-    }
-
-    let after = rest[bracket_end + 2..].trim_start();
-
-    if after.is_empty() || after.starts_with('\n') || after.starts_with('\r') {
-        return None;
-    }
-
-    // Parse URL (optionally angle-bracketed)
-    let (url, rest_after_url) = if let Some(inner) = after.strip_prefix('<') {
-        let close = inner.find('>')?;
-        (inner[..close].to_string(), inner[close + 1..].trim_start())
-    } else {
-        let end = after
-            .find(|c: char| c.is_whitespace())
-            .unwrap_or(after.len());
-        if end == 0 {
-            return None;
-        }
-        (after[..end].to_string(), after[end..].trim_start())
-    };
-
-    // Parse optional title
-    let title = if rest_after_url.trim().is_empty() {
-        String::new()
-    } else if let Some(s) = rest_after_url.strip_prefix('"') {
-        let end = s.find('"')?;
-        if !s[end + 1..].trim().is_empty() {
-            return None;
-        }
-        s[..end].to_string()
-    } else if let Some(s) = rest_after_url.strip_prefix('\'') {
-        let end = s.find('\'')?;
-        if !s[end + 1..].trim().is_empty() {
-            return None;
-        }
-        s[..end].to_string()
-    } else if let Some(s) = rest_after_url.strip_prefix('(') {
-        let end = s.find(')')?;
-        if !s[end + 1..].trim().is_empty() {
-            return None;
-        }
-        s[..end].to_string()
-    } else {
-        return None;
-    };
-
-    Some((normalize_label(label_text), url, title))
+    i
 }
 
-/// Try to parse a standalone title line (for multi-line reference definitions).
+/// Consume a single line ending (`\n`, `\r\n`, or `\r`) at `i`, returning the
+/// index just past it. If no line ending is present, returns `i` unchanged.
+const fn consume_line_ending(bytes: &[u8], mut i: usize) -> usize {
+    if i < bytes.len() && bytes[i] == b'\r' {
+        i += 1;
+    }
+    if i < bytes.len() && bytes[i] == b'\n' {
+        i += 1;
+    }
+    i
+}
+
+/// Scan a link destination starting at `start`.
 ///
-/// Matches `"title"`, `'title'`, or `(title)` optionally surrounded by
-/// whitespace, with nothing else on the line.
-fn parse_standalone_title(line: &str) -> Option<String> {
-    let trimmed = line.trim();
-    if let Some(s) = trimmed.strip_prefix('"') {
-        let end = s.find('"')?;
-        if s[end + 1..].trim().is_empty() {
-            return Some(s[..end].to_string());
+/// Either an angle-bracketed destination (`<...>`, single line) or a bare
+/// sequence of non-whitespace, non-control characters. Backslash escapes are
+/// skipped when locating the boundary. Returns the raw inner text and the
+/// index just past the destination, or `None` if no destination is present.
+fn scan_destination(s: &str, start: usize) -> Option<(String, usize)> {
+    let bytes = s.as_bytes();
+    let len = bytes.len();
+    if bytes[start] == b'<' {
+        let mut i = start + 1;
+        while i < len {
+            match bytes[i] {
+                b'\\' if i + 1 < len && bytes[i + 1] < 0x80 => i += 2,
+                b'>' => return Some((s[start + 1..i].to_string(), i + 1)),
+                b'\n' | b'\r' | b'<' => return None,
+                _ => i += 1,
+            }
         }
-    } else if let Some(s) = trimmed.strip_prefix('\'') {
-        let end = s.find('\'')?;
-        if s[end + 1..].trim().is_empty() {
-            return Some(s[..end].to_string());
+        None
+    } else {
+        let mut i = start;
+        while i < len {
+            let b = bytes[i];
+            if b == b'\\' && i + 1 < len && bytes[i + 1] < 0x80 {
+                i += 2;
+                continue;
+            }
+            if b == b' ' || b == b'\t' || b == b'\n' || b == b'\r' || b < 0x20 {
+                break;
+            }
+            i += 1;
         }
-    } else if let Some(s) = trimmed.strip_prefix('(') {
-        let end = s.find(')')?;
-        if s[end + 1..].trim().is_empty() {
-            return Some(s[..end].to_string());
+        if i == start {
+            None
+        } else {
+            Some((s[start..i].to_string(), i))
         }
     }
+}
+
+/// Scan a link title starting at its opening delimiter (`"`, `'`, or `(`).
+///
+/// Titles may span multiple lines (the caller never passes a buffer that
+/// crosses a blank line, so an unterminated title correctly fails). Backslash
+/// escapes are skipped. Returns the raw inner text and the index just past the
+/// closing delimiter, or `None` if the title is not closed.
+fn scan_title(s: &str, start: usize) -> Option<(String, usize)> {
+    let bytes = s.as_bytes();
+    let len = bytes.len();
+    let close = match bytes[start] {
+        b'"' => b'"',
+        b'\'' => b'\'',
+        b'(' => b')',
+        _ => return None,
+    };
+    let open = bytes[start];
+    let mut i = start + 1;
+    while i < len {
+        let b = bytes[i];
+        if b == b'\\' && i + 1 < len && bytes[i + 1] < 0x80 {
+            i += 2;
+            continue;
+        }
+        if b == close {
+            return Some((s[start + 1..i].to_string(), i + 1));
+        }
+        // An unescaped opening paren inside a `(...)` title is invalid.
+        if open == b'(' && b == b'(' {
+            return None;
+        }
+        i += 1;
+    }
     None
+}
+
+/// Scan a single link reference definition from the start of `s`.
+///
+/// `s` is the joined content of consecutive non-blank lines (each retaining its
+/// line ending). Implements the `CommonMark` grammar with multi-line
+/// destinations and titles and backslash escapes, including the
+/// through-destination fallback: when a title is started but cannot be
+/// completed, a definition valid up through the destination still matches.
+///
+/// Returns `(consumed_bytes, label, url, title)` for the first definition, or
+/// `None` if `s` does not begin with one. `consumed_bytes` always lands on a
+/// line boundary (or the end of `s`). The label is normalized.
+fn scan_one_refdef(s: &str) -> Option<(usize, String, String, String)> {
+    let bytes = s.as_bytes();
+    let len = bytes.len();
+
+    // Up to three spaces of indentation before the label.
+    let mut i = 0;
+    while i < len && bytes[i] == b' ' {
+        i += 1;
+    }
+    if i > 3 || i >= len || bytes[i] != b'[' {
+        return None;
+    }
+    i += 1;
+    // Footnote definitions (`[^...]`) are not reference definitions.
+    if i < len && bytes[i] == b'^' {
+        return None;
+    }
+
+    // Label: up to the first unescaped `]`; no unescaped `[`; max 999 bytes.
+    let label_start = i;
+    loop {
+        if i >= len {
+            return None;
+        }
+        match bytes[i] {
+            b'\\' if i + 1 < len && bytes[i + 1] < 0x80 => i += 2,
+            b']' => break,
+            b'[' => return None,
+            _ => i += 1,
+        }
+    }
+    let label = &s[label_start..i];
+    if label.trim().is_empty() || label.len() > 999 {
+        return None;
+    }
+    i += 1; // consume `]`
+    if i >= len || bytes[i] != b':' {
+        return None;
+    }
+    i += 1;
+
+    // Whitespace (including up to one line ending) before the destination.
+    i = skip_inline_ws(bytes, i);
+    if i < len && (bytes[i] == b'\n' || bytes[i] == b'\r') {
+        i = consume_line_ending(bytes, i);
+        i = skip_inline_ws(bytes, i);
+    }
+    // A second line ending (blank line) means there is no destination.
+    if i >= len || bytes[i] == b'\n' || bytes[i] == b'\r' {
+        return None;
+    }
+
+    // Destination.
+    let (url, dest_end) = scan_destination(s, i)?;
+
+    // Through-destination checkpoint: spaces/tabs then a line ending (or EOF)
+    // after the destination make the definition valid without a title.
+    let after_dest_ws = skip_inline_ws(bytes, dest_end);
+    let had_trailing_ws = after_dest_ws > dest_end;
+    let ckpt_dest = if after_dest_ws >= len {
+        Some(len)
+    } else if bytes[after_dest_ws] == b'\n' || bytes[after_dest_ws] == b'\r' {
+        Some(consume_line_ending(bytes, after_dest_ws))
+    } else {
+        None
+    };
+
+    // Locate a possible title: on the same line, or on the next line when the
+    // destination is followed only by whitespace (one line ending).
+    let mut title_pos = after_dest_ws;
+    let mut title_sep_ok = had_trailing_ws;
+    if ckpt_dest.is_some()
+        && after_dest_ws < len
+        && (bytes[after_dest_ws] == b'\n' || bytes[after_dest_ws] == b'\r')
+    {
+        let nl_end = consume_line_ending(bytes, after_dest_ws);
+        let next = skip_inline_ws(bytes, nl_end);
+        if next < len && bytes[next] != b'\n' && bytes[next] != b'\r' {
+            title_pos = next;
+            title_sep_ok = true;
+        }
+    }
+
+    if title_sep_ok
+        && title_pos < len
+        && matches!(bytes[title_pos], b'"' | b'\'' | b'(')
+        && let Some((title, title_end)) = scan_title(s, title_pos)
+    {
+        let after_title_ws = skip_inline_ws(bytes, title_end);
+        let ckpt_title = if after_title_ws >= len {
+            Some(len)
+        } else if bytes[after_title_ws] == b'\n' || bytes[after_title_ws] == b'\r' {
+            Some(consume_line_ending(bytes, after_title_ws))
+        } else {
+            None
+        };
+        if let Some(end) = ckpt_title {
+            return Some((end, normalize_label(label), url, title));
+        }
+    }
+
+    // Fall back to a definition through the destination only.
+    ckpt_dest.map(|end| (end, normalize_label(label), url, String::new()))
 }
 
 /// Try to parse the start of a footnote definition.
@@ -2597,18 +2706,16 @@ impl<'a> TreeBuilder<'a> {
                 );
                 pos += raw_len;
                 line_idx += 1;
-            } else if let Some((label, url, title)) = parse_reference_def(content) {
-                self.parse_reference_def_block(
-                    &lines,
-                    &mut pos,
-                    &mut line_idx,
-                    body_offset,
-                    content_start,
-                    raw_len,
-                    label,
-                    url,
-                    title,
-                );
+            } else if self.try_reference_defs(
+                &lines,
+                &mut pos,
+                &mut line_idx,
+                body_offset,
+                content,
+                content_start,
+                raw_len,
+            ) {
+                // One or more reference definitions were consumed.
             } else if let Some(label) = parse_footnote_def_start(content) {
                 self.parse_footnote_def(
                     &lines,
@@ -2732,30 +2839,53 @@ impl<'a> TreeBuilder<'a> {
     }
 
     /// Close all open block quote scopes.
-    ///
-    /// Before popping each `QuoteBlock`, closes any HTML container scopes
-    /// that sit above it on the scope stack. This keeps `html_stack` and
-    /// `scope_stack` in sync — same pattern as `close_all_html_scopes` at
-    /// end-of-document.
     fn close_block_quotes(&mut self, pos: usize) {
-        while self.quote_depth > 0 {
-            // Close HTML scopes above the QuoteBlock.
-            while self.html_stack.last().is_some_and(|hs| {
-                self.scope_stack
+        self.close_quote_levels(0, pos);
+    }
+
+    /// Close block quote scopes until `quote_depth` reaches `target_depth`.
+    ///
+    /// Each unmatched `QuoteBlock`/`Admonition` is closed along with every
+    /// scope nested inside it — lists, list items, and HTML containers —
+    /// keeping `list_stack`, `html_stack`, and `quote_depth` in sync with
+    /// `scope_stack`. Unclosed HTML containers emit a diagnostic, matching
+    /// the end-of-document cleanup.
+    fn close_quote_levels(&mut self, target_depth: usize, pos: usize) {
+        while self.quote_depth > target_depth {
+            // Pop scopes from the top until (and including) the next
+            // QuoteBlock. Scopes nested inside the quote — list items,
+            // lists, HTML containers — are closed first.
+            loop {
+                if self.scope_stack.len() <= 1 {
+                    // Never pop the root Document; bail to avoid spinning.
+                    return;
+                }
+                let top = self.current_scope();
+                let is_quote = matches!(
+                    self.nodes[top].kind,
+                    ElementKind::QuoteBlock | ElementKind::Admonition { .. }
+                );
+                if self.html_stack.last().is_some_and(|hs| hs.node_id == top) {
+                    if let Some(scope) = self.html_stack.pop() {
+                        self.diagnostics.push(Diagnostic {
+                            level: DiagnosticLevel::Error,
+                            span: self.nodes[scope.node_id].span,
+                            message: format!("unclosed `<{}>` tag", scope.tag),
+                        });
+                    }
+                } else if self
+                    .list_stack
                     .last()
-                    .is_some_and(|&top| top == hs.node_id)
-            }) {
-                if let Some(scope) = self.html_stack.pop() {
-                    self.diagnostics.push(Diagnostic {
-                        level: DiagnosticLevel::Error,
-                        span: self.nodes[scope.node_id].span,
-                        message: format!("unclosed `<{}>` tag", scope.tag),
-                    });
-                    self.pop_scope(pos);
+                    .is_some_and(|ctx| ctx.list_node == top)
+                {
+                    self.list_stack.pop();
+                }
+                self.pop_scope(pos);
+                if is_quote {
+                    self.quote_depth -= 1;
+                    break;
                 }
             }
-            self.pop_scope(pos);
-            self.quote_depth -= 1;
         }
     }
 
@@ -2773,12 +2903,10 @@ impl<'a> TreeBuilder<'a> {
         line: &'b str,
         line_start: usize,
     ) -> (&'b str, usize, usize) {
-        // Step 1: Strip continuation markers for existing depth.
+        // Step 1: Strip continuation markers for existing depth, closing any
+        // unmatched levels (and the lists/HTML nested inside them).
         let (matched, after_cont) = strip_n_quote_markers(line, self.quote_depth);
-        for _ in matched..self.quote_depth {
-            self.pop_scope(line_start);
-        }
-        self.quote_depth = matched;
+        self.close_quote_levels(matched, line_start);
 
         let marker_bytes = line.len() - after_cont.len();
         let mut content = after_cont;
@@ -3099,49 +3227,90 @@ impl<'a> TreeBuilder<'a> {
         );
     }
 
-    /// Parse a link reference definition, consuming a continuation title
-    /// line if the first line has a URL but no title.
+    /// Try to parse one link reference definition starting at the current
+    /// line, consuming continuation lines for a multi-line destination or
+    /// title. Returns `true` if a definition was emitted (advancing `pos` and
+    /// `line_idx` past it), `false` otherwise.
+    ///
+    /// Reference definitions are recognized only at the start of a block, so
+    /// the contiguous run of non-blank continuation lines is the candidate
+    /// "paragraph block". A definition is parsed off the front; any remaining
+    /// lines are left for the main loop (they become a paragraph or another
+    /// construct). Only one definition is consumed per call — stacked
+    /// definitions are handled by re-entering the main loop.
     #[allow(
         clippy::too_many_arguments,
         reason = "ref def parameters are distinct concerns"
     )]
-    fn parse_reference_def_block(
+    fn try_reference_defs(
         &mut self,
         lines: &[&str],
         pos: &mut usize,
         line_idx: &mut usize,
         body_offset: usize,
-        def_start: usize,
+        first_content: &str,
+        first_content_start: usize,
         first_raw_len: usize,
-        label: String,
-        url: String,
-        mut title: String,
-    ) {
-        *pos += first_raw_len;
-        *line_idx += 1;
-        let mut span_end = body_offset + *pos;
-
-        // If no title on first line, check next line for continuation title
-        if title.is_empty() && *line_idx < lines.len() {
-            let next_line = lines[*line_idx];
-            let next_start = body_offset + *pos;
-            let next_len = next_line.len();
-
-            if let Some((next_content, _)) = self.strip_continuation(next_line, next_start)
-                && let Some(t) = parse_standalone_title(next_content)
-            {
-                title = t;
-                *pos += next_len;
-                *line_idx += 1;
-                span_end = body_offset + *pos;
-            }
+    ) -> bool {
+        // Cheap pre-check: a definition starts with up to three spaces and a
+        // `[` that is not a footnote marker.
+        let probe = first_content.trim_start_matches(' ');
+        if first_content.len() - probe.len() > 3
+            || !probe.starts_with('[')
+            || probe.starts_with("[^")
+        {
+            return false;
         }
 
+        // Collect the contiguous run of non-blank continuation lines, joining
+        // their stripped content. Each entry is `(content_len, raw_len,
+        // content_start)`.
+        let mut run: Vec<(usize, usize, usize)> =
+            vec![(first_content.len(), first_raw_len, first_content_start)];
+        let mut text = String::from(first_content);
+        let mut probe_pos = *pos + first_raw_len;
+        let mut probe_idx = *line_idx + 1;
+        while probe_idx < lines.len() {
+            let raw = lines[probe_idx];
+            let raw_start = body_offset + probe_pos;
+            let Some((content, content_start)) = self.strip_continuation(raw, raw_start) else {
+                break;
+            };
+            if content.trim().is_empty() {
+                break;
+            }
+            text.push_str(content);
+            run.push((content.len(), raw.len(), content_start));
+            probe_pos += raw.len();
+            probe_idx += 1;
+        }
+
+        let Some((consumed, label, url, title)) = scan_one_refdef(&text) else {
+            return false;
+        };
+
+        // Map the consumed byte count to a whole number of run lines.
+        let mut acc = 0usize;
+        let mut consumed_lines = 0usize;
+        while consumed_lines < run.len() && acc < consumed {
+            acc += run[consumed_lines].0;
+            consumed_lines += 1;
+        }
+
+        let span_start = run[0].2;
+        let last = run[consumed_lines - 1];
+        let span_end = last.2 + last.0;
         self.add_leaf(
             ElementKind::ReferenceDef { label, url, title },
             Syntax::Markdown,
-            Span::new(def_start, span_end),
+            Span::new(span_start, span_end),
         );
+
+        for &(_, raw_len, _) in &run[..consumed_lines] {
+            *pos += raw_len;
+        }
+        *line_idx += consumed_lines;
+        true
     }
 
     /// Parse a footnote definition container.
