@@ -243,6 +243,11 @@ pub struct Tree {
     /// Whether the node-count limit diagnostic has been emitted. Carried
     /// from the builder so the inline pass does not duplicate it.
     node_limit_emitted: bool,
+    /// Whether the inline pass has already run. The pass is not re-entrant —
+    /// re-running it would duplicate every inline child node and diagnostic —
+    /// so [`crate::inline::parse_inlines`] checks this and no-ops on a second
+    /// call, making the pass idempotent.
+    inlines_parsed: bool,
 }
 
 impl Tree {
@@ -377,6 +382,17 @@ impl Tree {
     /// Append a diagnostic (used by the inline parser).
     pub fn add_diagnostic(&mut self, diagnostic: Diagnostic) {
         self.diagnostics.push(diagnostic);
+    }
+
+    /// Whether the inline pass has already run on this tree.
+    #[must_use]
+    pub const fn inlines_parsed(&self) -> bool {
+        self.inlines_parsed
+    }
+
+    /// Mark the inline pass as having run, so a later call is a no-op.
+    pub const fn mark_inlines_parsed(&mut self) {
+        self.inlines_parsed = true;
     }
 }
 
@@ -1915,6 +1931,7 @@ pub fn parse_tree_with_entries(
         nodes: builder.nodes,
         diagnostics: builder.diagnostics,
         node_limit_emitted: builder.limits_hit.nodes,
+        inlines_parsed: false,
     };
 
     // Second pass: parse inline elements in Paragraph and Heading nodes.

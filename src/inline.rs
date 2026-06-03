@@ -46,6 +46,14 @@ const IMPORT_EXTENSIONS: &[&str] = &[".json", ".md", ".toml", ".txt", ".xml", ".
 /// import directives. Emits diagnostics for undefined references,
 /// unused definitions, and duplicate definitions.
 pub fn parse_inlines(tree: &mut Tree) {
+    // Idempotent: the pass appends inline children and definition diagnostics,
+    // so running it twice would duplicate them. `parse_tree_with_entries` runs
+    // it once; any later call is a no-op.
+    if tree.inlines_parsed() {
+        return;
+    }
+    tree.mark_inlines_parsed();
+
     let source = tree.source().to_string();
 
     let mut ref_defs: HashMap<String, RefDef> = HashMap::new();

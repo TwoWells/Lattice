@@ -84,8 +84,8 @@ fn config() -> ProptestConfig {
 
 /// Run the full parse pipeline the way `workspace::parse_content` does:
 /// detect frontmatter (YAML, then TOML, then JSON), then build the block
-/// tree. The inline pass runs inside `parse_tree_with_entries`; calling it
-/// again here would re-scan every host and duplicate its inline children.
+/// tree. The inline pass runs inside `parse_tree_with_entries` (and is
+/// idempotent), so there is no separate `parse_inlines` call here.
 fn parse_full(source: &str) -> Tree {
     let (fm_block, fm_syntax) = detect_frontmatter(source);
     let fm_span = fm_block.as_ref().map(|b| b.span);
@@ -825,12 +825,21 @@ proptest! {
 proptest! {
     #![proptest_config(config())]
 
-    /// The inline pass never panics and preserves tree well-formedness on
-    /// any paragraph/heading content.
+    /// The inline pass is idempotent: `parse_tree` already runs it, so a
+    /// second `parse_inlines` call must be a no-op (no duplicated nodes or
+    /// diagnostics) and leave the tree well-formed.
     #[test]
-    fn parse_inlines_wellformed(source in arbitrary_string(300)) {
+    fn parse_inlines_is_idempotent(source in arbitrary_string(300)) {
         let mut tree = block::parse_tree(&source, None);
+        let nodes_before = tree.len();
+        let diags_before = tree.diagnostics().len();
         inline::parse_inlines(&mut tree);
+        prop_assert_eq!(tree.len(), nodes_before, "re-running the inline pass added nodes");
+        prop_assert_eq!(
+            tree.diagnostics().len(),
+            diags_before,
+            "re-running the inline pass added diagnostics"
+        );
         assert_tree_wellformed(&tree);
     }
 
