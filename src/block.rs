@@ -705,30 +705,42 @@ fn scan_title(s: &str, start: usize) -> Option<(String, usize)> {
     None
 }
 
-/// Cheap, allocation-free gate: could the first line begin a reference
-/// definition? Examines only `line` (the candidate's first line).
-///
-/// Returns `true` when the line — after up to three spaces of indent — opens a
-/// non-footnote `[` whose label either closes with `]:` here, or stays open at
-/// the line end (a label may continue on the next line). Returns `false` for
-/// ordinary bracketed text such as `[text][ref]`, `[link](url)`, and shortcut
-/// references, so they never trigger run collection.
-fn first_line_opens_refdef(line: &str) -> bool {
-    let bytes = line.as_bytes();
+/// Recognize the opener of a reference-definition label: up to three spaces of
+/// indentation, then a `[` that is not a footnote marker (`[^`). Returns the
+/// byte index just past the `[`, or `None`. Shared by the cheap gate and the
+/// full label scan — only their label-body handling differs.
+fn refdef_label_open(bytes: &[u8]) -> Option<usize> {
     let len = bytes.len();
-
     let mut i = 0;
     while i < len && bytes[i] == b' ' {
         i += 1;
     }
     if i > 3 || i >= len || bytes[i] != b'[' {
-        return false;
+        return None;
     }
     i += 1;
     // Footnote definitions (`[^...]`) are not reference definitions.
     if i < len && bytes[i] == b'^' {
-        return false;
+        return None;
     }
+    Some(i)
+}
+
+/// Cheap, allocation-free gate: could the first line begin a reference
+/// definition? Examines only `line` (the candidate's first line).
+///
+/// Returns `true` when the line opens a label that either closes with `]:`
+/// here, or stays open at the line end (a label may continue on the next
+/// line). Returns `false` for ordinary bracketed text such as `[text][ref]`,
+/// `[link](url)`, and shortcut references, so they never trigger run
+/// collection. Being a fast pre-filter, it tolerates false positives (e.g.
+/// `[]:`); the full scan rejects those.
+fn first_line_opens_refdef(line: &str) -> bool {
+    let bytes = line.as_bytes();
+    let len = bytes.len();
+    let Some(mut i) = refdef_label_open(bytes) else {
+        return false;
+    };
 
     loop {
         if i >= len {
@@ -746,31 +758,18 @@ fn first_line_opens_refdef(line: &str) -> bool {
 
 /// Recognize a reference-definition label at the start of `s`.
 ///
-/// Matches up to three spaces of indentation and a `[label]:` that is not a
-/// footnote marker (`[^...]`). The label runs to the first unescaped `]` and
-/// may span line endings (the caller's buffer never crosses a blank line, so a
-/// label that would needs one fails to close); it must contain at least one
-/// non-whitespace character and be at most 999 bytes. Returns the byte index
-/// just past the `:` and the raw label text, or `None`.
+/// The label runs to the first unescaped `]` and may span line endings (the
+/// caller's buffer never crosses a blank line, so a label that would need one
+/// fails to close); it must contain at least one non-whitespace character and
+/// be at most 999 bytes. Returns the byte index just past the `:` and the raw
+/// label text, or `None`.
 fn scan_refdef_label(s: &str) -> Option<(usize, &str)> {
     let bytes = s.as_bytes();
     let len = bytes.len();
 
-    let mut i = 0;
-    while i < len && bytes[i] == b' ' {
-        i += 1;
-    }
-    if i > 3 || i >= len || bytes[i] != b'[' {
-        return None;
-    }
-    i += 1;
-    // Footnote definitions (`[^...]`) are not reference definitions.
-    if i < len && bytes[i] == b'^' {
-        return None;
-    }
-
     // Label: up to the first unescaped `]`; no unescaped `[`; may span lines.
-    let label_start = i;
+    let label_start = refdef_label_open(bytes)?;
+    let mut i = label_start;
     loop {
         if i >= len {
             return None;
