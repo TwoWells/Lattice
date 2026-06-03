@@ -17,6 +17,8 @@ mod inline;
 mod json;
 mod lint;
 mod lsp;
+#[cfg(test)]
+mod property_tests;
 mod server;
 mod span;
 mod structural;
