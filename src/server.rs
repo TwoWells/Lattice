@@ -708,14 +708,8 @@ fn list_item_text(tree: &Tree, item_id: NodeId) -> String {
 fn node_range(tree: &Tree, node_id: NodeId) -> lsp::Range {
     let node = tree.node(node_id);
     let source = tree.source();
-    let start_line = source[..node.span.start]
-        .bytes()
-        .filter(|&b| b == b'\n')
-        .count() as u32;
-    let end_line = source[..node.span.end.min(source.len())]
-        .bytes()
-        .filter(|&b| b == b'\n')
-        .count() as u32;
+    let start_line = (crate::block::byte_offset_to_line(source, node.span.start) - 1) as u32;
+    let end_line = (crate::block::byte_offset_to_line(source, node.span.end) - 1) as u32;
     lsp::Range {
         start: lsp::Position {
             line: start_line,
@@ -1134,10 +1128,7 @@ fn collect_workspace_symbols(
             continue;
         }
 
-        let start_line = source[..node.span.start]
-            .bytes()
-            .filter(|&b| b == b'\n')
-            .count() as u32;
+        let start_line = (crate::block::byte_offset_to_line(source, node.span.start) - 1) as u32;
 
         out.push(lsp::SymbolInformation {
             name,
@@ -1982,7 +1973,7 @@ fn folding_ranges(workspaces: &Workspaces, uri: &str) -> Vec<lsp::FoldingRange> 
         return Vec::new();
     };
 
-    let total_lines = file_data.tree.source().lines().count() as u32;
+    let total_lines = crate::fm::line_count(file_data.tree.source()) as u32;
 
     let mut ranges = Vec::new();
 
@@ -2207,20 +2198,54 @@ fn find_classified_link(
         .find(|l| l.span == node_span)
 }
 
+/// Byte range `[start, content_end)` of 0-based `line` in `source`, excluding
+/// the line's terminator. Recognizes `\n`, `\r\n`, and bare `\r`. A line past
+/// the end of input yields an empty range at `source.len()`.
+fn line_byte_range(source: &str, line: u32) -> (usize, usize) {
+    let bytes = source.as_bytes();
+    let mut idx = 0u32;
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let (is_break, next) = match bytes[i] {
+            b'\n' => (true, i + 1),
+            b'\r' => (
+                true,
+                if bytes.get(i + 1) == Some(&b'\n') {
+                    i + 2
+                } else {
+                    i + 1
+                },
+            ),
+            _ => (false, i + 1),
+        };
+        if is_break {
+            if idx == line {
+                return (start, i);
+            }
+            idx += 1;
+            start = next;
+        }
+        i = next;
+    }
+    if idx == line {
+        (start, bytes.len())
+    } else {
+        (bytes.len(), bytes.len())
+    }
+}
+
 /// Convert an LSP 0-based position to a byte offset in `source`.
+///
+/// Recognizes `\n`, `\r\n`, and bare `\r`; `character` is a byte offset within
+/// the line, clamped to the line's content length.
 #[allow(
     clippy::cast_possible_truncation,
     reason = "line numbers in markdown files won't exceed u32::MAX"
 )]
 fn lsp_position_to_byte_offset(source: &str, pos: lsp::Position) -> usize {
-    let mut offset = 0;
-    for (i, line) in source.lines().enumerate() {
-        if i == pos.line as usize {
-            return offset + (pos.character as usize).min(line.len());
-        }
-        offset += line.len() + 1; // +1 for newline
-    }
-    source.len()
+    let (start, end) = line_byte_range(source, pos.line);
+    start + (pos.character as usize).min(end - start)
 }
 
 /// Convert a byte `Span` to an LSP `Range`.
@@ -2235,15 +2260,21 @@ fn span_to_lsp_range(source: &str, span: &Span) -> lsp::Range {
 }
 
 /// Convert a byte offset to an LSP 0-based position.
+///
+/// Line counting recognizes `\n`, `\r\n`, and bare `\r`. The `character`
+/// field is a byte offset within the line (Lattice's established convention),
+/// measured from the byte after the previous line break.
 #[allow(
     clippy::cast_possible_truncation,
     reason = "line/column values in markdown files won't exceed u32::MAX"
 )]
 fn byte_offset_to_lsp_position(source: &str, offset: usize) -> lsp::Position {
     let offset = offset.min(source.len());
-    let before = &source[..offset];
-    let line = before.bytes().filter(|&b| b == b'\n').count() as u32;
-    let line_start = before.rfind('\n').map_or(0, |i| i + 1);
+    let line = (crate::block::byte_offset_to_line(source, offset) - 1) as u32;
+    let line_start = source.as_bytes()[..offset]
+        .iter()
+        .rposition(|&b| b == b'\n' || b == b'\r')
+        .map_or(0, |i| i + 1);
     let character = (offset - line_start) as u32;
     lsp::Position { line, character }
 }
@@ -2306,9 +2337,11 @@ fn ref_def_label_at_offset(tree: &crate::block::Tree, offset: usize) -> Option<S
     None
 }
 
-/// Get the text of a 0-based line in the source.
+/// Get the text of a 0-based line in the source (recognizing `\n`, `\r\n`,
+/// and bare `\r`), excluding the line terminator.
 fn source_line_at(source: &str, lsp_line: u32) -> &str {
-    source.lines().nth(lsp_line as usize).unwrap_or("")
+    let (start, end) = line_byte_range(source, lsp_line);
+    &source[start..end]
 }
 
 // ---------------------------------------------------------------------------
@@ -2577,6 +2610,77 @@ mod tests {
             list_item_text(&tree, item),
             "日本語 café 😀",
             "multi-byte list item text is extracted intact"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Encoding edge cases: LSP position conversion across line endings
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn lsp_position_crlf_round_trips() {
+        let src = "ab\r\ncd\r\nef"; // c@4, e@8
+        let p = byte_offset_to_lsp_position(src, 4);
+        assert_eq!(
+            (p.line, p.character),
+            (1, 0),
+            "byte 4 is line 1 col 0 under CRLF (the pair is one break)"
+        );
+        assert_eq!(
+            lsp_position_to_byte_offset(src, p),
+            4,
+            "position → offset round-trips under CRLF"
+        );
+        assert_eq!(
+            source_line_at(src, 1),
+            "cd",
+            "line 1 text excludes the CRLF"
+        );
+        assert_eq!(source_line_at(src, 2), "ef", "last line under CRLF");
+    }
+
+    #[test]
+    fn lsp_position_bare_cr_round_trips() {
+        // a@0 b@1 \r@2 c@3 d@4 \r@5 e@6 f@7
+        let src = "ab\rcd\ref";
+        let p = byte_offset_to_lsp_position(src, 3);
+        assert_eq!((p.line, p.character), (1, 0), "bare CR starts a new line");
+        assert_eq!(
+            lsp_position_to_byte_offset(src, p),
+            3,
+            "position → offset round-trips under bare CR"
+        );
+        let p2 = byte_offset_to_lsp_position(src, 7);
+        assert_eq!((p2.line, p2.character), (2, 1), "f is line 2 col 1");
+        assert_eq!(source_line_at(src, 2), "ef", "bare-CR line text");
+    }
+
+    #[test]
+    fn lsp_character_is_byte_offset_within_line() {
+        // é is two bytes, so 'b' sits at byte 4 of line 0.
+        let src = "aé b\nx";
+        let p = byte_offset_to_lsp_position(src, 4);
+        assert_eq!(
+            (p.line, p.character),
+            (0, 4),
+            "character is a byte offset within the line, multi-byte aware"
+        );
+        // 'x' sits at byte 6 (after the LF); byte 5 is the LF itself.
+        assert_eq!(
+            byte_offset_to_lsp_position(src, 6).line,
+            1,
+            "the LF still advances to line 1"
+        );
+    }
+
+    #[test]
+    fn line_byte_range_past_eof_is_empty() {
+        let src = "only\none\r\n";
+        let (start, end) = line_byte_range(src, 99);
+        assert_eq!(
+            (start, end),
+            (src.len(), src.len()),
+            "a line past EOF yields an empty range at the end"
         );
     }
 

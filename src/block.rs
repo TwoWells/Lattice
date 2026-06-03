@@ -4382,17 +4382,11 @@ fn scan_bare_paths_in_text(text: &str, base_line: usize, out: &mut Vec<BarePath>
 // --- Text helpers ---
 
 /// Convert a byte offset to a 1-based line number.
-#[allow(
-    clippy::naive_bytecount,
-    reason = "not worth a dependency for line counting"
-)]
+///
+/// Recognizes `\n`, `\r\n`, and bare `\r` line endings (delegates to the
+/// crate-wide counter in [`crate::fm`]).
 pub fn byte_offset_to_line(content: &str, offset: usize) -> usize {
-    let offset = offset.min(content.len());
-    content.as_bytes()[..offset]
-        .iter()
-        .filter(|&&b| b == b'\n')
-        .count()
-        + 1
+    crate::fm::byte_offset_to_line(content, offset)
 }
 
 /// Strip backtick-delimited code spans from text, keeping inner content.

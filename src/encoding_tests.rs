@@ -217,6 +217,66 @@ fn crlf_table_cells_split_correctly() {
 }
 
 // ---------------------------------------------------------------------------
+// Line-number computation (1-based) across ending styles
+// ---------------------------------------------------------------------------
+
+#[test]
+fn byte_offset_to_line_lf() {
+    let s = "a\nb\nc"; // a@0, b@2, c@4
+    assert_eq!(block::byte_offset_to_line(s, 0), 1, "first line");
+    assert_eq!(block::byte_offset_to_line(s, 2), 2, "after one LF");
+    assert_eq!(block::byte_offset_to_line(s, 4), 3, "after two LFs");
+}
+
+#[test]
+fn byte_offset_to_line_crlf_counts_pair_once() {
+    let s = "a\r\nb\r\nc"; // a@0, b@3, c@6
+    assert_eq!(
+        block::byte_offset_to_line(s, 3),
+        2,
+        "a CRLF pair is one line break, not two"
+    );
+    assert_eq!(
+        block::byte_offset_to_line(s, 6),
+        3,
+        "two CRLF pairs → line 3"
+    );
+}
+
+#[test]
+fn byte_offset_to_line_bare_cr() {
+    let s = "a\rb\rc"; // a@0, b@2, c@4
+    assert_eq!(
+        block::byte_offset_to_line(s, 2),
+        2,
+        "bare CR advances the line"
+    );
+    assert_eq!(block::byte_offset_to_line(s, 4), 3, "two bare CRs → line 3");
+}
+
+#[test]
+fn byte_offset_to_line_mixed() {
+    // a@0 \n@1 b@2 \r@3 \n@4 c@5 \r@6 d@7
+    let s = "a\nb\r\nc\rd";
+    assert_eq!(block::byte_offset_to_line(s, 0), 1, "a is line 1");
+    assert_eq!(
+        block::byte_offset_to_line(s, 2),
+        2,
+        "b is line 2 (after LF)"
+    );
+    assert_eq!(
+        block::byte_offset_to_line(s, 5),
+        3,
+        "c is line 3 (after CRLF)"
+    );
+    assert_eq!(
+        block::byte_offset_to_line(s, 7),
+        4,
+        "d is line 4 (after bare CR)"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Multi-byte characters at structural boundaries
 // ---------------------------------------------------------------------------
 

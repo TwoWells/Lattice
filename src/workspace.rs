@@ -293,13 +293,11 @@ fn parse_content(content: &str, rel_path: &Path, config: &Config) -> FileData {
 
         let byte_range: Range<usize> = block.span.into();
         let start_line = 1;
-        let end_byte = byte_range.end;
-        let newline_count = content[..end_byte.min(content.len())]
-            .bytes()
-            .filter(|&b| b == b'\n')
-            .count();
-        let end_line =
-            newline_count + usize::from(!content[..end_byte.min(content.len())].ends_with('\n'));
+        let end_byte = byte_range.end.min(content.len());
+        // Step back one byte off the span end (which includes the closing
+        // delimiter's line ending) so we land on the delimiter line itself
+        // rather than the line after it. Recognizes all line-ending styles.
+        let end_line = byte_offset_to_line(content, end_byte.saturating_sub(1));
 
         let backlinks = fm::extract_backlinks(block, content);
 
@@ -337,17 +335,11 @@ fn parse_content(content: &str, rel_path: &Path, config: &Config) -> FileData {
 }
 
 /// Convert a byte offset to a 1-based line number.
-#[allow(
-    clippy::naive_bytecount,
-    reason = "not worth a dependency for line counting"
-)]
+///
+/// Recognizes `\n`, `\r\n`, and bare `\r` line endings (delegates to the
+/// crate-wide counter in [`crate::fm`]).
 fn byte_offset_to_line(content: &str, offset: usize) -> usize {
-    let offset = offset.min(content.len());
-    content.as_bytes()[..offset]
-        .iter()
-        .filter(|&&b| b == b'\n')
-        .count()
-        + 1
+    fm::byte_offset_to_line(content, offset)
 }
 
 /// Walk up from `start` looking for `.lattice.toml` or `.git`.

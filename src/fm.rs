@@ -265,11 +265,56 @@ pub fn find_predicate_line(block: &FrontmatterBlock, predicate: &str, source: &s
     1
 }
 
-/// Convert a byte offset to a 1-based line number.
+// ---------------------------------------------------------------------------
+// Line counting (shared by every line-number computation in the crate)
+// ---------------------------------------------------------------------------
+
+/// Count line breaks in `bytes`, treating `\n`, `\r\n`, and bare `\r` each as
+/// a single break.
+///
+/// Counting the two bytes of a `\r\n` pair separately would double every
+/// Windows line ending; ignoring bare `\r` would miss legacy-Mac breaks. This
+/// is the single source of truth so diagnostics, LSP positions, and folding
+/// ranges all agree regardless of ending style.
+pub fn count_line_breaks(bytes: &[u8]) -> usize {
+    let mut count = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\n' => {
+                count += 1;
+                i += 1;
+            }
+            b'\r' => {
+                count += 1;
+                i += if bytes.get(i + 1) == Some(&b'\n') {
+                    2
+                } else {
+                    1
+                };
+            }
+            _ => i += 1,
+        }
+    }
+    count
+}
+
+/// Number of lines in `source`, recognizing `\n`, `\r\n`, and bare `\r`.
+///
+/// Matches `str::lines().count()` semantics — a trailing line break does not
+/// add an empty final line — while also splitting on bare `\r`.
+pub fn line_count(source: &str) -> usize {
+    let bytes = source.as_bytes();
+    let breaks = count_line_breaks(bytes);
+    if bytes.is_empty() || matches!(bytes.last(), Some(b'\n' | b'\r')) {
+        breaks
+    } else {
+        breaks + 1
+    }
+}
+
+/// Convert a byte offset to a 1-based line number, recognizing `\n`, `\r\n`,
+/// and bare `\r`.
 pub fn byte_offset_to_line(source: &str, offset: usize) -> usize {
-    source[..offset.min(source.len())]
-        .bytes()
-        .filter(|&b| b == b'\n')
-        .count()
-        + 1
+    count_line_breaks(&source.as_bytes()[..offset.min(source.len())]) + 1
 }
