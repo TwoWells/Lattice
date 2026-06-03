@@ -1,0 +1,10 @@
+# Track only the curated seed files (which carry a file extension) and ignore
+# libFuzzer's discovered corpus entries (named by 40-char SHA, no extension).
+*
+!*/
+!*.md
+!*.yaml
+!*.toml
+!*.json
+!*.txt
+!.gitignore

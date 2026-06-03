@@ -44,6 +44,13 @@ missing_errors_doc = "warn"
 missing_panics_doc = "warn"
 missing_safety_doc = "warn"
 
+[features]
+# Exposes `lattice::fuzz_api` and `lattice::invariants` so the out-of-crate
+# `cargo-fuzz` targets (under `fuzz/`) can link the parsers and assert the same
+# invariants as the property suite. Off by default — the normal build and
+# `make check` never enable it, keeping the public surface to `lattice::run`.
+fuzzing = []
+
 [dependencies]
 anyhow = "1"
 phf = { version = "0.11", features = ["macros"] }

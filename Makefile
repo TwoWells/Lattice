@@ -7,13 +7,15 @@
 #   make release-major   # 0.1.0 -> 1.0.0
 #   make release V=0.2.0 # explicit version
 
-.PHONY: build-release check deny machete mutants setup setup-hooks setup-tools test release release-patch release-minor release-major publish tag-current
+.PHONY: build-release check deny fuzz soak machete mutants setup setup-hooks setup-tools test release release-patch release-minor release-major publish tag-current
 
 # Get current version from Cargo.toml
 CURRENT_VERSION := $(shell grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
 
-# Required cargo tools
-CARGO_TOOLS := cargo-deny cargo-machete cargo-nextest cargo-mutants
+# Required cargo tools. cargo-fuzz additionally needs the nightly toolchain
+# (see `make fuzz`); it is only used for fuzzing, like cargo-mutants is for
+# mutation testing.
+CARGO_TOOLS := cargo-deny cargo-machete cargo-nextest cargo-mutants cargo-fuzz
 
 # Hard per-process address-space cap (KiB) applied to test runs, so a runaway
 # allocation (e.g. a pathological property-test input) aborts that single
@@ -50,10 +52,10 @@ setup-tools:
 	 if [ $$missing -eq 1 ]; then \
 	   echo ""; \
 	   echo "Install missing tools with:"; \
-	   echo "  cargo binstall cargo-deny cargo-machete cargo-nextest cargo-mutants"; \
+	   echo "  cargo binstall cargo-deny cargo-machete cargo-nextest cargo-mutants cargo-fuzz"; \
 	   echo ""; \
 	   echo "Or with cargo install (slower, builds from source):"; \
-	   echo "  cargo install cargo-deny cargo-machete cargo-nextest cargo-mutants"; \
+	   echo "  cargo install cargo-deny cargo-machete cargo-nextest cargo-mutants cargo-fuzz"; \
 	 else \
 	   echo "All tools present."; \
 	 fi
@@ -96,6 +98,68 @@ machete:
 
 mutants:
 	@cargo mutants --timeout 60
+
+# --- Fuzzing (ticket 22) ---
+#
+# cargo-fuzz targets live in fuzz/. They require the nightly toolchain (for the
+# libFuzzer/ASAN instrumentation) and are NOT part of `make test` — they run
+# until stopped. `make fuzz` runs each target for a bounded duration as a local
+# smoke test; a dedicated CI job runs them far longer on a schedule. Crash
+# artifacts land in fuzz/artifacts/<target>/ and are checked in as regressions.
+#
+#   make fuzz                  # all targets sequentially, FUZZ_TIME seconds each
+#   make fuzz T=fuzz_yaml      # a single target
+#   make fuzz FUZZ_TIME=600    # longer per-target run (10 min)
+#   make soak FUZZ_TIME=3600   # all targets IN PARALLEL, 1 h each (~1 h wall)
+FUZZ_TARGETS := fuzz_parse_tree fuzz_yaml fuzz_toml fuzz_json fuzz_full fuzz_tokenize_tag fuzz_inlines
+FUZZ_TIME ?= 60
+
+# A prebuilt (musl) cargo-fuzz binary defaults `--target` to its own musl
+# platform, which has no installed std and is ASAN-incompatible. Pin the host
+# gnu target instead; override FUZZ_TRIPLE if your host differs.
+FUZZ_TRIPLE ?= x86_64-unknown-linux-gnu
+
+fuzz:
+	@command -v cargo-fuzz >/dev/null 2>&1 || { \
+	  echo "cargo-fuzz not found. Install with: cargo binstall cargo-fuzz"; exit 1; }
+	@export RUSTUP_TOOLCHAIN=nightly; \
+	 run_one() { \
+	   echo "=== fuzzing $$1 (max $(FUZZ_TIME)s) ==="; \
+	   cargo fuzz run "$$1" --target $(FUZZ_TRIPLE) -- -max_total_time=$(FUZZ_TIME); \
+	 }; \
+	 if [ -n "$(T)" ]; then \
+	   run_one "$(T)"; \
+	 else \
+	   for t in $(FUZZ_TARGETS); do run_one "$$t" || exit $$?; done; \
+	 fi
+
+# Soak every target IN PARALLEL for FUZZ_TIME seconds each (one process per
+# target), so `make soak FUZZ_TIME=3600` meets a 1 h/target bar in ~1 h of
+# wall-clock instead of ~7 h. Each target is single-threaded, so on a machine
+# with >= 8 cores there is no contention. Per-target output goes to
+# fuzz/soak-<target>.log; a non-zero exit means at least one target crashed
+# (its reproducer is under fuzz/artifacts/<target>/).
+soak:
+	@command -v cargo-fuzz >/dev/null 2>&1 || { \
+	  echo "cargo-fuzz not found. Install with: cargo binstall cargo-fuzz"; exit 1; }
+	@export RUSTUP_TOOLCHAIN=nightly; \
+	 echo "Building fuzz targets..."; \
+	 cargo fuzz build --target $(FUZZ_TRIPLE) || exit 1; \
+	 echo "Soaking $(words $(FUZZ_TARGETS)) targets in parallel for $(FUZZ_TIME)s each..."; \
+	 pids=""; \
+	 for t in $(FUZZ_TARGETS); do \
+	   cargo fuzz run "$$t" --target $(FUZZ_TRIPLE) -- -max_total_time=$(FUZZ_TIME) \
+	     > fuzz/soak-$$t.log 2>&1 & \
+	   pids="$$pids $$!:$$t"; \
+	 done; \
+	 fail=0; \
+	 for pt in $$pids; do \
+	   pid=$${pt%%:*}; t=$${pt#*:}; \
+	   if wait $$pid; then echo "  ok:   $$t"; \
+	   else echo "  FAIL: $$t (see fuzz/soak-$$t.log and fuzz/artifacts/$$t/)"; fail=1; fi; \
+	 done; \
+	 if [ $$fail -eq 0 ]; then echo "Soak clean: all targets survived $(FUZZ_TIME)s."; fi; \
+	 exit $$fail
 
 # Run tests. Pass T= to filter, N= to repeat, PROFILE= to select a nextest
 # profile (e.g. PROFILE=hardening for extended PROPTEST_CASES / fork runs).

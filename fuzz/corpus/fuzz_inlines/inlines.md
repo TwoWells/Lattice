@@ -1,0 +1,11 @@
+A paragraph with [inline](./a.md "references"), ![image](pic.png "t"),
+a [full][r] ref, a [collapsed][] ref, and a [shortcut] ref.
+
+Autolink <https://example.com/x?y=1> and `inline code` plus $x^2 + y^2$ math.
+
+A footnote ref[^note] and an escaped \[bracket\].
+
+[r]: ./b.md "references"
+[collapsed]: ./c.md
+[shortcut]: ./d.md "implements"
+[^note]: the footnote body.

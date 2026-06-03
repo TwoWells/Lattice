@@ -254,7 +254,8 @@ fn parse_file(
 ///
 /// Always succeeds — YAML parse errors become diagnostics instead of
 /// hard failures, enabling partial frontmatter recovery.
-fn parse_content(content: &str, rel_path: &Path, config: &Config) -> FileData {
+#[must_use]
+pub fn parse_content(content: &str, rel_path: &Path, config: &Config) -> FileData {
     // Try YAML (`---`), then TOML (`+++`), then JSON (`{`) frontmatter.
     let (fm_block, fm_syntax) = yaml::parse_frontmatter_block(content).map_or_else(
         || {

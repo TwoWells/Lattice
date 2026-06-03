@@ -128,6 +128,14 @@ impl<'a> Parser<'a> {
         });
     }
 
+    /// A one-byte span at the current position, clamped to the source end so an
+    /// at-EOF "expected X" diagnostic collapses to an empty span instead of
+    /// pointing one byte past the input.
+    fn here_span(&self) -> Span {
+        let start = self.abs();
+        Span::new(start, (start + 1).min(self.base + self.src.len()))
+    }
+
     fn skip_whitespace(&mut self) {
         while let Some(b) = self.peek() {
             if b == b' ' || b == b'\t' {
@@ -899,8 +907,7 @@ impl<'a> Parser<'a> {
             self.skip_whitespace();
 
             if self.peek() != Some(b'=') {
-                let span = Span::new(self.abs(), self.abs() + 1);
-                self.emit(span, FmSeverity::Error, "expected '='".into());
+                self.emit(self.here_span(), FmSeverity::Error, "expected '='".into());
                 self.skip_to_eol();
                 self.skip_newline();
                 continue;
@@ -1199,6 +1206,7 @@ fn build_array_table_entry(
 /// frontmatter is present.
 ///
 /// UTF-8 BOM at byte 0 is stripped transparently.
+#[must_use]
 pub fn parse_frontmatter_block(source: &str) -> Option<FrontmatterBlock> {
     let (stripped, bom_offset) = fm::strip_bom(source);
 

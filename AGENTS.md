@@ -48,8 +48,10 @@ Single crate. The `lattice` binary serves as both the LSP server and the CLI (`l
 ## Setup
 
 - **First time:** `make setup` — configures git hooks and checks for required cargo tools.
-- **Required tools:** cargo-deny, cargo-machete, cargo-nextest, cargo-mutants.
-- **Install tools:** `cargo binstall cargo-deny cargo-machete cargo-nextest cargo-mutants`
+- **Required tools:** cargo-deny, cargo-machete, cargo-nextest, cargo-mutants, cargo-fuzz.
+- **Install tools:** `cargo binstall cargo-deny cargo-machete cargo-nextest cargo-mutants cargo-fuzz`
+- **Nightly toolchain:** only `cargo-fuzz` needs it (for the libFuzzer/ASAN
+  build); everything else runs on the pinned stable toolchain.
 
 ## Development Commands
 
@@ -57,6 +59,41 @@ Single crate. The `lattice` binary serves as both the LSP server and the CLI (`l
 - **Test (all):** `make test`
 - **Test (filtered):** `make test T=<filter>`
 - **Test (repeat):** `make test T=<filter> N=<count>`
+
+## Fuzzing
+
+Coverage-guided fuzz targets (cargo-fuzz / libFuzzer) live in `fuzz/` and are
+**not** part of `make test` — they run until stopped. They require the nightly
+toolchain; `make fuzz` forces it.
+
+- **Smoke (all targets):** `make fuzz` — runs each target sequentially for
+  `FUZZ_TIME` seconds (default 60).
+- **Single target:** `make fuzz T=fuzz_yaml`
+- **Parallel soak:** `make soak FUZZ_TIME=3600` — runs all targets *at once*
+  (one process each), so a 1 h/target soak takes ~1 h of wall-clock instead of
+  ~7 h. Needs ≥8 cores and ~3-4 GB RAM; per-target logs in `fuzz/soak-*.log`.
+- **Targets** (one per parser entry point): `fuzz_parse_tree`, `fuzz_yaml`,
+  `fuzz_toml`, `fuzz_json`, `fuzz_full`, `fuzz_tokenize_tag`, `fuzz_inlines`.
+
+**The assertions are the product, the fuzzer is the input generator.** Each
+target embeds the same invariants as the property suite — tree
+well-formedness, content fidelity, and LSP position round-trip — factored into
+`src/invariants.rs` and called by both `src/property_tests.rs` and the fuzz
+targets, so the two suites cannot drift. A target that only catches panics is
+blind to silent wrong-output bugs (the largest class); never weaken a target to
+"no panic" only. If an invariant flags a *correct* parse (e.g. a legitimately
+decoded escape), refine the invariant precisely — do not broaden it into
+uselessness.
+
+- **Seed corpora:** `fuzz/corpus/<target>/` — curated seeds (committed; they
+  carry a file extension). libFuzzer's discovered inputs land here too but are
+  git-ignored. Seeds span each parser's syntax surface **and** the encoding
+  axis (mixed line endings, BOM, multi-byte, zero-width).
+- **A finding is a real, reproducible bug** (a shrunk counterexample), never a
+  flake. Fix the parser (or, if the invariant was over-strict, the invariant),
+  add the reproducing input to `fuzz/corpus/<target>/`, and add a deterministic
+  unit test to the parser's `#[cfg(test)]` module so the fix is permanent
+  without depending on the fuzzer.
 
 ## Release Workflow
 

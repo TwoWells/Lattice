@@ -53,9 +53,13 @@
 
 use proptest::prelude::*;
 
-use crate::block::{self, ElementKind, Syntax, Tree};
-use crate::fm::{self, FrontmatterBlock};
+use crate::block::{self, Tree};
+use crate::fm;
 use crate::html::{self, HtmlTag};
+use crate::invariants::{
+    assert_block_wellformed, assert_frontmatter_scalar_fidelity, assert_html_tag_in_bounds,
+    assert_inline_resource_fidelity, assert_tree_wellformed, collect_scalars, detect_frontmatter,
+};
 use crate::{inline, json, toml, yaml};
 
 // ---------------------------------------------------------------------------
@@ -91,243 +95,6 @@ fn parse_full(source: &str) -> Tree {
     let fm_span = fm_block.as_ref().map(|b| b.span);
     let fm_entries = fm_block.as_ref().map(|b| b.entries.as_slice());
     block::parse_tree_with_entries(source, fm_span, fm_syntax, fm_entries)
-}
-
-/// Detect frontmatter using the same precedence as the workspace loader.
-fn detect_frontmatter(source: &str) -> (Option<FrontmatterBlock>, Syntax) {
-    yaml::parse_frontmatter_block(source).map_or_else(
-        || {
-            toml::parse_frontmatter_block(source).map_or_else(
-                || {
-                    json::parse_frontmatter_block(source)
-                        .map_or((None, Syntax::Yaml), |b| (Some(b), Syntax::Json))
-                },
-                |b| (Some(b), Syntax::Toml),
-            )
-        },
-        |b| (Some(b), Syntax::Yaml),
-    )
-}
-
-// ---------------------------------------------------------------------------
-// Reusable invariant assertions
-// ---------------------------------------------------------------------------
-
-/// Assert every universal structural invariant on a parsed [`Tree`].
-fn assert_tree_wellformed(tree: &Tree) {
-    let nodes = tree.nodes();
-    let source = tree.source();
-    let len = source.len();
-
-    // Root structure: exactly one Document, at index 0, parentless.
-    assert!(!nodes.is_empty(), "tree must contain the Document root");
-    let doc_count = nodes
-        .iter()
-        .filter(|n| matches!(n.kind, ElementKind::Document))
-        .count();
-    assert_eq!(
-        doc_count, 1,
-        "tree must have exactly one Document node, found {doc_count}"
-    );
-    assert!(
-        matches!(nodes[0].kind, ElementKind::Document),
-        "root node (index 0) must be the Document, found {:?}",
-        nodes[0].kind
-    );
-    assert!(
-        nodes[0].parent.is_none(),
-        "Document root must have no parent"
-    );
-
-    for (id, node) in nodes.iter().enumerate() {
-        // Span ordering and bounds.
-        assert!(
-            node.span.start <= node.span.end,
-            "node {id} ({:?}) has start {} after end {}",
-            node.kind,
-            node.span.start,
-            node.span.end
-        );
-        assert!(
-            node.span.end <= len,
-            "node {id} ({:?}) span end {} exceeds source length {len}",
-            node.kind,
-            node.span.end
-        );
-        // Char boundaries: the span must be sliceable from the source.
-        assert!(
-            source.is_char_boundary(node.span.start),
-            "node {id} ({:?}) span start {} is not a UTF-8 char boundary",
-            node.kind,
-            node.span.start
-        );
-        assert!(
-            source.is_char_boundary(node.span.end),
-            "node {id} ({:?}) span end {} is not a UTF-8 char boundary",
-            node.kind,
-            node.span.end
-        );
-
-        // Non-root nodes have a parent; the parent contains the child span.
-        if id == 0 {
-            continue;
-        }
-        let parent_id = node
-            .parent
-            .unwrap_or_else(|| panic!("non-root node {id} ({:?}) must have a parent", node.kind));
-        assert!(
-            parent_id < nodes.len(),
-            "node {id} parent index {parent_id} is out of range ({} nodes)",
-            nodes.len()
-        );
-        let parent = &nodes[parent_id];
-        assert!(
-            parent.span.start <= node.span.start && node.span.end <= parent.span.end,
-            "node {id} ({:?}) span {:?} is not contained in parent {parent_id} ({:?}) span {:?}",
-            node.kind,
-            node.span,
-            parent.kind,
-            parent.span
-        );
-    }
-
-    // Acyclicity: every ancestor chain terminates at the root within a
-    // bounded number of hops (a cycle would loop past the node count).
-    for id in 0..nodes.len() {
-        let mut cursor = id;
-        let mut hops = 0usize;
-        while let Some(parent) = nodes[cursor].parent {
-            assert!(
-                parent < nodes.len(),
-                "ancestor of node {id} has out-of-range parent index {parent}"
-            );
-            cursor = parent;
-            hops += 1;
-            assert!(
-                hops <= nodes.len(),
-                "ancestor chain from node {id} exceeds node count — cycle detected"
-            );
-        }
-        assert_eq!(
-            cursor, 0,
-            "ancestor chain from node {id} must terminate at the Document root"
-        );
-    }
-
-    // Diagnostics: spans within bounds.
-    for diag in tree.diagnostics() {
-        assert!(
-            diag.span.start <= diag.span.end && diag.span.end <= len,
-            "diagnostic span {:?} out of bounds for source length {len}",
-            diag.span
-        );
-    }
-}
-
-/// Assert structural invariants on a parsed frontmatter block.
-fn assert_block_wellformed(block: &FrontmatterBlock, source: &str) {
-    let len = source.len();
-    assert!(
-        block.span.start <= block.span.end && block.span.end <= len,
-        "frontmatter block span {:?} out of bounds for source length {len}",
-        block.span
-    );
-    assert!(
-        source.is_char_boundary(block.span.start) && source.is_char_boundary(block.span.end),
-        "frontmatter block span {:?} not on UTF-8 char boundaries",
-        block.span
-    );
-    assert!(
-        block.content_span.start <= block.content_span.end && block.content_span.end <= len,
-        "frontmatter content span {:?} out of bounds for source length {len}",
-        block.content_span
-    );
-    // The body after the block must be a clean slice that does not reference
-    // frontmatter content — i.e. `span.end` is a valid char boundary, which
-    // the bounds/boundary checks above already guarantee.
-    for diag in &block.diagnostics {
-        assert!(
-            diag.span.start <= diag.span.end && diag.span.end <= len,
-            "frontmatter diagnostic span {:?} out of bounds for source length {len}",
-            diag.span
-        );
-    }
-}
-
-/// Collect every scalar (mapping keys and scalar values, recursively) in a
-/// parsed frontmatter block — the leaves whose resolved `text` must stay
-/// faithful to the source bytes.
-fn collect_scalars(block: &FrontmatterBlock) -> Vec<&fm::ScalarSpan> {
-    let mut out = Vec::new();
-    for entry in &block.entries {
-        collect_node_scalars(entry, &mut out);
-    }
-    out
-}
-
-fn collect_node_scalars<'a>(node: &'a fm::FmNode, out: &mut Vec<&'a fm::ScalarSpan>) {
-    match node {
-        fm::FmNode::Mapping { key, value, .. } => {
-            out.push(key);
-            collect_value_scalars(value, out);
-        }
-        fm::FmNode::SequenceItem { value, .. } => collect_value_scalars(value, out),
-    }
-}
-
-fn collect_value_scalars<'a>(value: &'a fm::FmValue, out: &mut Vec<&'a fm::ScalarSpan>) {
-    match value {
-        fm::FmValue::Scalar(s) => out.push(s),
-        fm::FmValue::Sequence(items) | fm::FmValue::Mapping(items) => {
-            for item in items {
-                collect_node_scalars(item, out);
-            }
-        }
-        fm::FmValue::FlowSequence { items, .. } => out.extend(items.iter()),
-        fm::FmValue::FlowMapping { entries, .. } => {
-            for (k, v) in entries {
-                out.push(k);
-                out.push(v);
-            }
-        }
-        fm::FmValue::BlockScalar { .. } => {}
-    }
-}
-
-/// Assert a tokenized HTML tag reports lengths and spans within `text`.
-fn assert_html_tag_in_bounds(tag: &HtmlTag, text: &str) {
-    let len = text.len();
-    match tag {
-        HtmlTag::Open {
-            attrs,
-            len: consumed,
-            ..
-        } => {
-            assert!(
-                *consumed <= len,
-                "open tag len {consumed} exceeds text {len}"
-            );
-            for attr in attrs {
-                assert!(
-                    attr.name_span.start <= attr.name_span.end && attr.name_span.end <= len,
-                    "attribute name span {:?} out of bounds for text length {len}",
-                    attr.name_span
-                );
-                if let Some(value_span) = attr.value_span {
-                    assert!(
-                        value_span.start <= value_span.end && value_span.end <= len,
-                        "attribute value span {value_span:?} out of bounds for text length {len}"
-                    );
-                }
-            }
-        }
-        HtmlTag::Close { len: consumed, .. } | HtmlTag::Comment { len: consumed } => {
-            assert!(
-                *consumed <= len,
-                "tag len {consumed} exceeds text length {len}"
-            );
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -957,29 +724,7 @@ proptest! {
     ) {
         let (block, _) = detect_frontmatter(&doc);
         if let Some(block) = block {
-            for sc in collect_scalars(&block) {
-                prop_assert!(
-                    sc.span.end <= doc.len()
-                        && doc.is_char_boundary(sc.span.start)
-                        && doc.is_char_boundary(sc.span.end),
-                    "scalar span {:?} out of bounds / off a char boundary (len {})",
-                    sc.span,
-                    doc.len()
-                );
-                let sliced = &doc[sc.span.start..sc.span.end];
-                // Escape-decoded or folded multi-line scalars legitimately
-                // differ from their raw slice; skip those.
-                if sliced.contains('\\') || sliced.contains('\n') || sliced.contains('\r') {
-                    continue;
-                }
-                prop_assert!(
-                    sliced.contains(sc.text.as_str()),
-                    "resolved scalar text {:?} does not occur in its source slice {:?} \
-                     — encoding corruption",
-                    sc.text,
-                    sliced
-                );
-            }
+            assert_frontmatter_scalar_fidelity(&block, &doc);
         }
     }
 
@@ -995,28 +740,7 @@ proptest! {
             proptest::collection::vec(link_fragment(), 1..12).prop_map(|v| v.concat()),
         ]
     ) {
-        let tree = parse_full(&doc);
-        for node in tree.nodes() {
-            let (ElementKind::Link { url, title }
-            | ElementKind::Image { url, title }
-            | ElementKind::Video { url, title }
-            | ElementKind::Audio { url, title }) = &node.kind
-            else {
-                continue;
-            };
-            for field in [url, title] {
-                // Empty, escaped, or multi-line fields legitimately differ from
-                // any single source slice; skip them.
-                if field.is_empty() || field.contains(['\\', '\n', '\r']) {
-                    continue;
-                }
-                prop_assert!(
-                    doc.contains(field.as_str()),
-                    "resolved inline field {:?} does not occur in the source — encoding corruption",
-                    field
-                );
-            }
-        }
+        assert_inline_resource_fidelity(&parse_full(&doc));
     }
 }
 

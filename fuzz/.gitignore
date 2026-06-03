@@ -1,0 +1,5 @@
+# Build artifacts only. Seed corpora (corpus/) and crash artifacts
+# (artifacts/) are tracked on purpose — they are the regression record.
+/target
+/Cargo.lock
+/soak-*.log

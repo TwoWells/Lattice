@@ -1,0 +1,76 @@
+# cargo-fuzz harness for Lattice (ticket 22).
+#
+# A standalone crate (note the empty `[workspace]` table below, which isolates
+# it from the parent package) that links `lattice` with the `fuzzing` feature
+# and drives each parser entry point through libFuzzer. Not part of `make
+# check`; run via `make fuzz` (which forces the nightly toolchain).
+[package]
+name = "lattice-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.lattice]
+path = ".."
+features = ["fuzzing"]
+
+# Keep the parent out of this crate's workspace resolution.
+[workspace]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "fuzz_parse_tree"
+path = "fuzz_targets/fuzz_parse_tree.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_yaml"
+path = "fuzz_targets/fuzz_yaml.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_toml"
+path = "fuzz_targets/fuzz_toml.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_json"
+path = "fuzz_targets/fuzz_json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_full"
+path = "fuzz_targets/fuzz_full.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_tokenize_tag"
+path = "fuzz_targets/fuzz_tokenize_tag.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_inlines"
+path = "fuzz_targets/fuzz_inlines.rs"
+test = false
+doc = false
+bench = false

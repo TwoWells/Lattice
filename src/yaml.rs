@@ -128,6 +128,14 @@ impl<'a> Parser<'a> {
         });
     }
 
+    /// A one-byte span at the current position, clamped to the source end so an
+    /// at-EOF "expected X" diagnostic collapses to an empty span instead of
+    /// pointing one byte past the input.
+    fn here_span(&self) -> Span {
+        let start = self.abs();
+        Span::new(start, (start + 1).min(self.base + self.src.len()))
+    }
+
     /// Skip spaces and tabs (not newlines). Returns the number of spaces.
     /// Tabs are flagged.
     fn skip_inline_whitespace(&mut self) -> usize {
@@ -867,8 +875,7 @@ impl<'a> Parser<'a> {
 
             // Expect `:`.
             if self.peek() != Some(b':') {
-                let span = Span::new(self.abs(), self.abs() + 1);
-                self.emit(span, FmSeverity::Error, "expected ':'".into());
+                self.emit(self.here_span(), FmSeverity::Error, "expected ':'".into());
                 self.skip_to_eol();
                 self.skip_newline();
                 continue;
@@ -1011,6 +1018,7 @@ impl<'a> Parser<'a> {
 /// frontmatter is present.
 ///
 /// UTF-8 BOM at byte 0 is stripped transparently.
+#[must_use]
 pub fn parse_frontmatter_block(source: &str) -> Option<FrontmatterBlock> {
     let (stripped, bom_offset) = fm::strip_bom(source);
 
@@ -1073,6 +1081,47 @@ pub fn parse_frontmatter_block(source: &str) -> Option<FrontmatterBlock> {
 mod tests {
     use super::*;
     use crate::fm::{extract_backlinks, find_predicate_line};
+
+    // -- Regression: fuzz findings ---------------------------------------
+
+    #[test]
+    fn scalar_fidelity_allows_single_quote_escape() {
+        // Regression (fuzz_yaml, ticket 22): a single-quoted YAML scalar
+        // containing `''` (YAML's escape for a literal `'`) decodes to one `'`,
+        // so its resolved text legitimately differs from the raw `''` source
+        // slice. The content-fidelity invariant must treat `''` as an escape
+        // and not flag it as encoding corruption.
+        let source = "---\nkey: 'it''s a test'\n---\n";
+        let block = parse_frontmatter_block(source).expect("frontmatter should parse");
+        crate::invariants::assert_block_wellformed(&block, source);
+        crate::invariants::assert_frontmatter_scalar_fidelity(&block, source);
+
+        // The escape decodes to exactly one apostrophe.
+        let FmNode::Mapping { value, .. } = &block.entries[0] else {
+            panic!("expected a mapping entry");
+        };
+        let FmValue::Scalar(scalar) = value else {
+            panic!("expected a scalar value");
+        };
+        assert_eq!(
+            scalar.text, "it's a test",
+            "`''` should decode to a single apostrophe"
+        );
+
+        // A plain (unquoted) scalar keeps `''` verbatim — the fidelity check
+        // must accept the raw slice too, not collapse `''` unconditionally
+        // (fuzz_yaml caught exactly this over-correction).
+        let plain = "---\nkey: tx''\n---\n";
+        let block = parse_frontmatter_block(plain).expect("frontmatter should parse");
+        crate::invariants::assert_frontmatter_scalar_fidelity(&block, plain);
+        let FmNode::Mapping { value, .. } = &block.entries[0] else {
+            panic!("expected a mapping entry");
+        };
+        let FmValue::Scalar(scalar) = value else {
+            panic!("expected a scalar value");
+        };
+        assert_eq!(scalar.text, "tx''", "a plain scalar keeps `''` verbatim");
+    }
 
     // -- BOM stripping ----------------------------------------------------
 

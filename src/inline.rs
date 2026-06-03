@@ -1485,6 +1485,17 @@ mod tests {
         assert_eq!(links.len(), 1, "URI autolink parsed as link, not tag");
     }
 
+    #[test]
+    fn email_autolink_passes_inline_fidelity() {
+        // Regression (fuzz_parse_tree, ticket 22): email autolinks synthesize a
+        // `mailto:` scheme that is absent from the source. The inline content-
+        // fidelity invariant must not flag the synthesized prefix as encoding
+        // corruption — only the address after it is sliced from the source.
+        let tree = parse("Reach <a@b.co> or <x.y@sub.example.com> today.\n");
+        crate::invariants::assert_tree_wellformed(&tree);
+        crate::invariants::assert_inline_resource_fidelity(&tree);
+    }
+
     // --- Inline <a> tags ---
 
     #[test]

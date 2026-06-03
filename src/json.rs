@@ -122,6 +122,14 @@ impl<'a> Parser<'a> {
         });
     }
 
+    /// A one-byte span at the current position, clamped to the source end so an
+    /// at-EOF "expected X" diagnostic collapses to an empty span instead of
+    /// pointing one byte past the input.
+    fn here_span(&self) -> Span {
+        let start = self.abs();
+        Span::new(start, (start + 1).min(self.base + self.src.len()))
+    }
+
     /// Skip JSON whitespace (space, tab, CR, LF).
     fn skip_ws(&mut self) {
         while let Some(b) = self.peek() {
@@ -541,9 +549,8 @@ impl<'a> Parser<'a> {
 
         // Key must be a string.
         if self.peek() != Some(b'"') {
-            let start = self.abs();
             self.emit(
-                Span::new(start, start + 1),
+                self.here_span(),
                 FmSeverity::Error,
                 "expected string key".into(),
             );
@@ -559,7 +566,7 @@ impl<'a> Parser<'a> {
             self.pos += 1;
         } else {
             self.emit(
-                Span::new(self.abs(), self.abs() + 1),
+                self.here_span(),
                 FmSeverity::Error,
                 "expected ':' after key".into(),
             );
@@ -684,6 +691,7 @@ impl<'a> Parser<'a> {
 ///
 /// The `{` must be at byte 0. The parser tracks brace depth to find the
 /// matching `}`. The body starts on the line after the closing `}`.
+#[must_use]
 pub fn parse_frontmatter_block(source: &str) -> Option<FrontmatterBlock> {
     let (stripped, bom_offset) = fm::strip_bom(source);
 
@@ -761,6 +769,30 @@ pub fn parse_frontmatter_block(source: &str) -> Option<FrontmatterBlock> {
 mod tests {
     use super::*;
     use crate::fm::{extract_backlinks, find_predicate_line};
+
+    // -- Regression: fuzz findings ---------------------------------------
+
+    #[test]
+    fn diagnostic_spans_stay_in_bounds_at_eof() {
+        // Regression (fuzz_json, ticket 22): a malformed object whose parse
+        // desyncs to EOF emitted "expected ':' after key" / "expected string
+        // key" diagnostics built as `pos + 1` — one byte past the source. The
+        // "expected X" sites now use `here_span`, which clamps the one-byte
+        // span to the source end. The committed corpus seed is the byte-exact
+        // reproducer.
+        let bytes = include_bytes!("../fuzz/corpus/fuzz_json/eof_diag_overshoot.json");
+        let source = std::str::from_utf8(bytes).expect("seed is valid UTF-8");
+        let block = parse_frontmatter_block(source).expect("recognized as JSON frontmatter");
+        crate::invariants::assert_block_wellformed(&block, source);
+
+        // Targeted cases for the two emit sites: a key with no following colon,
+        // and `{` with no key — both desyncing toward the closing brace.
+        for src in ["{\"k\"\"v\"}", "{\"k\" }", "{ }", "{\"a\":1 \"b\"}"] {
+            if let Some(block) = parse_frontmatter_block(src) {
+                crate::invariants::assert_block_wellformed(&block, src);
+            }
+        }
+    }
 
     // -- Detection --------------------------------------------------------
 

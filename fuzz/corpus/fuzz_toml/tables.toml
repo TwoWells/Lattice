@@ -1,0 +1,20 @@
++++
+title = "Test"
+count = 42
+ratio = 3.14
+enabled = true
+tags = ["a", "b"]
+literal = 'no \n escapes'
+basic = "with \t escape"
+multiline = """
+line1
+line2
+"""
+
+[author]
+name = "Jane"
+
+[[items]]
+id = 1
++++
+body

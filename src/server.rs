@@ -2243,7 +2243,8 @@ fn line_byte_range(source: &str, line: u32) -> (usize, usize) {
     clippy::cast_possible_truncation,
     reason = "line numbers in markdown files won't exceed u32::MAX"
 )]
-fn lsp_position_to_byte_offset(source: &str, pos: lsp::Position) -> usize {
+#[must_use]
+pub fn lsp_position_to_byte_offset(source: &str, pos: lsp::Position) -> usize {
     let (start, end) = line_byte_range(source, pos.line);
     start + (pos.character as usize).min(end - start)
 }
@@ -2268,7 +2269,8 @@ fn span_to_lsp_range(source: &str, span: &Span) -> lsp::Range {
     clippy::cast_possible_truncation,
     reason = "line/column values in markdown files won't exceed u32::MAX"
 )]
-fn byte_offset_to_lsp_position(source: &str, offset: usize) -> lsp::Position {
+#[must_use]
+pub fn byte_offset_to_lsp_position(source: &str, offset: usize) -> lsp::Position {
     let offset = offset.min(source.len());
     let line = (crate::block::byte_offset_to_line(source, offset) - 1) as u32;
     let line_start = source.as_bytes()[..offset]

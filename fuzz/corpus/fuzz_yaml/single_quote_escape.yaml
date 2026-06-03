@@ -1,0 +1,6 @@
+---
+key: 'it''s a test'
+nested:
+  inner: 'don''t mangle ''this'''
+---
+body
