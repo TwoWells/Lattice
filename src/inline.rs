@@ -1239,6 +1239,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn reference_def_multiline_label() {
+        // A link label may span a line ending; the run collector joins the
+        // lines and the label normalizes to a single space-collapsed string.
+        let tree = parse("[foo\nbar]: /url\n\n[foo bar]\n");
+        let defs = find_nodes(&tree, |k| matches!(k, ElementKind::ReferenceDef { .. }));
+        assert_eq!(defs.len(), 1, "definition with a wrapped label");
+        match &tree.node(defs[0]).kind {
+            ElementKind::ReferenceDef { label, url, .. } => {
+                assert_eq!(label, "foo bar", "label collapses the line ending");
+                assert_eq!(url, "/url", "url after the wrapped label");
+            }
+            other => panic!("expected ReferenceDef, got {other:?}"),
+        }
+    }
+
     // --- Nested brackets ---
 
     #[test]

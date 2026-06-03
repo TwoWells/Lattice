@@ -705,14 +705,53 @@ fn scan_title(s: &str, start: usize) -> Option<(String, usize)> {
     None
 }
 
+/// Cheap, allocation-free gate: could the first line begin a reference
+/// definition? Examines only `line` (the candidate's first line).
+///
+/// Returns `true` when the line — after up to three spaces of indent — opens a
+/// non-footnote `[` whose label either closes with `]:` here, or stays open at
+/// the line end (a label may continue on the next line). Returns `false` for
+/// ordinary bracketed text such as `[text][ref]`, `[link](url)`, and shortcut
+/// references, so they never trigger run collection.
+fn first_line_opens_refdef(line: &str) -> bool {
+    let bytes = line.as_bytes();
+    let len = bytes.len();
+
+    let mut i = 0;
+    while i < len && bytes[i] == b' ' {
+        i += 1;
+    }
+    if i > 3 || i >= len || bytes[i] != b'[' {
+        return false;
+    }
+    i += 1;
+    // Footnote definitions (`[^...]`) are not reference definitions.
+    if i < len && bytes[i] == b'^' {
+        return false;
+    }
+
+    loop {
+        if i >= len {
+            return true; // label still open at end of line — may continue
+        }
+        match bytes[i] {
+            b'\\' if i + 1 < len && bytes[i + 1] < 0x80 => i += 2,
+            b'\n' | b'\r' => return true, // label may continue on the next line
+            b']' => return bytes.get(i + 1) == Some(&b':'),
+            b'[' => return false, // unescaped `[` — not a label
+            _ => i += 1,
+        }
+    }
+}
+
 /// Recognize a reference-definition label at the start of `s`.
 ///
-/// Matches up to three spaces of indentation, a `[label]:` that is not a
-/// footnote marker (`[^...]`), with the label on a single line (no unescaped
-/// `[`, at least one non-whitespace character, max 999 bytes). Returns the byte
-/// index just past the `:` and the raw label text, or `None`.
-///
-/// This is the cheap gate used to skip non-definitions before any allocation.
+/// Matches up to three spaces of indentation and a `[label]:` that is not a
+/// footnote marker (`[^...]`). The label runs to the first unescaped `]` and
+/// may span line endings (the caller's buffer never crosses a blank line, so a
+/// label that would needs one fails to close); it must contain at least one
+/// non-whitespace character and be at most 999 bytes. Returns the byte index
+/// just past the `:` and the raw label text, or `None`.
 fn scan_refdef_label(s: &str) -> Option<(usize, &str)> {
     let bytes = s.as_bytes();
     let len = bytes.len();
@@ -730,7 +769,7 @@ fn scan_refdef_label(s: &str) -> Option<(usize, &str)> {
         return None;
     }
 
-    // Label: up to the first unescaped `]`; no unescaped `[`; single line.
+    // Label: up to the first unescaped `]`; no unescaped `[`; may span lines.
     let label_start = i;
     loop {
         if i >= len {
@@ -739,7 +778,7 @@ fn scan_refdef_label(s: &str) -> Option<(usize, &str)> {
         match bytes[i] {
             b'\\' if i + 1 < len && bytes[i + 1] < 0x80 => i += 2,
             b']' => break,
-            b'[' | b'\n' | b'\r' => return None,
+            b'[' => return None,
             _ => i += 1,
         }
     }
@@ -2881,12 +2920,11 @@ impl<'a> TreeBuilder<'a> {
         while self.quote_depth > target_depth {
             // Pop scopes from the top until (and including) the next
             // QuoteBlock. Scopes nested inside the quote — list items,
-            // lists, HTML containers — are closed first.
+            // lists, HTML containers — are closed first. At the root Document
+            // none of the bookkeeping below fires (it is neither quote, HTML,
+            // nor list), so the `pop_scope` progress check is the sole, shared
+            // termination guard.
             loop {
-                if self.scope_stack.len() <= 1 {
-                    // Never pop the root Document; bail to avoid spinning.
-                    return;
-                }
                 let top = self.current_scope();
                 let is_quote = matches!(
                     self.nodes[top].kind,
@@ -2907,7 +2945,9 @@ impl<'a> TreeBuilder<'a> {
                 {
                     self.list_stack.pop();
                 }
-                self.pop_scope(pos);
+                if !self.pop_scope(pos) {
+                    return; // reached the root Document
+                }
                 if is_quote {
                     self.quote_depth -= 1;
                     break;
@@ -3279,10 +3319,11 @@ impl<'a> TreeBuilder<'a> {
         first_content_start: usize,
         first_raw_len: usize,
     ) -> bool {
-        // Cheap gate: bail before any allocation unless the first line begins a
-        // reference-definition label (`[label]:`). This filters ordinary
-        // bracketed text (`[text][ref]`, `[link](url)`, shortcut refs).
-        if scan_refdef_label(first_content).is_none() {
+        // Cheap gate: bail before any allocation unless the first line could
+        // open a reference-definition label. This filters ordinary bracketed
+        // text (`[text][ref]`, `[link](url)`, shortcut refs) while still
+        // admitting labels that continue onto a later line.
+        if !first_line_opens_refdef(first_content) {
             return false;
         }
 
