@@ -517,7 +517,6 @@ fn expand_leading_tabs(line: &str) -> (String, Vec<TabMapping>) {
             let spaces = 4 - (col % 4);
             mappings.push(TabMapping {
                 original_byte: byte_idx,
-                expanded_col: col,
                 num_spaces: spaces,
             });
             for _ in 0..spaces {
@@ -550,7 +549,6 @@ fn expand_all_tabs(line: &str) -> (String, Vec<TabMapping>) {
             let spaces = 4 - (col % 4);
             mappings.push(TabMapping {
                 original_byte: byte_idx,
-                expanded_col: col,
                 num_spaces: spaces,
             });
             for _ in 0..spaces {
@@ -571,42 +569,41 @@ fn expand_all_tabs(line: &str) -> (String, Vec<TabMapping>) {
 struct TabMapping {
     /// Byte offset of the tab in the original line.
     original_byte: usize,
-    /// Column position where expansion starts.
-    expanded_col: usize,
     /// Number of spaces this tab expanded to.
     num_spaces: usize,
 }
 
-/// Map an offset in a tab-expanded string back to the corresponding byte
+/// Map a column offset in a tab-expanded string back to the corresponding byte
 /// offset in the original (pre-expansion) string.
 ///
-/// Uses the tab mappings produced by [`expand_leading_tabs`]. If there are
-/// no tabs, the expanded and raw offsets are identical.
+/// Walks the raw line accumulating expanded columns until it reaches
+/// `expanded_offset`. Because each character advances the byte index by its
+/// UTF-8 width, the returned offset always lands on a char boundary even when
+/// the indentation region contains multi-byte characters — e.g. a U+00A0
+/// non-breaking space, which `str::trim` counts as whitespace, so an
+/// all-whitespace continuation line can reach the slice path. A tab recorded in
+/// `mappings` occupies its expanded `num_spaces` columns; every other character
+/// (including a non-leading tab absent from `mappings`) is one column. With no
+/// tabs and ASCII content this reduces to the identity `min(len)`.
 fn expanded_to_raw(expanded_offset: usize, raw_line: &str, mappings: &[TabMapping]) -> usize {
-    if mappings.is_empty() {
-        return expanded_offset.min(raw_line.len());
-    }
-
-    // Walk through tab mappings. Each tab occupies columns
-    // [expanded_col .. expanded_col + num_spaces) in the expanded string
-    // but only 1 byte in the raw string. We track the cumulative extra
-    // bytes introduced by prior tab expansions.
-    let mut delta: usize = 0;
-    for m in mappings {
-        if expanded_offset <= m.expanded_col {
-            // Before this tab — delta is from prior tabs only.
-            break;
+    let mut col = 0;
+    let mut mi = 0;
+    for (byte_idx, ch) in raw_line.char_indices() {
+        if col >= expanded_offset {
+            return byte_idx;
         }
-        let tab_expanded_end = m.expanded_col + m.num_spaces;
-        if expanded_offset < tab_expanded_end {
-            // Inside the expansion of this tab — map to just past the tab byte.
-            return m.original_byte + 1;
+        // Mappings are in increasing byte order; skip any already passed.
+        while mi < mappings.len() && mappings[mi].original_byte < byte_idx {
+            mi += 1;
         }
-        // Past this tab: it added (num_spaces - 1) extra bytes.
-        delta += m.num_spaces - 1;
+        if ch == '\t' && mi < mappings.len() && mappings[mi].original_byte == byte_idx {
+            col += mappings[mi].num_spaces;
+            mi += 1;
+        } else {
+            col += 1;
+        }
     }
-
-    expanded_offset.saturating_sub(delta).min(raw_line.len())
+    raw_line.len()
 }
 
 // ---------------------------------------------------------------------------
@@ -4662,6 +4659,25 @@ mod tests {
     /// Helper: parse a tree with no frontmatter.
     fn parse(source: &str) -> Tree {
         parse_tree(source, None)
+    }
+
+    #[test]
+    fn list_continuation_multibyte_whitespace_wellformed() {
+        // Regression (fuzz_parse_tree / fuzz_inlines, ticket 22): an
+        // all-whitespace list-continuation line containing a multi-byte
+        // whitespace char (e.g. U+00A0 NBSP, U+2001 EM QUAD — both counted as
+        // whitespace by `str::trim`, so the early-return guard is bypassed)
+        // made `expanded_to_raw` return a byte offset inside the char, panicking
+        // when the indentation was sliced off. Column->byte mapping must land on
+        // a char boundary.
+        for src in [
+            "1. x\n  \u{a0}\n",   // ordered marker, content column 3, NBSP
+            "-  x\n  \u{a0}\n",   // wide bullet, NBSP straddles the slice point
+            "1. x\n  \u{2001}\n", // 3-byte multi-byte whitespace
+            "- x\n\t\u{a0}\n",    // tab + NBSP in the continuation indent
+        ] {
+            crate::invariants::assert_tree_wellformed(&parse_tree(src, None));
+        }
     }
 
     /// Helper: get the text of a span from source.
