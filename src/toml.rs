@@ -138,18 +138,32 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Skip a newline (`\n`, `\r\n`, or bare `\r`). Returns true if one was
+    /// consumed.
+    ///
+    /// Bare `\r` must advance the cursor: `skip_blanks` calls this in a loop
+    /// on any `\n`/`\r`, so a bare `\r` that did not advance would spin
+    /// forever.
     fn skip_newline(&mut self) -> bool {
         match self.peek() {
             Some(b'\n') => {
                 self.pos += 1;
                 true
             }
-            Some(b'\r') if self.peek_at(1) == Some(b'\n') => {
-                self.pos += 2;
+            Some(b'\r') => {
+                self.pos += if self.peek_at(1) == Some(b'\n') { 2 } else { 1 };
                 true
             }
             _ => false,
         }
+    }
+
+    /// Append the whole UTF-8 character whose lead byte `advance` just
+    /// consumed (now at `self.pos - 1`), advancing past its continuation
+    /// bytes so a multi-byte character is stored intact rather than as
+    /// per-byte mojibake.
+    fn push_char(&mut self, text: &mut String) {
+        self.pos = fm::push_utf8_char(text, self.src, self.pos - 1);
     }
 
     fn skip_to_eol(&mut self) {
@@ -300,7 +314,7 @@ impl<'a> Parser<'a> {
                     );
                     break;
                 }
-                Some(b) => text.push(b as char),
+                Some(_) => self.push_char(&mut text),
             }
         }
 
@@ -327,7 +341,7 @@ impl<'a> Parser<'a> {
                     break;
                 }
                 Some(b'\'') => break,
-                Some(b) => text.push(b as char),
+                Some(_) => self.push_char(&mut text),
             }
         }
 
@@ -405,7 +419,7 @@ impl<'a> Parser<'a> {
                     self.pos += 1;
                     text.push('\n');
                 }
-                Some(b) => text.push(b as char),
+                Some(_) => self.push_char(&mut text),
             }
         }
 
@@ -446,7 +460,7 @@ impl<'a> Parser<'a> {
                     self.pos += 1;
                     text.push('\n');
                 }
-                Some(b) => text.push(b as char),
+                Some(_) => self.push_char(&mut text),
             }
         }
 

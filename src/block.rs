@@ -1171,6 +1171,7 @@ fn html_block_start(line: &str) -> Option<u8> {
                 || after.starts_with('\t')
                 || after.starts_with('>')
                 || after.starts_with('\n')
+                || after.starts_with('\r')
         }) {
             return Some(1);
         }
@@ -1859,22 +1860,36 @@ pub fn parse_tree_with_entries(
     );
     builder.scope_stack.push(doc_id);
 
-    // If frontmatter is present, add it as first child.
-    let body_offset = frontmatter_span.map_or(0, |fm_span| {
-        let fm_id = builder.add_node(
-            ElementKind::Frontmatter,
-            frontmatter_syntax,
-            fm_span,
-            Some(doc_id),
-        );
+    // If frontmatter is present, add it as first child. The frontmatter span
+    // already starts after any leading BOM (the format parsers account for
+    // it). With no frontmatter, a UTF-8 BOM at byte 0 is skipped here so the
+    // first body block is still recognized; the BOM bytes fall under the
+    // Document span only, and all block spans stay aligned to the original
+    // source.
+    let body_offset = frontmatter_span.map_or_else(
+        || {
+            if source.as_bytes().starts_with(crate::fm::BOM) {
+                crate::fm::BOM.len()
+            } else {
+                0
+            }
+        },
+        |fm_span| {
+            let fm_id = builder.add_node(
+                ElementKind::Frontmatter,
+                frontmatter_syntax,
+                fm_span,
+                Some(doc_id),
+            );
 
-        // Expand frontmatter entries into child nodes.
-        if let Some(entries) = frontmatter_entries {
-            expand_frontmatter_entries(&mut builder, fm_id, frontmatter_syntax, entries);
-        }
+            // Expand frontmatter entries into child nodes.
+            if let Some(entries) = frontmatter_entries {
+                expand_frontmatter_entries(&mut builder, fm_id, frontmatter_syntax, entries);
+            }
 
-        fm_span.end
-    });
+            fm_span.end
+        },
+    );
 
     // Parse the body.
     let body = &source[body_offset..];
@@ -3714,9 +3729,7 @@ impl<'a> TreeBuilder<'a> {
         *line_idx += 1;
 
         // Check for GFM table: header row with pipes followed by delimiter row.
-        let header_end = self.source[para_start..]
-            .find('\n')
-            .map_or(self.source.len(), |p| para_start + p);
+        let header_end = line_content_end(self.source, para_start);
         let header_line = &self.source[para_start..header_end];
 
         if is_table_row(header_line) && *line_idx < lines.len() {
@@ -3898,9 +3911,7 @@ impl<'a> TreeBuilder<'a> {
         );
 
         // Parse header row cells.
-        let header_end = self.source[header_start..]
-            .find('\n')
-            .map_or(self.source.len(), |p| header_start + p);
+        let header_end = line_content_end(self.source, header_start);
         let header_line = &self.source[header_start..header_end];
         self.emit_table_row(header_line, header_start, header_end, col_count, true);
 
@@ -4014,15 +4025,29 @@ fn strip_n_quote_markers(line: &str, n: usize) -> (usize, &str) {
 
 /// Split text into lines, preserving the line endings in each slice.
 ///
-/// Each returned slice includes its trailing `\n` or `\r\n` if present.
+/// Recognizes all three line-ending styles — `\n` (Unix), `\r\n` (Windows),
+/// and bare `\r` (legacy Mac). Each returned slice includes its own trailing
+/// line ending, so the concatenation of all slices reproduces `text` exactly
+/// and byte offsets accumulated from slice lengths stay aligned with the
+/// original source.
 fn split_lines(text: &str) -> Vec<&str> {
     let mut lines = Vec::new();
     let mut start = 0;
     let bytes = text.as_bytes();
 
     while start < bytes.len() {
-        if let Some(offset) = bytes[start..].iter().position(|&b| b == b'\n') {
-            let end = start + offset + 1;
+        if let Some(offset) = bytes[start..]
+            .iter()
+            .position(|&b| b == b'\n' || b == b'\r')
+        {
+            let nl = start + offset;
+            // Include the line ending: `\r\n` is two bytes, `\n` and bare
+            // `\r` are one.
+            let end = if bytes[nl] == b'\r' && bytes.get(nl + 1) == Some(&b'\n') {
+                nl + 2
+            } else {
+                nl + 1
+            };
             lines.push(&text[start..end]);
             start = end;
         } else {
@@ -4032,6 +4057,17 @@ fn split_lines(text: &str) -> Vec<&str> {
     }
 
     lines
+}
+
+/// Find the byte offset where the line beginning at `start` ends — the
+/// position of the next line-ending byte (`\n` or `\r`), or `source.len()`
+/// if the line runs to the end of input. Robust to all three line-ending
+/// styles (the `\r` of a `\r\n` pair is reported, which is the line's true
+/// content boundary).
+fn line_content_end(source: &str, start: usize) -> usize {
+    source[start..]
+        .find(['\n', '\r'])
+        .map_or(source.len(), |p| start + p)
 }
 
 // ---------------------------------------------------------------------------
@@ -4636,6 +4672,96 @@ mod tests {
             node.kind
         );
         node
+    }
+
+    // --- Line splitting (encoding edge cases, ticket 21) ---
+
+    #[test]
+    fn split_lines_unix() {
+        assert_eq!(
+            split_lines("a\nb\nc"),
+            vec!["a\n", "b\n", "c"],
+            "LF lines retain their trailing newline; last line has none"
+        );
+        assert_eq!(
+            split_lines("a\nb\n"),
+            vec!["a\n", "b\n"],
+            "a trailing LF does not produce an empty final line"
+        );
+    }
+
+    #[test]
+    fn split_lines_crlf() {
+        assert_eq!(
+            split_lines("a\r\nb\r\n"),
+            vec!["a\r\n", "b\r\n"],
+            "CRLF is kept whole in each slice"
+        );
+    }
+
+    #[test]
+    fn split_lines_bare_cr() {
+        assert_eq!(
+            split_lines("a\rb\rc"),
+            vec!["a\r", "b\r", "c"],
+            "bare CR (legacy Mac) is recognized as a line break"
+        );
+    }
+
+    #[test]
+    fn split_lines_mixed_endings() {
+        assert_eq!(
+            split_lines("a\nb\r\nc\rd"),
+            vec!["a\n", "b\r\n", "c\r", "d"],
+            "LF, CRLF, and bare CR coexist in one document"
+        );
+    }
+
+    #[test]
+    fn split_lines_reconstructs_source() {
+        for src in [
+            "a\nb\r\nc\rd",
+            "\r\n\n\r",
+            "no endings",
+            "trailing\r\n",
+            "中\r日\n本\r\n",
+        ] {
+            let joined: String = split_lines(src).concat();
+            assert_eq!(
+                joined, src,
+                "concatenating the slices must reproduce the source exactly: {src:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn line_content_end_all_endings() {
+        assert_eq!(line_content_end("ab\ncd", 0), 2, "stops at the LF byte");
+        assert_eq!(
+            line_content_end("ab\r\ncd", 0),
+            2,
+            "stops at the CR of a CRLF pair (the content boundary)"
+        );
+        assert_eq!(line_content_end("ab\rcd", 0), 2, "stops at a bare CR");
+        assert_eq!(
+            line_content_end("abcd", 0),
+            4,
+            "runs to end of input when there is no line ending"
+        );
+    }
+
+    #[test]
+    fn bare_cr_splits_block_structure() {
+        // Three ATX headings separated only by bare CRs must be recognized
+        // as three separate headings, not one run-on line.
+        let tree = parse("# A\r# B\r# C");
+        let headings = tree.headings();
+        assert_eq!(
+            headings.len(),
+            3,
+            "bare CR must separate the three headings, got {}",
+            headings.len()
+        );
     }
 
     // --- Document root ---

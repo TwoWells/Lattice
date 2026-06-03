@@ -11,6 +11,8 @@ use clap::Parser;
 mod block;
 mod cli;
 mod config;
+#[cfg(test)]
+mod encoding_tests;
 mod fm;
 mod html;
 mod inline;

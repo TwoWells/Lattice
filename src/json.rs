@@ -163,7 +163,7 @@ impl<'a> Parser<'a> {
                 }
                 Some(b'"') => break,
                 Some(b'\\') => self.parse_escape(&mut text, abs_start),
-                Some(b) => text.push(b as char),
+                Some(_) => self.push_char(&mut text),
             }
         }
 
@@ -171,6 +171,14 @@ impl<'a> Parser<'a> {
             span: Span::new(abs_start, self.abs()),
             text,
         }
+    }
+
+    /// Append the whole UTF-8 character whose lead byte `advance` just
+    /// consumed (now at `self.pos - 1`), advancing past its continuation
+    /// bytes so a multi-byte character is stored intact rather than as
+    /// per-byte mojibake.
+    fn push_char(&mut self, text: &mut String) {
+        self.pos = fm::push_utf8_char(text, self.src, self.pos - 1);
     }
 
     /// Parse a JSON escape sequence. Position is right after the backslash.
@@ -700,7 +708,8 @@ pub fn parse_frontmatter_block(source: &str) -> Option<FrontmatterBlock> {
             && stripped.as_bytes().get(after_brace + 1) == Some(&b'\n')
         {
             after_brace + 2
-        } else if stripped.as_bytes().get(after_brace) == Some(&b'\n') {
+        } else if matches!(stripped.as_bytes().get(after_brace), Some(&b'\n' | &b'\r')) {
+            // Bare `\n` or bare `\r` (legacy Mac) line ending.
             after_brace + 1
         } else {
             after_brace // `}` at EOF

@@ -130,6 +130,45 @@ pub fn strip_bom(source: &str) -> (&str, usize) {
 }
 
 // ---------------------------------------------------------------------------
+// UTF-8 decoding for byte-oriented scanners
+// ---------------------------------------------------------------------------
+
+/// Number of bytes in the UTF-8 sequence introduced by lead byte `lead`.
+///
+/// Returns 1 for ASCII bytes (and, defensively, for stray continuation
+/// bytes that cannot legally appear in valid UTF-8 input).
+const fn utf8_seq_len(lead: u8) -> usize {
+    match lead {
+        0xF0..=0xF7 => 4,
+        0xE0..=0xEF => 3,
+        0xC0..=0xDF => 2,
+        _ => 1,
+    }
+}
+
+/// Append the whole UTF-8 character beginning at `bytes[start]` to `text` and
+/// return the index just past it.
+///
+/// The byte-at-a-time frontmatter scanners would otherwise push each byte as
+/// its own `char`, turning a multi-byte character (e.g. a CJK key) into Latin-1
+/// mojibake. Callers pass `bytes` from a `&str`, so the sequence is always
+/// valid and complete; an unexpected truncation degrades to the replacement
+/// character rather than panicking.
+pub fn push_utf8_char(text: &mut String, bytes: &[u8], start: usize) -> usize {
+    let lead = bytes[start];
+    if lead.is_ascii() {
+        text.push(char::from(lead));
+        return start + 1;
+    }
+    let end = (start + utf8_seq_len(lead)).min(bytes.len());
+    match std::str::from_utf8(&bytes[start..end]) {
+        Ok(s) => text.push_str(s),
+        Err(_) => text.push(char::REPLACEMENT_CHARACTER),
+    }
+    end
+}
+
+// ---------------------------------------------------------------------------
 // Backlink extraction helper
 // ---------------------------------------------------------------------------
 

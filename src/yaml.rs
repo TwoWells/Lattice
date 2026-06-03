@@ -152,15 +152,20 @@ impl<'a> Parser<'a> {
         self.pos - start
     }
 
-    /// Skip a newline (LF or CRLF). Returns true if a newline was consumed.
+    /// Skip a newline (`\n`, `\r\n`, or bare `\r`). Returns true if a newline
+    /// was consumed.
+    ///
+    /// Bare `\r` is a YAML 1.2 line break and must advance the cursor:
+    /// `skip_blanks_and_comments` calls this in a loop on any `\n`/`\r`, so a
+    /// bare `\r` that did not advance would spin forever.
     fn skip_newline(&mut self) -> bool {
         match self.peek() {
             Some(b'\n') => {
                 self.pos += 1;
                 true
             }
-            Some(b'\r') if self.peek_at(1) == Some(b'\n') => {
-                self.pos += 2;
+            Some(b'\r') => {
+                self.pos += if self.peek_at(1) == Some(b'\n') { 2 } else { 1 };
                 true
             }
             _ => false,

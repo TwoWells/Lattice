@@ -2484,6 +2484,103 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Encoding edge cases: symbol-name extraction (ticket 21)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn truncate_name_short_unchanged() {
+        let name = "短い名前"; // well under the limit
+        assert_eq!(
+            truncate_name(name),
+            name,
+            "names within SYMBOL_NAME_MAX are returned verbatim"
+        );
+    }
+
+    #[test]
+    fn truncate_name_multibyte_boundary_is_char_safe() {
+        // One ASCII byte shifts every `é` boundary to an odd byte offset, so
+        // the cut at SYMBOL_NAME_MAX (60, even) lands *inside* a two-byte `é`
+        // and truncation must back off to byte 59.
+        let name = format!("a{}", "é".repeat(40)); // 1 + 80 = 81 bytes
+        assert!(
+            !name.is_char_boundary(SYMBOL_NAME_MAX),
+            "test setup: byte 60 must fall mid-character"
+        );
+        let truncated = truncate_name(&name);
+        assert!(
+            std::str::from_utf8(truncated.as_bytes()).is_ok(),
+            "truncated name must remain valid UTF-8"
+        );
+        assert_eq!(
+            truncated,
+            format!("a{}…", "é".repeat(29)),
+            "cut retreats to a char boundary: 'a' + 29 whole 'é' + ellipsis"
+        );
+    }
+
+    #[test]
+    fn truncate_name_emoji_boundary_is_char_safe() {
+        // 59 ASCII bytes place the first 4-byte emoji across bytes 59..63, so
+        // the cut at byte 60 is mid-emoji and must retreat to byte 59.
+        let name = format!("{}{}", "a".repeat(59), "😀".repeat(5)); // 59 + 20 = 79 bytes
+        assert!(
+            !name.is_char_boundary(SYMBOL_NAME_MAX),
+            "test setup: byte 60 must fall mid-emoji"
+        );
+        let truncated = truncate_name(&name);
+        assert!(
+            std::str::from_utf8(truncated.as_bytes()).is_ok(),
+            "truncated emoji name must remain valid UTF-8"
+        );
+        assert_eq!(
+            truncated.matches('😀').count(),
+            0,
+            "the split emoji is dropped entirely, never emitted as partial bytes"
+        );
+        assert_eq!(
+            truncated,
+            format!("{}…", "a".repeat(59)),
+            "cut retreats to byte 59: 59 ASCII chars + ellipsis"
+        );
+    }
+
+    #[test]
+    fn code_block_language_multibyte() {
+        assert_eq!(
+            code_block_language("```日本語\ncode\n```").as_deref(),
+            Some("日本語"),
+            "a multi-byte fence info string yields the full language tag"
+        );
+    }
+
+    #[test]
+    fn code_block_language_multibyte_crlf() {
+        assert_eq!(
+            code_block_language("```日本語\r\ncode\r\n```").as_deref(),
+            Some("日本語"),
+            "CRLF after a multi-byte info string does not corrupt the language tag"
+        );
+    }
+
+    #[test]
+    fn list_item_text_multibyte() {
+        let tree = crate::block::parse_tree("- 日本語 café 😀\n", None);
+        let item = tree
+            .nodes()
+            .iter()
+            .enumerate()
+            .find(|(_, n)| matches!(n.kind, ElementKind::ListItem { .. }))
+            .map(|(id, _)| id)
+            .expect("a list item node should exist");
+        assert_eq!(
+            list_item_text(&tree, item),
+            "日本語 café 😀",
+            "multi-byte list item text is extracted intact"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // Existing tests: diagnostics and document symbols
     // -----------------------------------------------------------------------
 
