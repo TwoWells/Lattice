@@ -1213,6 +1213,32 @@ mod tests {
         assert_eq!(paras.len(), 1, "non-title line should be a paragraph");
     }
 
+    #[test]
+    fn reference_def_multiline_title_in_blockquote() {
+        // A definition whose title continues on the next line, inside a block
+        // quote: each continuation line keeps its `>` marker, which the run
+        // collector strips before joining.
+        let tree = parse("> [ref]: /url\n> \"pred\"\n");
+        let defs = find_nodes(&tree, |k| matches!(k, ElementKind::ReferenceDef { .. }));
+        assert_eq!(defs.len(), 1, "multi-line ref def inside a block quote");
+        match &tree.node(defs[0]).kind {
+            ElementKind::ReferenceDef { url, title, .. } => {
+                assert_eq!(url, "/url", "url from the first quoted line");
+                assert_eq!(title, "pred", "title from the second quoted line");
+            }
+            other => panic!("expected ReferenceDef, got {other:?}"),
+        }
+        // The definition is nested inside the block quote scope.
+        let quote = root_children(&tree)
+            .into_iter()
+            .find(|&id| matches!(tree.node(id).kind, ElementKind::QuoteBlock))
+            .expect("a block quote at the root");
+        assert!(
+            tree.children(quote).contains(&defs[0]),
+            "ref def should be a child of the block quote"
+        );
+    }
+
     // --- Nested brackets ---
 
     #[test]

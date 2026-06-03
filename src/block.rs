@@ -705,6 +705,55 @@ fn scan_title(s: &str, start: usize) -> Option<(String, usize)> {
     None
 }
 
+/// Recognize a reference-definition label at the start of `s`.
+///
+/// Matches up to three spaces of indentation, a `[label]:` that is not a
+/// footnote marker (`[^...]`), with the label on a single line (no unescaped
+/// `[`, at least one non-whitespace character, max 999 bytes). Returns the byte
+/// index just past the `:` and the raw label text, or `None`.
+///
+/// This is the cheap gate used to skip non-definitions before any allocation.
+fn scan_refdef_label(s: &str) -> Option<(usize, &str)> {
+    let bytes = s.as_bytes();
+    let len = bytes.len();
+
+    let mut i = 0;
+    while i < len && bytes[i] == b' ' {
+        i += 1;
+    }
+    if i > 3 || i >= len || bytes[i] != b'[' {
+        return None;
+    }
+    i += 1;
+    // Footnote definitions (`[^...]`) are not reference definitions.
+    if i < len && bytes[i] == b'^' {
+        return None;
+    }
+
+    // Label: up to the first unescaped `]`; no unescaped `[`; single line.
+    let label_start = i;
+    loop {
+        if i >= len {
+            return None;
+        }
+        match bytes[i] {
+            b'\\' if i + 1 < len && bytes[i + 1] < 0x80 => i += 2,
+            b']' => break,
+            b'[' | b'\n' | b'\r' => return None,
+            _ => i += 1,
+        }
+    }
+    let label = &s[label_start..i];
+    if label.trim().is_empty() || label.len() > 999 {
+        return None;
+    }
+    i += 1; // consume `]`
+    if i >= len || bytes[i] != b':' {
+        return None;
+    }
+    Some((i + 1, label))
+}
+
 /// Scan a single link reference definition from the start of `s`.
 ///
 /// `s` is the joined content of consecutive non-blank lines (each retaining its
@@ -720,42 +769,7 @@ fn scan_one_refdef(s: &str) -> Option<(usize, String, String, String)> {
     let bytes = s.as_bytes();
     let len = bytes.len();
 
-    // Up to three spaces of indentation before the label.
-    let mut i = 0;
-    while i < len && bytes[i] == b' ' {
-        i += 1;
-    }
-    if i > 3 || i >= len || bytes[i] != b'[' {
-        return None;
-    }
-    i += 1;
-    // Footnote definitions (`[^...]`) are not reference definitions.
-    if i < len && bytes[i] == b'^' {
-        return None;
-    }
-
-    // Label: up to the first unescaped `]`; no unescaped `[`; max 999 bytes.
-    let label_start = i;
-    loop {
-        if i >= len {
-            return None;
-        }
-        match bytes[i] {
-            b'\\' if i + 1 < len && bytes[i + 1] < 0x80 => i += 2,
-            b']' => break,
-            b'[' => return None,
-            _ => i += 1,
-        }
-    }
-    let label = &s[label_start..i];
-    if label.trim().is_empty() || label.len() > 999 {
-        return None;
-    }
-    i += 1; // consume `]`
-    if i >= len || bytes[i] != b':' {
-        return None;
-    }
-    i += 1;
+    let (mut i, label) = scan_refdef_label(s)?;
 
     // Whitespace (including up to one line ending) before the destination.
     i = skip_inline_ws(bytes, i);
@@ -1914,12 +1928,18 @@ impl<'a> TreeBuilder<'a> {
     }
 
     /// Pop the current scope, finalizing its span.
-    fn pop_scope(&mut self, end: usize) {
+    ///
+    /// Returns `true` if a scope was popped, `false` when refusing to pop the
+    /// root `Document`. "Pop until" drain loops rely on this signal to
+    /// terminate even if their target scope was already removed.
+    fn pop_scope(&mut self, end: usize) -> bool {
         if self.scope_stack.len() > 1
             && let Some(id) = self.scope_stack.pop()
         {
             self.nodes[id].span.end = end;
+            return true;
         }
+        false
     }
 
     /// The node ID of the current (innermost) scope.
@@ -2085,7 +2105,8 @@ impl<'a> TreeBuilder<'a> {
     fn close_list_item(&mut self, pos: usize) {
         if let Some(ctx) = self.list_stack.last() {
             let target = ctx.item_node;
-            // Pop scopes above the list item.
+            // Pop scopes above the list item. The `pop_scope` progress check
+            // bounds the loop even if `target` is no longer on the stack.
             while self.scope_stack.last().is_some_and(|&top| top != target) {
                 let top = *self.scope_stack.last().unwrap_or(&0);
                 if matches!(
@@ -2097,7 +2118,9 @@ impl<'a> TreeBuilder<'a> {
                 if self.html_stack.last().is_some_and(|hs| hs.node_id == top) {
                     self.html_stack.pop();
                 }
-                self.pop_scope(pos);
+                if !self.pop_scope(pos) {
+                    break;
+                }
             }
             // Pop the list item itself.
             self.pop_scope(pos);
@@ -2111,13 +2134,17 @@ impl<'a> TreeBuilder<'a> {
             if let ElementKind::List { ref mut tight, .. } = self.nodes[ctx.list_node].kind {
                 *tight = !ctx.loose;
             }
-            // Pop any scopes between the current top and the List node.
+            // Pop any scopes between the current top and the List node. The
+            // `pop_scope` progress check bounds the loop even if `list_node`
+            // is no longer on the stack.
             while self
                 .scope_stack
                 .last()
                 .is_some_and(|&top| top != ctx.list_node)
             {
-                self.pop_scope(pos);
+                if !self.pop_scope(pos) {
+                    break;
+                }
             }
             self.pop_scope(pos); // pop the List scope
         }
@@ -3252,13 +3279,10 @@ impl<'a> TreeBuilder<'a> {
         first_content_start: usize,
         first_raw_len: usize,
     ) -> bool {
-        // Cheap pre-check: a definition starts with up to three spaces and a
-        // `[` that is not a footnote marker.
-        let probe = first_content.trim_start_matches(' ');
-        if first_content.len() - probe.len() > 3
-            || !probe.starts_with('[')
-            || probe.starts_with("[^")
-        {
+        // Cheap gate: bail before any allocation unless the first line begins a
+        // reference-definition label (`[label]:`). This filters ordinary
+        // bracketed text (`[text][ref]`, `[link](url)`, shortcut refs).
+        if scan_refdef_label(first_content).is_none() {
             return false;
         }
 
@@ -5806,6 +5830,37 @@ mod tests {
 
         // `+ second` is a different marker → new list, not lazy continuation.
         assert_eq!(children.len(), 2, "two lists");
+    }
+
+    #[test]
+    fn blockquote_list_closed_by_lazy_list_marker() {
+        // `> - foo` opens a list inside a block quote; the unmarked `- bar`
+        // cannot lazily continue (a list marker is a block construct), so the
+        // quote and its list close and a new top-level list begins.
+        //
+        // Regression: closing the quote must keep `list_stack` in sync with
+        // `scope_stack` so the subsequent item transition does not spin
+        // popping a list item that was already removed.
+        let source = "> - foo\n- bar\n";
+        let tree = parse(source);
+        let children = root_children(&tree);
+
+        assert_eq!(children.len(), 2, "block quote then a top-level list");
+        assert!(
+            matches!(tree.node(children[0]).kind, ElementKind::QuoteBlock),
+            "first child is the block quote"
+        );
+        assert!(
+            matches!(tree.node(children[1]).kind, ElementKind::List { .. }),
+            "second child is a new top-level list"
+        );
+        // The quoted list is nested inside the block quote, not the top list.
+        let quoted_lists = tree
+            .children(children[0])
+            .iter()
+            .filter(|&&id| matches!(tree.node(id).kind, ElementKind::List { .. }))
+            .count();
+        assert_eq!(quoted_lists, 1, "one list nested in the block quote");
     }
 
     // --- Lists: marker changes ---
