@@ -973,6 +973,42 @@ proptest! {
             }
         }
     }
+
+    /// Every resolved inline resource field (link/image/video/audio `url` and
+    /// `title`) occurs verbatim in the source. The parsers slice these fields
+    /// rather than decode them, so a byte-as-char regression anywhere in the
+    /// inline or HTML-attribute path would make the field absent — the same
+    /// fidelity guarantee as for frontmatter scalars, extended to inline nodes.
+    #[test]
+    fn inline_resource_text_occurs_in_source(
+        doc in prop_oneof![
+            markdown_document(),
+            proptest::collection::vec(link_fragment(), 1..12).prop_map(|v| v.concat()),
+        ]
+    ) {
+        let tree = parse_full(&doc);
+        for node in tree.nodes() {
+            let (ElementKind::Link { url, title }
+            | ElementKind::Image { url, title }
+            | ElementKind::Video { url, title }
+            | ElementKind::Audio { url, title }) = &node.kind
+            else {
+                continue;
+            };
+            for field in [url, title] {
+                // Empty, escaped, or multi-line fields legitimately differ from
+                // any single source slice; skip them.
+                if field.is_empty() || field.contains(['\\', '\n', '\r']) {
+                    continue;
+                }
+                prop_assert!(
+                    doc.contains(field.as_str()),
+                    "resolved inline field {:?} does not occur in the source — encoding corruption",
+                    field
+                );
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

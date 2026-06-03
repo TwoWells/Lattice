@@ -2684,6 +2684,54 @@ mod tests {
         );
     }
 
+    /// Property: byte offset → LSP position → byte offset round-trips for any
+    /// source and any char-boundary offset, across `\n` / `\r\n` / bare `\r`
+    /// and multi-byte content. Pins the new line/column machinery generatively.
+    #[allow(
+        clippy::wildcard_imports,
+        reason = "proptest's prelude is its conventional import"
+    )]
+    mod position_props {
+        use super::super::{byte_offset_to_lsp_position, lsp_position_to_byte_offset};
+        use proptest::prelude::*;
+
+        /// Strings mixing ASCII, 2/3/4-byte characters, and `\n`/`\r` in any
+        /// arrangement (so `\r\n`, bare `\r`, and bare `\n` all occur).
+        fn position_source() -> impl Strategy<Value = String> {
+            proptest::collection::vec(
+                prop_oneof![
+                    (b'a'..=b'z').prop_map(char::from),
+                    Just('é'),
+                    Just('日'),
+                    Just('🎉'),
+                    Just('\n'),
+                    Just('\r'),
+                ],
+                0..40,
+            )
+            .prop_map(|cs| cs.into_iter().collect())
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(512))]
+
+            #[test]
+            fn lsp_position_byte_round_trips(src in position_source(), seed in any::<usize>()) {
+                let mut off = seed % (src.len() + 1);
+                while !src.is_char_boundary(off) {
+                    off -= 1;
+                }
+                // Skip the one degenerate case: an offset strictly inside a
+                // `\r\n` pair, which is not a stable round-trip point.
+                let b = src.as_bytes();
+                prop_assume!(!(off > 0 && b[off - 1] == b'\r' && b.get(off) == Some(&b'\n')));
+
+                let pos = byte_offset_to_lsp_position(&src, off);
+                prop_assert_eq!(lsp_position_to_byte_offset(&src, pos), off);
+            }
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Existing tests: diagnostics and document symbols
     // -----------------------------------------------------------------------
