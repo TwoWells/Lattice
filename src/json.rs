@@ -421,8 +421,16 @@ impl<'a> Parser<'a> {
                         );
                     }
 
+                    let arm_start = self.abs();
                     if let Some(entry) = self.parse_object_entry() {
                         entries.push(entry);
+                    }
+                    if self.abs() == arm_start {
+                        // Forward-progress guard: a stray `]` leaves
+                        // `skip_to_recovery` parked on a stop byte it won't
+                        // consume, so no entry is produced and nothing
+                        // advances. Skip one byte so the loop terminates.
+                        self.pos += 1;
                     }
                     expect_comma = true;
                 }
@@ -537,6 +545,12 @@ impl<'a> Parser<'a> {
                             value,
                             span: Span::new(item_start, self.abs()),
                         });
+                    }
+                    if self.abs() == item_start {
+                        // Forward-progress guard: a stray `}` inside `[...]` is
+                        // rejected by `parse_value` without consuming. Skip it
+                        // so the loop cannot spin forever allocating.
+                        self.pos += 1;
                     }
                     expect_comma = true;
                 }

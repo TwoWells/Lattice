@@ -602,8 +602,14 @@ impl<'a> Parser<'a> {
                     self.parse_inline_table();
                 }
                 _ => {
+                    let arm_start = self.pos;
                     let scalar = self.parse_value();
-                    if !scalar.text.is_empty() {
+                    if self.pos == arm_start {
+                        // Forward-progress guard: a stray `}` inside `[...]`
+                        // is rejected by `parse_value` without consuming. Skip
+                        // it so the loop cannot spin forever allocating.
+                        self.pos += 1;
+                    } else if !scalar.text.is_empty() {
                         items.push(scalar);
                     }
                 }

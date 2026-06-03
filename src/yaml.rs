@@ -525,8 +525,14 @@ impl<'a> Parser<'a> {
                 Some(b'\'') => items.push(self.parse_single_quoted()),
                 Some(b'"') => items.push(self.parse_double_quoted()),
                 _ => {
+                    let arm_start = self.pos;
                     let scalar = self.parse_plain_scalar(true);
-                    if !scalar.text.is_empty() {
+                    if self.pos == arm_start {
+                        // Forward-progress guard: a stray byte no scalar
+                        // accepts (e.g. `}` inside `[...]`) would otherwise
+                        // spin this loop forever. Skip it.
+                        self.pos += 1;
+                    } else if !scalar.text.is_empty() {
                         items.push(scalar);
                     }
                 }
@@ -564,6 +570,7 @@ impl<'a> Parser<'a> {
                 }
                 Some(b',') => self.pos += 1,
                 _ => {
+                    let arm_start = self.pos;
                     let key = self.parse_flow_key();
                     self.skip_flow_whitespace();
 
@@ -582,7 +589,15 @@ impl<'a> Parser<'a> {
                         _ => self.parse_plain_scalar(true),
                     };
 
-                    entries.push((key, value));
+                    if self.pos == arm_start {
+                        // Forward-progress guard: no sub-parser consumed
+                        // anything (e.g. a stray `]` or bare `:` that the
+                        // flow-key/value parsers reject). Skip one byte so the
+                        // loop cannot spin forever allocating empty entries.
+                        self.pos += 1;
+                    } else {
+                        entries.push((key, value));
+                    }
                 }
             }
         }
