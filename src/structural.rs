@@ -329,7 +329,7 @@ fn scan_line_for_bare_urls(
                 continue;
             }
 
-            let rest = &line[search_start - prefix.len() + idx..];
+            let rest = &line[search_start - prefix.len()..];
             let url_end = rest
                 .find(|c: char| c.is_whitespace() || c == ')' || c == ']' || c == '>')
                 .unwrap_or(rest.len());
@@ -856,29 +856,35 @@ fn emit_missing_blank_line_diagnostics(tree: &Tree, rel_path: &Path, out: &mut V
         }
 
         let before = &source[..start];
-        let prev_line_end = before.trim_end_matches('\n').trim_end_matches('\r');
-        if prev_line_end.is_empty() {
+        // Strip only the single terminator ending the line before the block
+        // (\r\n, \n, or bare \r). Stripping *all* trailing newlines collapses a
+        // blank separator line and misreports it as missing.
+        let before = before
+            .strip_suffix("\r\n")
+            .or_else(|| before.strip_suffix('\n'))
+            .or_else(|| before.strip_suffix('\r'))
+            .unwrap_or(before);
+
+        let prev_line = before
+            .rsplit_once(['\n', '\r'])
+            .map_or(before, |(_, line)| line);
+
+        if prev_line.trim().is_empty() {
             continue;
         }
 
-        let prev_line = prev_line_end
-            .rfind('\n')
-            .map_or(prev_line_end, |idx| &prev_line_end[idx + 1..]);
-
-        if !prev_line.trim().is_empty() {
-            // Don't flag after frontmatter closing delimiter.
-            if prev_line.trim() == "---" && start < 100 {
-                continue;
-            }
-
-            let line = block::byte_offset_to_line(source, start);
-            out.push(Diagnostic {
-                file: rel_path.to_path_buf(),
-                line,
-                severity: Severity::Hint,
-                message: "missing blank line before block element".to_string(),
-            });
+        // Don't flag after a frontmatter closing delimiter.
+        if prev_line.trim() == "---" && start < 100 {
+            continue;
         }
+
+        let line = block::byte_offset_to_line(source, start);
+        out.push(Diagnostic {
+            file: rel_path.to_path_buf(),
+            line,
+            severity: Severity::Hint,
+            message: "missing blank line before block element".to_string(),
+        });
     }
 }
 
@@ -1128,6 +1134,20 @@ mod tests {
         );
     }
 
+    // Regression: issue 006 — a bare URL past the midpoint of its line drove
+    // `scan_line_for_bare_urls` to slice at `2*idx`, an out-of-bounds byte
+    // index that aborted the LSP. It must warn, not panic.
+    #[test]
+    fn bare_url_past_line_midpoint_no_panic() {
+        let diags =
+            diagnose("A long line of filler text before the link, then https://example.com\n");
+        assert_eq!(
+            count_matching(&diags, Severity::Warning, "bare URL"),
+            1,
+            "one warning for bare URL past line midpoint: {diags:?}"
+        );
+    }
+
     // -- Error recovery --
 
     #[test]
@@ -1313,6 +1333,41 @@ mod tests {
             ),
             1,
             "one warning for markdown in opaque HTML: {diags:?}"
+        );
+    }
+
+    // -- Missing blank line before block --
+
+    // Regression: issue 010 — a block separated from prior content by a blank
+    // line must NOT flag. `trim_end_matches('\n')` collapsed the blank line and
+    // misreported it as missing on essentially every well-formed document.
+    #[test]
+    fn list_after_blank_line_no_missing_blank_hint() {
+        let diags = diagnose("Intro paragraph.\n\n- item one\n- item two\n");
+        assert_eq!(
+            count_matching(&diags, Severity::Hint, "missing blank line"),
+            0,
+            "blank line is present, no hint expected: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn block_flush_against_prior_block_flags_missing_blank() {
+        let diags = diagnose("## Heading\n- item one\n");
+        assert_eq!(
+            count_matching(&diags, Severity::Hint, "missing blank line"),
+            1,
+            "list flush against heading, one hint expected: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn block_after_blank_line_crlf_no_missing_blank_hint() {
+        let diags = diagnose("Intro paragraph.\r\n\r\n## Heading\r\n");
+        assert_eq!(
+            count_matching(&diags, Severity::Hint, "missing blank line"),
+            0,
+            "CRLF blank line is present, no hint expected: {diags:?}"
         );
     }
 }
