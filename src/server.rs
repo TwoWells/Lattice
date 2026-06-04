@@ -121,10 +121,10 @@ pub fn run() -> Result<()> {
         "documentLinkProvider": {},
         "foldingRangeProvider": true,
         "hoverProvider": true,
-        "diagnosticProvider": {
-            "interFileDependencies": true,
-            "workspaceDiagnostics": true
-        },
+        // Diagnostics are push-only. A server that advertises pull
+        // (`diagnosticProvider`) *and* pushes `publishDiagnostics` makes
+        // spec-compliant clients (e.g. Neovim 0.11) render every diagnostic
+        // twice, so pull is intentionally not advertised here.
         "documentFormattingProvider": true,
         "workspace": {
             "workspaceFolders": {
