@@ -16,6 +16,40 @@ lattice lint
 lattice serve
 ```
 
+## Neovim
+
+Lattice is not shipped by `nvim-lspconfig`, so configure it directly.
+On Neovim 0.11+:
+
+```lua
+vim.lsp.config.lattice = {
+  cmd = { "lattice", "serve" },
+  filetypes = { "markdown" },
+  root_markers = { ".lattice.toml", ".git" },
+}
+vim.lsp.enable("lattice")
+```
+
+Diagnostics appear inline on open, change, and save. Lattice is
+diagnostic-first, but the server also answers document/workspace
+symbols, references, rename, hover, folding, and document links over
+the predicate graph.
+
+On Neovim older than 0.11, start it per buffer instead:
+
+```lua
+vim.api.nvim_create_autocmd("FileType", {
+  pattern = "markdown",
+  callback = function(args)
+    vim.lsp.start({
+      name = "lattice",
+      cmd = { "lattice", "serve" },
+      root_dir = vim.fs.root(args.buf, { ".lattice.toml", ".git" }),
+    })
+  end,
+})
+```
+
 ## Git hook
 
 Add to `.githooks/pre-commit` or `.git/hooks/pre-commit`:
