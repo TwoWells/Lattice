@@ -883,8 +883,52 @@ fn emit_missing_blank_line_diagnostics(tree: &Tree, rel_path: &Path, out: &mut V
             file: rel_path.to_path_buf(),
             line,
             severity: Severity::Hint,
-            message: "missing blank line before block element".to_string(),
+            message: missing_blank_message(&node.kind, source, node.span),
         });
+    }
+}
+
+/// Build the "missing blank line" message.
+///
+/// For an HTML block, report which of the `CommonMark` start conditions
+/// (types 1–7) opened it, and name the tag when there is one. An
+/// inline-looking line such as `<link …>` that begins a continuation line
+/// interrupts the paragraph as a type-1–6 HTML block (spec example 185);
+/// spelling out "type 6 HTML block start" keeps the hint from reading as a
+/// false positive when the author meant inline content (e.g. text inside a
+/// code span that the block boundary split). Types 2–5 (comment, PI,
+/// declaration, CDATA) are nameless, so they report the type and kind only.
+fn missing_blank_message(kind: &ElementKind, source: &str, span: Span) -> String {
+    const BASE: &str = "missing blank line before block element";
+    if !matches!(kind, ElementKind::HtmlBlock) {
+        return BASE.to_string();
+    }
+    let first_line = source[span.start..]
+        .split(['\n', '\r'])
+        .next()
+        .unwrap_or("");
+    let Some(html_type) = block::html_block_start(first_line) else {
+        return format!("{BASE} (starts an HTML block)");
+    };
+    block::extract_html_tag_name(first_line.trim_start()).map_or_else(
+        || {
+            format!(
+                "{BASE} (type {html_type} HTML block start: {})",
+                html_block_kind(html_type)
+            )
+        },
+        |tag| format!("{BASE} (`<{tag}>` is a type {html_type} HTML block start)"),
+    )
+}
+
+/// Human label for the nameless HTML block start conditions (types 2–5).
+const fn html_block_kind(html_type: u8) -> &'static str {
+    match html_type {
+        2 => "comment",
+        3 => "processing instruction",
+        4 => "declaration",
+        5 => "CDATA",
+        _ => "HTML",
     }
 }
 
@@ -1368,6 +1412,45 @@ mod tests {
             count_matching(&diags, Severity::Hint, "missing blank line"),
             0,
             "CRLF blank line is present, no hint expected: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn html_block_missing_blank_names_the_tag() {
+        // `<link>` is a block-level (type-6) tag, so it interrupts the
+        // paragraph and starts an HTML block. The hint must name the tag and
+        // its type so it reads as an explanation, not a false positive.
+        let diags = diagnose("A paragraph line\n<link rel=\"x\">\n");
+        let hints: Vec<&Diagnostic> = diags
+            .iter()
+            .filter(|d| d.severity == Severity::Hint && d.message.contains("missing blank line"))
+            .collect();
+        assert_eq!(hints.len(), 1, "one missing-blank hint expected: {diags:?}");
+        assert!(
+            hints[0]
+                .message
+                .contains("`<link>` is a type 6 HTML block start"),
+            "hint should name the HTML tag and type, got: {}",
+            hints[0].message
+        );
+    }
+
+    #[test]
+    fn html_block_missing_blank_reports_nameless_opener() {
+        // A comment (type 2) is a nameless HTML block start. The hint reports
+        // the type and kind rather than a tag name.
+        let diags = diagnose("A paragraph line\n<!-- a comment -->\n");
+        let hints: Vec<&Diagnostic> = diags
+            .iter()
+            .filter(|d| d.severity == Severity::Hint && d.message.contains("missing blank line"))
+            .collect();
+        assert_eq!(hints.len(), 1, "one missing-blank hint expected: {diags:?}");
+        assert!(
+            hints[0]
+                .message
+                .contains("type 2 HTML block start: comment"),
+            "nameless opener should report its type and kind, got: {}",
+            hints[0].message
         );
     }
 }
