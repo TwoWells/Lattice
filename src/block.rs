@@ -1163,7 +1163,7 @@ fn block_math_close(line: &str) -> bool {
 ///
 /// Returns the type number (1–7) if the line starts an HTML block, or
 /// `None` otherwise.
-fn html_block_start(line: &str) -> Option<u8> {
+pub fn html_block_start(line: &str) -> Option<u8> {
     let trimmed = line.trim_start_matches(' ');
     let indent = line.len() - trimmed.len();
     if indent > 3 {
@@ -1228,7 +1228,7 @@ fn html_block_start(line: &str) -> Option<u8> {
 }
 
 /// Extract the tag name from an HTML-like line, lowercased.
-fn extract_html_tag_name(line: &str) -> Option<String> {
+pub fn extract_html_tag_name(line: &str) -> Option<String> {
     let rest = line.strip_prefix('<')?;
     let rest = rest.strip_prefix('/').unwrap_or(rest);
 
@@ -1653,15 +1653,16 @@ fn split_table_cells(line: &str, row_start: usize) -> Vec<Span> {
 
     while i < bytes.len() {
         if bytes[i] == b'`' {
-            // Skip backtick code span.
-            let bt_count = bytes[i..].iter().take_while(|&&b| b == b'`').count();
+            // Skip a backtick code span. Per CommonMark a span opened by a run
+            // of N backticks closes only on the next run of *exactly* N; a
+            // longer inner run (e.g. ``` inside a `` span) is literal content
+            // and must not be mistaken for the close. A plain substring search
+            // for N backticks would match the first N of a longer run, desync,
+            // and swallow `|` delimiters past the real close.
+            let bt_count = crate::inline::count_char(bytes, i, b'`');
             let after = i + bt_count;
-            // Find matching closing backticks.
-            if let Some(close_pos) = inner[after..].find(&inner[i..i + bt_count]) {
-                i = after + close_pos + bt_count;
-            } else {
-                i = bytes.len();
-            }
+            i = crate::inline::find_closing_backticks(bytes, after, bt_count)
+                .unwrap_or(bytes.len());
         } else if bytes[i] == b'\\' && i + 1 < bytes.len() && bytes[i + 1] == b'|' {
             // Escaped pipe — skip both characters.
             i += 2;
@@ -1718,13 +1719,12 @@ fn is_table_row(line: &str) -> bool {
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'`' {
-            let bt_count = bytes[i..].iter().take_while(|&&b| b == b'`').count();
+            // Same exact-length backtick-run close as `split_table_cells`; a
+            // longer inner run must not be mistaken for the closing run.
+            let bt_count = crate::inline::count_char(bytes, i, b'`');
             let after = i + bt_count;
-            if let Some(close_pos) = line[after..].find(&line[i..i + bt_count]) {
-                i = after + close_pos + bt_count;
-            } else {
-                i = bytes.len();
-            }
+            i = crate::inline::find_closing_backticks(bytes, after, bt_count)
+                .unwrap_or(bytes.len());
         } else if bytes[i] == b'\\' && i + 1 < bytes.len() && bytes[i + 1] == b'|' {
             i += 2;
         } else if bytes[i] == b'|' {
@@ -6677,6 +6677,31 @@ mod tests {
             body_cells.len(),
             1,
             "pipe in double-backtick code does not split"
+        );
+    }
+
+    #[test]
+    fn table_cell_double_backtick_wraps_longer_run() {
+        // A `` span containing a longer ``` run closes at the next `` — the
+        // inner triple-backtick run is literal content. The `|` delimiters
+        // outside the span must still split all three cells. Regression for the
+        // splitter matching the first N backticks of a longer run and merging
+        // the trailing cells.
+        let source = "| A | B | C |\n|---|---|---|\n| Code block | `` ``` `` | `Object` |\n";
+        let tree = parse(source);
+        let children = root_children(&tree);
+        let rows = tree.children(children[0]);
+
+        let body_cells = tree.children(rows[1]);
+        assert_eq!(
+            body_cells.len(),
+            3,
+            "double-backtick span wrapping a longer run must not swallow pipes"
+        );
+        assert_eq!(
+            tree.text(&tree.node(body_cells[1]).span),
+            "`` ``` ``",
+            "middle cell is the full code span, not merged with the next cell"
         );
     }
 
