@@ -711,6 +711,12 @@ fn parse_dest_url(text: &str, bytes: &[u8], start: usize) -> Option<(String, usi
         let mut paren_depth: i32 = 0;
         while i < bytes.len() {
             match bytes[i] {
+                // A bare destination never contains a line ending. CommonMark
+                // allows the title to follow on the next line (separated by up
+                // to one line ending), so the destination ends here regardless
+                // of paren depth — otherwise the newline and the title text get
+                // swallowed into the URL.
+                b'\n' | b'\r' => break,
                 b' ' | b'\t' | b')' if paren_depth == 0 => break,
                 b'(' => {
                     paren_depth += 1;
@@ -879,6 +885,30 @@ mod tests {
             ElementKind::Link { url, title } => {
                 assert_eq!(url, "url", "link url");
                 assert_eq!(title, "predicate", "link title");
+            }
+            other => panic!("expected Link, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inline_link_title_on_continuation_line() {
+        // CommonMark separates the title from the destination by spaces, tabs,
+        // and up to one line ending. The bare destination must stop at the
+        // newline and not swallow it plus the title text. Regression for a
+        // false `link target does not exist` on multi-line links.
+        let tree = parse("see ([18](18_commonmark_conformance.md\n\"references\")) ok\n");
+        let links = find_nodes(&tree, |k| matches!(k, ElementKind::Link { .. }));
+        assert_eq!(links.len(), 1, "should find one link");
+        match &tree.node(links[0]).kind {
+            ElementKind::Link { url, title } => {
+                assert_eq!(
+                    url, "18_commonmark_conformance.md",
+                    "destination stops at the line ending, not swallowing the title"
+                );
+                assert_eq!(
+                    title, "references",
+                    "title parsed from the continuation line"
+                );
             }
             other => panic!("expected Link, got {other:?}"),
         }
