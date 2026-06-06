@@ -18,17 +18,19 @@ use crate::workspace::Workspace;
 /// Run all validation checks on the workspace rooted at `start`.
 ///
 /// Structural diagnostics always run. Graph diagnostics require
-/// `.lattice.toml`. Writes diagnostics to `out` and returns `true`
-/// if any error-level diagnostics were emitted.
+/// `.lattice.toml`. Writes diagnostics to `out` and returns `true` if the run
+/// should fail the exit code: any error-level diagnostic, or — when `strict`
+/// is set — any warning-level diagnostic. Info/hint diagnostics never fail
+/// the exit code.
 ///
 /// # Errors
 ///
 /// Returns an error if the workspace cannot be scanned or output cannot
 /// be written.
-pub fn run(start: &Path, out: &mut impl Write) -> Result<bool> {
+pub fn run(start: &Path, strict: bool, out: &mut impl Write) -> Result<bool> {
     let workspace = Workspace::scan(start).context("failed to scan workspace")?;
 
-    let mut has_errors = false;
+    let mut failed = false;
     let mut diagnostics = Vec::new();
 
     // Structural diagnostics: always run.
@@ -62,7 +64,7 @@ pub fn run(start: &Path, out: &mut impl Write) -> Result<bool> {
         // Config errors are hard failures in CLI mode.
         if let Some(config_err) = workspace.config_error() {
             let _ = writeln!(out, ".lattice.toml: error: {config_err}");
-            has_errors = true;
+            failed = true;
         }
         diagnostics.extend(validation::collect_all(&workspace));
     } else {
@@ -75,13 +77,15 @@ pub fn run(start: &Path, out: &mut impl Write) -> Result<bool> {
     diagnostics.sort_by(|a, b| a.file.cmp(&b.file).then(a.line.cmp(&b.line)));
 
     for diag in &diagnostics {
-        if diag.severity == Severity::Error {
-            has_errors = true;
+        let gates =
+            diag.severity == Severity::Error || (strict && diag.severity == Severity::Warning);
+        if gates {
+            failed = true;
         }
         writeln!(out, "{}", format_diagnostic(diag))?;
     }
 
-    Ok(has_errors)
+    Ok(failed)
 }
 
 /// Format a diagnostic in `path:line: severity: message` format.
@@ -129,12 +133,17 @@ mod tests {
         dir
     }
 
-    /// Run lint on a temp dir and return (`has_errors`, output).
+    /// Run lint on a temp dir and return (`failed`, output).
     fn run_lint(dir: &TempDir) -> (bool, String) {
+        run_lint_with(dir, false)
+    }
+
+    /// Run lint on a temp dir with an explicit `strict` flag.
+    fn run_lint_with(dir: &TempDir, strict: bool) -> (bool, String) {
         let mut buf = Vec::new();
-        let has_errors = run(dir.path(), &mut buf).expect("run should succeed");
+        let failed = run(dir.path(), strict, &mut buf).expect("run should succeed");
         let output = String::from_utf8(buf).expect("output should be utf-8");
-        (has_errors, output)
+        (failed, output)
     }
 
     #[test]
@@ -256,6 +265,31 @@ mod tests {
         assert!(
             !output.contains("error:"),
             "output should not contain error diagnostics: {output}"
+        );
+    }
+
+    #[test]
+    fn strict_gates_warnings() {
+        // Same fixture as `warnings_only_exit_zero`: a missing backlink is a
+        // warning. Under --strict it must fail the exit code while staying a
+        // warning-level diagnostic in the output.
+        let dir = setup(&[
+            (".lattice.toml", ""),
+            ("a.md", "[b](b.md \"references\")\n"),
+            ("b.md", "# B\n"),
+        ]);
+        let (failed, output) = run_lint_with(&dir, true);
+        assert!(
+            failed,
+            "strict mode should fail the exit code on warnings: {output}"
+        );
+        assert!(
+            output.contains("warning:"),
+            "the gated diagnostic should still print as a warning: {output}"
+        );
+        assert!(
+            !output.contains("error:"),
+            "strict gating must not relabel warnings as errors: {output}"
         );
     }
 
