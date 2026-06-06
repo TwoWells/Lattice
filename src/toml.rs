@@ -22,10 +22,14 @@ use crate::span::Span;
 // ---------------------------------------------------------------------------
 
 /// Find the opening `+++` delimiter at byte 0 (after BOM).
+///
+/// Recognizes `\n`, `\r\n`, and bare `\r` (legacy-Mac) line endings; the
+/// `\r\n` form is checked first so its trailing `\n` is not mistaken for the
+/// start of the content.
 fn find_opening(source: &str) -> Option<usize> {
     if source.starts_with("+++\r\n") {
         Some(5)
-    } else if source.starts_with("+++\n") {
+    } else if source.starts_with("+++\n") || source.starts_with("+++\r") {
         Some(4)
     } else {
         None
@@ -39,7 +43,9 @@ fn find_closing(rest: &str) -> Option<usize> {
         let candidate = rest[search_from..].find("+++")?;
         let abs_pos = search_from + candidate;
 
-        let at_line_start = abs_pos == 0 || rest.as_bytes().get(abs_pos - 1) == Some(&b'\n');
+        // A line start follows `\n` (covers `\n` and `\r\n`) or a bare `\r`.
+        let prev = abs_pos.checked_sub(1).and_then(|i| rest.as_bytes().get(i));
+        let at_line_start = abs_pos == 0 || prev == Some(&b'\n') || prev == Some(&b'\r');
         if !at_line_start {
             search_from = abs_pos + 3;
             continue;
@@ -1221,7 +1227,7 @@ pub fn parse_frontmatter_block(source: &str) -> Option<FrontmatterBlock> {
 
     let closing_line_len = if rest[closing_pos..].starts_with("+++\r\n") {
         5
-    } else if rest[closing_pos..].starts_with("+++\n") {
+    } else if rest[closing_pos..].starts_with("+++\n") || rest[closing_pos..].starts_with("+++\r") {
         4
     } else {
         3 // `+++` at EOF
@@ -1737,6 +1743,25 @@ mod tests {
             bl.get("superseded_by"),
             Some(&vec!["a.md".to_string()]),
             "CRLF backlinks"
+        );
+    }
+
+    #[test]
+    fn bare_cr_line_endings() {
+        // A pure legacy-Mac (bare `\r`) document: the `+++\r` opener and
+        // closer must be recognized so the frontmatter is detected.
+        let source = "+++\r[backlinks]\rsuperseded_by = [\"a.md\"]\r+++\r";
+        let block = parse_frontmatter_block(source).expect("bare CR frontmatter should parse");
+        assert_eq!(
+            block.span.end,
+            source.len(),
+            "block span includes the bare-CR closing delimiter and its `\\r`"
+        );
+        let bl = extract_backlinks(&block, source);
+        assert_eq!(
+            bl.get("superseded_by"),
+            Some(&vec!["a.md".to_string()]),
+            "bare CR backlinks"
         );
     }
 

@@ -7,7 +7,7 @@
 //! target existence, predicate vocabulary, predicate policy compliance,
 //! and frontmatter backlink reconciliation.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use crate::block::{self, HeadingId, LinkKind};
@@ -218,15 +218,35 @@ pub fn validate_backlinks(workspace: &Workspace) -> Vec<Diagnostic> {
     diagnostics
 }
 
+/// Location of the forward link in a source document that creates a backlink
+/// expectation.
+///
+/// Carried so a missing-backlink diagnostic can anchor on the *source* link
+/// (the present artifact) rather than on the target's absent frontmatter
+/// entry. When a source links to the same target more than once with the same
+/// predicate, the earliest link is kept.
+#[derive(Debug, Clone, Copy)]
+struct ExpectedSource {
+    /// 1-based line of the forward link in the source document.
+    line: usize,
+    /// Byte span of the forward link in the source document.
+    span: Span,
+}
+
+/// Map from a target file to its expected backlinks.
+///
+/// `target file → { inverse predicate → { source file → forward-link
+/// location } }`. All paths are workspace-relative.
+type ExpectedBacklinks = HashMap<PathBuf, HashMap<String, BTreeMap<PathBuf, ExpectedSource>>>;
+
 /// Build expected backlinks from all forward links in the workspace.
 ///
-/// Returns a map: target file → { inverse predicate → set of source files }.
-/// All paths are workspace-relative.
-fn build_expected_backlinks(
-    workspace: &Workspace,
-) -> HashMap<PathBuf, HashMap<String, BTreeSet<PathBuf>>> {
+/// Returns a map keyed by target file. Each source carries the position of
+/// the forward link that created the expectation, so missing-backlink
+/// diagnostics can anchor on the source.
+fn build_expected_backlinks(workspace: &Workspace) -> ExpectedBacklinks {
     let config = workspace.config();
-    let mut expected: HashMap<PathBuf, HashMap<String, BTreeSet<PathBuf>>> = HashMap::new();
+    let mut expected: ExpectedBacklinks = HashMap::new();
 
     for (source_path, file_data) in workspace.files() {
         let links = file_data.tree.links(source_path);
@@ -248,7 +268,21 @@ fn build_expected_backlinks(
                     .or_default()
                     .entry(inverse.to_string())
                     .or_default()
-                    .insert(source_path.clone());
+                    .entry(source_path.clone())
+                    .and_modify(|loc| {
+                        // Keep the earliest link when a source links a target
+                        // more than once under the same predicate.
+                        if link.line < loc.line {
+                            *loc = ExpectedSource {
+                                line: link.line,
+                                span: link.span,
+                            };
+                        }
+                    })
+                    .or_insert(ExpectedSource {
+                        line: link.line,
+                        span: link.span,
+                    });
             }
         }
     }
@@ -293,20 +327,22 @@ fn file_relative(from: &Path, to: &Path) -> PathBuf {
 }
 
 /// Emit warnings for expected backlinks missing from frontmatter.
+///
+/// The diagnostic anchors on the *source* document at the forward link — the
+/// present artifact — rather than on the target's absent frontmatter entry.
+/// This puts the warning on the file an agent is editing when it adds the
+/// link, giving it an entry point to walk the graph to the target. The fix
+/// still belongs in the target's frontmatter; the message names it.
 fn check_missing_backlinks(
     workspace: &Workspace,
-    expected: &HashMap<PathBuf, HashMap<String, BTreeSet<PathBuf>>>,
+    expected: &ExpectedBacklinks,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     for (target_path, expected_backlinks) in expected {
-        let file_data = workspace.file(target_path);
-        let actual = file_data
+        let actual = workspace
+            .file(target_path)
             .and_then(|f| f.frontmatter.as_ref())
             .map(|fm| &fm.backlinks);
-
-        let line = file_data
-            .and_then(|f| f.frontmatter.as_ref())
-            .map_or(1, |fm| fm.start_line);
 
         for (inverse_pred, expected_sources) in expected_backlinks {
             let actual_sources: BTreeSet<PathBuf> = actual
@@ -319,18 +355,18 @@ fn check_missing_backlinks(
                 })
                 .unwrap_or_default();
 
-            for source in expected_sources {
+            for (source, loc) in expected_sources {
                 if !actual_sources.contains(source) {
-                    let rel = file_relative(target_path, source);
+                    let rel = file_relative(source, target_path);
                     diagnostics.push(Diagnostic {
-                        file: target_path.clone(),
-                        line,
+                        file: source.clone(),
+                        line: loc.line,
                         severity: Severity::Warning,
                         message: format!(
-                            "expected backlink `{inverse_pred}` from `{}`",
+                            "expected backlink `{inverse_pred}` in `{}`",
                             rel.display()
                         ),
-                        span: None,
+                        span: Some(loc.span),
                     });
                 }
             }
@@ -341,7 +377,7 @@ fn check_missing_backlinks(
 /// Emit warnings for frontmatter backlinks with no corresponding forward link.
 fn check_stale_backlinks(
     workspace: &Workspace,
-    expected: &HashMap<PathBuf, HashMap<String, BTreeSet<PathBuf>>>,
+    expected: &ExpectedBacklinks,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     for (file_path, file_data) in workspace.files() {
@@ -356,7 +392,7 @@ fn check_stale_backlinks(
 
             for source_str in sources {
                 let resolved = resolve_backlink_path(file_path, source_str);
-                let is_expected = expected_sources.is_some_and(|set| set.contains(&resolved));
+                let is_expected = expected_sources.is_some_and(|set| set.contains_key(&resolved));
 
                 if !is_expected {
                     diagnostics.push(Diagnostic {
@@ -746,14 +782,48 @@ backlinks:
             warnings[0].message
         );
         assert!(
-            warnings[0].message.contains("index.md"),
-            "message names the source file: {}",
+            warnings[0].message.contains("target.md"),
+            "message names the target file the backlink belongs in: {}",
             warnings[0].message
         );
         assert_eq!(
             warnings[0].file,
-            Path::new("target.md"),
-            "diagnostic is on the target file"
+            Path::new("index.md"),
+            "diagnostic anchors on the source (the forward link), not the target"
+        );
+    }
+
+    #[test]
+    fn missing_backlink_anchors_on_source_link_line() {
+        // The forward link sits on line 3 of the source. The missing-backlink
+        // diagnostic must point there (with a span), not at the target.
+        let (_dir, ws) = setup_workspace(&[
+            (
+                "index.md",
+                "# Index\n\n[target](target.md \"supersedes\")\n",
+            ),
+            ("target.md", "# Target\n"),
+        ]);
+
+        let diags = validate_backlinks(&ws);
+        let warnings: Vec<_> = diags
+            .iter()
+            .filter(|d| d.severity == Severity::Warning)
+            .collect();
+
+        assert_eq!(warnings.len(), 1, "one warning for missing backlink");
+        assert_eq!(
+            warnings[0].file,
+            Path::new("index.md"),
+            "diagnostic anchors on the source file"
+        );
+        assert_eq!(
+            warnings[0].line, 3,
+            "diagnostic anchors on the forward-link line, not line 1"
+        );
+        assert!(
+            warnings[0].span.is_some(),
+            "diagnostic carries the forward link's span"
         );
     }
 
@@ -857,9 +927,14 @@ backlinks:
             1,
             "one missing backlink (a.md present, b.md missing): {warnings:?}"
         );
+        assert_eq!(
+            warnings[0].file,
+            Path::new("b.md"),
+            "warning anchors on the source with the missing backlink (b.md): {warnings:?}"
+        );
         assert!(
-            warnings[0].message.contains("b.md"),
-            "warning is about the missing source: {}",
+            warnings[0].message.contains("target.md"),
+            "message names the target the backlink belongs in: {}",
             warnings[0].message
         );
     }
@@ -932,9 +1007,12 @@ backlinks:
 
     #[test]
     fn missing_backlink_message_shows_file_relative_path() {
+        // Source in a subdirectory links up to a root target. The message
+        // (now on the source) names the target relative to the source, so the
+        // file-relative `..` rendering must survive.
         let (_dir, ws) = setup_workspace(&[
-            ("index.md", r#"[api](docs/api.md "supersedes")"#),
-            ("docs/api.md", "# API\n"),
+            ("docs/guide.md", r#"[readme](../README.md "supersedes")"#),
+            ("README.md", "# README\n"),
         ]);
 
         let diags = validate_backlinks(&ws);
@@ -944,9 +1022,14 @@ backlinks:
             .collect();
 
         assert_eq!(warnings.len(), 1, "one warning for missing backlink");
+        assert_eq!(
+            warnings[0].file,
+            Path::new("docs/guide.md"),
+            "diagnostic anchors on the source"
+        );
         assert!(
-            warnings[0].message.contains("../index.md"),
-            "message shows file-relative path, not workspace-relative: {}",
+            warnings[0].message.contains("../README.md"),
+            "message shows file-relative path to the target, not workspace-relative: {}",
             warnings[0].message
         );
     }

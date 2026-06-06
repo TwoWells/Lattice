@@ -15,7 +15,8 @@ use anyhow::{Context, Result};
 use lsp_server::{Connection, Message, Notification, Response};
 
 use crate::block::{
-    ElementKind, Heading, HeadingId, LinkKind, NodeId, Syntax, Tree, normalize_label,
+    ElementKind, Heading, HeadingId, LinkKind, NodeId, Syntax, Tree, content_lines, first_line,
+    normalize_label,
 };
 use crate::lsp;
 use crate::span::Span;
@@ -589,8 +590,7 @@ fn link_display_text(raw: &str) -> String {
 
 /// Extract the language tag from a fenced code block.
 fn code_block_language(raw: &str) -> Option<String> {
-    let first_line = raw.lines().next().unwrap_or("");
-    let trimmed = first_line.trim();
+    let trimmed = first_line(raw).trim();
     // Fenced: ```lang or ~~~lang
     if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
         let fence_char = &trimmed[..1];
@@ -612,8 +612,7 @@ fn code_block_language(raw: &str) -> Option<String> {
 
 /// Extract the title (info string after the language) from a fenced code block.
 fn code_block_title(raw: &str) -> Option<String> {
-    let first_line = raw.lines().next().unwrap_or("");
-    let trimmed = first_line.trim();
+    let trimmed = first_line(raw).trim();
     if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
         let fence_char = trimmed.chars().next().unwrap_or('`');
         let after_fence = trimmed.trim_start_matches(fence_char);
@@ -652,8 +651,7 @@ fn details_summary_text(tree: &Tree, details_id: NodeId) -> String {
 
 /// Extract the tag name from a generic container's opening tag.
 fn container_tag_name(raw: &str) -> String {
-    let first_line = raw.lines().next().unwrap_or("");
-    let trimmed = first_line.trim();
+    let trimmed = first_line(raw).trim();
     if let Some(after) = trimmed.strip_prefix('<') {
         let end = after
             .find(|c: char| c.is_whitespace() || c == '>' || c == '/')
@@ -669,8 +667,7 @@ fn list_item_text(tree: &Tree, item_id: NodeId) -> String {
     let source = tree.source();
     let raw = &source[node.span.start..node.span.end];
 
-    let first_line = raw.lines().next().unwrap_or("");
-    let trimmed = first_line.trim_start();
+    let trimmed = first_line(raw).trim_start();
 
     // Strip list marker and optional task checkbox
     let text = if trimmed.starts_with("- [")
@@ -1933,7 +1930,7 @@ fn hover_preview(
 /// Build a ~5 line preview from the target file content.
 fn build_hover_preview(target_data: &crate::workspace::FileData, fragment: Option<&str>) -> String {
     let content = target_data.tree.source();
-    let lines: Vec<&str> = content.lines().collect();
+    let lines: Vec<&str> = content_lines(content).collect();
     let headings = target_data.tree.headings();
 
     // Determine the start line for the preview.
@@ -2630,6 +2627,26 @@ mod tests {
             code_block_language("```日本語\r\ncode\r\n```").as_deref(),
             Some("日本語"),
             "CRLF after a multi-byte info string does not corrupt the language tag"
+        );
+    }
+
+    #[test]
+    fn code_block_language_bare_cr() {
+        // A pure bare-CR document: the language tag must not fold in the
+        // following lines (`str::lines` would not break on the bare CR).
+        assert_eq!(
+            code_block_language("```rust\rcode\r```").as_deref(),
+            Some("rust"),
+            "bare CR after the info string does not fold later lines into the tag"
+        );
+    }
+
+    #[test]
+    fn container_tag_name_bare_cr() {
+        assert_eq!(
+            container_tag_name("<details>\rmore\r</details>"),
+            "details",
+            "bare CR after the opening tag does not corrupt the tag name"
         );
     }
 

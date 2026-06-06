@@ -4084,6 +4084,56 @@ fn line_content_end(source: &str, start: usize) -> usize {
         .map_or(source.len(), |p| start + p)
 }
 
+/// The first line of `source`, with no trailing line ending.
+///
+/// Equivalent to `source.lines().next().unwrap_or("")` except it also breaks
+/// on a bare `\r` (legacy-Mac line ending), which [`str::lines`] leaves
+/// embedded in the line. Returns `""` for empty input.
+#[must_use]
+pub fn first_line(source: &str) -> &str {
+    &source[..line_content_end(source, 0)]
+}
+
+/// Iterator over the content of each line in `source`, with the trailing line
+/// ending removed. See [`content_lines`].
+struct ContentLines<'a> {
+    source: &'a str,
+    pos: usize,
+}
+
+impl<'a> Iterator for ContentLines<'a> {
+    type Item = &'a str;
+
+    fn next(&mut self) -> Option<&'a str> {
+        if self.pos >= self.source.len() {
+            return None;
+        }
+        let bytes = self.source.as_bytes();
+        let end = line_content_end(self.source, self.pos);
+        let content = &self.source[self.pos..end];
+        self.pos = if end >= self.source.len() {
+            end
+        } else if bytes[end] == b'\r' && bytes.get(end + 1) == Some(&b'\n') {
+            end + 2
+        } else {
+            end + 1
+        };
+        Some(content)
+    }
+}
+
+/// Iterate the content of each line in `source` (no trailing line ending).
+///
+/// Like [`str::lines`] — a trailing line ending does not yield a final empty
+/// line, and `""` yields nothing — but also splits on a bare `\r` (legacy-Mac
+/// line ending). Line boundaries match the parser's own line counting, so an
+/// index into this iterator aligns with a 0-based parser line number.
+///
+/// The returned iterator is `#[must_use]` via the `Iterator` trait.
+pub fn content_lines(source: &str) -> impl Iterator<Item = &str> {
+    ContentLines { source, pos: 0 }
+}
+
 // ---------------------------------------------------------------------------
 // Consumer helpers
 // ---------------------------------------------------------------------------
@@ -4774,6 +4824,46 @@ mod tests {
             line_content_end("abcd", 0),
             4,
             "runs to end of input when there is no line ending"
+        );
+    }
+
+    #[test]
+    fn first_line_breaks_on_all_endings() {
+        assert_eq!(first_line("ab\ncd"), "ab", "breaks on LF");
+        assert_eq!(first_line("ab\r\ncd"), "ab", "breaks on CRLF");
+        assert_eq!(first_line("ab\rcd"), "ab", "breaks on bare CR");
+        assert_eq!(first_line("ab"), "ab", "whole string when no ending");
+        assert_eq!(first_line(""), "", "empty input yields empty first line");
+    }
+
+    #[test]
+    fn content_lines_matches_str_lines_plus_bare_cr() {
+        fn collect(s: &str) -> Vec<&str> {
+            content_lines(s).collect()
+        }
+
+        // Matches `str::lines` for the common cases.
+        assert_eq!(collect(""), Vec::<&str>::new(), "empty yields no lines");
+        assert_eq!(collect("a"), vec!["a"], "single line, no ending");
+        assert_eq!(
+            collect("a\n"),
+            vec!["a"],
+            "trailing LF yields no empty line"
+        );
+        assert_eq!(collect("a\nb"), vec!["a", "b"], "LF separates lines");
+        assert_eq!(collect("a\n\n"), vec!["a", ""], "interior blank line kept");
+        assert_eq!(collect("a\r\nb"), vec!["a", "b"], "CRLF separates lines");
+
+        // Unlike `str::lines`, a bare CR also splits.
+        assert_eq!(
+            collect("a\rb\rc"),
+            vec!["a", "b", "c"],
+            "bare CR separates lines (str::lines would not)"
+        );
+        assert_eq!(
+            collect("a\r"),
+            vec!["a"],
+            "trailing bare CR yields no empty line"
         );
     }
 
