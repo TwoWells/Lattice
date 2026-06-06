@@ -221,8 +221,12 @@ impl Workspace {
 
     /// Whether a `.lattice.toml` file was found in the workspace root.
     ///
-    /// When `true`, graph validation (predicates, backlinks, bare paths) is
-    /// active. When `false`, Lattice acts as a code intelligence server only.
+    /// This gates only the **graph** diagnostic tier — forward-link
+    /// existence, backlink reconciliation, and unknown predicates — which is
+    /// active only when this returns `true`. The **structural** tier (heading
+    /// hierarchy, trailing whitespace, HTML and code-block well-formedness,
+    /// bare paths, etc.) always runs via `structural::collect`, so
+    /// `has_config() == false` does not mean Lattice is silent.
     pub fn has_config(&self) -> bool {
         self.has_config
     }
