@@ -2237,16 +2237,24 @@ fn line_byte_range(source: &str, line: u32) -> (usize, usize) {
 
 /// Convert an LSP 0-based position to a byte offset in `source`.
 ///
-/// Recognizes `\n`, `\r\n`, and bare `\r`; `character` is a byte offset within
-/// the line, clamped to the line's content length.
-#[allow(
-    clippy::cast_possible_truncation,
-    reason = "line numbers in markdown files won't exceed u32::MAX"
-)]
+/// Recognizes `\n`, `\r\n`, and bare `\r`. `character` is a UTF-16 code-unit
+/// offset within the line (the LSP default position encoding); it is walked
+/// across the line's chars and clamped to the line's content length. A column
+/// landing inside a surrogate pair rounds down to the enclosing char's start.
 #[must_use]
 pub fn lsp_position_to_byte_offset(source: &str, pos: lsp::Position) -> usize {
     let (start, end) = line_byte_range(source, pos.line);
-    start + (pos.character as usize).min(end - start)
+    let mut remaining = pos.character as usize;
+    let mut byte = start;
+    for ch in source[start..end].chars() {
+        let units = ch.len_utf16();
+        if remaining < units {
+            break;
+        }
+        remaining -= units;
+        byte += ch.len_utf8();
+    }
+    byte
 }
 
 /// Convert a byte `Span` to an LSP `Range`.
@@ -2262,22 +2270,30 @@ fn span_to_lsp_range(source: &str, span: &Span) -> lsp::Range {
 
 /// Convert a byte offset to an LSP 0-based position.
 ///
-/// Line counting recognizes `\n`, `\r\n`, and bare `\r`. The `character`
-/// field is a byte offset within the line (Lattice's established convention),
-/// measured from the byte after the previous line break.
+/// Line counting recognizes `\n`, `\r\n`, and bare `\r`. The `character` field
+/// is a UTF-16 code-unit offset within the line (the LSP default position
+/// encoding), measured from the byte after the previous line break. A byte
+/// offset that falls inside a multi-byte char is floored to that char's start
+/// so the UTF-16 count cannot split a code point.
 #[allow(
     clippy::cast_possible_truncation,
     reason = "line/column values in markdown files won't exceed u32::MAX"
 )]
 #[must_use]
 pub fn byte_offset_to_lsp_position(source: &str, offset: usize) -> lsp::Position {
-    let offset = offset.min(source.len());
+    let mut offset = offset.min(source.len());
+    while offset > 0 && !source.is_char_boundary(offset) {
+        offset -= 1;
+    }
     let line = (crate::block::byte_offset_to_line(source, offset) - 1) as u32;
     let line_start = source.as_bytes()[..offset]
         .iter()
         .rposition(|&b| b == b'\n' || b == b'\r')
         .map_or(0, |i| i + 1);
-    let character = (offset - line_start) as u32;
+    let character = source[line_start..offset]
+        .chars()
+        .map(char::len_utf16)
+        .sum::<usize>() as u32;
     lsp::Position { line, character }
 }
 
@@ -2658,14 +2674,20 @@ mod tests {
     }
 
     #[test]
-    fn lsp_character_is_byte_offset_within_line() {
-        // é is two bytes, so 'b' sits at byte 4 of line 0.
+    fn lsp_character_is_utf16_offset_within_line() {
+        // é is two UTF-8 bytes but one UTF-16 unit, so 'b' sits at byte 4 of
+        // line 0 yet UTF-16 column 3 (a, é, space).
         let src = "aé b\nx";
         let p = byte_offset_to_lsp_position(src, 4);
         assert_eq!(
             (p.line, p.character),
-            (0, 4),
-            "character is a byte offset within the line, multi-byte aware"
+            (0, 3),
+            "character is a UTF-16 code-unit offset within the line"
+        );
+        assert_eq!(
+            lsp_position_to_byte_offset(src, p),
+            4,
+            "the UTF-16 column maps back to the byte offset"
         );
         // 'x' sits at byte 6 (after the LF); byte 5 is the LF itself.
         assert_eq!(
@@ -4629,6 +4651,62 @@ mod tests {
         assert_eq!(range.start.character, 2, "span starts at character 2");
         assert_eq!(range.end.line, 0, "span ends on line 0");
         assert_eq!(range.end.character, 7, "span ends at character 7");
+    }
+
+    // Regression: issue 003 — `character` must be a UTF-16 code-unit offset,
+    // not a byte offset, on lines with multi-byte content.
+    #[test]
+    fn position_character_is_utf16_not_bytes() {
+        // `é` is 2 UTF-8 bytes but 1 UTF-16 unit, so "header" begins at byte 8
+        // yet UTF-16 column 7.
+        let source = "# café header\n";
+        let pos = byte_offset_to_lsp_position(source, 8);
+        assert_eq!(pos.line, 0, "header is on line 0");
+        assert_eq!(
+            pos.character, 7,
+            "UTF-16 column counts é as one code unit (byte col would be 8)"
+        );
+        assert_eq!(
+            lsp_position_to_byte_offset(source, pos),
+            8,
+            "UTF-16 column 7 maps back to byte 8"
+        );
+    }
+
+    #[test]
+    fn position_character_counts_astral_as_two_utf16_units() {
+        // 😀 (U+1F600) is 4 UTF-8 bytes and 2 UTF-16 code units.
+        // 'x'=byte 0, 😀=bytes 1..5, 'y'=byte 5.
+        let source = "x😀y\n";
+        let pos = byte_offset_to_lsp_position(source, 5);
+        assert_eq!(
+            pos.character, 3,
+            "x(1) + emoji(2 UTF-16 units) = column 3 at 'y'"
+        );
+        assert_eq!(
+            lsp_position_to_byte_offset(source, pos),
+            5,
+            "column 3 round-trips back to byte 5"
+        );
+        // A column inside the surrogate pair rounds down to the emoji's start.
+        let mid = lsp_position_to_byte_offset(
+            source,
+            lsp::Position {
+                line: 0,
+                character: 2,
+            },
+        );
+        assert_eq!(
+            mid, 1,
+            "mid-surrogate column floors to the emoji's byte start"
+        );
+    }
+
+    #[test]
+    fn position_round_trip_multibyte_and_crlf() {
+        // Reuses the shared invariant the property/fuzz suites assert, over
+        // multi-byte content and mixed line endings.
+        crate::invariants::assert_position_round_trip("# café 😀 header\r\nsecond λ line\n");
     }
 
     #[test]
