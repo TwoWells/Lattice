@@ -333,7 +333,9 @@ fn scan_line_for_bare_urls(
             let url_end = rest
                 .find(|c: char| c.is_whitespace() || c == ')' || c == ']' || c == '>')
                 .unwrap_or(rest.len());
-            let url = &rest[..url_end];
+            // Exclude trailing sentence punctuation, mirroring GFM autolink:
+            // a trailing `.` `,` `;` `:` `!` `?` is not part of the URL.
+            let url = rest[..url_end].trim_end_matches(['.', ',', ';', ':', '!', '?']);
 
             if url.len() <= prefix.len() {
                 continue;
@@ -1175,6 +1177,22 @@ mod tests {
             count_matching(&diags, Severity::Warning, "bare URL"),
             1,
             "one warning for bare URL: {diags:?}"
+        );
+    }
+
+    // Regression: issue 012 — a URL written mid-sentence had its trailing
+    // punctuation folded into the reported URL (`https://example.com,`). GFM
+    // autolink excludes trailing `.,;:!?`, and so must the bare-URL hint.
+    #[test]
+    fn bare_url_trailing_punctuation_excluded() {
+        let diags = diagnose("See https://example.com, then continue.\n");
+        assert!(
+            has_matching(&diags, Severity::Warning, "bare URL `https://example.com`"),
+            "trailing comma excluded from the reported URL: {diags:?}"
+        );
+        assert!(
+            !has_any(&diags, "https://example.com,"),
+            "reported URL must not include the trailing comma: {diags:?}"
         );
     }
 
