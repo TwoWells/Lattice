@@ -266,7 +266,7 @@ pub struct WorkspaceEdit {
 }
 
 /// An LSP diagnostic.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Diagnostic {
     /// Range.
     pub range: Range,

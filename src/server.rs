@@ -7,7 +7,7 @@
 //! symbols, rename, references, type hierarchy, and call hierarchy for
 //! headings. Supports multiple workspace folders.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -27,6 +27,13 @@ use crate::workspace::Workspace;
 /// Multiple workspaces keyed by root path.
 struct Workspaces {
     inner: BTreeMap<PathBuf, Workspace>,
+    /// Diagnostics last published to the client, keyed by document URI.
+    ///
+    /// Used to suppress redundant `publishDiagnostics` notifications: a file
+    /// is only re-published when its diagnostic vector changes (issue 013 —
+    /// publication diffing). Only non-empty vectors are stored, so an absent
+    /// entry means the client currently holds no diagnostics for that URI.
+    published: HashMap<String, Vec<lsp::Diagnostic>>,
 }
 
 impl Workspaces {
@@ -51,7 +58,10 @@ impl Workspaces {
             }
         }
 
-        Self { inner }
+        Self {
+            inner,
+            published: HashMap::new(),
+        }
     }
 
     /// Add a workspace folder.
@@ -2420,13 +2430,37 @@ fn handle_notification(
 // Diagnostics
 // ---------------------------------------------------------------------------
 
-/// Publish diagnostics for all files across all workspaces.
-fn publish_all_diagnostics(connection: &Connection, workspaces: &Workspaces) -> Result<()> {
+/// Publish diagnostics for the files whose diagnostics changed.
+///
+/// A full-workspace recompute still happens internally (see
+/// [`desired_diagnostics`]); this only suppresses redundant
+/// `publishDiagnostics` notifications, collapsing the per-keystroke broadcast
+/// from `O(files)` down to the handful of documents that actually changed
+/// (issue 013 — publication diffing).
+fn publish_all_diagnostics(connection: &Connection, workspaces: &mut Workspaces) -> Result<()> {
+    for (uri, diagnostics) in diff_diagnostics(workspaces) {
+        let params = lsp::PublishDiagnosticsParams { uri, diagnostics };
+        let notif = Notification::new(lsp::method::PUBLISH_DIAGNOSTICS.to_string(), params);
+        connection.sender.send(Message::Notification(notif))?;
+    }
+
+    Ok(())
+}
+
+/// Compute the full desired diagnostic set across all workspaces, keyed by
+/// document URI.
+///
+/// Every indexed file gets an entry — an empty vector when it has no
+/// diagnostics — so a caller can tell a file that just became clean apart from
+/// one that left the workspace. This is the unconditional from-scratch
+/// recompute; [`diff_diagnostics`] decides what is worth sending.
+fn desired_diagnostics(workspaces: &Workspaces) -> BTreeMap<String, Vec<lsp::Diagnostic>> {
+    let mut desired: BTreeMap<String, Vec<lsp::Diagnostic>> = BTreeMap::new();
+
     for (root, workspace) in workspaces.iter() {
         let all_diagnostics = collect_all_diagnostics(workspace);
 
         let mut by_file: BTreeMap<PathBuf, Vec<lsp::Diagnostic>> = BTreeMap::new();
-
         for diag in &all_diagnostics {
             let source = workspace.file(&diag.file).map_or("", |fd| fd.tree.source());
             by_file
@@ -2435,23 +2469,58 @@ fn publish_all_diagnostics(connection: &Connection, workspaces: &Workspaces) -> 
                 .push(to_lsp_diagnostic(diag, source));
         }
 
-        let mut published: BTreeSet<PathBuf> = by_file.keys().cloned().collect();
-        for path in workspace.files().keys() {
-            published.insert(path.clone());
-        }
-
-        for rel_path in &published {
-            let abs_path = root.join(rel_path);
-            let uri = path_to_uri(&abs_path);
+        for rel_path in workspace.files().keys() {
+            let uri = path_to_uri(&root.join(rel_path));
             let diagnostics = by_file.remove(rel_path).unwrap_or_default();
-
-            let params = lsp::PublishDiagnosticsParams { uri, diagnostics };
-            let notif = Notification::new(lsp::method::PUBLISH_DIAGNOSTICS.to_string(), params);
-            connection.sender.send(Message::Notification(notif))?;
+            desired.insert(uri, diagnostics);
         }
     }
 
-    Ok(())
+    desired
+}
+
+/// Diff the freshly computed diagnostics against the last-published set,
+/// returning only the `(uri, diagnostics)` pairs that must be sent and
+/// updating the cache to match.
+///
+/// A pair is sent when its vector differs from what the client last received,
+/// including the transition to empty — a file that became clean, or one that
+/// left the workspace (deleted, or its folder removed) — so stale diagnostics
+/// are cleared. Only non-empty vectors are cached, so an absent entry means
+/// "the client currently holds none". The result is sorted by URI for
+/// deterministic output.
+fn diff_diagnostics(workspaces: &mut Workspaces) -> Vec<(String, Vec<lsp::Diagnostic>)> {
+    const EMPTY: &[lsp::Diagnostic] = &[];
+
+    let desired = desired_diagnostics(workspaces);
+    // Keyed by URI so the result is deterministically ordered.
+    let mut to_send: BTreeMap<String, Vec<lsp::Diagnostic>> = BTreeMap::new();
+
+    // Documents present now: send when the vector changed.
+    for (uri, diagnostics) in &desired {
+        let prev = workspaces.published.get(uri).map_or(EMPTY, Vec::as_slice);
+        if prev != diagnostics.as_slice() {
+            to_send.insert(uri.clone(), diagnostics.clone());
+        }
+    }
+
+    // Documents previously published but absent now: clear them on the client.
+    // Disjoint from the loop above — these URIs are, by definition, not in
+    // `desired`.
+    for uri in workspaces.published.keys() {
+        if !desired.contains_key(uri) {
+            to_send.insert(uri.clone(), Vec::new());
+        }
+    }
+
+    // Rebuild the cache from the desired set, dropping empties so an absent
+    // entry consistently means "no diagnostics".
+    workspaces.published = desired
+        .into_iter()
+        .filter(|(_, diagnostics)| !diagnostics.is_empty())
+        .collect();
+
+    to_send.into_iter().collect()
 }
 
 /// Convert a Lattice diagnostic to an LSP diagnostic.
@@ -2542,6 +2611,7 @@ mod tests {
         let ws = Workspace::scan(&root).expect("scan should succeed");
         Workspaces {
             inner: BTreeMap::from([(root, ws)]),
+            published: HashMap::new(),
         }
     }
 
@@ -5070,5 +5140,235 @@ mod tests {
             !syms.iter().any(|s| s.name.contains("API")),
             "terms should not appear in workspace symbols"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Publication diffing (issue 013)
+    // -----------------------------------------------------------------------
+
+    /// Replace a file's content in the single-workspace test set.
+    fn edit(workspaces: &mut Workspaces, rel: &str, content: &str) {
+        let ws = workspaces
+            .inner
+            .values_mut()
+            .next()
+            .expect("test workspace exists");
+        ws.update_content(Path::new(rel), content);
+    }
+
+    #[test]
+    fn diffing_first_publish_skips_clean_files() {
+        // a.md has a skipped heading level (structural, config-independent);
+        // b.md and c.md are clean.
+        let dir = workspace_with_files(&[
+            ("a.md", "# A\n\n### C\n"),
+            ("b.md", "# B\n"),
+            ("c.md", "# C\n"),
+        ]);
+        let mut workspaces = scan_workspaces(&dir);
+
+        let sent = diff_diagnostics(&mut workspaces);
+        assert_eq!(
+            sent.len(),
+            1,
+            "only the file with diagnostics is published on first pass: {sent:?}"
+        );
+        assert_eq!(
+            sent[0].0,
+            file_uri(&dir, "a.md"),
+            "the published file is a.md"
+        );
+        assert!(
+            !sent[0].1.is_empty(),
+            "a.md is published with its diagnostics"
+        );
+    }
+
+    #[test]
+    fn diffing_skips_unchanged_on_resync() {
+        let dir = workspace_with_files(&[("a.md", "# A\n\n### C\n"), ("b.md", "# B\n")]);
+        let mut workspaces = scan_workspaces(&dir);
+
+        let first = diff_diagnostics(&mut workspaces);
+        assert_eq!(first.len(), 1, "first pass publishes a.md");
+
+        let second = diff_diagnostics(&mut workspaces);
+        assert!(
+            second.is_empty(),
+            "a re-sync with no edits publishes nothing: {second:?}"
+        );
+    }
+
+    #[test]
+    fn diffing_resends_changed_file() {
+        let dir = workspace_with_files(&[("a.md", "# A\n")]);
+        let mut workspaces = scan_workspaces(&dir);
+
+        let first = diff_diagnostics(&mut workspaces);
+        assert!(first.is_empty(), "clean file publishes nothing: {first:?}");
+
+        edit(&mut workspaces, "a.md", "# A\n\n### C\n");
+        let second = diff_diagnostics(&mut workspaces);
+        assert_eq!(second.len(), 1, "introducing a diagnostic republishes a.md");
+        assert_eq!(
+            second[0].0,
+            file_uri(&dir, "a.md"),
+            "the republished file is a.md"
+        );
+        assert!(!second[0].1.is_empty(), "vector carries the new diagnostic");
+    }
+
+    #[test]
+    fn diffing_clears_file_that_became_clean() {
+        let dir = workspace_with_files(&[("a.md", "# A\n\n### C\n")]);
+        let mut workspaces = scan_workspaces(&dir);
+
+        let first = diff_diagnostics(&mut workspaces);
+        assert_eq!(first.len(), 1, "first pass publishes a.md's diagnostic");
+
+        edit(&mut workspaces, "a.md", "# A\n");
+        let second = diff_diagnostics(&mut workspaces);
+        assert_eq!(
+            second.len(),
+            1,
+            "fixing the file sends one clearing publish: {second:?}"
+        );
+        assert_eq!(
+            second[0].0,
+            file_uri(&dir, "a.md"),
+            "the cleared file is a.md"
+        );
+        assert!(
+            second[0].1.is_empty(),
+            "the clearing publish carries an empty vector"
+        );
+
+        let third = diff_diagnostics(&mut workspaces);
+        assert!(
+            third.is_empty(),
+            "a clean file is not re-cleared on the next sync: {third:?}"
+        );
+    }
+
+    #[test]
+    fn diffing_clears_removed_file() {
+        let dir = workspace_with_files(&[("a.md", "# A\n\n### C\n"), ("b.md", "# B\n")]);
+        let mut workspaces = scan_workspaces(&dir);
+
+        let first = diff_diagnostics(&mut workspaces);
+        assert_eq!(first.len(), 1, "first pass publishes a.md");
+
+        // Delete a.md from disk and drop it from the index.
+        fs::remove_file(dir.path().join("a.md")).expect("remove a.md");
+        {
+            let ws = workspaces
+                .inner
+                .values_mut()
+                .next()
+                .expect("test workspace exists");
+            ws.update(Path::new("a.md")).expect("update after delete");
+        }
+
+        let second = diff_diagnostics(&mut workspaces);
+        assert_eq!(
+            second.len(),
+            1,
+            "removing a file sends one clearing publish: {second:?}"
+        );
+        assert_eq!(
+            second[0].0,
+            file_uri(&dir, "a.md"),
+            "the removed file is cleared"
+        );
+        assert!(
+            second[0].1.is_empty(),
+            "the clearing publish carries an empty vector"
+        );
+    }
+
+    /// Apply one `publishDiagnostics` to the simulated client (replace
+    /// semantics; an empty vector removes the entry, matching the cache rule).
+    fn apply_publish(
+        client: &mut HashMap<String, Vec<lsp::Diagnostic>>,
+        uri: String,
+        diagnostics: Vec<lsp::Diagnostic>,
+    ) {
+        if diagnostics.is_empty() {
+            client.remove(&uri);
+        } else {
+            client.insert(uri, diagnostics);
+        }
+    }
+
+    /// Assert the client's accumulated diagnostics equal a from-scratch full
+    /// publish (the non-empty entries of `desired_diagnostics`).
+    fn assert_client_matches(
+        workspaces: &Workspaces,
+        client: &HashMap<String, Vec<lsp::Diagnostic>>,
+        context: &str,
+    ) {
+        let expected: HashMap<String, Vec<lsp::Diagnostic>> = desired_diagnostics(workspaces)
+            .into_iter()
+            .filter(|(_, diagnostics)| !diagnostics.is_empty())
+            .collect();
+        assert_eq!(
+            client, &expected,
+            "diffed publish stream must equal a from-scratch publish {context}"
+        );
+    }
+
+    #[test]
+    fn diffing_published_stream_matches_full_recompute() {
+        // The safety net from issue 013: replaying the diffed publish stream
+        // into a client must reproduce, at every step, exactly what a
+        // from-scratch full publish would show. Config present so the graph
+        // tier (forward links, backlink reconciliation) participates too.
+        let dir = workspace_with_files(&[
+            (".lattice.toml", ""),
+            ("a.md", "# A\n"),
+            ("b.md", "# B\n"),
+            ("index.md", "# Index\n"),
+        ]);
+        let mut workspaces = scan_workspaces(&dir);
+
+        // The simulated client: URI -> diagnostics, mutated by each publish.
+        let mut client: HashMap<String, Vec<lsp::Diagnostic>> = HashMap::new();
+
+        // (file, new content) — edits that add, remove, and move diagnostics,
+        // including a cross-file backlink dependency: index -> a "supersedes"
+        // expects `superseded_by: index.md` in a's frontmatter, and the
+        // missing-backlink warning is reported on the *source* (index.md).
+        let steps: &[(&str, &str)] = &[
+            // add a skipped-heading diagnostic on a.md
+            ("a.md", "# A\n\n### C\n"),
+            // forward link expects a backlink on a.md -> warns on index.md
+            ("index.md", "[a](a.md \"supersedes\")\n"),
+            // satisfy the backlink and drop the heading diagnostic
+            (
+                "a.md",
+                "---\nbacklinks:\n  superseded_by:\n    - index.md\n---\n# A\n",
+            ),
+            // a broken forward link error on b.md
+            ("b.md", "[gone](missing.md \"references\")\n"),
+            // remove the forward link -> a.md's backlink is now stale
+            ("index.md", "# Index\n"),
+            // fix b.md
+            ("b.md", "# B\n"),
+        ];
+
+        // Initial sync, then one per edit. After every sync the client must
+        // equal the from-scratch desired (non-empty) set.
+        for (uri, diagnostics) in diff_diagnostics(&mut workspaces) {
+            apply_publish(&mut client, uri, diagnostics);
+        }
+        assert_client_matches(&workspaces, &client, "after initial sync");
+
+        for (i, (rel, content)) in steps.iter().enumerate() {
+            edit(&mut workspaces, rel, content);
+            for (uri, diagnostics) in diff_diagnostics(&mut workspaces) {
+                apply_publish(&mut client, uri, diagnostics);
+            }
+            assert_client_matches(&workspaces, &client, &format!("after edit {i} ({rel})"));
+        }
     }
 }
