@@ -37,7 +37,13 @@ pub fn collect(
     emit_parser_diagnostics(tree, rel_path, &mut diagnostics);
     emit_heading_diagnostics(tree, rel_path, &mut diagnostics);
     emit_tree_bare_paths(tree, rel_path, config, file_exists, &mut diagnostics);
-    emit_bare_path_diagnostics(tree, rel_path, file_exists, &mut diagnostics);
+    emit_bare_path_diagnostics(
+        tree,
+        rel_path,
+        config.policy.bare_paths,
+        file_exists,
+        &mut diagnostics,
+    );
     emit_html_diagnostics(tree, rel_path, &mut diagnostics);
     check_markdown_in_opaque_html(tree, rel_path, &mut diagnostics);
     emit_code_block_diagnostics(tree, rel_path, config, &mut diagnostics);
@@ -217,14 +223,34 @@ fn heading_display_text(raw: &str, syntax: Syntax) -> String {
 // Bare path / URL / quoted path / backticked path diagnostics
 // ---------------------------------------------------------------------------
 
+/// Resolve the severity of a prose bare-path diagnostic from the policy.
+///
+/// `base` is the diagnostic's default severity under `Warn`; `Deny` escalates
+/// it to an error. `Disabled` is handled by an early return in the caller, so
+/// it never reaches here.
+const fn bare_path_severity(policy: BarePathPolicy, base: Severity) -> Severity {
+    match policy {
+        BarePathPolicy::Deny => Severity::Error,
+        _ => base,
+    }
+}
+
 /// Emit diagnostics for bare paths, bare URLs, quoted paths, and backticked
 /// paths found in paragraph text.
+///
+/// Honors the `bare_paths` policy: `Disabled` suppresses all of these, `Deny`
+/// escalates them to errors (mirroring `emit_tree_bare_paths`).
 fn emit_bare_path_diagnostics(
     tree: &Tree,
     rel_path: &Path,
+    policy: BarePathPolicy,
     file_exists: &dyn Fn(&Path) -> bool,
     out: &mut Vec<Diagnostic>,
 ) {
+    if policy == BarePathPolicy::Disabled {
+        return;
+    }
+
     let source = tree.source();
 
     for node in tree.nodes() {
@@ -241,7 +267,16 @@ fn emit_bare_path_diagnostics(
         let text = &source[node.span.start..node.span.end];
         let base = node.span.start;
 
-        scan_text_for_paths(text, base, source, rel_path, file_exists, &excluded, out);
+        scan_text_for_paths(
+            text,
+            base,
+            source,
+            rel_path,
+            policy,
+            file_exists,
+            &excluded,
+            out,
+        );
 
         // Check InlineCode children for backticked paths.
         for &child_id in &node.children {
@@ -257,7 +292,7 @@ fn emit_bare_path_diagnostics(
                         out.push(Diagnostic {
                             file: rel_path.to_path_buf(),
                             line,
-                            severity: Severity::Hint,
+                            severity: bare_path_severity(policy, Severity::Hint),
                             message: format!(
                                 "backticked path `{inner}` refers to an existing file: consider making it a link"
                             ),
@@ -279,6 +314,7 @@ fn scan_text_for_paths(
     base: usize,
     source: &str,
     rel_path: &Path,
+    policy: BarePathPolicy,
     file_exists: &dyn Fn(&Path) -> bool,
     excluded: &[Span],
     out: &mut Vec<Diagnostic>,
@@ -292,12 +328,15 @@ fn scan_text_for_paths(
                 .map_or(0, |(i, _)| i + 1);
         let line_num = block::byte_offset_to_line(source, line_start);
 
-        scan_line_for_bare_urls(line_text, line_start, line_num, rel_path, excluded, out);
+        scan_line_for_bare_urls(
+            line_text, line_start, line_num, rel_path, policy, excluded, out,
+        );
         scan_line_for_quoted_paths(
             line_text,
             line_start,
             line_num,
             rel_path,
+            policy,
             file_exists,
             excluded,
             out,
@@ -316,6 +355,7 @@ fn scan_line_for_bare_urls(
     line_start: usize,
     line_num: usize,
     rel_path: &Path,
+    policy: BarePathPolicy,
     excluded: &[Span],
     out: &mut Vec<Diagnostic>,
 ) {
@@ -344,7 +384,7 @@ fn scan_line_for_bare_urls(
             out.push(Diagnostic {
                 file: rel_path.to_path_buf(),
                 line: line_num,
-                severity: Severity::Warning,
+                severity: bare_path_severity(policy, Severity::Warning),
                 message: format!(
                     "bare URL `{url}`: wrap in angle brackets or make a markdown link"
                 ),
@@ -363,6 +403,7 @@ fn scan_line_for_quoted_paths(
     line_start: usize,
     line_num: usize,
     rel_path: &Path,
+    policy: BarePathPolicy,
     file_exists: &dyn Fn(&Path) -> bool,
     excluded: &[Span],
     out: &mut Vec<Diagnostic>,
@@ -382,7 +423,7 @@ fn scan_line_for_quoted_paths(
                         out.push(Diagnostic {
                             file: rel_path.to_path_buf(),
                             line: line_num,
-                            severity: Severity::Hint,
+                            severity: bare_path_severity(policy, Severity::Hint),
                             message: format!(
                                 "quoted path `\"{inner}\"`: use backticks or make a markdown link"
                             ),
@@ -1324,6 +1365,67 @@ mod tests {
             1,
             "one error when deny: {diags:?}"
         );
+    }
+
+    // -- Config: bare_paths policy governs both emitters (issue 007) --
+
+    fn diagnose_with_policy(
+        content: &str,
+        existing: &[&str],
+        policy: BarePathPolicy,
+    ) -> Vec<Diagnostic> {
+        let fm = yaml::parse_frontmatter_block(content);
+        let fm_span = fm.as_ref().map(|b| b.span);
+        let tree = block::parse_tree(content, fm_span);
+        let mut config = Config::default();
+        config.policy.bare_paths = policy;
+        let rel_path = std::path::Path::new("test.md");
+        let existing_set: HashSet<&str> = existing.iter().copied().collect();
+        collect(&tree, rel_path, &config, &|p| {
+            existing_set.contains(p.to_str().unwrap_or(""))
+        })
+    }
+
+    // One paragraph exercising every bare-path emitter: a tree-level bare path
+    // (`docs/page.md`), a prose bare URL, a quoted path, and a backticked path.
+    const BARE_PATH_SAMPLE: &str =
+        "Visit https://example.com and see \"other.md\" or `other.md` in docs/page.md here.\n";
+
+    const BARE_PATH_NEEDLES: [&str; 4] = [
+        "convert to a markdown link",
+        "bare URL",
+        "quoted path",
+        "backticked path",
+    ];
+
+    #[test]
+    fn bare_paths_disabled_silences_both_emitters() {
+        let diags = diagnose_with_policy(
+            BARE_PATH_SAMPLE,
+            &["other.md", "docs/page.md"],
+            BarePathPolicy::Disabled,
+        );
+        for needle in BARE_PATH_NEEDLES {
+            assert!(
+                !has_any(&diags, needle),
+                "disabled should silence `{needle}`: {diags:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bare_paths_deny_escalates_both_emitters() {
+        let diags = diagnose_with_policy(
+            BARE_PATH_SAMPLE,
+            &["other.md", "docs/page.md"],
+            BarePathPolicy::Deny,
+        );
+        for needle in BARE_PATH_NEEDLES {
+            assert!(
+                has_matching(&diags, Severity::Error, needle),
+                "deny should escalate `{needle}` to error: {diags:?}"
+            );
+        }
     }
 
     // -- close_block_quotes HTML scope desync --
