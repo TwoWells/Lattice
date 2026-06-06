@@ -1821,6 +1821,7 @@ fn collect_all_diagnostics(workspace: &Workspace) -> Vec<Diagnostic> {
                 line: pd.line,
                 severity,
                 message: format!("frontmatter: {}", pd.message),
+                span: None,
             });
         }
     }
@@ -1838,9 +1839,10 @@ fn collect_all_diagnostics(workspace: &Workspace) -> Vec<Diagnostic> {
 fn document_diagnostic(workspaces: &Workspaces, uri: &str) -> lsp::FullDocumentDiagnosticReport {
     let items = if let Some((workspace, rel_path)) = workspaces.resolve(uri) {
         let all = collect_all_diagnostics(workspace);
+        let source = workspace.file(&rel_path).map_or("", |fd| fd.tree.source());
         all.iter()
             .filter(|d| d.file == rel_path)
-            .map(to_lsp_diagnostic)
+            .map(|d| to_lsp_diagnostic(d, source))
             .collect()
     } else {
         Vec::new()
@@ -1861,10 +1863,11 @@ fn workspace_diagnostic(workspaces: &Workspaces) -> lsp::WorkspaceDiagnosticRepo
         let mut by_file: BTreeMap<PathBuf, Vec<lsp::Diagnostic>> = BTreeMap::new();
 
         for diag in &all {
+            let source = workspace.file(&diag.file).map_or("", |fd| fd.tree.source());
             by_file
                 .entry(diag.file.clone())
                 .or_default()
-                .push(to_lsp_diagnostic(diag));
+                .push(to_lsp_diagnostic(diag, source));
         }
 
         for (rel_path, items) in by_file {
@@ -2428,10 +2431,11 @@ fn publish_all_diagnostics(connection: &Connection, workspaces: &Workspaces) -> 
         let mut by_file: BTreeMap<PathBuf, Vec<lsp::Diagnostic>> = BTreeMap::new();
 
         for diag in &all_diagnostics {
+            let source = workspace.file(&diag.file).map_or("", |fd| fd.tree.source());
             by_file
                 .entry(diag.file.clone())
                 .or_default()
-                .push(to_lsp_diagnostic(diag));
+                .push(to_lsp_diagnostic(diag, source));
         }
 
         let mut published: BTreeSet<PathBuf> = by_file.keys().cloned().collect();
@@ -2454,11 +2458,11 @@ fn publish_all_diagnostics(connection: &Connection, workspaces: &Workspaces) -> 
 }
 
 /// Convert a Lattice diagnostic to an LSP diagnostic.
-#[allow(
-    clippy::cast_possible_truncation,
-    reason = "line numbers in markdown files won't exceed u32::MAX"
-)]
-fn to_lsp_diagnostic(diag: &Diagnostic) -> lsp::Diagnostic {
+///
+/// Builds the range from the diagnostic's byte span when present (precise
+/// underline); otherwise falls back to a whole-line range anchored on
+/// `diag.line`. `source` is the text of the file the diagnostic belongs to.
+fn to_lsp_diagnostic(diag: &Diagnostic, source: &str) -> lsp::Diagnostic {
     let severity = match diag.severity {
         Severity::Error => lsp::diagnostic_severity::ERROR,
         Severity::Warning => lsp::diagnostic_severity::WARNING,
@@ -2466,17 +2470,32 @@ fn to_lsp_diagnostic(diag: &Diagnostic) -> lsp::Diagnostic {
         Severity::Hint => lsp::diagnostic_severity::HINT,
     };
 
-    let line = diag.line.saturating_sub(1) as u32;
-    let range = lsp::Range {
-        start: lsp::Position { line, character: 0 },
-        end: lsp::Position { line, character: 0 },
-    };
+    let range = diag.span.map_or_else(
+        || whole_line_range(source, diag.line),
+        |span| span_to_lsp_range(source, &span),
+    );
 
     lsp::Diagnostic {
         range,
         severity: Some(severity),
         source: Some("lattice".to_string()),
         message: diag.message.clone(),
+    }
+}
+
+/// An LSP range covering an entire line's content (column 0 to the line's end,
+/// excluding the terminator). Used for diagnostics that carry only a line
+/// anchor, so the underline at least covers the line instead of a zero-width
+/// point at column 0.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "line numbers in markdown files won't exceed u32::MAX"
+)]
+fn whole_line_range(source: &str, line: usize) -> lsp::Range {
+    let (start, end) = line_byte_range(source, line.saturating_sub(1) as u32);
+    lsp::Range {
+        start: byte_offset_to_lsp_position(source, start),
+        end: byte_offset_to_lsp_position(source, end),
     }
 }
 
@@ -2762,19 +2781,25 @@ mod tests {
 
     #[test]
     fn error_maps_to_lsp_error() {
+        // A spanned diagnostic underlines exactly its byte span. "zzzz" is on
+        // line 3 (LSP line 2) at bytes 4..8.
+        let source = "x\ny\nzzzz\n";
         let diag = Diagnostic {
             file: PathBuf::from("a.md"),
             line: 3,
             severity: Severity::Error,
             message: "target does not exist".to_string(),
+            span: Some(Span::new(4, 8)),
         };
-        let d = to_lsp_diagnostic(&diag);
+        let d = to_lsp_diagnostic(&diag, source);
         assert_eq!(
             d.severity,
             Some(lsp::diagnostic_severity::ERROR),
             "error should map to LSP ERROR"
         );
         assert_eq!(d.range.start.line, 2, "line 3 should map to LSP line 2");
+        assert_eq!(d.range.start.character, 0, "span starts at column 0");
+        assert_eq!(d.range.end.character, 4, "span covers the four z's");
         assert_eq!(
             d.source.as_deref(),
             Some("lattice"),
@@ -2784,30 +2809,43 @@ mod tests {
 
     #[test]
     fn warning_maps_to_lsp_warning() {
+        // A line-only diagnostic (span: None) underlines the whole line.
+        let source = "first line\nsecond line\n";
         let diag = Diagnostic {
             file: PathBuf::from("b.md"),
             line: 1,
             severity: Severity::Warning,
             message: "missing backlink".to_string(),
+            span: None,
         };
-        let d = to_lsp_diagnostic(&diag);
+        let d = to_lsp_diagnostic(&diag, source);
         assert_eq!(
             d.severity,
             Some(lsp::diagnostic_severity::WARNING),
             "warning should map to LSP WARNING"
         );
         assert_eq!(d.range.start.line, 0, "line 1 should map to LSP line 0");
+        assert_eq!(
+            d.range.start.character, 0,
+            "whole-line range starts at column 0"
+        );
+        assert_eq!(
+            d.range.end.character, 10,
+            "whole-line range ends at the line's length"
+        );
     }
 
     #[test]
     fn info_maps_to_lsp_information() {
+        let source = "note\n";
         let diag = Diagnostic {
             file: PathBuf::from("c.md"),
-            line: 5,
+            line: 1,
             severity: Severity::Info,
             message: "no explicit predicate".to_string(),
+            span: None,
         };
-        let d = to_lsp_diagnostic(&diag);
+        let d = to_lsp_diagnostic(&diag, source);
         assert_eq!(
             d.severity,
             Some(lsp::diagnostic_severity::INFORMATION),

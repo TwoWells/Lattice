@@ -55,6 +55,7 @@ pub fn run(start: &Path, strict: bool, out: &mut impl Write) -> Result<bool> {
                 line: pd.line,
                 severity,
                 message: format!("frontmatter: {}", pd.message),
+                span: None,
             });
         }
     }
@@ -153,6 +154,7 @@ mod tests {
             line: 5,
             severity: Severity::Error,
             message: "target does not exist".to_string(),
+            span: None,
         };
         assert_eq!(
             format_diagnostic(&diag),
@@ -168,6 +170,7 @@ mod tests {
             line: 1,
             severity: Severity::Warning,
             message: "expected backlink".to_string(),
+            span: None,
         };
         assert_eq!(
             format_diagnostic(&diag),
@@ -183,6 +186,7 @@ mod tests {
             line: 12,
             severity: Severity::Info,
             message: "no explicit predicate".to_string(),
+            span: None,
         };
         assert_eq!(
             format_diagnostic(&diag),

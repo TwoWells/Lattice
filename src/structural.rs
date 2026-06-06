@@ -75,6 +75,7 @@ fn emit_parser_diagnostics(tree: &Tree, rel_path: &Path, out: &mut Vec<Diagnosti
             line,
             severity,
             message: diag.message.clone(),
+            span: Some(diag.span),
         });
     }
 }
@@ -112,6 +113,8 @@ fn emit_tree_bare_paths(
             line: bare.line,
             severity,
             message: format!("bare path `{}`: convert to a markdown link", bare.path),
+            // `BarePath` carries only a line; fall back to a whole-line range.
+            span: None,
         });
     }
 }
@@ -144,6 +147,7 @@ fn emit_heading_diagnostics(tree: &Tree, rel_path: &Path, out: &mut Vec<Diagnost
                 line,
                 severity: Severity::Warning,
                 message: "empty heading".to_string(),
+                span: Some(node.span),
             });
             prev_level = Some(level);
             continue;
@@ -157,6 +161,7 @@ fn emit_heading_diagnostics(tree: &Tree, rel_path: &Path, out: &mut Vec<Diagnost
                     line,
                     severity: Severity::Warning,
                     message: "multiple H1 headings".to_string(),
+                    span: Some(node.span),
                 });
             }
         }
@@ -169,6 +174,7 @@ fn emit_heading_diagnostics(tree: &Tree, rel_path: &Path, out: &mut Vec<Diagnost
                 line,
                 severity: Severity::Warning,
                 message: format!("skipped heading level: H{prev} to H{level}"),
+                span: Some(node.span),
             });
         }
 
@@ -184,6 +190,7 @@ fn emit_heading_diagnostics(tree: &Tree, rel_path: &Path, out: &mut Vec<Diagnost
                     "duplicate heading text `{}` (first at line {first_line})",
                     text.trim()
                 ),
+                span: Some(node.span),
             });
         } else {
             seen_texts.insert(normalized, line);
@@ -296,6 +303,7 @@ fn emit_bare_path_diagnostics(
                             message: format!(
                                 "backticked path `{inner}` refers to an existing file: consider making it a link"
                             ),
+                            span: Some(child.span),
                         });
                     }
                 }
@@ -388,6 +396,8 @@ fn scan_line_for_bare_urls(
                 message: format!(
                     "bare URL `{url}`: wrap in angle brackets or make a markdown link"
                 ),
+                // `abs_pos` is the URL start; `url` is already punctuation-trimmed.
+                span: Some(Span::new(abs_pos, abs_pos + url.len())),
             });
         }
     }
@@ -427,6 +437,8 @@ fn scan_line_for_quoted_paths(
                             message: format!(
                                 "quoted path `\"{inner}\"`: use backticks or make a markdown link"
                             ),
+                            // Span the whole quoted token, both quotes included.
+                            span: Some(Span::new(abs_pos, line_start + start + end + 1)),
                         });
                     }
                 }
@@ -513,6 +525,7 @@ fn emit_html_diagnostics(tree: &Tree, rel_path: &Path, out: &mut Vec<Diagnostic>
                         line,
                         severity: Severity::Warning,
                         message: format!("self-closing non-void tag `<{name}/>`"),
+                        span: Some(node.span),
                     });
                 }
 
@@ -522,6 +535,7 @@ fn emit_html_diagnostics(tree: &Tree, rel_path: &Path, out: &mut Vec<Diagnostic>
                         line,
                         severity: Severity::Info,
                         message: format!("unknown HTML element `<{name}>`"),
+                        span: Some(node.span),
                     });
                 }
 
@@ -538,6 +552,7 @@ fn emit_html_diagnostics(tree: &Tree, rel_path: &Path, out: &mut Vec<Diagnostic>
                                 message: format!(
                                     "duplicate `id` attribute `{val}` (first at line {first_line})",
                                 ),
+                                span: Some(node.span),
                             });
                         } else {
                             seen_ids.insert(val.clone(), line);
@@ -602,6 +617,7 @@ fn check_markdown_in_opaque_html(tree: &Tree, rel_path: &Path, out: &mut Vec<Dia
                     message:
                         "markdown syntax inside HTML block without blank lines will not be parsed"
                             .to_string(),
+                    span: None,
                 });
                 // One diagnostic per HTML block is enough.
                 break;
@@ -631,6 +647,8 @@ fn check_required_attrs(
                 line,
                 severity: Severity::Warning,
                 message: format!("`<{tag}>` missing required attribute `{attr_name}`"),
+                // No node in scope here; fall back to a whole-line range.
+                span: None,
             });
         }
     }
@@ -665,6 +683,7 @@ fn check_block_in_inline(
                     line,
                     severity: Severity::Error,
                     message: format!("block element `<{tag}>` inside inline element `<{name}>`"),
+                    span: Some(node.span),
                 });
                 return;
             }
@@ -726,6 +745,7 @@ fn check_invalid_parent(
                 .collect::<Vec<_>>()
                 .join(" or ")
         ),
+        span: Some(node.span),
     });
 }
 
@@ -775,6 +795,7 @@ fn emit_code_block_diagnostics(
                 line,
                 severity,
                 message: "code block without language tag".to_string(),
+                span: Some(node.span),
             });
         }
     }
@@ -809,6 +830,7 @@ fn emit_image_diagnostics(tree: &Tree, rel_path: &Path, out: &mut Vec<Diagnostic
                     line,
                     severity: Severity::Warning,
                     message: "image with empty alt text".to_string(),
+                    span: Some(node.span),
                 });
             }
         }
@@ -858,6 +880,7 @@ fn emit_trailing_whitespace_diagnostics(
 
         let trailing = line.len() - line.trim_end_matches(' ').len();
         if trailing == 1 || trailing >= 3 {
+            let line_end = line_start + line.len();
             out.push(Diagnostic {
                 file: rel_path.to_path_buf(),
                 line: line_num,
@@ -865,6 +888,8 @@ fn emit_trailing_whitespace_diagnostics(
                 message: format!(
                     "invalid trailing whitespace ({trailing} spaces): use 2 for hard break or 0"
                 ),
+                // Underline only the offending trailing spaces.
+                span: Some(Span::new(line_end - trailing, line_end)),
             });
         }
     }
@@ -927,6 +952,7 @@ fn emit_missing_blank_line_diagnostics(tree: &Tree, rel_path: &Path, out: &mut V
             line,
             severity: Severity::Hint,
             message: missing_blank_message(&node.kind, source, node.span),
+            span: Some(node.span),
         });
     }
 }
@@ -1248,6 +1274,42 @@ mod tests {
             count_matching(&diags, Severity::Warning, "bare URL"),
             1,
             "one warning for bare URL past line midpoint: {diags:?}"
+        );
+    }
+
+    // Issue 011: producers must carry a precise byte span, not just a line.
+    #[test]
+    fn bare_url_diagnostic_has_precise_span() {
+        let content = "Visit https://example.com for info.\n";
+        let diags = diagnose(content);
+        let d = diags
+            .iter()
+            .find(|d| d.message.contains("bare URL"))
+            .expect("a bare URL diagnostic");
+        let span = d.span.expect("bare URL diagnostic carries a span");
+        assert_eq!(
+            &content[span.start..span.end],
+            "https://example.com",
+            "span underlines exactly the URL: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn trailing_whitespace_diagnostic_spans_the_spaces() {
+        // Three trailing spaces after "hello"; the span must cover only them.
+        let content = "hello   \nworld\n";
+        let diags = diagnose(content);
+        let d = diags
+            .iter()
+            .find(|d| d.message.contains("trailing whitespace"))
+            .expect("a trailing whitespace diagnostic");
+        let span = d
+            .span
+            .expect("trailing whitespace diagnostic carries a span");
+        assert_eq!(
+            &content[span.start..span.end],
+            "   ",
+            "span covers exactly the three trailing spaces: {diags:?}"
         );
     }
 

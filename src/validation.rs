@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 
 use crate::block::{self, HeadingId, LinkKind};
 use crate::config::{Config, FragmentAlgorithm, PredicatePolicy};
+use crate::span::Span;
 use crate::workspace::Workspace;
 
 /// Diagnostic severity level.
@@ -38,6 +39,13 @@ pub struct Diagnostic {
     pub severity: Severity,
     /// Human-readable description of the issue.
     pub message: String,
+    /// Byte span of the offending text, when a precise location is known.
+    ///
+    /// `Some` yields a precise LSP range; `None` falls back to a whole-line
+    /// range anchored on `line` (used by line-level diagnostics such as
+    /// backlinks). `line` stays authoritative for sorting and the CLI's
+    /// `path:line:` output regardless.
+    pub span: Option<Span>,
 }
 
 /// Validate forward links across all files in the workspace.
@@ -58,7 +66,14 @@ pub fn validate_forward_links(workspace: &Workspace) -> Vec<Diagnostic> {
                 LinkKind::External { .. } | LinkKind::IntraDocument { .. } => {}
 
                 LinkKind::NonMarkdown { target } => {
-                    check_target_exists(workspace, file_path, link.line, target, &mut diagnostics);
+                    check_target_exists(
+                        workspace,
+                        file_path,
+                        link.line,
+                        link.span,
+                        target,
+                        &mut diagnostics,
+                    );
                 }
 
                 LinkKind::IntraProject {
@@ -67,11 +82,19 @@ pub fn validate_forward_links(workspace: &Workspace) -> Vec<Diagnostic> {
                     predicate,
                     explicit_predicate,
                 } => {
-                    check_target_exists(workspace, file_path, link.line, target, &mut diagnostics);
+                    check_target_exists(
+                        workspace,
+                        file_path,
+                        link.line,
+                        link.span,
+                        target,
+                        &mut diagnostics,
+                    );
                     check_predicate(
                         config,
                         file_path,
                         link.line,
+                        link.span,
                         predicate,
                         *explicit_predicate,
                         &mut diagnostics,
@@ -82,6 +105,7 @@ pub fn validate_forward_links(workspace: &Workspace) -> Vec<Diagnostic> {
                             config,
                             file_path,
                             link.line,
+                            link.span,
                             target,
                             frag,
                             &mut diagnostics,
@@ -101,6 +125,7 @@ fn check_target_exists(
     workspace: &Workspace,
     source: &Path,
     line: usize,
+    span: Span,
     target: &Path,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
@@ -118,6 +143,7 @@ fn check_target_exists(
             line,
             severity: Severity::Error,
             message: format!("link target does not exist: {}", target.display()),
+            span: Some(span),
         });
     }
 }
@@ -127,6 +153,7 @@ fn check_predicate(
     config: &Config,
     source: &Path,
     line: usize,
+    span: Span,
     predicate: &str,
     explicit: bool,
     diagnostics: &mut Vec<Diagnostic>,
@@ -142,6 +169,7 @@ fn check_predicate(
                     "unknown predicate '{predicate}': choose from [{}]",
                     known.join(", ")
                 ),
+                span: Some(span),
             });
         }
     } else {
@@ -153,6 +181,7 @@ fn check_predicate(
                     severity: Severity::Info,
                     message: "link has no explicit predicate (defaulting to 'references')"
                         .to_string(),
+                    span: Some(span),
                 });
             }
             PredicatePolicy::Required => {
@@ -162,6 +191,7 @@ fn check_predicate(
                     line,
                     severity: Severity::Error,
                     message: format!("link missing predicate: choose from [{}]", known.join(", ")),
+                    span: Some(span),
                 });
             }
         }
@@ -300,6 +330,7 @@ fn check_missing_backlinks(
                             "expected backlink `{inverse_pred}` from `{}`",
                             rel.display()
                         ),
+                        span: None,
                     });
                 }
             }
@@ -335,6 +366,7 @@ fn check_stale_backlinks(
                         message: format!(
                             "backlink `{inverse_pred}` from `{source_str}` has no corresponding forward link"
                         ),
+                        span: None,
                     });
                 }
             }
@@ -348,11 +380,16 @@ fn check_stale_backlinks(
 /// slugs, the algorithm policy determines which slugs are considered.
 /// Skips the check when the target file does not exist (forward link
 /// validation handles that case).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "validation context parameters are distinct concerns"
+)]
 fn check_fragment(
     workspace: &Workspace,
     config: &Config,
     source: &Path,
     line: usize,
+    span: Span,
     target: &Path,
     fragment: &str,
     diagnostics: &mut Vec<Diagnostic>,
@@ -388,6 +425,7 @@ fn check_fragment(
                 fragment,
                 target.display()
             ),
+            span: Some(span),
         });
     }
 }
@@ -416,6 +454,7 @@ pub fn collect_all(workspace: &Workspace) -> Vec<Diagnostic> {
                 line: bd.line,
                 severity: Severity::Error,
                 message: format!("unknown inverse predicate `{}`", bd.predicate),
+                span: None,
             });
         }
         // Note: parse_diagnostics (frontmatter errors) are emitted by the
