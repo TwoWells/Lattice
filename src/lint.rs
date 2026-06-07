@@ -11,7 +11,6 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-use crate::structural;
 use crate::validation::{self, Diagnostic, Severity};
 use crate::workspace::Workspace;
 
@@ -33,16 +32,10 @@ pub fn run(start: &Path, strict: bool, out: &mut impl Write) -> Result<bool> {
     let mut failed = false;
     let mut diagnostics = Vec::new();
 
-    // Structural diagnostics: always run.
-    let config = workspace.config();
+    // Structural diagnostics: always run. Read from the per-file cache the
+    // workspace scan populated (issue 013 — stage 2).
     for (path, file_data) in workspace.files() {
-        let file_exists = |target: &Path| workspace.file(target).is_some();
-        diagnostics.extend(structural::collect(
-            &file_data.tree,
-            path,
-            config,
-            &file_exists,
-        ));
+        diagnostics.extend(file_data.structural.iter().cloned());
 
         // Frontmatter parse diagnostics are structural (unconditional).
         for pd in &file_data.parse_diagnostics {

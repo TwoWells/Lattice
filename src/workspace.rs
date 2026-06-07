@@ -17,7 +17,9 @@ use crate::block::{self, Syntax, Tree};
 use crate::config::{Config, ConfigError};
 use crate::fm;
 use crate::json;
+use crate::structural;
 use crate::toml;
+use crate::validation::Diagnostic;
 use crate::yaml;
 
 /// Errors that can occur during workspace operations.
@@ -51,6 +53,16 @@ pub struct FileData {
     pub backlink_diagnostics: Vec<BacklinkDiagnostic>,
     /// Frontmatter parse diagnostics (partial recovery — file is still indexed).
     pub parse_diagnostics: Vec<ParseDiagnostic>,
+    /// Cached structural diagnostics (`structural::collect` output) for this
+    /// file.
+    ///
+    /// Structural diagnostics are file-local: they depend only on this file's
+    /// tree plus workspace *membership* (the bare-path "refers to an existing
+    /// file" check reads the file set). The cache is refreshed when this file
+    /// is reparsed and, on a membership change, for every file — so the
+    /// diagnostic collectors read it directly instead of re-walking every
+    /// cached tree on each sync (issue 013 — stage 2).
+    pub structural: Vec<Diagnostic>,
 }
 
 /// Parsed frontmatter from a markdown document.
@@ -149,13 +161,18 @@ impl Workspace {
             }
         }
 
-        Ok(Self {
+        let mut workspace = Self {
             root,
             config,
             config_error,
             has_config,
             files,
-        })
+        };
+        // Membership is final after the scan loop, so structural caches can be
+        // computed for every file now (bare-path existence sees the full set).
+        workspace.recompute_all_structural();
+
+        Ok(workspace)
     }
 
     /// Re-parse a single file and update the workspace index.
@@ -170,16 +187,22 @@ impl Workspace {
         let abs_path = self.root.join(rel_path);
 
         if !abs_path.is_file() {
-            self.files.remove(rel_path);
+            if self.files.remove(rel_path).is_some() {
+                self.recompute_all_structural();
+            }
             return Ok(());
         }
 
+        let membership_changed = !self.files.contains_key(rel_path);
         match parse_file(&abs_path, rel_path, &self.config) {
             Ok(data) => {
                 self.files.insert(rel_path.to_path_buf(), data);
+                self.refresh_structural_after_update(rel_path, membership_changed);
             }
             Err(e) => {
-                self.files.remove(rel_path);
+                if self.files.remove(rel_path).is_some() {
+                    self.recompute_all_structural();
+                }
                 return Err(WorkspaceError::Read {
                     path: rel_path.to_path_buf(),
                     source: e,
@@ -196,8 +219,50 @@ impl Workspace {
     /// parsed directly without reading from disk, which is used by the LSP
     /// server for unsaved editor buffers.
     pub fn update_content(&mut self, rel_path: &Path, content: &str) {
+        let membership_changed = !self.files.contains_key(rel_path);
         let data = parse_content(content, rel_path, &self.config);
         self.files.insert(rel_path.to_path_buf(), data);
+        self.refresh_structural_after_update(rel_path, membership_changed);
+    }
+
+    /// Refresh the structural cache after `rel_path` was (re)parsed.
+    ///
+    /// An edit that does not change membership only invalidates the edited
+    /// file's cache. A membership change (a file added or removed) can flip a
+    /// bare-path existence answer in *any* file, so it forces a full recompute.
+    fn refresh_structural_after_update(&mut self, rel_path: &Path, membership_changed: bool) {
+        if membership_changed {
+            self.recompute_all_structural();
+        } else {
+            self.recompute_structural(rel_path);
+        }
+    }
+
+    /// Recompute and cache the structural diagnostics for a single indexed
+    /// file from its cached tree and the current workspace membership. No-op if
+    /// the path is not indexed.
+    fn recompute_structural(&mut self, rel_path: &Path) {
+        let Some(file_data) = self.files.get(rel_path) else {
+            return;
+        };
+        let file_exists = |target: &Path| self.files.contains_key(target);
+        let diagnostics =
+            structural::collect(&file_data.tree, rel_path, &self.config, &file_exists);
+        if let Some(file_data) = self.files.get_mut(rel_path) {
+            file_data.structural = diagnostics;
+        }
+    }
+
+    /// Recompute the structural cache for every indexed file.
+    ///
+    /// Required on a membership change: the bare-path "refers to an existing
+    /// file" check reads the full file set, so adding or removing one file can
+    /// change structural diagnostics on any other file.
+    fn recompute_all_structural(&mut self) {
+        let paths: Vec<PathBuf> = self.files.keys().cloned().collect();
+        for path in &paths {
+            self.recompute_structural(path);
+        }
     }
 
     /// The absolute path to the workspace root.
@@ -336,6 +401,10 @@ pub fn parse_content(content: &str, rel_path: &Path, config: &Config) -> FileDat
         frontmatter,
         backlink_diagnostics,
         parse_diagnostics,
+        // Left empty here — `structural::collect` needs workspace membership
+        // (for bare-path existence) that a standalone parse cannot know. The
+        // workspace fills it via `recompute_structural` after insertion.
+        structural: Vec::new(),
     }
 }
 
@@ -724,5 +793,88 @@ mod tests {
 
         let ws = Workspace::scan(dir.path()).expect("scan should succeed");
         assert!(ws.has_config(), "broken config still means user opted in");
+    }
+
+    // -- Stage-2 structural cache (issue 013) --
+
+    /// Stage-2 differential invariant: every file's cached `structural` vector
+    /// must equal a from-scratch `structural::collect` for that file. A drift
+    /// here is the "silent stale diagnostic" failure mode the cache risks.
+    fn assert_cache_matches_recompute(ws: &Workspace) {
+        for (path, file_data) in ws.files() {
+            let file_exists = |target: &Path| ws.file(target).is_some();
+            let fresh = structural::collect(&file_data.tree, path, ws.config(), &file_exists);
+            assert_eq!(
+                file_data.structural,
+                fresh,
+                "cached structural for {} drifted from a fresh collect",
+                path.display()
+            );
+        }
+    }
+
+    /// Severity of the bare-path diagnostic on `path`, if any.
+    fn bare_path_severity(ws: &Workspace, path: &Path) -> Option<crate::validation::Severity> {
+        ws.file(path)?
+            .structural
+            .iter()
+            .find(|d| d.message.contains("convert to a markdown link"))
+            .map(|d| d.severity)
+    }
+
+    #[test]
+    fn structural_cache_matches_recompute_across_mutations() {
+        let dir = workspace_with_files(&[
+            ("a.md", "See docs/page.md for details.\ntrailing \n"),
+            ("docs/page.md", "# Page\n"),
+        ]);
+        let mut ws = Workspace::scan(dir.path()).expect("scan should succeed");
+        assert_cache_matches_recompute(&ws);
+        assert!(
+            !ws.file(Path::new("a.md"))
+                .expect("a.md indexed")
+                .structural
+                .is_empty(),
+            "fixture should exercise real structural diagnostics"
+        );
+
+        // Content edit, membership unchanged.
+        ws.update_content(
+            Path::new("a.md"),
+            "# Clean\n\nstill referencing docs/page.md.\n",
+        );
+        assert_cache_matches_recompute(&ws);
+
+        // Add a file: membership grows.
+        ws.update_content(Path::new("docs/extra.md"), "# Extra\n");
+        assert_cache_matches_recompute(&ws);
+
+        // Remove a file from disk: membership shrinks.
+        fs::remove_file(dir.path().join("docs/page.md")).expect("delete page.md");
+        ws.update(Path::new("docs/page.md"))
+            .expect("update should succeed");
+        assert_cache_matches_recompute(&ws);
+    }
+
+    #[test]
+    fn bare_path_severity_flips_when_target_added() {
+        // a.md references docs/page.md as a bare path. With the target absent
+        // it is a hint; adding the target must flip a.md's cached diagnostic to
+        // a warning even though a.md itself never changed — the membership
+        // recompute path.
+        let dir = workspace_with_files(&[("a.md", "See docs/page.md for details.\n")]);
+        let mut ws = Workspace::scan(dir.path()).expect("scan should succeed");
+        assert_eq!(
+            bare_path_severity(&ws, Path::new("a.md")),
+            Some(crate::validation::Severity::Hint),
+            "absent target should be a hint"
+        );
+
+        ws.update_content(Path::new("docs/page.md"), "# Page\n");
+        assert_eq!(
+            bare_path_severity(&ws, Path::new("a.md")),
+            Some(crate::validation::Severity::Warning),
+            "adding the target should flip the source's bare-path to a warning"
+        );
     }
 }

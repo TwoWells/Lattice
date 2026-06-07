@@ -29,7 +29,7 @@ pub enum Severity {
 }
 
 /// A diagnostic produced by validation.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Diagnostic {
     /// Workspace-relative path of the file containing the issue.
     pub file: PathBuf,

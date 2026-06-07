@@ -20,7 +20,6 @@ use crate::block::{
 };
 use crate::lsp;
 use crate::span::Span;
-use crate::structural;
 use crate::validation::{self, Diagnostic, Severity};
 use crate::workspace::Workspace;
 
@@ -1806,16 +1805,12 @@ fn document_links(workspaces: &Workspaces, uri: &str) -> Vec<lsp::DocumentLink> 
 fn collect_all_diagnostics(workspace: &Workspace) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
 
-    // Structural diagnostics: always run, no config required.
-    let config = workspace.config();
+    // Structural diagnostics: always run, no config required. Read from the
+    // per-file cache, which the workspace refreshes only for the reparsed file
+    // (or, on a membership change, all files) — so this no longer re-walks
+    // every cached tree on each sync (issue 013 — stage 2).
     for (path, file_data) in workspace.files() {
-        let file_exists = |target: &std::path::Path| workspace.file(target).is_some();
-        diagnostics.extend(structural::collect(
-            &file_data.tree,
-            path,
-            config,
-            &file_exists,
-        ));
+        diagnostics.extend(file_data.structural.iter().cloned());
 
         // Frontmatter parse diagnostics are structural (unconditional).
         for pd in &file_data.parse_diagnostics {
