@@ -21,7 +21,7 @@ use crate::block::{
 use crate::lsp;
 use crate::span::Span;
 use crate::validation::{self, Diagnostic, Severity};
-use crate::workspace::Workspace;
+use crate::workspace::{FileData, Workspace};
 
 /// Multiple workspaces keyed by root path.
 struct Workspaces {
@@ -1810,22 +1810,7 @@ fn collect_all_diagnostics(workspace: &Workspace) -> Vec<Diagnostic> {
     // (or, on a membership change, all files) — so this no longer re-walks
     // every cached tree on each sync (issue 013 — stage 2).
     for (path, file_data) in workspace.files() {
-        diagnostics.extend(file_data.structural.iter().cloned());
-
-        // Frontmatter parse diagnostics are structural (unconditional).
-        for pd in &file_data.parse_diagnostics {
-            let severity = match pd.severity {
-                crate::fm::FmSeverity::Error => Severity::Error,
-                crate::fm::FmSeverity::Warning => Severity::Warning,
-            };
-            diagnostics.push(Diagnostic {
-                file: path.clone(),
-                line: pd.line,
-                severity,
-                message: format!("frontmatter: {}", pd.message),
-                span: None,
-            });
-        }
+        diagnostics.extend(file_local_diagnostics(file_data, path));
     }
 
     // Graph diagnostics: only when .lattice.toml is present.
@@ -1835,6 +1820,51 @@ fn collect_all_diagnostics(workspace: &Workspace) -> Vec<Diagnostic> {
 
     diagnostics.sort_by(|a, b| a.file.cmp(&b.file).then(a.line.cmp(&b.line)));
     diagnostics
+}
+
+/// The unconditional (config-independent) diagnostics for a single file: its
+/// cached structural diagnostics (issue 013 — stage 2) plus frontmatter parse
+/// diagnostics. Returned unsorted — callers sort as they need.
+///
+/// Shared by the full-workspace collect and the per-file incremental publish so
+/// the two cannot drift (the stage-2.5 differential invariant).
+fn file_local_diagnostics(file_data: &FileData, rel_path: &Path) -> Vec<Diagnostic> {
+    let mut diagnostics = file_data.structural.clone();
+    for pd in &file_data.parse_diagnostics {
+        let severity = match pd.severity {
+            crate::fm::FmSeverity::Error => Severity::Error,
+            crate::fm::FmSeverity::Warning => Severity::Warning,
+        };
+        diagnostics.push(Diagnostic {
+            file: rel_path.to_path_buf(),
+            line: pd.line,
+            severity,
+            message: format!("frontmatter: {}", pd.message),
+            span: None,
+        });
+    }
+    diagnostics
+}
+
+/// The desired LSP diagnostics for a single file, in the same order
+/// [`desired_diagnostics`] would produce for it: file-local diagnostics sorted
+/// by line, then materialized against the file's source. Empty when the file is
+/// not indexed.
+///
+/// This is the structural-tier slice of the full desired set; it excludes graph
+/// diagnostics, so [`diff_file_diagnostics`] is sound only in the structural
+/// tier (its callers gate on `!has_config()`).
+fn file_desired_lsp(workspace: &Workspace, rel_path: &Path) -> Vec<lsp::Diagnostic> {
+    let Some(file_data) = workspace.file(rel_path) else {
+        return Vec::new();
+    };
+    let source = file_data.tree.source();
+    let mut diagnostics = file_local_diagnostics(file_data, rel_path);
+    diagnostics.sort_by_key(|d| d.line);
+    diagnostics
+        .iter()
+        .map(|d| to_lsp_diagnostic(d, source))
+        .collect()
 }
 
 /// Return diagnostics for a single document.
@@ -2399,10 +2429,26 @@ fn handle_notification(
         lsp::method::DID_CHANGE => {
             let params: lsp::DidChangeTextDocumentParams = serde_json::from_value(notif.params)?;
             if let Some(change) = params.content_changes.into_iter().last() {
-                if let Some((ws, rel_path)) = workspaces.resolve_mut(&params.text_document.uri) {
+                // A didChange targets an already-open (already-indexed) document,
+                // so it never changes workspace membership. In the structural
+                // tier that means only the edited file's diagnostics can change,
+                // so publish just its delta instead of an O(workspace) recompute
+                // (issue 013 — stage 2.5). The graph tier still needs a full
+                // recompute (a link/backlink edit reaches other files) until the
+                // stage-3 reverse index exists.
+                let incremental = if let Some((ws, rel_path)) =
+                    workspaces.resolve_mut(&params.text_document.uri)
+                {
                     ws.update_content(&rel_path, &change.text);
+                    !ws.has_config()
+                } else {
+                    false
+                };
+                if incremental {
+                    publish_file_diagnostics(connection, workspaces, &params.text_document.uri)?;
+                } else {
+                    publish_all_diagnostics(connection, workspaces)?;
                 }
-                publish_all_diagnostics(connection, workspaces)?;
             }
         }
         lsp::method::DID_CHANGE_WORKSPACE_FOLDERS => {
@@ -2440,6 +2486,69 @@ fn publish_all_diagnostics(connection: &Connection, workspaces: &mut Workspaces)
     }
 
     Ok(())
+}
+
+/// Publish the diagnostic delta for a single file (issue 013 — stage 2.5).
+///
+/// Recomputes the desired diagnostics for just `uri` and sends a
+/// `publishDiagnostics` only if its vector changed. This avoids the
+/// `O(workspace)` materialize/diff that [`publish_all_diagnostics`] pays every
+/// sync. It is correct only when the triggering edit cannot affect any other
+/// file's diagnostics — i.e. a content edit (no membership change) in the
+/// structural tier — so the caller must gate on that.
+fn publish_file_diagnostics(
+    connection: &Connection,
+    workspaces: &mut Workspaces,
+    uri: &str,
+) -> Result<()> {
+    if let Some((uri, diagnostics)) = diff_file_diagnostics(workspaces, uri) {
+        let params = lsp::PublishDiagnosticsParams { uri, diagnostics };
+        let notif = Notification::new(lsp::method::PUBLISH_DIAGNOSTICS.to_string(), params);
+        connection.sender.send(Message::Notification(notif))?;
+    }
+
+    Ok(())
+}
+
+/// Diff one file's freshly computed diagnostics against the last published set,
+/// updating the cache and returning the `(uri, diagnostics)` to send when it
+/// changed (including the transition to empty, which clears the file). Returns
+/// `None` when nothing changed or the URI resolves to no workspace.
+///
+/// The single-file counterpart to [`diff_diagnostics`]; it touches only this
+/// file's cache entry, leaving every other file's last-published set intact —
+/// which is correct precisely under the structural-tier, no-membership-change
+/// precondition its caller enforces.
+fn diff_file_diagnostics(
+    workspaces: &mut Workspaces,
+    uri: &str,
+) -> Option<(String, Vec<lsp::Diagnostic>)> {
+    let (canonical, desired) = {
+        let (workspace, rel_path) = workspaces.resolve(uri)?;
+        let canonical = path_to_uri(&workspace.root().join(&rel_path));
+        let desired = file_desired_lsp(workspace, &rel_path);
+        (canonical, desired)
+    };
+
+    let unchanged = workspaces
+        .published
+        .get(&canonical)
+        .map_or(desired.is_empty(), |prev| prev == &desired);
+    if unchanged {
+        return None;
+    }
+
+    // Keep the cache invariant: only non-empty vectors are stored, so an absent
+    // entry means "the client currently holds none".
+    if desired.is_empty() {
+        workspaces.published.remove(&canonical);
+    } else {
+        workspaces
+            .published
+            .insert(canonical.clone(), desired.clone());
+    }
+
+    Some((canonical, desired))
 }
 
 /// Compute the full desired diagnostic set across all workspaces, keyed by
@@ -5361,6 +5470,41 @@ mod tests {
         for (i, (rel, content)) in steps.iter().enumerate() {
             edit(&mut workspaces, rel, content);
             for (uri, diagnostics) in diff_diagnostics(&mut workspaces) {
+                apply_publish(&mut client, uri, diagnostics);
+            }
+            assert_client_matches(&workspaces, &client, &format!("after edit {i} ({rel})"));
+        }
+    }
+
+    #[test]
+    fn incremental_file_publish_matches_full_recompute() {
+        // Stage-2.5 safety net: in the structural tier a content edit changes
+        // only the edited file, so the per-file incremental publish
+        // (`diff_file_diagnostics`) must reproduce, at every step, exactly what
+        // a from-scratch full publish would show. No `.lattice.toml` -> the
+        // structural tier the incremental path is gated to.
+        let dir = workspace_with_files(&[("a.md", "# A\n"), ("b.md", "# B\n"), ("c.md", "# C\n")]);
+        let mut workspaces = scan_workspaces(&dir);
+        let mut client: HashMap<String, Vec<lsp::Diagnostic>> = HashMap::new();
+
+        // Seed the client with the initial full publish, as didOpen would.
+        for (uri, diagnostics) in diff_diagnostics(&mut workspaces) {
+            apply_publish(&mut client, uri, diagnostics);
+        }
+        assert_client_matches(&workspaces, &client, "after initial sync");
+
+        // didChange-style edits that add, move, and clear diagnostics across
+        // different files — each published via the per-file incremental path.
+        let steps: &[(&str, &str)] = &[
+            ("a.md", "# A\n\n### C\n"),             // add a skipped-heading diagnostic
+            ("b.md", "Visit docs/page.md here.\n"), // add a bare-path hint
+            ("a.md", "# A\n"),                      // clear a.md's diagnostic
+            ("c.md", "trailing \n"),                // add trailing whitespace on c.md
+        ];
+        for (i, (rel, content)) in steps.iter().enumerate() {
+            edit(&mut workspaces, rel, content);
+            let uri = file_uri(&dir, rel);
+            if let Some((uri, diagnostics)) = diff_file_diagnostics(&mut workspaces, &uri) {
                 apply_publish(&mut client, uri, diagnostics);
             }
             assert_client_matches(&workspaces, &client, &format!("after edit {i} ({rel})"));
