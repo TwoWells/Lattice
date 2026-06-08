@@ -80,6 +80,8 @@ predicates = "optional"    # or "required"
 backlinks = true
 bare_paths = "warn"        # or "deny", "disabled"
 # fragments = "github"    # or "gitlab", "vscode"; omit to try all
+# connectivity = "off"    # or "no-orphans", "no-islands", "reachable"
+# roots = ["README.md"]   # entry points for "reachable"; default = root README
 ```
 
 ## Agent instructions

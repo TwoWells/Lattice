@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use crate::block::{self, HeadingId, LinkKind};
-use crate::config::{Config, FragmentAlgorithm, PredicatePolicy};
+use crate::config::{Config, ConnectivityPolicy, FragmentAlgorithm, PredicatePolicy};
 use crate::span::Span;
 use crate::workspace::Workspace;
 
@@ -466,10 +466,166 @@ fn check_fragment(
     }
 }
 
+/// Validate graph connectivity (topology) across the workspace.
+///
+/// Flags isolated documents per the configured [`ConnectivityPolicy`]:
+///
+/// - `no-orphans` — any non-root document with no intra-project edge.
+/// - `no-islands` — any non-root document outside a root's connected
+///   component (edges undirected).
+/// - `reachable` — any non-root document not forward-reachable from a root.
+///
+/// Returns an empty list when `connectivity = "off"` (the default). The
+/// diagnostic anchors on the isolated document itself (line 1), mirroring the
+/// missing-backlink-on-target convention.
+///
+/// Edges are built from valid intra-project markdown forward links (target
+/// must exist; self-loops excluded). A link counts as an edge regardless of
+/// predicate validity — connectivity asks whether documents reference each
+/// other, which is orthogonal to the predicate vocabulary; an unknown
+/// predicate is a separate diagnostic. Roots are exempt at every level. When
+/// no configured root resolves to an indexed file, `no-islands` and
+/// `reachable` emit nothing (they have no anchor to traverse from), while
+/// `no-orphans` still runs (it uses roots only for exemption).
+pub fn validate_connectivity(workspace: &Workspace) -> Vec<Diagnostic> {
+    let level = workspace.config().policy.connectivity;
+    if level == ConnectivityPolicy::Off {
+        return Vec::new();
+    }
+
+    let files = workspace.files();
+
+    // Build forward (directed) and undirected adjacency over valid
+    // intra-project markdown edges in a single pass.
+    let mut forward: HashMap<&Path, BTreeSet<&Path>> = HashMap::new();
+    let mut undirected: HashMap<&Path, BTreeSet<&Path>> = HashMap::new();
+    for (source, file_data) in files {
+        let src = source.as_path();
+        for link in &file_data.tree.links(source) {
+            let LinkKind::IntraProject { target, .. } = &link.kind else {
+                continue;
+            };
+            // Skip broken targets (forward validation handles those) and
+            // self-loops (a document linking to itself does not connect it to
+            // any *other* document).
+            let Some((target_key, _)) = files.get_key_value(target) else {
+                continue;
+            };
+            let dst = target_key.as_path();
+            if dst == src {
+                continue;
+            }
+            forward.entry(src).or_default().insert(dst);
+            undirected.entry(src).or_default().insert(dst);
+            undirected.entry(dst).or_default().insert(src);
+        }
+    }
+
+    // Resolve configured roots to indexed files (normalized).
+    let root_set: BTreeSet<&Path> = workspace
+        .config()
+        .policy
+        .roots
+        .iter()
+        .filter_map(|r| {
+            files
+                .get_key_value(&block::normalize_path(r))
+                .map(|(k, _)| k.as_path())
+        })
+        .collect();
+
+    let mut diagnostics = Vec::new();
+    let flag = |node: &Path, message: &str, diags: &mut Vec<Diagnostic>| {
+        diags.push(Diagnostic {
+            file: node.to_path_buf(),
+            line: 1,
+            severity: Severity::Warning,
+            message: message.to_string(),
+            span: None,
+        });
+    };
+
+    match level {
+        ConnectivityPolicy::Off => {}
+        ConnectivityPolicy::NoOrphans => {
+            for path in files.keys() {
+                let node = path.as_path();
+                if root_set.contains(node) {
+                    continue;
+                }
+                if undirected.get(node).is_none_or(BTreeSet::is_empty) {
+                    flag(
+                        node,
+                        "orphaned document: no links to or from any other document",
+                        &mut diagnostics,
+                    );
+                }
+            }
+        }
+        ConnectivityPolicy::NoIslands | ConnectivityPolicy::Reachable => {
+            if root_set.is_empty() {
+                tracing::debug!(
+                    "connectivity: no configured root resolves to an indexed file; skipping {level:?}"
+                );
+                return Vec::new();
+            }
+            let (adjacency, message) = if level == ConnectivityPolicy::NoIslands {
+                (
+                    &undirected,
+                    "isolated document: not connected to the project graph",
+                )
+            } else {
+                (
+                    &forward,
+                    "unreachable document: not reachable from any root by forward links",
+                )
+            };
+            let visited = flood(&root_set, adjacency);
+            for path in files.keys() {
+                let node = path.as_path();
+                if root_set.contains(node) {
+                    continue;
+                }
+                if !visited.contains(node) {
+                    flag(node, message, &mut diagnostics);
+                }
+            }
+        }
+    }
+
+    diagnostics.sort_by(|a, b| a.file.cmp(&b.file).then(a.line.cmp(&b.line)));
+    diagnostics
+}
+
+/// Flood-fill the set of nodes reachable from `roots` over `adjacency`.
+///
+/// Iterative DFS; pass undirected adjacency for `no-islands` (component
+/// membership) or forward adjacency for `reachable` (directed navigability).
+fn flood<'a>(
+    roots: &BTreeSet<&'a Path>,
+    adjacency: &HashMap<&'a Path, BTreeSet<&'a Path>>,
+) -> BTreeSet<&'a Path> {
+    let mut visited: BTreeSet<&Path> = BTreeSet::new();
+    let mut stack: Vec<&Path> = roots.iter().copied().collect();
+    while let Some(node) = stack.pop() {
+        if !visited.insert(node) {
+            continue;
+        }
+        if let Some(neighbors) = adjacency.get(node) {
+            for &next in neighbors {
+                if !visited.contains(next) {
+                    stack.push(next);
+                }
+            }
+        }
+    }
+    visited
+}
+
 /// Collect all diagnostics for the workspace.
 ///
-/// Runs every validation check (forward links, backlinks, bare paths),
-/// collects unknown inverse predicate errors from frontmatter, and
+/// Runs every validation check (forward links, backlinks, connectivity, bare
+/// paths), collects unknown inverse predicate errors from frontmatter, and
 /// includes frontmatter parse errors. Returns diagnostics sorted by
 /// file then line number.
 pub fn collect_all(workspace: &Workspace) -> Vec<Diagnostic> {
@@ -480,6 +636,7 @@ pub fn collect_all(workspace: &Workspace) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
     diagnostics.extend(validate_forward_links(workspace));
     diagnostics.extend(validate_backlinks(workspace));
+    diagnostics.extend(validate_connectivity(workspace));
     // Note: bare paths are emitted by the structural diagnostics layer
     // unconditionally — not duplicated here.
 
@@ -1282,6 +1439,195 @@ fragments = \"gitlab\"
         assert!(
             !diags.is_empty(),
             "collect_all should produce diagnostics with .lattice.toml"
+        );
+    }
+
+    // --- Connectivity validation (issue 018) ---
+
+    /// Collect the workspace-relative paths flagged by connectivity.
+    fn flagged_files(ws: &Workspace) -> Vec<String> {
+        let mut files: Vec<String> = validate_connectivity(ws)
+            .into_iter()
+            .map(|d| d.file.display().to_string())
+            .collect();
+        files.sort();
+        files
+    }
+
+    #[test]
+    fn connectivity_off_by_default() {
+        // .lattice.toml present but no connectivity setting → no topology checks.
+        let (_dir, ws) = setup_workspace(&[
+            (".lattice.toml", "[policy]\nbacklinks = true\n"),
+            ("orphan.md", "# Orphan\n"),
+        ]);
+
+        assert!(
+            validate_connectivity(&ws).is_empty(),
+            "connectivity defaults off: {:?}",
+            validate_connectivity(&ws)
+        );
+    }
+
+    #[test]
+    fn no_orphans_flags_degree_zero_document() {
+        let (_dir, ws) = setup_workspace(&[
+            (".lattice.toml", "[policy]\nconnectivity = \"no-orphans\"\n"),
+            ("index.md", r#"[a](a.md "references")"#),
+            ("a.md", "# A\n"),
+            ("orphan.md", "# Orphan\n"),
+        ]);
+
+        let diags = validate_connectivity(&ws);
+        assert_eq!(diags.len(), 1, "only the orphan is flagged: {diags:?}");
+        assert_eq!(
+            diags[0].file,
+            PathBuf::from("orphan.md"),
+            "orphan.md flagged"
+        );
+        assert_eq!(diags[0].line, 1, "anchored on line 1");
+        assert_eq!(
+            diags[0].severity,
+            Severity::Warning,
+            "connectivity is a warning"
+        );
+        assert!(
+            diags[0].message.contains("orphaned document"),
+            "message names the orphan: {}",
+            diags[0].message
+        );
+    }
+
+    #[test]
+    fn no_orphans_exempts_default_root_readme() {
+        // A lone README (the default root) links nowhere but is never
+        // self-flagged — a single-document workspace stays clean.
+        let (_dir, ws) = setup_workspace(&[
+            (".lattice.toml", "[policy]\nconnectivity = \"no-orphans\"\n"),
+            ("README.md", "# Readme\n"),
+        ]);
+
+        assert!(
+            validate_connectivity(&ws).is_empty(),
+            "the root README is exempt: {:?}",
+            validate_connectivity(&ws)
+        );
+    }
+
+    #[test]
+    fn no_orphans_ignores_self_loop() {
+        // A document linking only to itself has no edge to any *other* document.
+        let (_dir, ws) = setup_workspace(&[
+            (".lattice.toml", "[policy]\nconnectivity = \"no-orphans\"\n"),
+            ("selfish.md", r#"[me](selfish.md "references")"#),
+        ]);
+
+        assert_eq!(
+            flagged_files(&ws),
+            vec!["selfish.md".to_string()],
+            "self-loop does not connect a document"
+        );
+    }
+
+    #[test]
+    fn no_islands_flags_disconnected_cluster() {
+        let (_dir, ws) = setup_workspace(&[
+            (".lattice.toml", "[policy]\nconnectivity = \"no-islands\"\n"),
+            ("README.md", r#"[a](a.md "references")"#),
+            ("a.md", "# A\n"),
+            ("island1.md", r#"[two](island2.md "references")"#),
+            ("island2.md", "# Island 2\n"),
+        ]);
+
+        assert_eq!(
+            flagged_files(&ws),
+            vec!["island1.md".to_string(), "island2.md".to_string()],
+            "both island members flagged, root component clean"
+        );
+        let diags = validate_connectivity(&ws);
+        assert!(
+            diags[0].message.contains("isolated document"),
+            "no-islands message: {}",
+            diags[0].message
+        );
+    }
+
+    #[test]
+    fn reachable_flags_inbound_only_deadend() {
+        // `lonely` links into the root component but nothing forward-navigates
+        // to it from any root — connected, but unreachable.
+        let (_dir, ws) = setup_workspace(&[
+            (".lattice.toml", "[policy]\nconnectivity = \"reachable\"\n"),
+            ("README.md", r#"[a](a.md "references")"#),
+            ("a.md", "# A\n"),
+            ("lonely.md", r#"[home](README.md "references")"#),
+        ]);
+
+        assert_eq!(
+            flagged_files(&ws),
+            vec!["lonely.md".to_string()],
+            "inbound-only dead-end is unreachable"
+        );
+        let diags = validate_connectivity(&ws);
+        assert!(
+            diags[0].message.contains("unreachable document"),
+            "reachable message: {}",
+            diags[0].message
+        );
+    }
+
+    #[test]
+    fn no_islands_passes_inbound_only_deadend() {
+        // The same graph as `reachable_flags_inbound_only_deadend`: `lonely`
+        // shares an (undirected) edge with the root, so no-islands accepts it.
+        // Demonstrates the strict superset `no-islands ⊆ reachable`.
+        let (_dir, ws) = setup_workspace(&[
+            (".lattice.toml", "[policy]\nconnectivity = \"no-islands\"\n"),
+            ("README.md", r#"[a](a.md "references")"#),
+            ("a.md", "# A\n"),
+            ("lonely.md", r#"[home](README.md "references")"#),
+        ]);
+
+        assert!(
+            validate_connectivity(&ws).is_empty(),
+            "no-islands accepts the inbound-only dead-end: {:?}",
+            validate_connectivity(&ws)
+        );
+    }
+
+    #[test]
+    fn reachable_uses_custom_roots() {
+        let (_dir, ws) = setup_workspace(&[
+            (
+                ".lattice.toml",
+                "[policy]\nconnectivity = \"reachable\"\nroots = [\"docs/home.md\"]\n",
+            ),
+            ("docs/home.md", r#"[a](../a.md "references")"#),
+            ("a.md", "# A\n"),
+            ("stray.md", "# Stray\n"),
+        ]);
+
+        assert_eq!(
+            flagged_files(&ws),
+            vec!["stray.md".to_string()],
+            "traversal starts from the configured root, reaches a.md"
+        );
+    }
+
+    #[test]
+    fn reachable_without_resolvable_root_emits_nothing() {
+        // Default root README.md is absent, so `reachable` has no anchor and
+        // stays silent rather than flagging every document.
+        let (_dir, ws) = setup_workspace(&[
+            (".lattice.toml", "[policy]\nconnectivity = \"reachable\"\n"),
+            ("a.md", "# A\n"),
+            ("b.md", "# B\n"),
+        ]);
+
+        assert!(
+            validate_connectivity(&ws).is_empty(),
+            "no root → no reachable diagnostics: {:?}",
+            validate_connectivity(&ws)
         );
     }
 }

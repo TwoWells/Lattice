@@ -93,6 +93,25 @@ pub enum CodeBlockLanguagePolicy {
     Disabled,
 }
 
+/// Graph connectivity (topology) check level.
+///
+/// An escalating ladder where each level flags a superset of the previous
+/// one (`no-orphans ⊆ no-islands ⊆ reachable`), given the uniform root
+/// exemption. See issue 018.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConnectivityPolicy {
+    /// No connectivity check (default).
+    #[default]
+    Off,
+    /// Flag any non-root document with no intra-project edge (degree 0).
+    NoOrphans,
+    /// Flag any non-root document outside a root's connected component
+    /// (edges treated as undirected).
+    NoIslands,
+    /// Flag any non-root document not forward-reachable from a root.
+    Reachable,
+}
+
 /// Slug algorithm for heading-fragment validation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FragmentAlgorithm {
@@ -119,6 +138,15 @@ pub struct Policy {
     pub admonitions: AdmonitionPolicy,
     /// Code block language tag policy.
     pub code_block_language: CodeBlockLanguagePolicy,
+    /// Graph connectivity (topology) check level.
+    pub connectivity: ConnectivityPolicy,
+    /// Entry-point documents for connectivity checks.
+    ///
+    /// Workspace-relative paths; normalized and matched against indexed files
+    /// at check time. Roots are exempt from connectivity flagging at every
+    /// level and anchor the `no-islands`/`reachable` traversals. Defaults to
+    /// the workspace-root `README.md`.
+    pub roots: Vec<PathBuf>,
 }
 
 impl Default for Policy {
@@ -130,6 +158,8 @@ impl Default for Policy {
             fragments: None,
             admonitions: AdmonitionPolicy::default(),
             code_block_language: CodeBlockLanguagePolicy::default(),
+            connectivity: ConnectivityPolicy::default(),
+            roots: vec![PathBuf::from("README.md")],
         }
     }
 }
@@ -254,6 +284,18 @@ impl Config {
                         }
                     })?;
             }
+            if let Some(ref value) = policy.connectivity {
+                config.policy.connectivity =
+                    parse_connectivity_policy(value).ok_or_else(|| ConfigError::Invalid {
+                        path: path.clone(),
+                        message: format!(
+                            "unknown connectivity policy '{value}': expected 'off', 'no-orphans', 'no-islands', or 'reachable'"
+                        ),
+                    })?;
+            }
+            if let Some(roots) = policy.roots {
+                config.policy.roots = roots.iter().map(PathBuf::from).collect();
+            }
         }
 
         if let Some(format) = raw.format {
@@ -309,6 +351,8 @@ struct RawPolicy {
     fragments: Option<String>,
     admonitions: Option<String>,
     code_block_language: Option<String>,
+    connectivity: Option<String>,
+    roots: Option<Vec<String>>,
 }
 
 // --- Helpers ---
@@ -392,6 +436,16 @@ fn parse_code_block_language_policy(s: &str) -> Option<CodeBlockLanguagePolicy> 
         "warn" => Some(CodeBlockLanguagePolicy::Warn),
         "deny" => Some(CodeBlockLanguagePolicy::Deny),
         "disabled" => Some(CodeBlockLanguagePolicy::Disabled),
+        _ => None,
+    }
+}
+
+fn parse_connectivity_policy(s: &str) -> Option<ConnectivityPolicy> {
+    match s {
+        "off" => Some(ConnectivityPolicy::Off),
+        "no-orphans" => Some(ConnectivityPolicy::NoOrphans),
+        "no-islands" => Some(ConnectivityPolicy::NoIslands),
+        "reachable" => Some(ConnectivityPolicy::Reachable),
         _ => None,
     }
 }
@@ -680,6 +734,71 @@ fragments = "gitlab"
         let err = Config::load(dir.path()).expect_err("should fail");
         let msg = err.to_string();
         assert!(msg.contains("bitbucket"), "mentions bad value: {msg}");
+    }
+
+    #[test]
+    fn connectivity_defaults() {
+        let dir = temp_dir_with(None);
+        fs::create_dir(dir.path().join(".git")).expect("create .git");
+
+        let config = Config::load(dir.path()).expect("load should succeed");
+
+        assert_eq!(
+            config.policy.connectivity,
+            ConnectivityPolicy::Off,
+            "connectivity defaults off"
+        );
+        assert_eq!(
+            config.policy.roots,
+            vec![PathBuf::from("README.md")],
+            "roots default to the workspace-root README"
+        );
+    }
+
+    #[test]
+    fn connectivity_levels_parse() {
+        for (value, expected) in [
+            ("no-orphans", ConnectivityPolicy::NoOrphans),
+            ("no-islands", ConnectivityPolicy::NoIslands),
+            ("reachable", ConnectivityPolicy::Reachable),
+            ("off", ConnectivityPolicy::Off),
+        ] {
+            let dir = temp_dir_with(Some(&format!("[policy]\nconnectivity = \"{value}\"")));
+            let config = Config::load(dir.path()).expect("load should succeed");
+            assert_eq!(
+                config.policy.connectivity, expected,
+                "connectivity = {value:?} parses"
+            );
+        }
+    }
+
+    #[test]
+    fn connectivity_custom_roots_parse() {
+        let dir = temp_dir_with(Some(
+            "[policy]\nconnectivity = \"reachable\"\nroots = [\"docs/index.md\", \"CONTRIBUTING.md\"]",
+        ));
+        let config = Config::load(dir.path()).expect("load should succeed");
+
+        assert_eq!(
+            config.policy.roots,
+            vec![
+                PathBuf::from("docs/index.md"),
+                PathBuf::from("CONTRIBUTING.md"),
+            ],
+            "custom roots override the default"
+        );
+    }
+
+    #[test]
+    fn invalid_connectivity_policy() {
+        let dir = temp_dir_with(Some("[policy]\nconnectivity = \"weak\""));
+        let err = Config::load(dir.path()).expect_err("should fail");
+        let msg = err.to_string();
+        assert!(msg.contains("weak"), "mentions bad value: {msg}");
+        assert!(
+            msg.contains("no-orphans") && msg.contains("reachable"),
+            "lists valid options: {msg}"
+        );
     }
 
     #[test]
