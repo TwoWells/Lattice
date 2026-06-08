@@ -2086,8 +2086,29 @@ fn hover_preview(
 
     let target_data = workspace.file(&target)?;
 
+    // For a graph edge whose predicate was explicitly authored, surface the
+    // opposite label the edge derives on its target's backlinks, so an agent
+    // sees both ends of the relationship without opening the target (decision
+    // 008). Implicit `references` links, non-markdown links, and unknown
+    // predicates have no informative paired label, so the clause is omitted.
+    let opposite = match &link.kind {
+        LinkKind::IntraProject {
+            explicit_predicate: true,
+            ..
+        } => workspace.config().opposite_of(predicate),
+        _ => None,
+    };
+
     let preview = build_hover_preview(target_data, fragment.as_deref());
-    let header = format!("**{predicate}** → `{}`", target.display());
+    let target_display = target.display();
+    let header = opposite.map_or_else(
+        || format!("**{predicate}** → `{target_display}`"),
+        |opposite| {
+            format!(
+                "**{predicate}** → `{target_display}` (derives **{opposite}** on `{target_display}`)"
+            )
+        },
+    );
 
     Some(lsp::Hover {
         contents: lsp::MarkupContent {
@@ -3904,6 +3925,101 @@ mod tests {
         assert!(
             hover.contents.value.contains("# B"),
             "hover should include target content"
+        );
+    }
+
+    #[test]
+    fn hover_surfaces_derived_opposite_label() {
+        // The hover on a forward link shows the opposite label the edge derives
+        // on the target, so both ends are visible without opening it.
+        let dir = workspace_with_files(&[
+            (".lattice.toml", ""),
+            ("a.md", "# A\n\n[see B](b.md \"supersedes\")\n"),
+            ("b.md", "# B\n\nFirst line.\n"),
+        ]);
+        let workspaces = scan_workspaces(&dir);
+
+        let params = lsp::TextDocumentPositionParams {
+            text_document: lsp::TextDocumentIdentifier {
+                uri: file_uri(&dir, "a.md"),
+            },
+            position: lsp::Position {
+                line: 2,
+                character: 0,
+            },
+        };
+        let hover = hover_preview(&workspaces, &params).expect("should produce hover");
+        assert!(
+            hover.contents.value.contains("derives **superseded_by**"),
+            "hover should surface the derived opposite label: {}",
+            hover.contents.value
+        );
+    }
+
+    #[test]
+    fn hover_omits_derived_label_for_unknown_predicate() {
+        // An unknown predicate has no paired label, so the derives clause is
+        // omitted and the authored predicate is still echoed verbatim.
+        let dir = workspace_with_files(&[
+            (".lattice.toml", ""),
+            ("a.md", "# A\n\n[see B](b.md \"bogus\")\n"),
+            ("b.md", "# B\n\nFirst line.\n"),
+        ]);
+        let workspaces = scan_workspaces(&dir);
+
+        let params = lsp::TextDocumentPositionParams {
+            text_document: lsp::TextDocumentIdentifier {
+                uri: file_uri(&dir, "a.md"),
+            },
+            position: lsp::Position {
+                line: 2,
+                character: 0,
+            },
+        };
+        let hover = hover_preview(&workspaces, &params).expect("should produce hover");
+        assert!(
+            !hover.contents.value.contains("derives"),
+            "unknown predicate should have no derived label: {}",
+            hover.contents.value
+        );
+        assert!(
+            hover.contents.value.contains("**bogus**"),
+            "unknown predicate should still be echoed verbatim: {}",
+            hover.contents.value
+        );
+    }
+
+    #[test]
+    fn hover_omits_derived_label_for_implicit_predicate() {
+        // A plain link with no authored predicate defaults to `references`; the
+        // derived clause is gated off so the common case stays terse, but the
+        // hover still renders the header and preview.
+        let dir = workspace_with_files(&[
+            (".lattice.toml", ""),
+            ("a.md", "# A\n\n[see B](b.md)\n"),
+            ("b.md", "# B\n\nFirst line.\n"),
+        ]);
+        let workspaces = scan_workspaces(&dir);
+
+        let params = lsp::TextDocumentPositionParams {
+            text_document: lsp::TextDocumentIdentifier {
+                uri: file_uri(&dir, "a.md"),
+            },
+            position: lsp::Position {
+                line: 2,
+                character: 0,
+            },
+        };
+        let hover = hover_preview(&workspaces, &params).expect("should produce hover");
+        assert!(
+            !hover.contents.value.contains("derives"),
+            "implicit predicate should have no derived label: {}",
+            hover.contents.value
+        );
+        assert!(
+            hover.contents.value.contains("**references**"),
+            "hover should still render the header for a plain link: {}",
+            hover.contents.value
         );
     }
 
