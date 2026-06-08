@@ -327,6 +327,30 @@ impl Config {
             .find(|(_, v)| v.as_str() == inverse)
             .map(|(k, _)| k.as_str())
     }
+
+    /// Returns `true` if `predicate` is a known forward *or* inverse predicate.
+    ///
+    /// Decision 008 lifts the direction restriction: a link or backlink may
+    /// name either member of a vocabulary pair. The closed vocabulary remains
+    /// the floor — a string in neither direction is still unknown.
+    pub fn is_known_predicate(&self, predicate: &str) -> bool {
+        self.is_known_forward(predicate) || self.is_known_inverse(predicate)
+    }
+
+    /// Returns the opposite member of `predicate`'s vocabulary pair.
+    ///
+    /// For a forward predicate this is its inverse; for an inverse predicate,
+    /// the forward. Returns `None` when `predicate` belongs to neither
+    /// direction. The opposite is the label a forward link derives on its
+    /// target's backlinks, so an inverse-predicate link (`"superseded_by"`)
+    /// derives the forward label (`"supersedes"`).
+    ///
+    /// Assumes forward keys and inverse values are disjoint (sane configs);
+    /// on the unlikely overlap the inverse reading wins.
+    pub fn opposite_of(&self, predicate: &str) -> Option<&str> {
+        self.inverse_of(predicate)
+            .or_else(|| self.forward_of(predicate))
+    }
 }
 
 // --- Raw deserialization types ---
@@ -850,6 +874,50 @@ fragments = "gitlab"
             config.inverse_of("unknown"),
             None,
             "unknown forward returns None"
+        );
+    }
+
+    #[test]
+    fn known_predicate_accepts_either_direction() {
+        let config = Config::default();
+
+        assert!(
+            config.is_known_predicate("supersedes"),
+            "forward member is known"
+        );
+        assert!(
+            config.is_known_predicate("superseded_by"),
+            "inverse member is known"
+        );
+        assert!(
+            !config.is_known_predicate("invented"),
+            "a string in neither direction is unknown"
+        );
+    }
+
+    #[test]
+    fn opposite_of_maps_both_directions() {
+        let config = Config::default();
+
+        assert_eq!(
+            config.opposite_of("supersedes"),
+            Some("superseded_by"),
+            "forward maps to its inverse"
+        );
+        assert_eq!(
+            config.opposite_of("superseded_by"),
+            Some("supersedes"),
+            "inverse maps to its forward"
+        );
+        assert_eq!(
+            config.opposite_of("references"),
+            Some("referenced_by"),
+            "the default predicate still derives referenced_by"
+        );
+        assert_eq!(
+            config.opposite_of("invented"),
+            None,
+            "neither direction returns None"
         );
     }
 }

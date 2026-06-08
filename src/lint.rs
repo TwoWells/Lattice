@@ -305,7 +305,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_inverse_predicate_reports_error() {
+    fn unknown_backlink_predicate_reports_error() {
         let dir = setup(&[
             (".lattice.toml", ""),
             (
@@ -316,11 +316,30 @@ mod tests {
         let (has_errors, output) = run_lint(&dir);
         assert!(
             has_errors,
-            "unknown inverse predicate should produce errors"
+            "predicate known in neither direction should produce errors"
         );
         assert!(
-            output.contains("unknown inverse predicate"),
+            output.contains("unknown backlink predicate"),
             "output should mention the unknown predicate: {output}"
+        );
+    }
+
+    #[test]
+    fn forward_label_backlink_key_is_known() {
+        // A backlink keyed by a forward predicate (decision 008) is valid —
+        // it derives from a reciprocal `superseded_by` forward link.
+        let dir = setup(&[
+            (".lattice.toml", ""),
+            (
+                "a.md",
+                "---\nbacklinks:\n  supersedes:\n    - b.md\n---\n\n# A\n",
+            ),
+            ("b.md", "[a](a.md \"superseded_by\")\n"),
+        ]);
+        let (has_errors, output) = run_lint(&dir);
+        assert!(
+            !has_errors,
+            "forward-label backlink key should not error: {output}"
         );
     }
 

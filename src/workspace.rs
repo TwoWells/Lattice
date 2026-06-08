@@ -49,7 +49,7 @@ pub struct FileData {
     pub tree: Tree,
     /// Parsed frontmatter, if present.
     pub frontmatter: Option<Frontmatter>,
-    /// Diagnostics from frontmatter parsing (unknown inverse predicates).
+    /// Diagnostics from frontmatter parsing (unknown backlink predicates).
     pub backlink_diagnostics: Vec<BacklinkDiagnostic>,
     /// Frontmatter parse diagnostics (partial recovery — file is still indexed).
     pub parse_diagnostics: Vec<ParseDiagnostic>,
@@ -74,7 +74,9 @@ pub struct Frontmatter {
     pub start_line: usize,
     /// 1-based line of the closing `---`.
     pub end_line: usize,
-    /// Parsed backlinks: inverse predicate → list of relative file paths.
+    /// Parsed backlinks: backlink label → list of relative file paths. The
+    /// label is any known predicate — an inverse value or a forward label
+    /// (decision 008).
     pub backlinks: HashMap<String, Vec<String>>,
 }
 
@@ -83,7 +85,7 @@ pub struct Frontmatter {
 pub struct BacklinkDiagnostic {
     /// 1-based line number of the predicate key in the source file.
     pub line: usize,
-    /// The unknown inverse predicate.
+    /// The unknown backlink predicate (known in neither direction).
     pub predicate: String,
 }
 
@@ -371,9 +373,11 @@ pub fn parse_content(content: &str, rel_path: &Path, config: &Config) -> FileDat
 
         let backlinks = fm::extract_backlinks(block, content);
 
-        // Validate inverse predicates.
+        // Validate backlink keys. A key may be any known predicate — an
+        // inverse value or a forward label (decision 008) — since a forward
+        // link may now derive a forward-labelled backlink on its target.
         for predicate in backlinks.keys() {
-            if !config.is_known_inverse(predicate) {
+            if !config.is_known_predicate(predicate) {
                 let line = fm::find_predicate_line(block, predicate, content);
                 backlink_diagnostics.push(BacklinkDiagnostic {
                     line,

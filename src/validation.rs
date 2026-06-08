@@ -159,7 +159,10 @@ fn check_predicate(
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     if explicit {
-        if !config.is_known_forward(predicate) {
+        // Decision 008: a forward link may name either member of a pair —
+        // a known forward predicate or a known inverse. Only a predicate in
+        // neither direction is an error.
+        if !config.is_known_predicate(predicate) {
             let known: Vec<&str> = config.predicates.keys().map(String::as_str).collect();
             diagnostics.push(Diagnostic {
                 file: source.to_path_buf(),
@@ -235,8 +238,10 @@ struct ExpectedSource {
 
 /// Map from a target file to its expected backlinks.
 ///
-/// `target file → { inverse predicate → { source file → forward-link
-/// location } }`. All paths are workspace-relative.
+/// `target file → { backlink label → { source file → forward-link location } }`.
+/// The backlink label is the *opposite* member of the forward link's predicate
+/// pair (decision 008), so an inverse-predicate link derives the forward label.
+/// All paths are workspace-relative.
 type ExpectedBacklinks = HashMap<PathBuf, HashMap<String, BTreeMap<PathBuf, ExpectedSource>>>;
 
 /// Build expected backlinks from all forward links in the workspace.
@@ -259,14 +264,17 @@ fn build_expected_backlinks(workspace: &Workspace) -> ExpectedBacklinks {
                 if workspace.file(target).is_none() {
                     continue;
                 }
-                let Some(inverse) = config.inverse_of(predicate) else {
+                // Key by the opposite member of the pair (decision 008): an
+                // inverse-predicate link (`"superseded_by"`) derives the
+                // forward label (`"supersedes"`) on its target.
+                let Some(opposite) = config.opposite_of(predicate) else {
                     continue;
                 };
 
                 expected
                     .entry(target.clone())
                     .or_default()
-                    .entry(inverse.to_string())
+                    .entry(opposite.to_string())
                     .or_default()
                     .entry(source_path.clone())
                     .and_modify(|loc| {
@@ -333,6 +341,11 @@ fn file_relative(from: &Path, to: &Path) -> PathBuf {
 /// This puts the warning on the file an agent is editing when it adds the
 /// link, giving it an entry point to walk the graph to the target. The fix
 /// still belongs in the target's frontmatter; the message names it.
+///
+/// An obligation is satisfied by *either* a frontmatter backlink *or* a
+/// reciprocal forward link from the target back to the source carrying the
+/// matching paired predicate (decision 008). A warning fires only when
+/// neither exists.
 fn check_missing_backlinks(
     workspace: &Workspace,
     expected: &ExpectedBacklinks,
@@ -344,9 +357,9 @@ fn check_missing_backlinks(
             .and_then(|f| f.frontmatter.as_ref())
             .map(|fm| &fm.backlinks);
 
-        for (inverse_pred, expected_sources) in expected_backlinks {
+        for (backlink_key, expected_sources) in expected_backlinks {
             let actual_sources: BTreeSet<PathBuf> = actual
-                .and_then(|a| a.get(inverse_pred.as_str()))
+                .and_then(|a| a.get(backlink_key.as_str()))
                 .map(|paths| {
                     paths
                         .iter()
@@ -356,22 +369,52 @@ fn check_missing_backlinks(
                 .unwrap_or_default();
 
             for (source, loc) in expected_sources {
-                if !actual_sources.contains(source) {
-                    let rel = file_relative(source, target_path);
-                    diagnostics.push(Diagnostic {
-                        file: source.clone(),
-                        line: loc.line,
-                        severity: Severity::Warning,
-                        message: format!(
-                            "expected backlink `{inverse_pred}` in `{}`",
-                            rel.display()
-                        ),
-                        span: Some(loc.span),
-                    });
+                // Satisfied by a materialized frontmatter backlink...
+                if actual_sources.contains(source) {
+                    continue;
                 }
+                // ...or by a reciprocal forward link from the target back to
+                // the source under the same label (decision 008). The floor is
+                // met from both ends, so no frontmatter copy is required.
+                if has_reciprocal_forward_link(workspace, target_path, source, backlink_key) {
+                    continue;
+                }
+                let rel = file_relative(source, target_path);
+                diagnostics.push(Diagnostic {
+                    file: source.clone(),
+                    line: loc.line,
+                    severity: Severity::Warning,
+                    message: format!("expected backlink `{backlink_key}` in `{}`", rel.display()),
+                    span: Some(loc.span),
+                });
             }
         }
     }
+}
+
+/// Returns `true` if `target` has a forward link to `source` carrying
+/// `predicate` — a reciprocal forward link that satisfies a backlink
+/// obligation without a frontmatter entry (decision 008).
+///
+/// The obligation's label is already in the target's own forward direction
+/// (it is `opposite_of` the source's link predicate), so the reciprocal link
+/// satisfies it exactly when its predicate equals that label.
+fn has_reciprocal_forward_link(
+    workspace: &Workspace,
+    target: &Path,
+    source: &Path,
+    predicate: &str,
+) -> bool {
+    let Some(target_data) = workspace.file(target) else {
+        return false;
+    };
+    target_data.tree.links(target).iter().any(|link| {
+        matches!(
+            &link.kind,
+            LinkKind::IntraProject { target: t, predicate: p, .. }
+                if t == source && p == predicate
+        )
+    })
 }
 
 /// Emit warnings for frontmatter backlinks with no corresponding forward link.
@@ -385,10 +428,10 @@ fn check_stale_backlinks(
             continue;
         };
 
-        for (inverse_pred, sources) in &fm.backlinks {
+        for (backlink_key, sources) in &fm.backlinks {
             let expected_sources = expected
                 .get(file_path)
-                .and_then(|e| e.get(inverse_pred.as_str()));
+                .and_then(|e| e.get(backlink_key.as_str()));
 
             for source_str in sources {
                 let resolved = resolve_backlink_path(file_path, source_str);
@@ -400,7 +443,7 @@ fn check_stale_backlinks(
                         line: fm.start_line,
                         severity: Severity::Warning,
                         message: format!(
-                            "backlink `{inverse_pred}` from `{source_str}` has no corresponding forward link"
+                            "backlink `{backlink_key}` from `{source_str}` has no corresponding forward link"
                         ),
                         span: None,
                     });
@@ -625,7 +668,7 @@ fn flood<'a>(
 /// Collect all diagnostics for the workspace.
 ///
 /// Runs every validation check (forward links, backlinks, connectivity, bare
-/// paths), collects unknown inverse predicate errors from frontmatter, and
+/// paths), collects unknown backlink predicate errors from frontmatter, and
 /// includes frontmatter parse errors. Returns diagnostics sorted by
 /// file then line number.
 pub fn collect_all(workspace: &Workspace) -> Vec<Diagnostic> {
@@ -646,7 +689,7 @@ pub fn collect_all(workspace: &Workspace) -> Vec<Diagnostic> {
                 file: path.clone(),
                 line: bd.line,
                 severity: Severity::Error,
-                message: format!("unknown inverse predicate `{}`", bd.predicate),
+                message: format!("unknown backlink predicate `{}`", bd.predicate),
                 span: None,
             });
         }
@@ -1035,6 +1078,130 @@ backlinks:
             warnings[0].message.contains("referenced_by"),
             "implicit references produces referenced_by backlink: {}",
             warnings[0].message
+        );
+    }
+
+    // --- Symmetric predicates (decision 008) ---
+
+    #[test]
+    fn inverse_predicate_forward_link_accepted() {
+        // A forward link may use the inverse member of a pair — no
+        // unknown-predicate error.
+        let (_dir, ws) =
+            setup_workspace(&[("a.md", r#"[b](b.md "superseded_by")"#), ("b.md", "# B\n")]);
+
+        let diags = validate_forward_links(&ws);
+        assert!(
+            diags.iter().all(|d| d.severity != Severity::Error),
+            "inverse-predicate forward link should not error: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn inverse_predicate_derives_forward_label() {
+        // `a` is superseded_by `b`, so `b` supersedes `a`: the derived
+        // backlink on `b` is keyed by the *forward* label `supersedes`.
+        let (_dir, ws) =
+            setup_workspace(&[("a.md", r#"[b](b.md "superseded_by")"#), ("b.md", "# B\n")]);
+
+        let diags = validate_backlinks(&ws);
+        let warnings: Vec<_> = diags
+            .iter()
+            .filter(|d| d.severity == Severity::Warning)
+            .collect();
+
+        assert_eq!(warnings.len(), 1, "one missing-backlink warning: {diags:?}");
+        assert!(
+            warnings[0].message.contains("supersedes"),
+            "derived label is the forward `supersedes`, not the inverse: {}",
+            warnings[0].message
+        );
+    }
+
+    #[test]
+    fn reciprocal_forward_links_need_no_frontmatter() {
+        // A→B `superseded_by` and B→A `supersedes` express the same edge from
+        // both ends. The floor is met without any frontmatter backlink.
+        let (_dir, ws) = setup_workspace(&[
+            ("a.md", r#"[b](b.md "superseded_by")"#),
+            ("b.md", r#"[a](a.md "supersedes")"#),
+        ]);
+
+        assert!(
+            validate_backlinks(&ws).is_empty(),
+            "reciprocal forward links require no backlinks: {:?}",
+            validate_backlinks(&ws)
+        );
+        assert!(
+            validate_forward_links(&ws)
+                .iter()
+                .all(|d| d.severity != Severity::Error),
+            "reciprocal forward links produce no errors"
+        );
+    }
+
+    #[test]
+    fn removing_reciprocal_reverts_to_missing_warning() {
+        // Drop B's reciprocal link: A→B `superseded_by` again needs a
+        // `supersedes` backlink on B (now neither frontmatter nor reciprocal).
+        let (_dir, ws) =
+            setup_workspace(&[("a.md", r#"[b](b.md "superseded_by")"#), ("b.md", "# B\n")]);
+
+        let warnings: Vec<_> = validate_backlinks(&ws)
+            .into_iter()
+            .filter(|d| d.severity == Severity::Warning)
+            .collect();
+
+        assert_eq!(warnings.len(), 1, "the obligation reverts to a warning");
+        assert!(
+            warnings[0].message.contains("supersedes"),
+            "warning names the unmet `supersedes` backlink: {}",
+            warnings[0].message
+        );
+    }
+
+    #[test]
+    fn forward_label_backlink_key_validates_as_known() {
+        // A frontmatter backlink keyed by a forward predicate is accepted —
+        // it materializes the edge that B's `superseded_by` link authored.
+        let (_dir, ws) = setup_workspace(&[
+            (
+                "b.md",
+                "---\nbacklinks:\n  supersedes:\n    - a.md\n---\n# B\n",
+            ),
+            ("a.md", r#"[b](b.md "superseded_by")"#),
+        ]);
+
+        let errors: Vec<_> = collect_all(&ws)
+            .into_iter()
+            .filter(|d| d.severity == Severity::Error)
+            .collect();
+
+        assert!(
+            errors.is_empty(),
+            "forward-label backlink key is known, not an error: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn reciprocal_link_plus_frontmatter_is_not_warned() {
+        // Over-specification — both reciprocal forward links *and* both
+        // frontmatter backlinks — is redundant but consistent: no warning.
+        let (_dir, ws) = setup_workspace(&[
+            (
+                "a.md",
+                "---\nbacklinks:\n  superseded_by:\n    - b.md\n---\n[b](b.md \"superseded_by\")\n",
+            ),
+            (
+                "b.md",
+                "---\nbacklinks:\n  supersedes:\n    - a.md\n---\n[a](a.md \"supersedes\")\n",
+            ),
+        ]);
+
+        assert!(
+            validate_backlinks(&ws).is_empty(),
+            "redundant-but-consistent edge is not warned: {:?}",
+            validate_backlinks(&ws)
         );
     }
 
