@@ -1458,20 +1458,132 @@ fn go_to_type_definition(
     })
 }
 
-/// Go to the implementation (forward link) of a backlink entry in frontmatter.
+/// A zero-width LSP location at the start of 0-based `line` in `abs_path`.
+fn point_location(abs_path: &Path, line: u32) -> lsp::Location {
+    lsp::Location {
+        uri: path_to_uri(abs_path),
+        range: lsp::Range {
+            start: lsp::Position { line, character: 0 },
+            end: lsp::Position { line, character: 0 },
+        },
+    }
+}
+
+/// Go to the *implementation* of the predicate edge at the cursor.
 ///
-/// When the cursor is on a backlink path like `    - decisions/38.md` in the
-/// frontmatter, navigates to the forward link line in the source document.
-#[allow(
-    clippy::cast_possible_truncation,
-    reason = "line numbers in markdown files won't exceed u32::MAX"
-)]
+/// An edge is reconcilable from either end (decision 008), so navigation has two
+/// entry points:
+///
+/// - **Body link** `S --[P]--> T`: jump to the edge's counterpart authored on
+///   `T` — a reciprocal forward link `T --[opposite_of(P)]--> S`, or, failing
+///   that, the frontmatter backlink entry on `T` keyed by `opposite_of(P)`.
+/// - **Frontmatter backlink** entry on `T`: jump to the source link in `S` that
+///   derives it — `S --[opposite_of(K)]--> T`, where `K` is the backlink key in
+///   *either* direction.
+///
+/// `textDocument/definition` stays distinct: on a body link it resolves to the
+/// target *document* (see [`go_to_definition`]), never the counterpart edge.
 fn go_to_implementation(
     workspaces: &Workspaces,
     params: &lsp::TextDocumentPositionParams,
 ) -> Option<lsp::Location> {
     let (workspace, rel_path) = workspaces.resolve(&params.text_document.uri)?;
     let file_data = workspace.file(&rel_path)?;
+
+    implementation_from_body_link(workspace, &rel_path, file_data, params)
+        .or_else(|| implementation_from_backlink(workspace, &rel_path, file_data, params))
+}
+
+/// Body-link entry point for [`go_to_implementation`].
+///
+/// From a body link `S --[P]--> T` under the cursor, resolve the counterpart of
+/// the edge as authored on `T`: a reciprocal forward link
+/// `T --[opposite_of(P)]--> S` if one exists, else the frontmatter backlink
+/// entry on `T` keyed by `opposite_of(P)` listing `S`. Returns `None` when the
+/// cursor is not on an intra-project body link, or the target carries no
+/// counterpart for the edge.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "line numbers in markdown files won't exceed u32::MAX"
+)]
+fn implementation_from_body_link(
+    workspace: &Workspace,
+    rel_path: &Path,
+    file_data: &FileData,
+    params: &lsp::TextDocumentPositionParams,
+) -> Option<lsp::Location> {
+    let source = file_data.tree.source();
+    let offset = lsp_position_to_byte_offset(source, params.position);
+    let (_, node) = file_data.tree.find_link_at_offset(offset)?;
+    let cursor_link = find_classified_link(&file_data.tree, rel_path, node.span)?;
+
+    let LinkKind::IntraProject {
+        target, predicate, ..
+    } = &cursor_link.kind
+    else {
+        return None;
+    };
+
+    // The counterpart authored on T carries the opposite predicate.
+    let paired = workspace.config().opposite_of(predicate)?;
+    let target_data = workspace.file(target)?;
+    let root = workspace.root();
+
+    // Prefer a reciprocal body link T --[opposite_of(P)]--> S.
+    let target_links = target_data.tree.links(target);
+    let reciprocal = target_links.iter().find(|l| {
+        let LinkKind::IntraProject {
+            target: t,
+            predicate: p,
+            ..
+        } = &l.kind
+        else {
+            return false;
+        };
+        t == rel_path && p == paired
+    });
+    if let Some(recip) = reciprocal {
+        let line = recip.line.saturating_sub(1) as u32;
+        return Some(point_location(&root.join(target), line));
+    }
+
+    // Otherwise a frontmatter backlink entry on T keyed by opposite_of(P) and
+    // listing S. Backlink paths are file-relative to T, so resolve each against
+    // T's directory (matching validation) before comparing to S.
+    let lists_source = target_data
+        .frontmatter
+        .as_ref()
+        .and_then(|fm| fm.backlinks.get(paired))
+        .is_some_and(|paths| {
+            paths
+                .iter()
+                .any(|p| validation::resolve_backlink_path(target, p).as_path() == rel_path)
+        });
+    if lists_source {
+        let line = backlink_key_line(target_data, paired)?;
+        return Some(point_location(&root.join(target), line));
+    }
+
+    None
+}
+
+/// Frontmatter entry point for [`go_to_implementation`].
+///
+/// When the cursor is on a backlink path like `    - decisions/38.md` in the
+/// frontmatter of `T`, navigate to the forward link line in the source document
+/// `S` that derives it. The justifying link is always `S --[opposite_of(K)]--> T`
+/// regardless of the backlink key `K`'s direction (decision 008), so a key that
+/// is a forward label (e.g. `supersedes:`) resolves just as an inverse one does.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "line numbers in markdown files won't exceed u32::MAX"
+)]
+fn implementation_from_backlink(
+    workspace: &Workspace,
+    rel_path: &Path,
+    file_data: &FileData,
+    params: &lsp::TextDocumentPositionParams,
+) -> Option<lsp::Location> {
     let fm = file_data.frontmatter.as_ref()?;
 
     // Check cursor is inside frontmatter.
@@ -1488,19 +1600,22 @@ fn go_to_implementation(
         return None;
     }
 
-    // Find which inverse predicate this path belongs to.
-    let inverse_predicate = fm.backlinks.iter().find_map(|(pred, paths)| {
-        paths
-            .iter()
-            .any(|p| p == path_text)
-            .then_some(pred.as_str())
+    // Find the backlink key listing this path. Decision 008 lets the key name
+    // either direction of a vocabulary pair, so accept any known predicate and
+    // skip keys unknown in both directions.
+    let config = workspace.config();
+    let backlink_key = fm.backlinks.iter().find_map(|(key, paths)| {
+        (config.is_known_predicate(key) && paths.iter().any(|p| p == path_text))
+            .then_some(key.as_str())
     })?;
 
-    // Map inverse → forward predicate.
-    let forward_predicate = workspace.config().forward_of(inverse_predicate)?;
+    // The justifying source link is S --[opposite_of(K)]--> T.
+    let paired_predicate = config.opposite_of(backlink_key)?;
 
-    // Find the source document and the forward link.
-    let source_path = PathBuf::from(path_text);
+    // Find the source document and the forward link. Backlink paths are
+    // file-relative to T, so resolve against T's directory (matching validation)
+    // before looking S up in the workspace index.
+    let source_path = validation::resolve_backlink_path(rel_path, path_text);
     let source_data = workspace.file(&source_path)?;
     let source_links = source_data.tree.links(&source_path);
 
@@ -1511,18 +1626,38 @@ fn go_to_implementation(
         else {
             return false;
         };
-        target == &rel_path && predicate == forward_predicate
+        target == rel_path && predicate == paired_predicate
     })?;
 
-    let root = workspace.root();
     let line = forward_link.line.saturating_sub(1) as u32;
-    Some(lsp::Location {
-        uri: path_to_uri(&root.join(&source_path)),
-        range: lsp::Range {
-            start: lsp::Position { line, character: 0 },
-            end: lsp::Position { line, character: 0 },
-        },
-    })
+    Some(point_location(&workspace.root().join(&source_path), line))
+}
+
+/// Line (0-based) of the `backlinks` predicate key `predicate` in `file_data`'s
+/// frontmatter, or `None` when the file has no such key.
+///
+/// Resolves to the predicate key line (e.g. `superseded_by:`), the same anchor
+/// backlink diagnostics use, rather than an individual list entry.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "line numbers in markdown files won't exceed u32::MAX"
+)]
+fn backlink_key_line(file_data: &FileData, predicate: &str) -> Option<u32> {
+    let tree = &file_data.tree;
+    let backlinks_id = tree.nodes().iter().position(
+        |n| matches!(&n.kind, ElementKind::FrontmatterMap { key } if key == "backlinks"),
+    )?;
+    let key_node = tree.children(backlinks_id).iter().find_map(|&cid| {
+        let node = tree.node(cid);
+        let (ElementKind::FrontmatterKey { key, .. } | ElementKind::FrontmatterMap { key }) =
+            &node.kind
+        else {
+            return None;
+        };
+        (key == predicate).then_some(node)
+    })?;
+    let line = crate::block::byte_offset_to_line(tree.source(), key_node.span.start);
+    Some(line.saturating_sub(1) as u32)
 }
 
 // ---------------------------------------------------------------------------
@@ -4738,6 +4873,248 @@ mod tests {
         assert_eq!(
             loc.range.start.line, 2,
             "implementation should point to the forward link line"
+        );
+    }
+
+    #[test]
+    fn implementation_forward_label_backlink_goes_to_forward_link() {
+        // Gap 1: a backlink keyed by a *forward* label (`supersedes:`) — legal
+        // under decision 008 — must still resolve to the source link that
+        // derives it (`a.md "superseded_by" b.md`).
+        let dir = workspace_with_files(&[
+            (".lattice.toml", ""),
+            ("a.md", "# A\n\n[see B](b.md \"superseded_by\")\n"),
+            (
+                "b.md",
+                "---\nbacklinks:\n  supersedes:\n    - a.md\n---\n\n# B\n",
+            ),
+        ]);
+        let workspaces = scan_workspaces(&dir);
+
+        // Cursor on the backlink path "    - a.md" (line 3, 0-based).
+        let params = lsp::TextDocumentPositionParams {
+            text_document: lsp::TextDocumentIdentifier {
+                uri: file_uri(&dir, "b.md"),
+            },
+            position: lsp::Position {
+                line: 3,
+                character: 6,
+            },
+        };
+        let loc = go_to_implementation(&workspaces, &params)
+            .expect("forward-label backlink should resolve its source link");
+        assert!(
+            loc.uri.ends_with("a.md"),
+            "implementation should go to the source document"
+        );
+        assert_eq!(
+            loc.range.start.line, 2,
+            "implementation should point to the forward link line"
+        );
+    }
+
+    #[test]
+    fn implementation_body_link_goes_to_reciprocal_link() {
+        // Gap 2: a body link that is one half of a reciprocal pair jumps to the
+        // reciprocal link authored on the target.
+        let dir = workspace_with_files(&[
+            (".lattice.toml", ""),
+            ("a.md", "# A\n\n[to B](b.md \"superseded_by\")\n"),
+            ("b.md", "# B\n\n[to A](a.md \"supersedes\")\n"),
+        ]);
+        let workspaces = scan_workspaces(&dir);
+
+        // Cursor on a.md's body link (line 2, 0-based).
+        let params = lsp::TextDocumentPositionParams {
+            text_document: lsp::TextDocumentIdentifier {
+                uri: file_uri(&dir, "a.md"),
+            },
+            position: lsp::Position {
+                line: 2,
+                character: 2,
+            },
+        };
+        let loc = go_to_implementation(&workspaces, &params)
+            .expect("body link should resolve its reciprocal link");
+        assert!(
+            loc.uri.ends_with("b.md"),
+            "implementation should go to the reciprocal link's document"
+        );
+        assert_eq!(
+            loc.range.start.line, 2,
+            "implementation should point to the reciprocal link line"
+        );
+    }
+
+    #[test]
+    fn implementation_body_link_goes_to_frontmatter_backlink() {
+        // Gap 2: a one-sided edge — the counterpart is a frontmatter backlink on
+        // the target, with no reciprocal body link.
+        let dir = workspace_with_files(&[
+            (".lattice.toml", ""),
+            ("a.md", "# A\n\n[to B](b.md \"supersedes\")\n"),
+            (
+                "b.md",
+                "---\nbacklinks:\n  superseded_by:\n    - a.md\n---\n\n# B\n",
+            ),
+        ]);
+        let workspaces = scan_workspaces(&dir);
+
+        // Cursor on a.md's body link (line 2, 0-based).
+        let params = lsp::TextDocumentPositionParams {
+            text_document: lsp::TextDocumentIdentifier {
+                uri: file_uri(&dir, "a.md"),
+            },
+            position: lsp::Position {
+                line: 2,
+                character: 2,
+            },
+        };
+        let loc = go_to_implementation(&workspaces, &params)
+            .expect("body link should resolve its frontmatter backlink");
+        assert!(
+            loc.uri.ends_with("b.md"),
+            "implementation should go to the target's frontmatter"
+        );
+        assert_eq!(
+            loc.range.start.line, 2,
+            "implementation should point to the `superseded_by:` key line"
+        );
+    }
+
+    #[test]
+    fn definition_on_body_link_stays_on_target_document() {
+        // The counterpart navigation is `implementation`-only: `definition` on
+        // the same body link must resolve to the target *document* (line 0), not
+        // the reciprocal link.
+        let dir = workspace_with_files(&[
+            (".lattice.toml", ""),
+            ("a.md", "# A\n\n[to B](b.md \"superseded_by\")\n"),
+            ("b.md", "# B\n\n[to A](a.md \"supersedes\")\n"),
+        ]);
+        let workspaces = scan_workspaces(&dir);
+
+        let params = lsp::TextDocumentPositionParams {
+            text_document: lsp::TextDocumentIdentifier {
+                uri: file_uri(&dir, "a.md"),
+            },
+            position: lsp::Position {
+                line: 2,
+                character: 2,
+            },
+        };
+        let loc =
+            go_to_definition(&workspaces, &params).expect("definition should resolve the target");
+        assert!(
+            loc.uri.ends_with("b.md"),
+            "definition should go to the target document"
+        );
+        assert_eq!(
+            loc.range.start.line, 0,
+            "definition should point to the document, not the reciprocal link"
+        );
+    }
+
+    #[test]
+    fn implementation_body_link_without_counterpart_is_none() {
+        // A body link whose target carries no counterpart yields no jump rather
+        // than a wrong one.
+        let dir = workspace_with_files(&[
+            (".lattice.toml", ""),
+            ("a.md", "# A\n\n[to B](b.md \"supersedes\")\n"),
+            ("b.md", "# B\n"),
+        ]);
+        let workspaces = scan_workspaces(&dir);
+
+        let params = lsp::TextDocumentPositionParams {
+            text_document: lsp::TextDocumentIdentifier {
+                uri: file_uri(&dir, "a.md"),
+            },
+            position: lsp::Position {
+                line: 2,
+                character: 2,
+            },
+        };
+        assert!(
+            go_to_implementation(&workspaces, &params).is_none(),
+            "a body link without a counterpart should yield no implementation jump"
+        );
+    }
+
+    #[test]
+    fn implementation_backlink_resolves_file_relative_path_in_nested_dirs() {
+        // Backlink paths are file-relative to the document that holds them. With
+        // the source and target in different directories, the entry reads
+        // `../docs/a.md` and must resolve against the target's directory — not
+        // be treated as a workspace-relative path.
+        let dir = workspace_with_files(&[
+            (".lattice.toml", ""),
+            ("docs/a.md", "# A\n\n[B](../tickets/b.md \"supersedes\")\n"),
+            (
+                "tickets/b.md",
+                "---\nbacklinks:\n  superseded_by:\n    - ../docs/a.md\n---\n\n# B\n",
+            ),
+        ]);
+        let workspaces = scan_workspaces(&dir);
+
+        // Cursor on the backlink path "    - ../docs/a.md" (line 3, 0-based).
+        let params = lsp::TextDocumentPositionParams {
+            text_document: lsp::TextDocumentIdentifier {
+                uri: file_uri(&dir, "tickets/b.md"),
+            },
+            position: lsp::Position {
+                line: 3,
+                character: 8,
+            },
+        };
+        let loc = go_to_implementation(&workspaces, &params)
+            .expect("file-relative backlink should resolve its source link");
+        assert!(
+            loc.uri.ends_with("docs/a.md"),
+            "implementation should resolve the source document across directories: {}",
+            loc.uri
+        );
+        assert_eq!(
+            loc.range.start.line, 2,
+            "implementation should point to the forward link line"
+        );
+    }
+
+    #[test]
+    fn implementation_body_link_resolves_file_relative_backlink_in_nested_dirs() {
+        // Gap-2 fallback across directories: the target's backlink entry is
+        // file-relative (`../docs/a.md`) and must resolve against the target's
+        // directory before being matched to the source.
+        let dir = workspace_with_files(&[
+            (".lattice.toml", ""),
+            ("docs/a.md", "# A\n\n[B](../tickets/b.md \"supersedes\")\n"),
+            (
+                "tickets/b.md",
+                "---\nbacklinks:\n  superseded_by:\n    - ../docs/a.md\n---\n\n# B\n",
+            ),
+        ]);
+        let workspaces = scan_workspaces(&dir);
+
+        // Cursor on docs/a.md's body link (line 2, 0-based).
+        let params = lsp::TextDocumentPositionParams {
+            text_document: lsp::TextDocumentIdentifier {
+                uri: file_uri(&dir, "docs/a.md"),
+            },
+            position: lsp::Position {
+                line: 2,
+                character: 1,
+            },
+        };
+        let loc = go_to_implementation(&workspaces, &params)
+            .expect("body link should resolve a file-relative frontmatter backlink");
+        assert!(
+            loc.uri.ends_with("tickets/b.md"),
+            "implementation should resolve the target's frontmatter across directories: {}",
+            loc.uri
+        );
+        assert_eq!(
+            loc.range.start.line, 2,
+            "implementation should point to the `superseded_by:` key line"
         );
     }
 

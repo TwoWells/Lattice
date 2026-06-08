@@ -302,8 +302,10 @@ fn build_expected_backlinks(workspace: &Workspace) -> ExpectedBacklinks {
 ///
 /// Backlink paths in frontmatter are relative to the file containing them,
 /// just like forward link targets. This joins the containing file's parent
-/// directory with the backlink path and normalizes the result.
-fn resolve_backlink_path(containing_file: &Path, backlink_path: &str) -> PathBuf {
+/// directory with the backlink path and normalizes the result. Shared with the
+/// LSP navigation handlers so that path resolution stays identical to the
+/// consistency check.
+pub fn resolve_backlink_path(containing_file: &Path, backlink_path: &str) -> PathBuf {
     let dir = containing_file.parent().unwrap_or_else(|| Path::new(""));
     block::normalize_path(&dir.join(backlink_path))
 }

@@ -264,3 +264,53 @@ fn malformed_request_returns_error_response() {
 
     shutdown_server(stdin, &mut stdout, child);
 }
+
+#[test]
+fn implementation_follows_reciprocal_link() {
+    // End-to-end: cursor on one half of a reciprocal predicate pair, the server
+    // resolves the counterpart link authored on the target (ticket server 07).
+    let dir = workspace_with_files(&[
+        (".lattice.toml", ""),
+        ("a.md", "# A\n\n[to B](b.md \"superseded_by\")\n"),
+        ("b.md", "# B\n\n[to A](a.md \"supersedes\")\n"),
+    ]);
+    let root_uri = path_to_uri(dir.path());
+
+    let (mut stdin, mut stdout, child) = spawn_server();
+    initialize_server(&root_uri, &mut stdin, &mut stdout);
+
+    let impl_req = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "textDocument/implementation",
+        "params": {
+            "textDocument": { "uri": path_to_uri(&dir.path().join("a.md")) },
+            "position": { "line": 2, "character": 2 }
+        }
+    });
+    stdin
+        .write_all(&lsp_message(&impl_req))
+        .expect("send textDocument/implementation");
+    stdin.flush().expect("flush");
+
+    let resp = read_next_response(&mut stdout);
+    assert_eq!(resp["id"], 1, "response id should match request");
+    assert!(
+        resp.get("error").is_none(),
+        "implementation should not return an error: {resp}"
+    );
+
+    let uri = resp["result"]["uri"]
+        .as_str()
+        .expect("result should carry a location uri");
+    assert!(
+        uri.ends_with("b.md"),
+        "implementation should resolve to the reciprocal link's document: {uri}"
+    );
+    assert_eq!(
+        resp["result"]["range"]["start"]["line"], 2,
+        "implementation should point to the reciprocal link line: {resp}"
+    );
+
+    shutdown_server(stdin, &mut stdout, child);
+}
