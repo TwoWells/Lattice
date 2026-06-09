@@ -314,3 +314,69 @@ fn implementation_follows_reciprocal_link() {
 
     shutdown_server(stdin, &mut stdout, child);
 }
+
+#[test]
+fn completion_returns_target_headings() {
+    // End-to-end: an open editor buffer with a half-typed fragment link; the
+    // server completes the target document's headings against the live buffer
+    // (ticket integration 14).
+    let dir = workspace_with_files(&[
+        ("doc.md", "placeholder\n"),
+        ("target.md", "# Hello World\n\n## Setup\n"),
+    ]);
+    let root_uri = path_to_uri(dir.path());
+
+    let (mut stdin, mut stdout, child) = spawn_server();
+    initialize_server(&root_uri, &mut stdin, &mut stdout);
+
+    // Open doc.md with a half-typed fragment link — the unsaved buffer differs
+    // from disk, so completion must read the synced content.
+    let did_open = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didOpen",
+        "params": {
+            "textDocument": {
+                "uri": path_to_uri(&dir.path().join("doc.md")),
+                "languageId": "markdown",
+                "version": 1,
+                "text": "[x](target.md#"
+            }
+        }
+    });
+    stdin
+        .write_all(&lsp_message(&did_open))
+        .expect("send didOpen");
+    stdin.flush().expect("flush");
+
+    let completion_req = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "textDocument/completion",
+        "params": {
+            "textDocument": { "uri": path_to_uri(&dir.path().join("doc.md")) },
+            "position": { "line": 0, "character": 14 }
+        }
+    });
+    stdin
+        .write_all(&lsp_message(&completion_req))
+        .expect("send textDocument/completion");
+    stdin.flush().expect("flush");
+
+    let resp = read_next_response(&mut stdout);
+    assert_eq!(resp["id"], 1, "response id should match request");
+    assert!(
+        resp.get("error").is_none(),
+        "completion should not return an error: {resp}"
+    );
+
+    let items = resp["result"]["items"]
+        .as_array()
+        .expect("result should carry a completion items array");
+    let labels: Vec<&str> = items.iter().filter_map(|i| i["label"].as_str()).collect();
+    assert!(
+        labels.contains(&"hello-world") && labels.contains(&"setup"),
+        "completion should offer the target document's heading slugs: {labels:?}"
+    );
+
+    shutdown_server(stdin, &mut stdout, child);
+}

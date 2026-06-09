@@ -16,6 +16,7 @@ use clap::Parser;
 
 mod block;
 mod cli;
+mod completion;
 mod config;
 mod fm;
 mod html;

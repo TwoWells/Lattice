@@ -7,7 +7,7 @@
 //! symbols, rename, references, type hierarchy, and call hierarchy for
 //! headings. Supports multiple workspace folders.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -18,6 +18,8 @@ use crate::block::{
     ElementKind, Heading, HeadingId, LinkKind, NodeId, Syntax, Tree, content_lines, first_line,
     normalize_label,
 };
+use crate::completion::Context as CompletionContext;
+use crate::config::{Config, FragmentAlgorithm};
 use crate::lsp;
 use crate::span::Span;
 use crate::validation::{self, Diagnostic, Severity};
@@ -136,6 +138,11 @@ pub fn run() -> Result<()> {
         // spec-compliant clients (e.g. Neovim 0.11) render every diagnostic
         // twice, so pull is intentionally not advertised here.
         "documentFormattingProvider": true,
+        "completionProvider": {
+            // Destination open, path separator, fragment, title quote, and
+            // reference/footnote open (ticket integration 14).
+            "triggerCharacters": ["(", "/", "#", "\"", "[", "^"]
+        },
         "workspace": {
             "workspaceFolders": {
                 "supported": true,
@@ -311,6 +318,14 @@ fn handle_request(
             let params: lsp::DocumentFormattingParams = serde_json::from_value(req.params)?;
             let edits = format_document(workspaces, &params.text_document.uri);
             Response::new_ok(req.id, edits)
+        }
+        lsp::method::COMPLETION => {
+            // `context` (the trigger char) is ignored — the surface and partial
+            // are recovered from the line prefix. The extra field deserializes
+            // fine into `TextDocumentPositionParams` (unknown fields skipped).
+            let params: lsp::TextDocumentPositionParams = serde_json::from_value(req.params)?;
+            let list = completion(workspaces, &params);
+            Response::new_ok(req.id, list)
         }
         _ => Response::new_err(
             req.id,
@@ -2551,6 +2566,386 @@ fn ref_def_label_at_offset(tree: &crate::block::Tree, offset: usize) -> Option<S
 fn source_line_at(source: &str, lsp_line: u32) -> &str {
     let (start, end) = line_byte_range(source, lsp_line);
     &source[start..end]
+}
+
+// ---------------------------------------------------------------------------
+// Completion (decision 007, ticket integration 14)
+// ---------------------------------------------------------------------------
+
+/// Build completion candidates for the construct under the cursor.
+///
+/// Returns `None` when the cursor is not in a completion site (prose) or sits
+/// inside a code span, code block, or math node. Otherwise returns the
+/// candidate list for the detected surface — possibly empty (e.g. a fragment
+/// against a target that is not yet a resolvable file).
+fn completion(
+    workspaces: &Workspaces,
+    params: &lsp::TextDocumentPositionParams,
+) -> Option<lsp::CompletionList> {
+    let (workspace, rel_path) = workspaces.resolve(&params.text_document.uri)?;
+    let file_data = workspace.file(&rel_path)?;
+    let tree = &file_data.tree;
+    let source = tree.source();
+    let offset = lsp_position_to_byte_offset(source, params.position);
+
+    // No completion inside code or math — the tree is authoritative here, so a
+    // link-shaped string in a code span (e.g. `` `[x](y` ``) is suppressed even
+    // though its line prefix would otherwise look like a destination.
+    if offset_in_code(tree, offset) {
+        return None;
+    }
+
+    let (line_start, _) = line_byte_range(source, params.position.line);
+    let prefix = &source[line_start..offset];
+    let context = crate::completion::detect(prefix)?;
+
+    let pos = params.position;
+    let items = match context {
+        CompletionContext::Path { partial } => {
+            complete_path(workspace, &rel_path, partial, source, offset, pos)
+        }
+        CompletionContext::Fragment { target, partial } => {
+            complete_fragment(workspace, &rel_path, target, partial, source, offset, pos)
+        }
+        CompletionContext::Predicate { target, partial } => {
+            complete_predicate(workspace.config(), target, partial, source, offset, pos)
+        }
+        CompletionContext::ReferenceLabel { partial } => {
+            complete_reference_label(tree, partial, source, offset, pos)
+        }
+        CompletionContext::Footnote { partial } => {
+            complete_footnote(tree, partial, source, offset, pos)
+        }
+    };
+
+    Some(lsp::CompletionList {
+        is_incomplete: false,
+        items,
+    })
+}
+
+/// Whether `offset` falls inside a code span, code block, or math node.
+fn offset_in_code(tree: &Tree, offset: usize) -> bool {
+    tree.nodes().iter().any(|node| {
+        matches!(
+            node.kind,
+            ElementKind::CodeBlock
+                | ElementKind::Math
+                | ElementKind::InlineCode
+                | ElementKind::InlineMath
+        ) && node.span.start <= offset
+            && offset < node.span.end
+    })
+}
+
+/// The range a completion replaces: the `partial`-length slice ending at the
+/// cursor.
+fn replace_range(
+    source: &str,
+    cursor_offset: usize,
+    cursor_pos: lsp::Position,
+    partial: &str,
+) -> lsp::Range {
+    let start = byte_offset_to_lsp_position(source, cursor_offset.saturating_sub(partial.len()));
+    lsp::Range {
+        start,
+        end: cursor_pos,
+    }
+}
+
+/// Build a completion item that replaces `range` with `label`.
+fn completion_item(
+    label: String,
+    kind: u32,
+    detail: Option<String>,
+    sort_text: Option<String>,
+    range: lsp::Range,
+) -> lsp::CompletionItem {
+    lsp::CompletionItem {
+        filter_text: Some(label.clone()),
+        text_edit: Some(lsp::TextEdit {
+            range,
+            new_text: label.clone(),
+        }),
+        label,
+        kind: Some(kind),
+        detail,
+        sort_text,
+    }
+}
+
+/// Case-insensitive prefix test for completion filtering.
+fn matches_prefix(candidate: &str, partial: &str) -> bool {
+    candidate
+        .to_lowercase()
+        .starts_with(&partial.to_lowercase())
+}
+
+/// Complete link-target paths in a destination: workspace files and
+/// directories under the typed (relative) directory, with only the trailing
+/// filename segment replaced.
+fn complete_path(
+    workspace: &Workspace,
+    rel_path: &Path,
+    partial: &str,
+    source: &str,
+    offset: usize,
+    pos: lsp::Position,
+) -> Vec<lsp::CompletionItem> {
+    // Split into the committed directory prefix and the filename being typed.
+    let (dir_part, name_part) = partial
+        .rfind('/')
+        .map_or(("", partial), |i| (&partial[..=i], &partial[i + 1..]));
+
+    let cur_dir = rel_path.parent().unwrap_or_else(|| Path::new(""));
+    let rel_dir = crate::block::normalize_path(&cur_dir.join(dir_part));
+    // Don't list outside the workspace — those files aren't graph nodes.
+    if rel_dir.starts_with("..") {
+        return Vec::new();
+    }
+    let base = workspace.root().join(&rel_dir);
+
+    // Only the filename segment is replaced; the directory prefix stays put.
+    let range = replace_range(source, offset, pos, name_part);
+
+    // Walk just the immediate directory, honoring `.gitignore` and skipping
+    // hidden entries (`.git`, dotfiles) exactly as workspace discovery does, so
+    // path completion never offers files the index itself would exclude.
+    let mut items = Vec::new();
+    for entry in ignore::WalkBuilder::new(&base)
+        .max_depth(Some(1))
+        .build()
+        .flatten()
+    {
+        if entry.depth() == 0 {
+            continue; // the base directory itself
+        }
+        let Some(name) = entry.file_name().to_str() else {
+            continue;
+        };
+        if !matches_prefix(name, name_part) {
+            continue;
+        }
+        if entry.file_type().is_some_and(|t| t.is_dir()) {
+            // Directories sort first (`0` prefix) and re-trigger on the `/`.
+            items.push(completion_item(
+                format!("{name}/"),
+                lsp::completion_item_kind::FOLDER,
+                None,
+                Some(format!("0{name}")),
+                range,
+            ));
+        } else {
+            items.push(completion_item(
+                name.to_string(),
+                lsp::completion_item_kind::FILE,
+                None,
+                Some(format!("1{name}")),
+                range,
+            ));
+        }
+    }
+    items
+}
+
+/// Complete heading fragments: the target document's anchors (explicit `{#id}`
+/// and computed slugs), or the current document's for an in-doc `#`.
+fn complete_fragment(
+    workspace: &Workspace,
+    rel_path: &Path,
+    target: &str,
+    partial: &str,
+    source: &str,
+    offset: usize,
+    pos: lsp::Position,
+) -> Vec<lsp::CompletionItem> {
+    let target_rel = if target.is_empty() {
+        rel_path.to_path_buf()
+    } else {
+        resolve_fragment_target(rel_path, target)
+    };
+    let Some(target_data) = workspace.file(&target_rel) else {
+        return Vec::new();
+    };
+
+    let config = workspace.config();
+    let range = replace_range(source, offset, pos, partial);
+
+    let mut items = Vec::new();
+    let mut seen = HashSet::new();
+    for heading in target_data.tree.headings() {
+        for anchor in heading_anchors(&heading, config) {
+            if matches_prefix(&anchor, partial) && seen.insert(anchor.clone()) {
+                items.push(completion_item(
+                    anchor,
+                    lsp::completion_item_kind::VALUE,
+                    Some(heading.text.clone()),
+                    None,
+                    range,
+                ));
+            }
+        }
+    }
+    items
+}
+
+/// Resolve a half-typed destination path against the current file's directory.
+fn resolve_fragment_target(rel_path: &Path, target: &str) -> PathBuf {
+    let parent = rel_path.parent().unwrap_or_else(|| Path::new(""));
+    crate::block::normalize_path(&parent.join(target))
+}
+
+/// The anchor IDs a heading offers for fragment completion.
+///
+/// An explicit `{#id}` is the sole anchor. Otherwise the computed slug(s): the
+/// configured algorithm's slug when `fragments` is set, else all three
+/// conventions (deduplicated) since the default validates against any.
+fn heading_anchors(heading: &Heading, config: &Config) -> Vec<String> {
+    match &heading.id {
+        HeadingId::Explicit(id) => vec![id.clone()],
+        HeadingId::Computed {
+            github,
+            gitlab,
+            vscode,
+        } => match config.policy.fragments {
+            Some(FragmentAlgorithm::Github) => vec![github.clone()],
+            Some(FragmentAlgorithm::Gitlab) => vec![gitlab.clone()],
+            Some(FragmentAlgorithm::Vscode) => vec![vscode.clone()],
+            None => {
+                let mut anchors = vec![github.clone()];
+                for slug in [gitlab, vscode] {
+                    if !anchors.contains(slug) {
+                        anchors.push(slug.clone());
+                    }
+                }
+                anchors
+            }
+        },
+    }
+}
+
+/// Complete the predicate vocabulary inside a title string.
+///
+/// Offers both members of each vocabulary pair (decision 008 — a link may name
+/// either direction): the label is the predicate, the detail its opposite.
+/// Yields nothing when the destination does not take a predicate (external or
+/// non-markdown links carry a plain title, not a predicate).
+fn complete_predicate(
+    config: &Config,
+    target: &str,
+    partial: &str,
+    source: &str,
+    offset: usize,
+    pos: lsp::Position,
+) -> Vec<lsp::CompletionItem> {
+    if !target_takes_predicate(target) {
+        return Vec::new();
+    }
+
+    let range = replace_range(source, offset, pos, partial);
+    let mut items = Vec::new();
+    let mut seen = HashSet::new();
+    for (forward, inverse) in &config.predicates {
+        if matches_prefix(forward, partial) && seen.insert(forward.clone()) {
+            items.push(completion_item(
+                forward.clone(),
+                lsp::completion_item_kind::KEYWORD,
+                Some(inverse.clone()),
+                None,
+                range,
+            ));
+        }
+        if matches_prefix(inverse, partial) && seen.insert(inverse.clone()) {
+            items.push(completion_item(
+                inverse.clone(),
+                lsp::completion_item_kind::KEYWORD,
+                Some(forward.clone()),
+                None,
+                range,
+            ));
+        }
+    }
+    items
+}
+
+/// Whether a destination URL takes a predicate — an intra-project markdown
+/// link. External links and non-markdown targets carry a plain title; a
+/// fragment-only link (`#section`) is not a graph edge.
+fn target_takes_predicate(target: &str) -> bool {
+    let target = target.trim();
+    if target.is_empty()
+        || target.starts_with("http://")
+        || target.starts_with("https://")
+        || target.starts_with("mailto:")
+    {
+        return false;
+    }
+    let path = target.split_once('#').map_or(target, |(p, _)| p);
+    !path.is_empty()
+        && Path::new(path)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
+}
+
+/// Complete the document's defined link reference labels.
+fn complete_reference_label(
+    tree: &Tree,
+    partial: &str,
+    source: &str,
+    offset: usize,
+    pos: lsp::Position,
+) -> Vec<lsp::CompletionItem> {
+    // Definition labels are stored normalized; match the partial the same way.
+    let normalized = normalize_label(partial);
+    let range = replace_range(source, offset, pos, partial);
+
+    let mut items = Vec::new();
+    let mut seen = HashSet::new();
+    for node in tree.nodes() {
+        if let ElementKind::ReferenceDef { label, url, .. } = &node.kind
+            && label.starts_with(&normalized)
+            && seen.insert(label.clone())
+        {
+            let detail = (!url.is_empty()).then(|| url.clone());
+            items.push(completion_item(
+                label.clone(),
+                lsp::completion_item_kind::REFERENCE,
+                detail,
+                None,
+                range,
+            ));
+        }
+    }
+    items
+}
+
+/// Complete the document's defined footnote labels.
+fn complete_footnote(
+    tree: &Tree,
+    partial: &str,
+    source: &str,
+    offset: usize,
+    pos: lsp::Position,
+) -> Vec<lsp::CompletionItem> {
+    let range = replace_range(source, offset, pos, partial);
+
+    let mut items = Vec::new();
+    let mut seen = HashSet::new();
+    for node in tree.nodes() {
+        if let ElementKind::FootnoteDef { label } = &node.kind
+            && matches_prefix(label, partial)
+            && seen.insert(label.clone())
+        {
+            items.push(completion_item(
+                label.clone(),
+                lsp::completion_item_kind::CONSTANT,
+                Some("footnote".to_string()),
+                None,
+                range,
+            ));
+        }
+    }
+    items
 }
 
 // ---------------------------------------------------------------------------
@@ -6002,5 +6397,300 @@ mod tests {
             }
             assert_client_matches(&workspaces, &client, &format!("after edit {i} ({rel})"));
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Completion (decision 007, ticket integration 14)
+    // -----------------------------------------------------------------------
+
+    /// Request completion at a 0-based (line, character) position in `rel`.
+    fn complete_at(
+        workspaces: &Workspaces,
+        dir: &tempfile::TempDir,
+        rel: &str,
+        line: u32,
+        character: u32,
+    ) -> Option<lsp::CompletionList> {
+        let params = lsp::TextDocumentPositionParams {
+            text_document: lsp::TextDocumentIdentifier {
+                uri: file_uri(dir, rel),
+            },
+            position: lsp::Position { line, character },
+        };
+        completion(workspaces, &params)
+    }
+
+    /// The labels of a completion list.
+    fn labels(list: &lsp::CompletionList) -> Vec<String> {
+        list.items.iter().map(|i| i.label.clone()).collect()
+    }
+
+    #[test]
+    fn completion_path_offers_workspace_files_and_dirs() {
+        let dir = workspace_with_files(&[
+            ("doc.md", "[x]("),
+            ("other.md", "# Other\n"),
+            ("guide.md", "# Guide\n"),
+            ("sub/page.md", "# Page\n"),
+        ]);
+        let workspaces = scan_workspaces(&dir);
+
+        let list = complete_at(&workspaces, &dir, "doc.md", 0, 4).expect("path completion");
+        let got = labels(&list);
+        assert!(
+            got.contains(&"other.md".to_string()),
+            "offers sibling md: {got:?}"
+        );
+        assert!(
+            got.contains(&"guide.md".to_string()),
+            "offers sibling md: {got:?}"
+        );
+        assert!(
+            got.contains(&"sub/".to_string()),
+            "offers subdirectory: {got:?}"
+        );
+        assert!(
+            !got.iter().any(|l| l.starts_with('.')),
+            "hidden entries (.git) are skipped: {got:?}"
+        );
+    }
+
+    #[test]
+    fn completion_path_respects_relative_directory() {
+        let dir = workspace_with_files(&[("a.md", "[x](docs/"), ("docs/inner.md", "# Inner\n")]);
+        let workspaces = scan_workspaces(&dir);
+
+        // Cursor after `[x](docs/` — column 9.
+        let list = complete_at(&workspaces, &dir, "a.md", 0, 9).expect("path completion");
+        let got = labels(&list);
+        assert_eq!(
+            got,
+            vec!["inner.md".to_string()],
+            "only the typed directory's contents are offered: {got:?}"
+        );
+        // The replacement covers just the filename segment, leaving `docs/`.
+        let edit = list.items[0].text_edit.as_ref().expect("text edit");
+        assert_eq!(
+            edit.range.start.character, 9,
+            "edit starts after the directory separator, not replacing it"
+        );
+    }
+
+    #[test]
+    fn completion_path_skips_gitignored() {
+        let dir = workspace_with_files(&[
+            (".gitignore", "secret.md\nbuild/\n"),
+            ("doc.md", "[x]("),
+            ("visible.md", "# Visible\n"),
+            ("secret.md", "# Secret\n"),
+            ("build/out.md", "# Out\n"),
+        ]);
+        let workspaces = scan_workspaces(&dir);
+
+        let got = labels(&complete_at(&workspaces, &dir, "doc.md", 0, 4).expect("path completion"));
+        assert!(
+            got.contains(&"visible.md".to_string()),
+            "offers tracked files: {got:?}"
+        );
+        assert!(
+            !got.contains(&"secret.md".to_string()),
+            "a gitignored file is not offered: {got:?}"
+        );
+        assert!(
+            !got.contains(&"build/".to_string()),
+            "a gitignored directory is not offered: {got:?}"
+        );
+    }
+
+    #[test]
+    fn completion_fragment_offers_target_headings() {
+        let dir = workspace_with_files(&[
+            ("doc.md", "[x](target.md#"),
+            ("target.md", "# Hello World\n\n## Setup {#install}\n"),
+        ]);
+        let workspaces = scan_workspaces(&dir);
+
+        let list = complete_at(&workspaces, &dir, "doc.md", 0, 14).expect("fragment completion");
+        let got = labels(&list);
+        assert!(
+            got.contains(&"hello-world".to_string()),
+            "offers the computed slug: {got:?}"
+        );
+        assert!(
+            got.contains(&"install".to_string()),
+            "offers the explicit anchor id: {got:?}"
+        );
+        let hello = list
+            .items
+            .iter()
+            .find(|i| i.label == "hello-world")
+            .expect("hello-world item");
+        assert_eq!(
+            hello.detail.as_deref(),
+            Some("Hello World"),
+            "detail is the heading text"
+        );
+    }
+
+    #[test]
+    fn completion_fragment_in_doc_offers_current_headings() {
+        let dir = workspace_with_files(&[("doc.md", "# Top\n\n[x](#")]);
+        let workspaces = scan_workspaces(&dir);
+
+        let list = complete_at(&workspaces, &dir, "doc.md", 2, 5).expect("in-doc fragment");
+        assert_eq!(
+            labels(&list),
+            vec!["top".to_string()],
+            "an in-doc `#` completes the current file's headings"
+        );
+    }
+
+    #[test]
+    fn completion_predicate_offers_vocabulary_with_inverse_detail() {
+        let dir = workspace_with_files(&[
+            (".lattice.toml", "[predicates]\ntracks = \"tracked_by\"\n"),
+            ("doc.md", "[x](target.md \""),
+            ("target.md", "# Target\n"),
+        ]);
+        let workspaces = scan_workspaces(&dir);
+
+        let list = complete_at(&workspaces, &dir, "doc.md", 0, 15).expect("predicate completion");
+        let supersedes = list
+            .items
+            .iter()
+            .find(|i| i.label == "supersedes")
+            .expect("offers a forward predicate");
+        assert_eq!(
+            supersedes.detail.as_deref(),
+            Some("superseded_by"),
+            "a forward predicate's detail is its inverse"
+        );
+        // Both directions are offered (decision 008): the inverse member of a
+        // pair, detailed with its forward.
+        let superseded_by = list
+            .items
+            .iter()
+            .find(|i| i.label == "superseded_by")
+            .expect("offers the inverse direction too");
+        assert_eq!(
+            superseded_by.detail.as_deref(),
+            Some("supersedes"),
+            "an inverse predicate's detail is its forward"
+        );
+        let got = labels(&list);
+        assert!(
+            got.contains(&"tracks".to_string()) && got.contains(&"tracked_by".to_string()),
+            "offers both directions of a config-defined predicate: {got:?}"
+        );
+        // Selecting any item inserts a known predicate (either direction), which
+        // clears a missing/unknown-predicate diagnostic on the link.
+        let (workspace, _) = workspaces
+            .resolve(&file_uri(&dir, "doc.md"))
+            .expect("resolve workspace");
+        for item in &list.items {
+            assert!(
+                workspace.config().is_known_predicate(&item.label),
+                "every offered predicate is known to the vocabulary: {}",
+                item.label
+            );
+        }
+    }
+
+    #[test]
+    fn completion_predicate_filters_by_partial() {
+        let dir = workspace_with_files(&[
+            ("doc.md", "[x](target.md \"sup"),
+            ("target.md", "# Target\n"),
+        ]);
+        let workspaces = scan_workspaces(&dir);
+
+        let list = complete_at(&workspaces, &dir, "doc.md", 0, 18).expect("predicate completion");
+        assert_eq!(
+            labels(&list),
+            vec!["supersedes".to_string(), "superseded_by".to_string()],
+            "both directions matching the typed partial are offered"
+        );
+    }
+
+    #[test]
+    fn completion_predicate_skipped_on_exempt_links() {
+        // Predicates apply only to intra-project markdown links; external and
+        // non-markdown destinations carry a plain title, not a predicate.
+        let dir = workspace_with_files(&[
+            ("ext.md", "[x](https://example.com \""),
+            ("asset.md", "[x](diagram.png \""),
+        ]);
+        let workspaces = scan_workspaces(&dir);
+
+        let external =
+            complete_at(&workspaces, &dir, "ext.md", 0, 25).expect("known title context");
+        assert!(
+            external.items.is_empty(),
+            "no predicate completion on an external link: {:?}",
+            labels(&external)
+        );
+        let asset = complete_at(&workspaces, &dir, "asset.md", 0, 17).expect("known title context");
+        assert!(
+            asset.items.is_empty(),
+            "no predicate completion on a non-markdown link: {:?}",
+            labels(&asset)
+        );
+    }
+
+    #[test]
+    fn completion_reference_label_offers_definitions() {
+        let dir =
+            workspace_with_files(&[("doc.md", "[def]: https://example.com/page\n\nSee [link][")]);
+        let workspaces = scan_workspaces(&dir);
+
+        let list = complete_at(&workspaces, &dir, "doc.md", 2, 11).expect("reference completion");
+        let def = list
+            .items
+            .iter()
+            .find(|i| i.label == "def")
+            .expect("offers the defined reference label");
+        assert_eq!(
+            def.detail.as_deref(),
+            Some("https://example.com/page"),
+            "detail is the definition's URL"
+        );
+    }
+
+    #[test]
+    fn completion_footnote_offers_definitions() {
+        let dir =
+            workspace_with_files(&[("doc.md", "Body.[^note]\n\n[^note]: A footnote.\n\nMore [^")]);
+        let workspaces = scan_workspaces(&dir);
+
+        let list = complete_at(&workspaces, &dir, "doc.md", 4, 7).expect("footnote completion");
+        assert_eq!(
+            labels(&list),
+            vec!["note".to_string()],
+            "offers the defined footnote label"
+        );
+    }
+
+    #[test]
+    fn completion_none_in_prose() {
+        let dir = workspace_with_files(&[("doc.md", "just some prose here\n")]);
+        let workspaces = scan_workspaces(&dir);
+
+        assert!(
+            complete_at(&workspaces, &dir, "doc.md", 0, 10).is_none(),
+            "prose is not a completion site"
+        );
+    }
+
+    #[test]
+    fn completion_none_in_code_block() {
+        // A fenced code block whose body is a link-shaped string: the line
+        // prefix looks like a destination, but the tree marks it as code.
+        let dir = workspace_with_files(&[("doc.md", "```\n[x](\n```\n")]);
+        let workspaces = scan_workspaces(&dir);
+
+        assert!(
+            complete_at(&workspaces, &dir, "doc.md", 1, 4).is_none(),
+            "no completion inside a code block"
+        );
     }
 }

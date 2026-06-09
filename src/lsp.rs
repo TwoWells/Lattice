@@ -396,6 +396,39 @@ pub struct DocumentDiagnosticParams {
     pub text_document: TextDocumentIdentifier,
 }
 
+/// A completion item.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompletionItem {
+    /// Display label (also the default inserted text).
+    pub label: String,
+    /// Completion item kind (numeric LSP `CompletionItemKind`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<u32>,
+    /// Optional detail string (e.g. the inverse predicate, or a target URL).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// Text the client filters against the typed prefix.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filter_text: Option<String>,
+    /// Text the client orders items by.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sort_text: Option<String>,
+    /// Replacement edit applied when the item is selected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text_edit: Option<TextEdit>,
+}
+
+/// A completion result list.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompletionList {
+    /// Whether the list is incomplete (recomputed as the user types further).
+    pub is_incomplete: bool,
+    /// The completion items.
+    pub items: Vec<CompletionItem>,
+}
+
 /// An incoming call.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -442,6 +475,22 @@ pub mod symbol_kind {
     pub const EVENT: u32 = 24;
     /// Operator (thematic breaks).
     pub const OPERATOR: u32 = 25;
+}
+
+/// LSP `CompletionItemKind` constants (subset).
+pub mod completion_item_kind {
+    /// Value (heading fragments / anchors).
+    pub const VALUE: u32 = 12;
+    /// Keyword (predicate vocabulary).
+    pub const KEYWORD: u32 = 14;
+    /// File (link-target files).
+    pub const FILE: u32 = 17;
+    /// Reference (link reference labels).
+    pub const REFERENCE: u32 = 18;
+    /// Folder (link-target directories).
+    pub const FOLDER: u32 = 19;
+    /// Constant (footnote labels).
+    pub const CONSTANT: u32 = 21;
 }
 
 /// LSP `DiagnosticSeverity` constants.
@@ -513,4 +562,6 @@ pub mod method {
     pub const WORKSPACE_DIAGNOSTIC: &str = "workspace/diagnostic";
     /// `textDocument/formatting`.
     pub const FORMATTING: &str = "textDocument/formatting";
+    /// `textDocument/completion`.
+    pub const COMPLETION: &str = "textDocument/completion";
 }
