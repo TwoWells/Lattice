@@ -60,8 +60,7 @@ pub fn validate_forward_links(workspace: &Workspace) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
 
     for (file_path, file_data) in workspace.files() {
-        let links = file_data.tree.links(file_path);
-        for link in &links {
+        for link in &file_data.links {
             match &link.kind {
                 LinkKind::External { .. } => {}
 
@@ -272,8 +271,7 @@ fn build_expected_backlinks(workspace: &Workspace) -> ExpectedBacklinks {
     let mut expected: ExpectedBacklinks = HashMap::new();
 
     for (source_path, file_data) in workspace.files() {
-        let links = file_data.tree.links(source_path);
-        for link in &links {
+        for link in &file_data.links {
             if let LinkKind::IntraProject {
                 target, predicate, ..
             } = &link.kind
@@ -428,7 +426,7 @@ fn has_reciprocal_forward_link(
     let Some(target_data) = workspace.file(target) else {
         return false;
     };
-    target_data.tree.links(target).iter().any(|link| {
+    target_data.links.iter().any(|link| {
         matches!(
             &link.kind,
             LinkKind::IntraProject { target: t, predicate: p, .. }
@@ -509,7 +507,7 @@ fn check_fragment(
     }
 
     let algorithm = config.policy.fragments;
-    let headings = target_data.tree.headings();
+    let headings = &target_data.headings;
 
     let found = headings.iter().any(|heading| match &heading.id {
         HeadingId::Explicit(id) => id == fragment,
@@ -575,7 +573,7 @@ pub fn validate_connectivity(workspace: &Workspace) -> Vec<Diagnostic> {
     let mut undirected: HashMap<&Path, BTreeSet<&Path>> = HashMap::new();
     for (source, file_data) in files {
         let src = source.as_path();
-        for link in &file_data.tree.links(source) {
+        for link in &file_data.links {
             let LinkKind::IntraProject { target, .. } = &link.kind else {
                 continue;
             };

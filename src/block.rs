@@ -401,7 +401,7 @@ impl Tree {
 // ---------------------------------------------------------------------------
 
 /// A link extracted from the parse tree.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct Link {
     /// 1-based line number in the source.
     pub line: usize,
@@ -412,7 +412,7 @@ pub struct Link {
 }
 
 /// Classification of a link.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum LinkKind {
     /// External URL (`http://`, `https://`, `mailto:`).
     External {
@@ -444,7 +444,7 @@ pub enum LinkKind {
 }
 
 /// A heading extracted from the parse tree.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct Heading {
     /// 1-based line number in the source.
     pub line: usize,
@@ -462,7 +462,7 @@ pub struct Heading {
 }
 
 /// How a heading's anchor ID was determined.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum HeadingId {
     /// Explicit `{#id}` attribute on the heading.
     Explicit(String),
@@ -4541,6 +4541,37 @@ pub fn extract_html_heading_text(source: &str) -> String {
 // Tree accessors
 // ---------------------------------------------------------------------------
 
+// Counts actual `Tree::headings()` / `Tree::links()` extraction passes so a test
+// can prove the per-file `FileData` cache (ticket perf 06) serves repeated graph
+// validator reads from a single per-reparse extraction — not one `headings()`
+// pass per fragment-link, nor one `links()` pass per file per sync. The analog of
+// ticket 02's materialization counter; compiled out of release builds, so the hot
+// path pays nothing.
+#[cfg(test)]
+thread_local! {
+    static HEADINGS_EXTRACT_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static LINKS_EXTRACT_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Reset both extraction counters to zero (test instrumentation, ticket perf 06).
+#[cfg(test)]
+pub fn reset_extract_counts() {
+    HEADINGS_EXTRACT_COUNT.with(|count| count.set(0));
+    LINKS_EXTRACT_COUNT.with(|count| count.set(0));
+}
+
+/// Number of `Tree::headings()` extraction passes since the last reset.
+#[cfg(test)]
+pub fn headings_extract_count() -> usize {
+    HEADINGS_EXTRACT_COUNT.with(std::cell::Cell::get)
+}
+
+/// Number of `Tree::links()` extraction passes since the last reset.
+#[cfg(test)]
+pub fn links_extract_count() -> usize {
+    LINKS_EXTRACT_COUNT.with(std::cell::Cell::get)
+}
+
 impl Tree {
     /// Extract links from the tree, classified relative to `file_path`.
     ///
@@ -4548,6 +4579,9 @@ impl Tree {
     /// resolve relative link targets.
     #[must_use]
     pub fn links(&self, file_path: &Path) -> Vec<Link> {
+        #[cfg(test)]
+        LINKS_EXTRACT_COUNT.with(|count| count.set(count.get() + 1));
+
         let mut links = Vec::new();
 
         for node in &self.nodes {
@@ -4572,6 +4606,9 @@ impl Tree {
     /// Extract headings with computed slugs.
     #[must_use]
     pub fn headings(&self) -> Vec<Heading> {
+        #[cfg(test)]
+        HEADINGS_EXTRACT_COUNT.with(|count| count.set(count.get() + 1));
+
         let mut slugs = SlugCounts::new();
         let mut headings = Vec::new();
 

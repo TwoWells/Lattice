@@ -63,6 +63,23 @@ pub struct FileData {
     /// diagnostic collectors read it directly instead of re-walking every
     /// cached tree on each sync (issue 013 — stage 2).
     pub structural: Vec<Diagnostic>,
+    /// Cached extracted headings (`Tree::headings()` output, with precomputed
+    /// github/gitlab/vscode slugs) for this file.
+    ///
+    /// Unlike `structural`, which also reads workspace membership, this is a
+    /// pure function of this file's own tree — so it is built directly in the
+    /// parse path and refreshed exactly when the file reparses. Fragment
+    /// validation reads it instead of re-deriving a linked document's headings
+    /// once per `file.md#heading` reference (issue 013 — ticket perf 06).
+    pub headings: Vec<block::Heading>,
+    /// Cached extracted links (`Tree::links()` output) for this file, classified
+    /// against its own workspace-relative path.
+    ///
+    /// Like `headings`, a pure function of this file's tree and path, rebuilt
+    /// only on reparse. The forward-link, backlink, connectivity, and
+    /// reciprocal-link validators read it instead of re-walking and
+    /// re-classifying every link on each sync (ticket perf 06).
+    pub links: Vec<block::Link>,
 }
 
 /// Parsed frontmatter from a markdown document.
@@ -400,6 +417,15 @@ pub fn parse_content(content: &str, rel_path: &Path, config: &Config) -> FileDat
         let _ = diag;
     }
 
+    // Extract this file's headings (with precomputed slugs) and links once, here
+    // in the parse path, so the graph validators read a cached vector instead of
+    // re-deriving it — `headings()` per fragment-link, `links()` per file per
+    // sync (ticket perf 06). Both are pure functions of this file's own tree and
+    // path, so the cache refreshes exactly when the file reparses; no
+    // post-insertion workspace step is needed, unlike `structural`.
+    let headings = tree.headings();
+    let links = tree.links(rel_path);
+
     FileData {
         tree,
         frontmatter,
@@ -409,6 +435,8 @@ pub fn parse_content(content: &str, rel_path: &Path, config: &Config) -> FileDat
         // (for bare-path existence) that a standalone parse cannot know. The
         // workspace fills it via `recompute_structural` after insertion.
         structural: Vec::new(),
+        headings,
+        links,
     }
 }
 
@@ -879,6 +907,126 @@ mod tests {
             bare_path_severity(&ws, Path::new("a.md")),
             Some(crate::validation::Severity::Warning),
             "adding the target should flip the source's bare-path to a warning"
+        );
+    }
+
+    // -- Parsed-extraction cache (ticket perf 06) --
+
+    /// Differential invariant: every file's cached `headings`/`links` vector
+    /// must equal a fresh `Tree::headings()`/`Tree::links()` extraction. A drift
+    /// here is the "silent stale extraction" failure mode the cache risks — the
+    /// stage-2 spirit applied to fragment and forward-link inputs.
+    fn assert_extraction_cache_matches_recompute(ws: &Workspace) {
+        for (path, file_data) in ws.files() {
+            assert_eq!(
+                file_data.headings,
+                file_data.tree.headings(),
+                "cached headings for {} drifted from a fresh extraction",
+                path.display()
+            );
+            assert_eq!(
+                file_data.links,
+                file_data.tree.links(path),
+                "cached links for {} drifted from a fresh extraction",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn extraction_cache_matches_recompute_across_mutations() {
+        let dir = workspace_with_files(&[
+            ("a.md", "# A\n\n[to b](b.md \"references\")\n\n## Section\n"),
+            ("b.md", "# B\n"),
+        ]);
+        let mut ws = Workspace::scan(dir.path()).expect("scan should succeed");
+        assert_extraction_cache_matches_recompute(&ws);
+        assert!(
+            !ws.file(Path::new("a.md"))
+                .expect("a.md indexed")
+                .links
+                .is_empty(),
+            "fixture should exercise real cached links"
+        );
+        assert!(
+            !ws.file(Path::new("a.md"))
+                .expect("a.md indexed")
+                .headings
+                .is_empty(),
+            "fixture should exercise real cached headings"
+        );
+
+        // Content edit, membership unchanged.
+        ws.update_content(
+            Path::new("a.md"),
+            "# A renamed\n\n[to b](b.md#b \"references\")\n",
+        );
+        assert_extraction_cache_matches_recompute(&ws);
+
+        // Add a file: membership grows.
+        ws.update_content(Path::new("c.md"), "# C\n\n[to a](a.md \"references\")\n");
+        assert_extraction_cache_matches_recompute(&ws);
+
+        // Remove a file from disk: membership shrinks.
+        fs::remove_file(dir.path().join("b.md")).expect("delete b.md");
+        ws.update(Path::new("b.md")).expect("update should succeed");
+        assert_extraction_cache_matches_recompute(&ws);
+    }
+
+    #[test]
+    fn extraction_cache_rebuilt_only_on_reparse() {
+        // target.md owns headings; three sources each reference a fragment in
+        // it, so a from-scratch fragment pass would re-derive its headings three
+        // times. The cache must serve all three from one parse-time extraction.
+        let dir = workspace_with_files(&[
+            (".lattice.toml", ""),
+            ("target.md", "# Alpha\n\n## Beta\n"),
+            ("a.md", "[x](target.md#alpha \"references\")\n"),
+            ("b.md", "[y](target.md#beta \"references\")\n"),
+            ("c.md", "[z](target.md#alpha \"references\")\n"),
+        ]);
+        let mut ws = Workspace::scan(dir.path()).expect("scan should succeed");
+
+        // A full forward-link/fragment validation reads the cache: it re-extracts
+        // nothing, no matter how many fragment-links point at target.md.
+        block::reset_extract_counts();
+        let _ = crate::validation::validate_forward_links(&ws);
+        assert_eq!(
+            block::headings_extract_count(),
+            0,
+            "fragment validation must read cached headings, not re-extract once per fragment-link"
+        );
+        assert_eq!(
+            block::links_extract_count(),
+            0,
+            "forward-link validation must read cached links, not re-extract once per file"
+        );
+
+        // Editing one file re-extracts exactly that file's headings/links once,
+        // leaving every other file's cache untouched.
+        let a_links_before = format!(
+            "{:?}",
+            ws.file(Path::new("a.md")).expect("a.md indexed").links
+        );
+        block::reset_extract_counts();
+        ws.update_content(Path::new("target.md"), "# Alpha\n\n## Gamma\n");
+        assert_eq!(
+            block::headings_extract_count(),
+            1,
+            "one reparse re-extracts headings exactly once, not once per other file"
+        );
+        assert_eq!(
+            block::links_extract_count(),
+            1,
+            "one reparse re-extracts links exactly once, not once per other file"
+        );
+        let a_links_after = format!(
+            "{:?}",
+            ws.file(Path::new("a.md")).expect("a.md indexed").links
+        );
+        assert_eq!(
+            a_links_before, a_links_after,
+            "editing target.md must not rebuild another file's link cache"
         );
     }
 }
