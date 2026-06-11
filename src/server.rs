@@ -1388,7 +1388,17 @@ fn go_to_declaration(
     go_to_definition(workspaces, params)
 }
 
-/// Go to the definition (target document) of a link.
+/// Go to the definition of a link.
+///
+/// A cross-file or non-markdown link resolves to the target document. A
+/// same-document anchor (`[…](#heading)`) resolves the fragment against this
+/// file's own headings and goes to the heading line — an in-page anchor's
+/// "target document" is itself, so the heading is the meaningful destination
+/// (issue 021).
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "line numbers in markdown files won't exceed u32::MAX"
+)]
 fn go_to_definition(
     workspaces: &Workspaces,
     params: &lsp::TextDocumentPositionParams,
@@ -1413,7 +1423,28 @@ fn go_to_definition(
                 range: lsp::Range::default(),
             })
         }
-        _ => None,
+        LinkKind::IntraDocument { fragment } => {
+            let heading = file_data
+                .tree
+                .headings()
+                .into_iter()
+                .find(|h| heading_matches_fragment(h, fragment))?;
+            let heading_line = heading.line.saturating_sub(1) as u32;
+            Some(lsp::Location {
+                uri: params.text_document.uri.clone(),
+                range: lsp::Range {
+                    start: lsp::Position {
+                        line: heading_line,
+                        character: 0,
+                    },
+                    end: lsp::Position {
+                        line: heading_line,
+                        character: 0,
+                    },
+                },
+            })
+        }
+        LinkKind::External { .. } => None,
     }
 }
 
@@ -5289,6 +5320,33 @@ mod tests {
         assert!(
             loc.uri.ends_with("b.md"),
             "definition should go to target document"
+        );
+    }
+
+    #[test]
+    fn definition_same_document_anchor_goes_to_heading() {
+        // Issue 021: a same-document anchor navigates to its own heading.
+        let dir = workspace_with_files(&[("a.md", "# A\n\n[jump](#details)\n\n## Details\n")]);
+        let workspaces = scan_workspaces(&dir);
+
+        let params = lsp::TextDocumentPositionParams {
+            text_document: lsp::TextDocumentIdentifier {
+                uri: file_uri(&dir, "a.md"),
+            },
+            position: lsp::Position {
+                line: 2,
+                character: 2,
+            },
+        };
+        let loc = go_to_definition(&workspaces, &params)
+            .expect("same-document anchor should resolve to its heading");
+        assert!(
+            loc.uri.ends_with("a.md"),
+            "same-document anchor stays in the current file"
+        );
+        assert_eq!(
+            loc.range.start.line, 4,
+            "definition should go to the `## Details` heading line"
         );
     }
 

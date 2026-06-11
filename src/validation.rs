@@ -478,7 +478,9 @@ fn check_stale_backlinks(
 /// Explicit `{#id}` anchors are checked first (exact match). For computed
 /// slugs, the algorithm policy determines which slugs are considered.
 /// Skips the check when the target file does not exist (forward link
-/// validation handles that case).
+/// validation handles that case). The HTML "top of document" idioms — an
+/// empty fragment (`#`) and `#top` (ASCII case-insensitive) — are always
+/// valid and never flagged.
 #[allow(
     clippy::too_many_arguments,
     reason = "validation context parameters are distinct concerns"
@@ -496,6 +498,15 @@ fn check_fragment(
     let Some(target_data) = workspace.file(target) else {
         return;
     };
+
+    // `#` (empty) and `#top` (ASCII case-insensitive) are the HTML
+    // "top of document" idioms: a renderer scrolls to the top regardless of
+    // headings (a real `top` heading, if present, just takes precedence). Both
+    // are valid, so never flag them — for same-document and cross-file links
+    // alike (issue 021).
+    if fragment.is_empty() || fragment.eq_ignore_ascii_case("top") {
+        return;
+    }
 
     let algorithm = config.policy.fragments;
     let headings = target_data.tree.headings();
@@ -1630,6 +1641,53 @@ fragments = \"gitlab\"
             errors[0].message.contains("#nonexistent"),
             "message includes the fragment: {}",
             errors[0].message
+        );
+    }
+
+    #[test]
+    fn same_document_top_idioms_are_valid() {
+        // `#` and `#top` (any case) are back-to-top idioms — never flagged,
+        // even with no matching heading (issue 021).
+        let (_dir, ws) = setup_workspace(&[(
+            "index.md",
+            "[a](#) [b](#top) [c](#Top) [d](#TOP)\n\n## Intro\n",
+        )]);
+
+        let diags = validate_forward_links(&ws);
+        assert!(
+            diags.is_empty(),
+            "back-to-top idioms must not be flagged: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn cross_file_top_idioms_are_valid() {
+        // The exemption is symmetric: a cross-file `#`/`#top` is valid too.
+        let (_dir, ws) = setup_workspace(&[
+            ("index.md", "[a](other.md#) [b](other.md#top)\n"),
+            ("other.md", "## Other Heading\n"),
+        ]);
+
+        let diags = validate_forward_links(&ws);
+        let errors: Vec<_> = diags
+            .iter()
+            .filter(|d| d.severity == Severity::Error)
+            .collect();
+        assert!(
+            errors.is_empty(),
+            "cross-file back-to-top idioms must not error: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn same_document_real_top_heading_still_resolves() {
+        // `#top` pointing at an actual `## Top` heading is fine either way.
+        let (_dir, ws) = setup_workspace(&[("index.md", "[a](#top)\n\n## Top\n")]);
+
+        let diags = validate_forward_links(&ws);
+        assert!(
+            diags.is_empty(),
+            "a real `top` heading resolves cleanly: {diags:?}"
         );
     }
 
