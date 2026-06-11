@@ -794,7 +794,9 @@ fn emit_code_block_diagnostics(
                 file: rel_path.to_path_buf(),
                 line,
                 severity,
-                message: "code block without language tag".to_string(),
+                message:
+                    "code block without a language tag — add one (use `text` for non-code output)"
+                        .to_string(),
                 span: Some(node.span),
             });
         }
@@ -1159,9 +1161,16 @@ mod tests {
     fn code_block_without_language() {
         let diags = diagnose("```\ncode\n```\n");
         assert_eq!(
-            count_matching(&diags, Severity::Hint, "without language tag"),
+            count_matching(&diags, Severity::Hint, "without a language tag"),
             1,
             "one hint for missing language: {diags:?}"
+        );
+        // Issue 020: the hint must name the `text` escape hatch so authors of
+        // non-code blocks (output, diagrams, trees) tag them deliberately
+        // instead of guessing a language.
+        assert!(
+            has_matching(&diags, Severity::Hint, "`text`"),
+            "missing-language hint should point at the `text` escape hatch: {diags:?}"
         );
     }
 
@@ -1169,7 +1178,7 @@ mod tests {
     fn code_block_with_language_no_diagnostic() {
         let diags = diagnose("```rust\ncode\n```\n");
         assert!(
-            !has_any(&diags, "without language tag"),
+            !has_any(&diags, "language tag"),
             "no hint for code block with language: {diags:?}"
         );
     }
@@ -1408,7 +1417,7 @@ mod tests {
         let rel_path = std::path::Path::new("test.md");
         let diags = collect(&tree, rel_path, &config, &|_| false);
         assert!(
-            !has_any(&diags, "without language tag"),
+            !has_any(&diags, "language tag"),
             "no diagnostic when disabled: {diags:?}"
         );
     }
@@ -1423,7 +1432,7 @@ mod tests {
         let rel_path = std::path::Path::new("test.md");
         let diags = collect(&tree, rel_path, &config, &|_| false);
         assert_eq!(
-            count_matching(&diags, Severity::Error, "without language tag"),
+            count_matching(&diags, Severity::Error, "without a language tag"),
             1,
             "one error when deny: {diags:?}"
         );
