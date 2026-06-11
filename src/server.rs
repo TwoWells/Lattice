@@ -1957,11 +1957,20 @@ fn document_links(workspaces: &Workspaces, uri: &str) -> Vec<lsp::DocumentLink> 
     let mut links = Vec::new();
 
     for link in &file_links {
+        // DocumentLink is intentionally *file-granularity*. `DocumentLink.target`
+        // is a bare URI with no position field, so it can only open a document,
+        // never land on a heading. Hence cross-file links deliberately drop their
+        // fragment (the `..` below), and same-document anchors are skipped
+        // entirely: an in-page anchor's only useful destination is a heading in
+        // *this* file, which a URI can't express. Heading-precise navigation is
+        // delivered by go-to-definition instead, which returns a `Location` with
+        // a range (see `go_to_definition`, issue 021). Do NOT "fix" the skip by
+        // emitting a file-top link here — it would send an in-page anchor to the
+        // top of the file you're already in, which reads as broken.
         let target_uri = match &link.kind {
             LinkKind::IntraProject { target, .. } | LinkKind::NonMarkdown { target } => {
                 path_to_uri(&root.join(target))
             }
-            // Skip external and intra-document links.
             LinkKind::External { .. } | LinkKind::IntraDocument { .. } => continue,
         };
         let line = link.line.saturating_sub(1) as u32;
