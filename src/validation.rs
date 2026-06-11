@@ -63,7 +63,25 @@ pub fn validate_forward_links(workspace: &Workspace) -> Vec<Diagnostic> {
         let links = file_data.tree.links(file_path);
         for link in &links {
             match &link.kind {
-                LinkKind::External { .. } | LinkKind::IntraDocument { .. } => {}
+                LinkKind::External { .. } => {}
+
+                LinkKind::IntraDocument { fragment } => {
+                    // Same-document anchor (`[…](#heading)`): resolve against
+                    // this file's own headings, exactly as a cross-file
+                    // fragment resolves against its target's. A dangling
+                    // in-page anchor is as broken as a dangling cross-file one
+                    // (issue 021).
+                    check_fragment(
+                        workspace,
+                        config,
+                        file_path,
+                        link.line,
+                        link.span,
+                        file_path,
+                        fragment,
+                        &mut diagnostics,
+                    );
+                }
 
                 LinkKind::NonMarkdown { target } => {
                     check_target_exists(
@@ -859,14 +877,6 @@ predicates = \"required\"
     }
 
     #[test]
-    fn intra_document_links_skipped() {
-        let (_dir, ws) = setup_workspace(&[("index.md", "[section](#heading)")]);
-
-        let diags = validate_forward_links(&ws);
-        assert!(diags.is_empty(), "no diagnostics for intra-document links");
-    }
-
-    #[test]
     fn non_markdown_target_exists() {
         let (_dir, ws) = setup_workspace(&[
             ("index.md", "[diagram](arch.png)"),
@@ -1565,6 +1575,59 @@ fragments = \"gitlab\"
         assert_eq!(errors.len(), 1, "error when target has no headings at all");
         assert!(
             errors[0].message.contains("#something"),
+            "message includes the fragment: {}",
+            errors[0].message
+        );
+    }
+
+    #[test]
+    fn same_document_anchor_resolves_to_own_heading() {
+        // `[…](#slug)` resolves against the source file's own headings.
+        let (_dir, ws) = setup_workspace(&[(
+            "index.md",
+            "[top](#getting-started)\n\n## Getting Started\n",
+        )]);
+
+        let diags = validate_forward_links(&ws);
+        assert!(
+            diags.is_empty(),
+            "no errors when same-doc anchor matches an own heading: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn same_document_anchor_resolves_to_explicit_id() {
+        let (_dir, ws) = setup_workspace(&[(
+            "index.md",
+            "[go](#custom-id)\n\n## Some Heading {#custom-id}\n",
+        )]);
+
+        let diags = validate_forward_links(&ws);
+        assert!(
+            diags.is_empty(),
+            "no errors when same-doc anchor matches an explicit {{#id}}: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn same_document_anchor_not_found_produces_error() {
+        // Issue 021: a dangling in-page anchor must error, like a cross-file one.
+        let (_dir, ws) =
+            setup_workspace(&[("index.md", "[broken](#nonexistent)\n\n## Introduction\n")]);
+
+        let diags = validate_forward_links(&ws);
+        let errors: Vec<_> = diags
+            .iter()
+            .filter(|d| d.severity == Severity::Error)
+            .collect();
+
+        assert_eq!(
+            errors.len(),
+            1,
+            "one error for an unresolved same-doc anchor: {errors:?}"
+        );
+        assert!(
+            errors[0].message.contains("#nonexistent"),
             "message includes the fragment: {}",
             errors[0].message
         );

@@ -423,7 +423,6 @@ pub enum LinkKind {
     /// Intra-document fragment-only link (`#section`).
     IntraDocument {
         /// Fragment without the leading `#`.
-        #[allow(dead_code, reason = "stored for LSP diagnostics")]
         fragment: String,
     },
     /// Link to a non-markdown file in the project.
