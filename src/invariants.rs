@@ -35,6 +35,7 @@
 use crate::block::{ElementKind, Syntax, Tree};
 use crate::fm::{FmNode, FmValue, FrontmatterBlock, ScalarSpan};
 use crate::html::HtmlTag;
+use crate::line_index::LineIndex;
 use crate::{json, toml, yaml};
 
 // ---------------------------------------------------------------------------
@@ -394,6 +395,42 @@ pub fn assert_position_round_trip(source: &str) {
             back, off,
             "byte → LSP position → byte must round-trip at offset {off} \
              (position {pos:?} mapped back to {back})"
+        );
+    }
+}
+
+/// Assert the cached [`LineIndex`] is a byte-for-byte drop-in for the scalar
+/// position conversions over `source`. For every char-boundary offset: the
+/// index's forward conversion equals [`crate::server::byte_offset_to_lsp_position`]
+/// (so routing diagnostic materialization through the index cannot move a
+/// position), and `offset → position → offset` round-trips through the index
+/// itself — excluding the one `\r\n`-interior point that is not a stable
+/// round-trip target. Exercises the same line/column machinery the server uses,
+/// across every line-ending style and multi-byte content; `index` must have been
+/// built from `source`.
+pub fn assert_line_index_agrees(source: &str, index: &LineIndex) {
+    let bytes = source.as_bytes();
+    for off in 0..=source.len() {
+        if !source.is_char_boundary(off) {
+            continue;
+        }
+        let scalar = crate::server::byte_offset_to_lsp_position(source, off);
+        let indexed = index.position(source, off);
+        assert_eq!(
+            indexed, scalar,
+            "LineIndex position {indexed:?} disagrees with the scalar conversion \
+             {scalar:?} at offset {off}"
+        );
+        // Skip the degenerate offset strictly inside a `\r\n` pair: like the
+        // scalar round-trip, it is not a stable round-trip target.
+        if off > 0 && bytes[off - 1] == b'\r' && bytes.get(off) == Some(&b'\n') {
+            continue;
+        }
+        let back = index.offset(source, indexed);
+        assert_eq!(
+            back, off,
+            "LineIndex offset → position → offset must round-trip at {off} \
+             (position {indexed:?} mapped back to {back})"
         );
     }
 }

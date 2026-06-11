@@ -17,6 +17,7 @@ use crate::block::{self, Syntax, Tree};
 use crate::config::{Config, ConfigError};
 use crate::fm;
 use crate::json;
+use crate::line_index::LineIndex;
 use crate::structural;
 use crate::toml;
 use crate::validation::Diagnostic;
@@ -80,6 +81,15 @@ pub struct FileData {
     /// reciprocal-link validators read it instead of re-walking and
     /// re-classifying every link on each sync (ticket perf 06).
     pub links: Vec<block::Link>,
+    /// Cached byte-offset ↔ LSP-position map for this file's source.
+    ///
+    /// Built from `tree.source()` once per parse, so it refreshes exactly when
+    /// the file reparses — like `headings`/`links`, a pure function of this
+    /// file's own text. Diagnostic materialization routes its byte→UTF-16
+    /// position conversion through it instead of re-walking the source per
+    /// diagnostic, and the inverse direction feeds the future incremental
+    /// text-sync path (ticket perf 01).
+    pub line_index: LineIndex,
 }
 
 /// Parsed frontmatter from a markdown document.
@@ -426,6 +436,10 @@ pub fn parse_content(content: &str, rel_path: &Path, config: &Config) -> FileDat
     let headings = tree.headings();
     let links = tree.links(rel_path);
 
+    // Build the byte↔position index from the same source the tree carries, so it
+    // refreshes exactly when the file reparses (ticket perf 01).
+    let line_index = LineIndex::new(content);
+
     FileData {
         tree,
         frontmatter,
@@ -437,6 +451,7 @@ pub fn parse_content(content: &str, rel_path: &Path, config: &Config) -> FileDat
         structural: Vec::new(),
         headings,
         links,
+        line_index,
     }
 }
 
@@ -971,6 +986,64 @@ mod tests {
         fs::remove_file(dir.path().join("b.md")).expect("delete b.md");
         ws.update(Path::new("b.md")).expect("update should succeed");
         assert_extraction_cache_matches_recompute(&ws);
+    }
+
+    // -- Line index cache (ticket perf 01) --
+
+    /// Differential invariant: every file's cached `line_index` must equal a
+    /// fresh index built from the same source the tree carries — the index is a
+    /// pure function of the file's text, so any drift is a stale cache.
+    fn assert_line_index_cache_matches_recompute(ws: &Workspace) {
+        for (path, file_data) in ws.files() {
+            assert_eq!(
+                file_data.line_index,
+                LineIndex::new(file_data.tree.source()),
+                "cached line index for {} drifted from a fresh build",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn line_index_rebuilt_only_on_reparse() {
+        // Two files with deliberately different line shapes (CRLF vs LF, multi-
+        // byte content) so an index swap would be observable.
+        let dir = workspace_with_files(&[
+            ("a.md", "# A\r\n\r\nfirst café line\r\n"),
+            ("b.md", "# B\n\nsecond λ line\n"),
+        ]);
+        let mut ws = Workspace::scan(dir.path()).expect("scan should succeed");
+        assert_line_index_cache_matches_recompute(&ws);
+
+        let a_before = ws
+            .file(Path::new("a.md"))
+            .expect("a.md indexed")
+            .line_index
+            .clone();
+        let b_before = ws
+            .file(Path::new("b.md"))
+            .expect("b.md indexed")
+            .line_index
+            .clone();
+
+        // Edit only a.md, changing its line structure.
+        ws.update_content(Path::new("a.md"), "# A renamed\n\nshorter\n");
+
+        assert_ne!(
+            ws.file(Path::new("a.md"))
+                .expect("a.md still indexed")
+                .line_index,
+            a_before,
+            "the edited file's index must be rebuilt from its new source"
+        );
+        assert_eq!(
+            ws.file(Path::new("b.md"))
+                .expect("b.md still indexed")
+                .line_index,
+            b_before,
+            "an unrelated file's index must be untouched by another file's edit"
+        );
+        assert_line_index_cache_matches_recompute(&ws);
     }
 
     #[test]

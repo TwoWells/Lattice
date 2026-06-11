@@ -23,6 +23,7 @@ mod html;
 mod inline;
 mod json;
 mod limits;
+mod line_index;
 mod lint;
 mod lsp;
 mod server;

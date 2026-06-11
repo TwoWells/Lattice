@@ -20,6 +20,7 @@ use crate::block::{
 };
 use crate::completion::Context as CompletionContext;
 use crate::config::{Config, FragmentAlgorithm};
+use crate::line_index::LineIndex;
 use crate::lsp;
 use crate::span::Span;
 use crate::validation::{self, Diagnostic, Severity};
@@ -1210,6 +1211,7 @@ fn prepare_rename(
 
     Some(span_to_lsp_range(
         file_data.tree.source(),
+        &file_data.line_index,
         &heading.text_span,
     ))
 }
@@ -1224,7 +1226,11 @@ fn do_rename(workspaces: &Workspaces, params: &lsp::RenameParams) -> Option<lsp:
     let headings = file_data.tree.headings();
     let heading = heading_at_line(&headings, params.position.line)?;
 
-    let range = span_to_lsp_range(file_data.tree.source(), &heading.text_span);
+    let range = span_to_lsp_range(
+        file_data.tree.source(),
+        &file_data.line_index,
+        &heading.text_span,
+    );
 
     let mut changes = std::collections::HashMap::new();
     changes.insert(
@@ -1399,7 +1405,7 @@ fn go_to_declaration(
         let (_, def_node) = file_data.tree.find_ref_def(&label)?;
         return Some(lsp::Location {
             uri: params.text_document.uri.clone(),
-            range: span_to_lsp_range(source, &def_node.span),
+            range: span_to_lsp_range(source, &file_data.line_index, &def_node.span),
         });
     }
 
@@ -2067,11 +2073,12 @@ fn file_desired(workspace: &Workspace, rel_path: &Path) -> (Vec<Diagnostic>, Vec
         return (Vec::new(), Vec::new());
     };
     let source = file_data.tree.source();
+    let index = &file_data.line_index;
     let mut lattice = file_local_diagnostics(file_data, rel_path);
     lattice.sort_by_key(|d| d.line);
     let lsp = lattice
         .iter()
-        .map(|d| to_lsp_diagnostic(d, source))
+        .map(|d| to_lsp_diagnostic(d, source, index))
         .collect();
     (lattice, lsp)
 }
@@ -2080,10 +2087,13 @@ fn file_desired(workspace: &Workspace, rel_path: &Path) -> (Vec<Diagnostic>, Vec
 fn document_diagnostic(workspaces: &Workspaces, uri: &str) -> lsp::FullDocumentDiagnosticReport {
     let items = if let Some((workspace, rel_path)) = workspaces.resolve(uri) {
         let all = collect_all_diagnostics(workspace);
-        let source = workspace.file(&rel_path).map_or("", |fd| fd.tree.source());
+        let fd = workspace.file(&rel_path);
+        let source = fd.map_or("", |fd| fd.tree.source());
+        let empty = LineIndex::default();
+        let index = fd.map_or(&empty, |fd| &fd.line_index);
         all.iter()
             .filter(|d| d.file == rel_path)
-            .map(|d| to_lsp_diagnostic(d, source))
+            .map(|d| to_lsp_diagnostic(d, source, index))
             .collect()
     } else {
         Vec::new()
@@ -2099,16 +2109,19 @@ fn document_diagnostic(workspaces: &Workspaces, uri: &str) -> lsp::FullDocumentD
 fn workspace_diagnostic(workspaces: &Workspaces) -> lsp::WorkspaceDiagnosticReport {
     let mut reports = Vec::new();
 
+    let empty = LineIndex::default();
     for (root, workspace) in workspaces.iter() {
         let all = collect_all_diagnostics(workspace);
         let mut by_file: BTreeMap<PathBuf, Vec<lsp::Diagnostic>> = BTreeMap::new();
 
         for diag in &all {
-            let source = workspace.file(&diag.file).map_or("", |fd| fd.tree.source());
+            let fd = workspace.file(&diag.file);
+            let source = fd.map_or("", |fd| fd.tree.source());
+            let index = fd.map_or(&empty, |fd| &fd.line_index);
             by_file
                 .entry(diag.file.clone())
                 .or_default()
-                .push(to_lsp_diagnostic(diag, source));
+                .push(to_lsp_diagnostic(diag, source, index));
         }
 
         for (rel_path, items) in by_file {
@@ -2522,14 +2535,12 @@ pub fn lsp_position_to_byte_offset(source: &str, pos: lsp::Position) -> usize {
     byte
 }
 
-/// Convert a byte `Span` to an LSP `Range`.
-#[allow(
-    clippy::cast_possible_truncation,
-    reason = "line/column values in markdown files won't exceed u32::MAX"
-)]
-fn span_to_lsp_range(source: &str, span: &Span) -> lsp::Range {
-    let start = byte_offset_to_lsp_position(source, span.start);
-    let end = byte_offset_to_lsp_position(source, span.end);
+/// Convert a byte `Span` to an LSP `Range` through the file's cached
+/// [`LineIndex`], so each endpoint is a binary search rather than an
+/// `O(offset)` scan of `source`.
+fn span_to_lsp_range(source: &str, index: &LineIndex, span: &Span) -> lsp::Range {
+    let start = index.position(source, span.start);
+    let end = index.position(source, span.end);
     lsp::Range { start, end }
 }
 
@@ -3196,17 +3207,20 @@ fn diff_file_diagnostics(
 #[cfg(test)]
 fn desired_diagnostics(workspaces: &Workspaces) -> BTreeMap<String, Vec<lsp::Diagnostic>> {
     let mut desired: BTreeMap<String, Vec<lsp::Diagnostic>> = BTreeMap::new();
+    let empty = LineIndex::default();
 
     for (root, workspace) in workspaces.iter() {
         let all_diagnostics = collect_all_diagnostics(workspace);
 
         let mut by_file: BTreeMap<PathBuf, Vec<lsp::Diagnostic>> = BTreeMap::new();
         for diag in &all_diagnostics {
-            let source = workspace.file(&diag.file).map_or("", |fd| fd.tree.source());
+            let fd = workspace.file(&diag.file);
+            let source = fd.map_or("", |fd| fd.tree.source());
+            let index = fd.map_or(&empty, |fd| &fd.line_index);
             by_file
                 .entry(diag.file.clone())
                 .or_default()
-                .push(to_lsp_diagnostic(diag, source));
+                .push(to_lsp_diagnostic(diag, source, index));
         }
 
         for rel_path in workspace.files().keys() {
@@ -3278,6 +3292,9 @@ fn diff_diagnostics(
     let published = &workspaces.published;
     let mut materialized: Vec<Materialized> = Vec::new();
     let mut present: HashSet<String> = HashSet::new();
+    // Fallback index for the defensive unindexed-file path (a diagnostic whose
+    // file is not in the index); real files use their own cached `line_index`.
+    let empty = LineIndex::default();
 
     for (root, workspace) in inner {
         let mut by_file: BTreeMap<PathBuf, Vec<Diagnostic>> = BTreeMap::new();
@@ -3304,10 +3321,12 @@ fn diff_diagnostics(
                 }
             }
 
-            let source = workspace.file(rel_path).map_or("", |fd| fd.tree.source());
+            let fd = workspace.file(rel_path);
+            let source = fd.map_or("", |fd| fd.tree.source());
+            let index = fd.map_or(&empty, |fd| &fd.line_index);
             let lsp: Vec<lsp::Diagnostic> = lattice
                 .iter()
-                .map(|d| to_lsp_diagnostic(d, source))
+                .map(|d| to_lsp_diagnostic(d, source, index))
                 .collect();
             let send = cached.map_or(!lsp.is_empty(), |prev| prev.lsp != lsp);
             materialized.push(Materialized {
@@ -3370,8 +3389,10 @@ thread_local! {
 ///
 /// Builds the range from the diagnostic's byte span when present (precise
 /// underline); otherwise falls back to a whole-line range anchored on
-/// `diag.line`. `source` is the text of the file the diagnostic belongs to.
-fn to_lsp_diagnostic(diag: &Diagnostic, source: &str) -> lsp::Diagnostic {
+/// `diag.line`. `source` is the text of the file the diagnostic belongs to and
+/// `index` is that file's cached [`LineIndex`], through which the byte→position
+/// conversion is routed (ticket perf 01).
+fn to_lsp_diagnostic(diag: &Diagnostic, source: &str, index: &LineIndex) -> lsp::Diagnostic {
     #[cfg(test)]
     MATERIALIZE_COUNT.with(|count| count.set(count.get() + 1));
 
@@ -3383,8 +3404,8 @@ fn to_lsp_diagnostic(diag: &Diagnostic, source: &str) -> lsp::Diagnostic {
     };
 
     let range = diag.span.map_or_else(
-        || whole_line_range(source, diag.line),
-        |span| span_to_lsp_range(source, &span),
+        || whole_line_range(source, index, diag.line),
+        |span| span_to_lsp_range(source, index, &span),
     );
 
     lsp::Diagnostic {
@@ -3398,16 +3419,17 @@ fn to_lsp_diagnostic(diag: &Diagnostic, source: &str) -> lsp::Diagnostic {
 /// An LSP range covering an entire line's content (column 0 to the line's end,
 /// excluding the terminator). Used for diagnostics that carry only a line
 /// anchor, so the underline at least covers the line instead of a zero-width
-/// point at column 0.
+/// point at column 0. The two endpoint conversions route through the file's
+/// cached [`LineIndex`].
 #[allow(
     clippy::cast_possible_truncation,
     reason = "line numbers in markdown files won't exceed u32::MAX"
 )]
-fn whole_line_range(source: &str, line: usize) -> lsp::Range {
+fn whole_line_range(source: &str, index: &LineIndex, line: usize) -> lsp::Range {
     let (start, end) = line_byte_range(source, line.saturating_sub(1) as u32);
     lsp::Range {
-        start: byte_offset_to_lsp_position(source, start),
-        end: byte_offset_to_lsp_position(source, end),
+        start: index.position(source, start),
+        end: index.position(source, end),
     }
 }
 
@@ -3724,7 +3746,7 @@ mod tests {
             message: "target does not exist".to_string(),
             span: Some(Span::new(4, 8)),
         };
-        let d = to_lsp_diagnostic(&diag, source);
+        let d = to_lsp_diagnostic(&diag, source, &LineIndex::new(source));
         assert_eq!(
             d.severity,
             Some(lsp::diagnostic_severity::ERROR),
@@ -3751,7 +3773,7 @@ mod tests {
             message: "missing backlink".to_string(),
             span: None,
         };
-        let d = to_lsp_diagnostic(&diag, source);
+        let d = to_lsp_diagnostic(&diag, source, &LineIndex::new(source));
         assert_eq!(
             d.severity,
             Some(lsp::diagnostic_severity::WARNING),
@@ -3778,7 +3800,7 @@ mod tests {
             message: "no explicit predicate".to_string(),
             span: None,
         };
-        let d = to_lsp_diagnostic(&diag, source);
+        let d = to_lsp_diagnostic(&diag, source, &LineIndex::new(source));
         assert_eq!(
             d.severity,
             Some(lsp::diagnostic_severity::INFORMATION),
@@ -5981,7 +6003,7 @@ mod tests {
     fn span_to_lsp_range_basic() {
         let source = "# Title\n\nContent\n";
         let span = Span::new(2, 7); // "Title"
-        let range = span_to_lsp_range(source, &span);
+        let range = span_to_lsp_range(source, &LineIndex::new(source), &span);
         assert_eq!(range.start.line, 0, "span starts on line 0");
         assert_eq!(range.start.character, 2, "span starts at character 2");
         assert_eq!(range.end.line, 0, "span ends on line 0");

@@ -19,6 +19,7 @@ pub use crate::fm::FrontmatterBlock;
 pub use crate::html::{HtmlTag, tokenize_tag};
 pub use crate::inline::parse_inlines;
 pub use crate::json::parse_frontmatter_block as parse_json_frontmatter;
+pub use crate::line_index::LineIndex;
 pub use crate::span::Span;
 pub use crate::toml::parse_frontmatter_block as parse_toml_frontmatter;
 pub use crate::workspace::{FileData, parse_content};

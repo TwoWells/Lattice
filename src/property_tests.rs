@@ -58,8 +58,10 @@ use crate::fm;
 use crate::html::{self, HtmlTag};
 use crate::invariants::{
     assert_block_wellformed, assert_frontmatter_scalar_fidelity, assert_html_tag_in_bounds,
-    assert_inline_resource_fidelity, assert_tree_wellformed, collect_scalars, detect_frontmatter,
+    assert_inline_resource_fidelity, assert_line_index_agrees, assert_tree_wellformed,
+    collect_scalars, detect_frontmatter,
 };
+use crate::line_index::LineIndex;
 use crate::{inline, json, toml, yaml};
 
 // ---------------------------------------------------------------------------
@@ -741,6 +743,24 @@ proptest! {
         ]
     ) {
         assert_inline_resource_fidelity(&parse_full(&doc));
+    }
+
+    /// The cached [`LineIndex`] is a byte-for-byte drop-in for the scalar
+    /// byte↔position conversions: its forward direction equals the server's
+    /// `byte_offset_to_lsp_position`, and `offset → position → offset`
+    /// round-trips through the index. Exercises the encoding axis — arbitrary
+    /// UTF-8 plus structured documents under every line-ending style and an
+    /// optional BOM — that diagnostic materialization now routes through the
+    /// index (ticket perf 01).
+    #[test]
+    fn line_index_matches_scalar_conversion(
+        doc in prop_oneof![
+            arbitrary_string(60),
+            (markdown_document(), 0u8..4, any::<bool>())
+                .prop_map(|(d, style, bom)| line_ending_variant(d, style, bom)),
+        ]
+    ) {
+        assert_line_index_agrees(&doc, &LineIndex::new(&doc));
     }
 }
 
