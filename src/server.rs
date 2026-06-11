@@ -25,16 +25,35 @@ use crate::span::Span;
 use crate::validation::{self, Diagnostic, Severity};
 use crate::workspace::{FileData, Workspace};
 
+/// What the client currently holds for one document: the Lattice diagnostics
+/// that produced the published set (kept for cheap change-detection) and their
+/// materialized LSP form (what was actually sent).
+///
+/// Storing both together lets the change-detector compare the cheap Lattice
+/// vector and skip the expensive UTF-16 materialization for files an edit did
+/// not touch, while still serving the exact bytes the client last received
+/// (issue 013 — ticket perf 02). The two are always sized together: each
+/// Lattice diagnostic materializes to exactly one LSP diagnostic, so one is
+/// empty iff the other is.
+struct PublishedDiagnostics {
+    /// The Lattice diagnostics whose materialization was last published.
+    lattice: Vec<Diagnostic>,
+    /// The materialized LSP diagnostics last sent to the client.
+    lsp: Vec<lsp::Diagnostic>,
+}
+
 /// Multiple workspaces keyed by root path.
 struct Workspaces {
     inner: BTreeMap<PathBuf, Workspace>,
     /// Diagnostics last published to the client, keyed by document URI.
     ///
-    /// Used to suppress redundant `publishDiagnostics` notifications: a file
-    /// is only re-published when its diagnostic vector changes (issue 013 —
-    /// publication diffing). Only non-empty vectors are stored, so an absent
+    /// Used to suppress redundant `publishDiagnostics` notifications and to
+    /// detect which files an edit moved: a file is only re-published when its
+    /// materialized vector changes, and only re-materialized when its Lattice
+    /// vector changes (issue 013 — publication diffing, then ticket perf 02's
+    /// materialization cache). Only non-empty entries are stored, so an absent
     /// entry means the client currently holds no diagnostics for that URI.
-    published: HashMap<String, Vec<lsp::Diagnostic>>,
+    published: HashMap<String, PublishedDiagnostics>,
 }
 
 impl Workspaces {
@@ -2036,25 +2055,25 @@ fn file_local_diagnostics(file_data: &FileData, rel_path: &Path) -> Vec<Diagnost
     diagnostics
 }
 
-/// The desired LSP diagnostics for a single file, in the same order
-/// [`desired_diagnostics`] would produce for it: file-local diagnostics sorted
-/// by line, then materialized against the file's source. Empty when the file is
-/// not indexed.
+/// The file-local diagnostics for a single file in both forms: the Lattice
+/// vector (sorted by line — the change-detection key) and its materialization
+/// against the file's source. Both are empty when the file is not indexed.
 ///
 /// This is the structural-tier slice of the full desired set; it excludes graph
 /// diagnostics, so [`diff_file_diagnostics`] is sound only in the structural
 /// tier (its callers gate on `!has_config()`).
-fn file_desired_lsp(workspace: &Workspace, rel_path: &Path) -> Vec<lsp::Diagnostic> {
+fn file_desired(workspace: &Workspace, rel_path: &Path) -> (Vec<Diagnostic>, Vec<lsp::Diagnostic>) {
     let Some(file_data) = workspace.file(rel_path) else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
     let source = file_data.tree.source();
-    let mut diagnostics = file_local_diagnostics(file_data, rel_path);
-    diagnostics.sort_by_key(|d| d.line);
-    diagnostics
+    let mut lattice = file_local_diagnostics(file_data, rel_path);
+    lattice.sort_by_key(|d| d.line);
+    let lsp = lattice
         .iter()
         .map(|d| to_lsp_diagnostic(d, source))
-        .collect()
+        .collect();
+    (lattice, lsp)
 }
 
 /// Return diagnostics for a single document.
@@ -3004,7 +3023,7 @@ fn handle_notification(
             if let Some((ws, rel_path)) = workspaces.resolve_mut(&params.text_document.uri) {
                 ws.update_content(&rel_path, &params.text_document.text);
             }
-            publish_all_diagnostics(connection, workspaces)?;
+            publish_all_diagnostics(connection, workspaces, Some(&params.text_document.uri))?;
         }
         lsp::method::DID_SAVE => {
             let params: lsp::DidSaveTextDocumentParams = serde_json::from_value(notif.params)?;
@@ -3015,7 +3034,7 @@ fn handle_notification(
                     let _ = ws.update(&rel_path);
                 }
             }
-            publish_all_diagnostics(connection, workspaces)?;
+            publish_all_diagnostics(connection, workspaces, Some(&params.text_document.uri))?;
         }
         lsp::method::DID_CHANGE => {
             let params: lsp::DidChangeTextDocumentParams = serde_json::from_value(notif.params)?;
@@ -3024,9 +3043,11 @@ fn handle_notification(
                 // so it never changes workspace membership. In the structural
                 // tier that means only the edited file's diagnostics can change,
                 // so publish just its delta instead of an O(workspace) recompute
-                // (issue 013 — stage 2.5). The graph tier still needs a full
-                // recompute (a link/backlink edit reaches other files) until the
-                // stage-3 reverse index exists.
+                // (issue 013 — stage 2.5). The graph tier takes the full path —
+                // a link/backlink edit reaches other files — but that path now
+                // re-materializes only the files the whole-graph recompute shows
+                // actually changed (ticket perf 02), with the edited URI passed
+                // so its own materialization is refreshed unconditionally.
                 let incremental = if let Some((ws, rel_path)) =
                     workspaces.resolve_mut(&params.text_document.uri)
                 {
@@ -3038,7 +3059,11 @@ fn handle_notification(
                 if incremental {
                     publish_file_diagnostics(connection, workspaces, &params.text_document.uri)?;
                 } else {
-                    publish_all_diagnostics(connection, workspaces)?;
+                    publish_all_diagnostics(
+                        connection,
+                        workspaces,
+                        Some(&params.text_document.uri),
+                    )?;
                 }
             }
         }
@@ -3051,7 +3076,9 @@ fn handle_notification(
             for added in &params.event.added {
                 workspaces.add(&added.uri);
             }
-            publish_all_diagnostics(connection, workspaces)?;
+            // No single file's text changed — added folders bring cache-miss
+            // files that re-materialize regardless, removed ones are cleared.
+            publish_all_diagnostics(connection, workspaces, None)?;
         }
         _ => {}
     }
@@ -3064,13 +3091,22 @@ fn handle_notification(
 
 /// Publish diagnostics for the files whose diagnostics changed.
 ///
-/// A full-workspace recompute still happens internally (see
-/// [`desired_diagnostics`]); this only suppresses redundant
-/// `publishDiagnostics` notifications, collapsing the per-keystroke broadcast
-/// from `O(files)` down to the handful of documents that actually changed
-/// (issue 013 — publication diffing).
-fn publish_all_diagnostics(connection: &Connection, workspaces: &mut Workspaces) -> Result<()> {
-    for (uri, diagnostics) in diff_diagnostics(workspaces) {
+/// The cheap whole-graph recompute still happens internally (see
+/// [`diff_diagnostics`]), but the expensive per-diagnostic materialization and
+/// the `publishDiagnostics` notifications are both restricted to the documents
+/// an edit actually moved — collapsing the per-keystroke cost from `O(files)`
+/// down to the handful that changed (issue 013 — publication diffing, then
+/// ticket perf 02's materialization cache).
+///
+/// `changed_uri` names the document whose source text just changed, if any, so
+/// its materialization is refreshed unconditionally; see [`diff_diagnostics`]
+/// for why the edited file cannot trust its cached LSP form.
+fn publish_all_diagnostics(
+    connection: &Connection,
+    workspaces: &mut Workspaces,
+    changed_uri: Option<&str>,
+) -> Result<()> {
+    for (uri, diagnostics) in diff_diagnostics(workspaces, changed_uri) {
         let params = lsp::PublishDiagnosticsParams { uri, diagnostics };
         let notif = Notification::new(lsp::method::PUBLISH_DIAGNOSTICS.to_string(), params);
         connection.sender.send(Message::Notification(notif))?;
@@ -3114,41 +3150,50 @@ fn diff_file_diagnostics(
     workspaces: &mut Workspaces,
     uri: &str,
 ) -> Option<(String, Vec<lsp::Diagnostic>)> {
-    let (canonical, desired) = {
+    let (canonical, lattice, lsp) = {
         let (workspace, rel_path) = workspaces.resolve(uri)?;
         let canonical = path_to_uri(&workspace.root().join(&rel_path));
-        let desired = file_desired_lsp(workspace, &rel_path);
-        (canonical, desired)
+        let (lattice, lsp) = file_desired(workspace, &rel_path);
+        (canonical, lattice, lsp)
     };
 
     let unchanged = workspaces
         .published
         .get(&canonical)
-        .map_or(desired.is_empty(), |prev| prev == &desired);
+        .map_or(lsp.is_empty(), |prev| prev.lsp == lsp);
     if unchanged {
         return None;
     }
 
-    // Keep the cache invariant: only non-empty vectors are stored, so an absent
-    // entry means "the client currently holds none".
-    if desired.is_empty() {
+    // Keep the cache invariant: only non-empty entries are stored, so an absent
+    // entry means "the client currently holds none". Caching the Lattice vector
+    // alongside the LSP form keeps this entry coherent with the full path's
+    // change-detector (ticket perf 02).
+    if lsp.is_empty() {
         workspaces.published.remove(&canonical);
     } else {
-        workspaces
-            .published
-            .insert(canonical.clone(), desired.clone());
+        workspaces.published.insert(
+            canonical.clone(),
+            PublishedDiagnostics {
+                lattice,
+                lsp: lsp.clone(),
+            },
+        );
     }
 
-    Some((canonical, desired))
+    Some((canonical, lsp))
 }
 
 /// Compute the full desired diagnostic set across all workspaces, keyed by
-/// document URI.
+/// document URI, materializing every file from scratch.
 ///
 /// Every indexed file gets an entry — an empty vector when it has no
 /// diagnostics — so a caller can tell a file that just became clean apart from
 /// one that left the workspace. This is the unconditional from-scratch
-/// recompute; [`diff_diagnostics`] decides what is worth sending.
+/// recompute that the differential tests use as their oracle; production goes
+/// through [`diff_diagnostics`], which materializes only the files an edit
+/// moved.
+#[cfg(test)]
 fn desired_diagnostics(workspaces: &Workspaces) -> BTreeMap<String, Vec<lsp::Diagnostic>> {
     let mut desired: BTreeMap<String, Vec<lsp::Diagnostic>> = BTreeMap::new();
 
@@ -3175,47 +3220,150 @@ fn desired_diagnostics(workspaces: &Workspaces) -> BTreeMap<String, Vec<lsp::Dia
 }
 
 /// Diff the freshly computed diagnostics against the last-published set,
-/// returning only the `(uri, diagnostics)` pairs that must be sent and
-/// updating the cache to match.
+/// returning only the `(uri, diagnostics)` pairs that must be sent and updating
+/// the cache to match.
 ///
-/// A pair is sent when its vector differs from what the client last received,
-/// including the transition to empty — a file that became clean, or one that
-/// left the workspace (deleted, or its folder removed) — so stale diagnostics
-/// are cleared. Only non-empty vectors are cached, so an absent entry means
-/// "the client currently holds none". The result is sorted by URI for
-/// deterministic output.
-fn diff_diagnostics(workspaces: &mut Workspaces) -> Vec<(String, Vec<lsp::Diagnostic>)> {
-    const EMPTY: &[lsp::Diagnostic] = &[];
+/// Runs the cheap whole-graph recompute ([`collect_all_diagnostics`]) and then,
+/// per file, compares the new Lattice diagnostic vector against the cached one.
+/// A file whose Lattice vector is unchanged keeps its cached materialization
+/// untouched — the expensive UTF-16 [`to_lsp_diagnostic`] pass runs only for the
+/// files the recompute shows actually moved — so a graph-tier (`.lattice.toml`)
+/// sync no longer re-materializes every file on every keystroke. Detection,
+/// not prediction: the whole-graph recompute already reflects cross-file edges
+/// (a missing backlink reported on the *source*), so a dependent file an edit
+/// touched only indirectly is caught the same way (issue 013 — ticket perf 02).
+///
+/// `changed_uri` names the document whose source text just changed, if any. Its
+/// materialization is recomputed unconditionally: a length-preserving edit can
+/// leave the Lattice vector byte-identical yet shift a span's UTF-16 column (an
+/// astral-plane swap upstream of the span on its line), so the cached LSP form
+/// cannot be trusted for the edited file even when its Lattice vector matches.
+/// Every *other* file's source is unchanged, so Lattice-vector equality there
+/// does guarantee an identical materialization. Pass `None` when no single
+/// file's text changed (e.g. a workspace-folder add/remove — newly scanned
+/// files are cache misses and re-materialize regardless).
+///
+/// A pair is sent when its materialized vector differs from what the client last
+/// received, including the transition to empty — a file that became clean, or
+/// one that left the workspace (deleted, or its folder removed) — so stale
+/// diagnostics are cleared. Only non-empty entries are cached, so an absent
+/// entry means "the client currently holds none". The result is sorted by URI
+/// for deterministic output.
+fn diff_diagnostics(
+    workspaces: &mut Workspaces,
+    changed_uri: Option<&str>,
+) -> Vec<(String, Vec<lsp::Diagnostic>)> {
+    // A file the detector decided to (re-)materialize: its fresh Lattice and LSP
+    // vectors, plus whether the LSP form differs from what the client holds.
+    struct Materialized {
+        uri: String,
+        lattice: Vec<Diagnostic>,
+        lsp: Vec<lsp::Diagnostic>,
+        send: bool,
+    }
 
-    let desired = desired_diagnostics(workspaces);
+    // Canonicalize the edited URI to the form the cache is keyed by, so the
+    // force-re-materialize check below lines up with the per-file URIs.
+    let changed_canonical = changed_uri.and_then(|uri| {
+        workspaces
+            .resolve(uri)
+            .map(|(workspace, rel_path)| path_to_uri(&workspace.root().join(rel_path)))
+    });
+
+    // Phase 1 — detection. With an immutable view of the workspaces and the
+    // published cache, recompute each file's Lattice vector, decide whether it
+    // changed, and materialize only the changed files. Collect owned results so
+    // the cache can be mutated afterward.
+    let inner = &workspaces.inner;
+    let published = &workspaces.published;
+    let mut materialized: Vec<Materialized> = Vec::new();
+    let mut present: HashSet<String> = HashSet::new();
+
+    for (root, workspace) in inner {
+        let mut by_file: BTreeMap<PathBuf, Vec<Diagnostic>> = BTreeMap::new();
+        for diag in collect_all_diagnostics(workspace) {
+            by_file.entry(diag.file.clone()).or_default().push(diag);
+        }
+
+        for rel_path in workspace.files().keys() {
+            let uri = path_to_uri(&root.join(rel_path));
+            present.insert(uri.clone());
+
+            let lattice = by_file.remove(rel_path).unwrap_or_default();
+            let cached = published.get(&uri);
+            let force = changed_canonical.as_deref() == Some(uri.as_str());
+
+            // Reuse the cached materialization when this file's source is
+            // unchanged (it is not the edited file) and its Lattice vector still
+            // matches what produced the cached LSP form.
+            if !force {
+                match cached {
+                    Some(prev) if prev.lattice == lattice => continue,
+                    None if lattice.is_empty() => continue,
+                    _ => {}
+                }
+            }
+
+            let source = workspace.file(rel_path).map_or("", |fd| fd.tree.source());
+            let lsp: Vec<lsp::Diagnostic> = lattice
+                .iter()
+                .map(|d| to_lsp_diagnostic(d, source))
+                .collect();
+            let send = cached.map_or(!lsp.is_empty(), |prev| prev.lsp != lsp);
+            materialized.push(Materialized {
+                uri,
+                lattice,
+                lsp,
+                send,
+            });
+        }
+    }
+
     // Keyed by URI so the result is deterministically ordered.
     let mut to_send: BTreeMap<String, Vec<lsp::Diagnostic>> = BTreeMap::new();
 
-    // Documents present now: send when the vector changed.
-    for (uri, diagnostics) in &desired {
-        let prev = workspaces.published.get(uri).map_or(EMPTY, Vec::as_slice);
-        if prev != diagnostics.as_slice() {
-            to_send.insert(uri.clone(), diagnostics.clone());
+    // Phase 2 — apply. Update only the changed entries in place; untouched files
+    // keep their cache entries, so this stays O(changed), not O(workspace).
+    for entry in materialized {
+        if entry.send {
+            to_send.insert(entry.uri.clone(), entry.lsp.clone());
+        }
+        if entry.lsp.is_empty() {
+            workspaces.published.remove(&entry.uri);
+        } else {
+            workspaces.published.insert(
+                entry.uri,
+                PublishedDiagnostics {
+                    lattice: entry.lattice,
+                    lsp: entry.lsp,
+                },
+            );
         }
     }
 
-    // Documents previously published but absent now: clear them on the client.
-    // Disjoint from the loop above — these URIs are, by definition, not in
-    // `desired`.
-    for uri in workspaces.published.keys() {
-        if !desired.contains_key(uri) {
-            to_send.insert(uri.clone(), Vec::new());
-        }
-    }
-
-    // Rebuild the cache from the desired set, dropping empties so an absent
-    // entry consistently means "no diagnostics".
-    workspaces.published = desired
-        .into_iter()
-        .filter(|(_, diagnostics)| !diagnostics.is_empty())
+    // Phase 3 — clear files that left the workspace (cached but no longer
+    // present): send an empty vector and drop the entry.
+    let absent: Vec<String> = workspaces
+        .published
+        .keys()
+        .filter(|uri| !present.contains(uri.as_str()))
+        .cloned()
         .collect();
+    for uri in absent {
+        workspaces.published.remove(&uri);
+        to_send.insert(uri, Vec::new());
+    }
 
     to_send.into_iter().collect()
+}
+
+// Counts `to_lsp_diagnostic` calls so tests can assert that an incremental
+// publish re-materializes only the files whose diagnostics changed, rather than
+// the whole workspace (ticket perf 02 acceptance). Compiled out of release
+// builds, so the hot path pays nothing.
+#[cfg(test)]
+thread_local! {
+    static MATERIALIZE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Convert a Lattice diagnostic to an LSP diagnostic.
@@ -3224,6 +3372,9 @@ fn diff_diagnostics(workspaces: &mut Workspaces) -> Vec<(String, Vec<lsp::Diagno
 /// underline); otherwise falls back to a whole-line range anchored on
 /// `diag.line`. `source` is the text of the file the diagnostic belongs to.
 fn to_lsp_diagnostic(diag: &Diagnostic, source: &str) -> lsp::Diagnostic {
+    #[cfg(test)]
+    MATERIALIZE_COUNT.with(|count| count.set(count.get() + 1));
+
     let severity = match diag.severity {
         Severity::Error => lsp::diagnostic_severity::ERROR,
         Severity::Warning => lsp::diagnostic_severity::WARNING,
@@ -6226,7 +6377,7 @@ mod tests {
         ]);
         let mut workspaces = scan_workspaces(&dir);
 
-        let sent = diff_diagnostics(&mut workspaces);
+        let sent = diff_diagnostics(&mut workspaces, None);
         assert_eq!(
             sent.len(),
             1,
@@ -6248,10 +6399,10 @@ mod tests {
         let dir = workspace_with_files(&[("a.md", "# A\n\n### C\n"), ("b.md", "# B\n")]);
         let mut workspaces = scan_workspaces(&dir);
 
-        let first = diff_diagnostics(&mut workspaces);
+        let first = diff_diagnostics(&mut workspaces, None);
         assert_eq!(first.len(), 1, "first pass publishes a.md");
 
-        let second = diff_diagnostics(&mut workspaces);
+        let second = diff_diagnostics(&mut workspaces, None);
         assert!(
             second.is_empty(),
             "a re-sync with no edits publishes nothing: {second:?}"
@@ -6263,11 +6414,11 @@ mod tests {
         let dir = workspace_with_files(&[("a.md", "# A\n")]);
         let mut workspaces = scan_workspaces(&dir);
 
-        let first = diff_diagnostics(&mut workspaces);
+        let first = diff_diagnostics(&mut workspaces, None);
         assert!(first.is_empty(), "clean file publishes nothing: {first:?}");
 
         edit(&mut workspaces, "a.md", "# A\n\n### C\n");
-        let second = diff_diagnostics(&mut workspaces);
+        let second = diff_diagnostics(&mut workspaces, None);
         assert_eq!(second.len(), 1, "introducing a diagnostic republishes a.md");
         assert_eq!(
             second[0].0,
@@ -6282,11 +6433,11 @@ mod tests {
         let dir = workspace_with_files(&[("a.md", "# A\n\n### C\n")]);
         let mut workspaces = scan_workspaces(&dir);
 
-        let first = diff_diagnostics(&mut workspaces);
+        let first = diff_diagnostics(&mut workspaces, None);
         assert_eq!(first.len(), 1, "first pass publishes a.md's diagnostic");
 
         edit(&mut workspaces, "a.md", "# A\n");
-        let second = diff_diagnostics(&mut workspaces);
+        let second = diff_diagnostics(&mut workspaces, None);
         assert_eq!(
             second.len(),
             1,
@@ -6302,7 +6453,7 @@ mod tests {
             "the clearing publish carries an empty vector"
         );
 
-        let third = diff_diagnostics(&mut workspaces);
+        let third = diff_diagnostics(&mut workspaces, None);
         assert!(
             third.is_empty(),
             "a clean file is not re-cleared on the next sync: {third:?}"
@@ -6314,7 +6465,7 @@ mod tests {
         let dir = workspace_with_files(&[("a.md", "# A\n\n### C\n"), ("b.md", "# B\n")]);
         let mut workspaces = scan_workspaces(&dir);
 
-        let first = diff_diagnostics(&mut workspaces);
+        let first = diff_diagnostics(&mut workspaces, None);
         assert_eq!(first.len(), 1, "first pass publishes a.md");
 
         // Delete a.md from disk and drop it from the index.
@@ -6328,7 +6479,7 @@ mod tests {
             ws.update(Path::new("a.md")).expect("update after delete");
         }
 
-        let second = diff_diagnostics(&mut workspaces);
+        let second = diff_diagnostics(&mut workspaces, None);
         assert_eq!(
             second.len(),
             1,
@@ -6357,6 +6508,16 @@ mod tests {
         } else {
             client.insert(uri, diagnostics);
         }
+    }
+
+    /// Reset the materialization counter, returning the count accumulated by a
+    /// closure that drives a publish — so a test can assert how many diagnostics
+    /// a single sync re-materialized (ticket perf 02).
+    fn count_materializations<T>(f: impl FnOnce() -> T) -> (usize, T) {
+        MATERIALIZE_COUNT.with(|count| count.set(0));
+        let value = f();
+        let count = MATERIALIZE_COUNT.with(std::cell::Cell::get);
+        (count, value)
     }
 
     /// Assert the client's accumulated diagnostics equal a from-scratch full
@@ -6417,14 +6578,17 @@ mod tests {
 
         // Initial sync, then one per edit. After every sync the client must
         // equal the from-scratch desired (non-empty) set.
-        for (uri, diagnostics) in diff_diagnostics(&mut workspaces) {
+        for (uri, diagnostics) in diff_diagnostics(&mut workspaces, None) {
             apply_publish(&mut client, uri, diagnostics);
         }
         assert_client_matches(&workspaces, &client, "after initial sync");
 
         for (i, (rel, content)) in steps.iter().enumerate() {
             edit(&mut workspaces, rel, content);
-            for (uri, diagnostics) in diff_diagnostics(&mut workspaces) {
+            // Drive the full path with the edited URI, as a graph-tier didChange
+            // does, so the force-re-materialize branch is exercised too.
+            let changed = file_uri(&dir, rel);
+            for (uri, diagnostics) in diff_diagnostics(&mut workspaces, Some(&changed)) {
                 apply_publish(&mut client, uri, diagnostics);
             }
             assert_client_matches(&workspaces, &client, &format!("after edit {i} ({rel})"));
@@ -6443,7 +6607,7 @@ mod tests {
         let mut client: HashMap<String, Vec<lsp::Diagnostic>> = HashMap::new();
 
         // Seed the client with the initial full publish, as didOpen would.
-        for (uri, diagnostics) in diff_diagnostics(&mut workspaces) {
+        for (uri, diagnostics) in diff_diagnostics(&mut workspaces, None) {
             apply_publish(&mut client, uri, diagnostics);
         }
         assert_client_matches(&workspaces, &client, "after initial sync");
@@ -6464,6 +6628,118 @@ mod tests {
             }
             assert_client_matches(&workspaces, &client, &format!("after edit {i} ({rel})"));
         }
+    }
+
+    #[test]
+    fn graph_tier_incremental_publish_matches_full_recompute() {
+        // Ticket perf 02: in the graph tier (`.lattice.toml` present) the full
+        // publish path runs the whole-graph recompute, then re-materializes and
+        // re-publishes only the files whose Lattice vector changed — yet must
+        // still reproduce, at every step, exactly what a from-scratch full
+        // publish would show (the stage-2.5 differential invariant, extended to
+        // config-present workspaces). Each step drives `diff_diagnostics` with
+        // the edited URI, as a graph-tier `didChange` does, and several clean
+        // files ride along to prove they are not disturbed.
+        let dir = workspace_with_files(&[
+            (".lattice.toml", ""),
+            ("index.md", "# Index\n"),
+            ("a.md", "# A\n"),
+            ("b.md", "# B\n"),
+            ("clean1.md", "# Clean\n"),
+            ("clean2.md", "# Clean\n"),
+        ]);
+        let mut workspaces = scan_workspaces(&dir);
+        let mut client: HashMap<String, Vec<lsp::Diagnostic>> = HashMap::new();
+
+        for (uri, diagnostics) in diff_diagnostics(&mut workspaces, None) {
+            apply_publish(&mut client, uri, diagnostics);
+        }
+        assert_client_matches(&workspaces, &client, "after initial sync");
+
+        // Each edit changes exactly one file's text but its graph consequence
+        // can land on a *different* file — the cross-file dependency the full
+        // path must catch through the recompute, not the edited URI alone.
+        let steps: &[(&str, &str)] = &[
+            // index supersedes a -> missing-backlink warning on index.md
+            ("index.md", "[a](a.md \"supersedes\")\n"),
+            // a adds the reciprocal backlink -> clears index.md's warning, even
+            // though a.md is the file that was edited
+            (
+                "a.md",
+                "---\nbacklinks:\n  superseded_by:\n    - index.md\n---\n# A\n",
+            ),
+            // a broken forward-link error appears on b.md
+            ("b.md", "[gone](missing.md \"references\")\n"),
+            // fix b.md
+            ("b.md", "# B\n"),
+        ];
+        for (i, (rel, content)) in steps.iter().enumerate() {
+            edit(&mut workspaces, rel, content);
+            let changed = file_uri(&dir, rel);
+            for (uri, diagnostics) in diff_diagnostics(&mut workspaces, Some(&changed)) {
+                apply_publish(&mut client, uri, diagnostics);
+            }
+            assert_client_matches(&workspaces, &client, &format!("after edit {i} ({rel})"));
+        }
+    }
+
+    #[test]
+    fn graph_tier_didchange_rematerializes_only_changed_files() {
+        // Ticket perf 02 acceptance: a graph-tier `didChange` re-materializes and
+        // re-publishes only the files whose diagnostics changed — asserted by
+        // counting materializations and publishes, not latency. index.md carries
+        // two missing-backlink warnings; editing a.md's frontmatter clears one of
+        // them, so index.md changes although a.md was the file edited. The four
+        // other files must be neither re-materialized nor re-published.
+        let dir = workspace_with_files(&[
+            (".lattice.toml", ""),
+            (
+                "index.md",
+                "[a](a.md \"supersedes\")\n[b](b.md \"supersedes\")\n",
+            ),
+            ("a.md", "# A\n"),
+            ("b.md", "# B\n"),
+            ("clean1.md", "# Clean\n"),
+            ("clean2.md", "# Clean\n"),
+            ("clean3.md", "# Clean\n"),
+        ]);
+        let mut workspaces = scan_workspaces(&dir);
+        let mut client: HashMap<String, Vec<lsp::Diagnostic>> = HashMap::new();
+
+        for (uri, diagnostics) in diff_diagnostics(&mut workspaces, None) {
+            apply_publish(&mut client, uri, diagnostics);
+        }
+        assert_client_matches(&workspaces, &client, "after initial sync");
+
+        // Add the reciprocal backlink for index -> a, clearing one of index.md's
+        // two warnings. a.md is the edited file; index.md is the one that moves.
+        edit(
+            &mut workspaces,
+            "a.md",
+            "---\nbacklinks:\n  superseded_by:\n    - index.md\n---\n# A\n",
+        );
+        let changed = file_uri(&dir, "a.md");
+        let (materializations, sent) =
+            count_materializations(|| diff_diagnostics(&mut workspaces, Some(&changed)));
+
+        // a.md (the edited file) materializes to nothing; index.md re-materializes
+        // its one remaining warning. The four clean files are untouched, so the
+        // whole sync materializes exactly one diagnostic — not the workspace.
+        assert_eq!(
+            materializations, 1,
+            "only the changed, non-empty file is re-materialized: {sent:?}"
+        );
+        let sent_uris: Vec<&str> = sent.iter().map(|(uri, _)| uri.as_str()).collect();
+        assert_eq!(
+            sent_uris,
+            vec![file_uri(&dir, "index.md").as_str()],
+            "only index.md is re-published"
+        );
+
+        for (uri, diagnostics) in sent {
+            apply_publish(&mut client, uri, diagnostics);
+        }
+        assert_client_matches(&workspaces, &client, "after backlink edit");
     }
 
     // -----------------------------------------------------------------------
