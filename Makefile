@@ -111,7 +111,7 @@ mutants:
 #   make fuzz T=fuzz_yaml      # a single target
 #   make fuzz FUZZ_TIME=600    # longer per-target run (10 min)
 #   make soak FUZZ_TIME=3600   # all targets IN PARALLEL, 1 h each (~1 h wall)
-FUZZ_TARGETS := fuzz_parse_tree fuzz_yaml fuzz_toml fuzz_json fuzz_full fuzz_tokenize_tag fuzz_inlines
+FUZZ_TARGETS := fuzz_parse_tree fuzz_yaml fuzz_toml fuzz_json fuzz_full fuzz_tokenize_tag fuzz_inlines fuzz_edits
 FUZZ_TIME ?= 60
 
 # A prebuilt (musl) cargo-fuzz binary defaults `--target` to its own musl
@@ -135,10 +135,10 @@ fuzz:
 
 # Soak every target IN PARALLEL for FUZZ_TIME seconds each (one process per
 # target), so `make soak FUZZ_TIME=3600` meets a 1 h/target bar in ~1 h of
-# wall-clock instead of ~7 h. Each target is single-threaded, so on a machine
-# with >= 8 cores there is no contention. Per-target output goes to
-# fuzz/soak-<target>.log; a non-zero exit means at least one target crashed
-# (its reproducer is under fuzz/artifacts/<target>/).
+# wall-clock instead of ~8 h. Each target is single-threaded, so on a machine
+# with >= 9 cores (8 targets + headroom) there is no contention. Per-target
+# output goes to fuzz/soak-<target>.log; a non-zero exit means at least one
+# target crashed (its reproducer is under fuzz/artifacts/<target>/).
 soak:
 	@command -v cargo-fuzz >/dev/null 2>&1 || { \
 	  echo "cargo-fuzz not found. Install with: cargo binstall cargo-fuzz"; exit 1; }

@@ -71,9 +71,16 @@ toolchain; `make fuzz` forces it.
 - **Single target:** `make fuzz T=fuzz_yaml`
 - **Parallel soak:** `make soak FUZZ_TIME=3600` — runs all targets *at once*
   (one process each), so a 1 h/target soak takes ~1 h of wall-clock instead of
-  ~7 h. Needs ≥8 cores and ~3-4 GB RAM; per-target logs in `fuzz/soak-*.log`.
+  ~8 h. Needs ≥9 cores (8 single-threaded targets + headroom) and ~4 GB RAM;
+  per-target logs in `fuzz/soak-*.log`.
 - **Targets** (one per parser entry point): `fuzz_parse_tree`, `fuzz_yaml`,
   `fuzz_toml`, `fuzz_json`, `fuzz_full`, `fuzz_tokenize_tag`, `fuzz_inlines`.
+  Plus `fuzz_edits` — the differential edit-sequence oracle (perf ticket 03):
+  it applies a random sequence of `{range, text}` edits to a base document and
+  reruns the full-pipeline invariants after each, exercising the `LineIndex`
+  range→offset inverse. It is the gate for the incremental parse/graph work
+  (perf tickets 04 / 05), which will extend it with the
+  `incremental(edits) ≡ full(final_text)` arm.
 
 **The assertions are the product, the fuzzer is the input generator.** Each
 target embeds the same invariants as the property suite — tree

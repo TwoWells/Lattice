@@ -32,11 +32,15 @@
     reason = "these are assertion helpers: panicking with a descriptive message on violation is their entire contract, the tree-wellformedness check is necessarily long, and each helper intentionally leads with a full explanatory paragraph describing the invariant it enforces"
 )]
 
+use std::path::Path;
+
 use crate::block::{ElementKind, Syntax, Tree};
+use crate::config::Config;
 use crate::fm::{FmNode, FmValue, FrontmatterBlock, ScalarSpan};
 use crate::html::HtmlTag;
 use crate::line_index::LineIndex;
-use crate::{json, toml, yaml};
+use crate::workspace::parse_content;
+use crate::{json, lsp, toml, yaml};
 
 // ---------------------------------------------------------------------------
 // Full-pipeline helper
@@ -432,5 +436,115 @@ pub fn assert_line_index_agrees(source: &str, index: &LineIndex) {
             "LineIndex offset → position → offset must round-trip at {off} \
              (position {indexed:?} mapped back to {back})"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Differential edit-sequence oracle (perf ticket 03)
+// ---------------------------------------------------------------------------
+
+/// One `{range, text}` content edit, in the shape of an LSP incremental
+/// `textDocument/didChange` change: a half-open LSP range in the *current*
+/// document's coordinates, and the text that replaces it. This is the exact unit
+/// the incremental text-sync path of issue 014 / ticket perf 05 will consume.
+///
+/// The coordinates are stored as plain `u32`s rather than an `lsp::Range` so the
+/// type carries no protocol internals; [`apply_lsp_edit`] assembles the positions
+/// and maps them to byte offsets through the cached [`LineIndex`].
+#[derive(Debug, Clone)]
+pub struct Edit {
+    /// 0-based start line.
+    pub start_line: u32,
+    /// 0-based start character (UTF-16 code units within the line).
+    pub start_char: u32,
+    /// 0-based end line.
+    pub end_line: u32,
+    /// 0-based end character (UTF-16 code units within the line).
+    pub end_char: u32,
+    /// Replacement text spliced in place of the range.
+    pub text: String,
+}
+
+/// Apply one `{range, text}` edit to `source`, returning the edited document.
+///
+/// Both range endpoints are mapped to byte offsets through `index` — the same
+/// [`LineIndex::offset`] primitive the incremental text-sync path will use to
+/// turn an incoming range into byte offsets, so this exercises ticket perf 01's
+/// inverse direction across arbitrary inputs. `LineIndex::offset` clamps each
+/// position to an in-bounds char boundary, and the endpoints are ordered so
+/// `lo <= hi`; the splice is therefore always in-bounds and on char boundaries
+/// regardless of where the edit came from. `index` must have been built from
+/// `source`.
+#[must_use]
+pub fn apply_lsp_edit(source: &str, index: &LineIndex, edit: &Edit) -> String {
+    let a = index.offset(
+        source,
+        lsp::Position {
+            line: edit.start_line,
+            character: edit.start_char,
+        },
+    );
+    let b = index.offset(
+        source,
+        lsp::Position {
+            line: edit.end_line,
+            character: edit.end_char,
+        },
+    );
+    let lo = a.min(b);
+    let hi = a.max(b);
+    let mut edited = String::with_capacity(source.len() + edit.text.len());
+    edited.push_str(&source[..lo]);
+    edited.push_str(&edit.text);
+    edited.push_str(&source[hi..]);
+    edited
+}
+
+/// Assert every full-pipeline parse invariant on a single document.
+///
+/// Parses `source` exactly as the workspace loader does ([`parse_content`]) and
+/// asserts the tree is well-formed, inline resources are faithful, the LSP
+/// byte↔position round-trip holds, the cached [`LineIndex`] agrees byte-for-byte
+/// with the scalar conversion, and — when frontmatter is present — the
+/// frontmatter block is well-formed and its scalars are faithful. This is the
+/// same bar [`crate::fuzz_api`]'s `fuzz_full` target asserts, bundled here so the
+/// edit-sequence oracle re-checks an identical set after every edit.
+pub fn assert_document_invariants(source: &str) {
+    let file = parse_content(source, Path::new("oracle.md"), &Config::default());
+    assert_tree_wellformed(&file.tree);
+    assert_inline_resource_fidelity(&file.tree);
+    assert_position_round_trip(source);
+    assert_line_index_agrees(source, &file.line_index);
+    if let (Some(block), _) = detect_frontmatter(source) {
+        assert_block_wellformed(&block, source);
+        assert_frontmatter_scalar_fidelity(&block, source);
+    }
+}
+
+/// The differential parse/diagnostic oracle of perf ticket 03.
+///
+/// Applies `edits` to `base` one at a time, re-parsing from scratch and asserting
+/// [`assert_document_invariants`] after each step. Two things fall out of this:
+/// a random edit sequence becomes a strong parser-stability net over documents
+/// the static generators never assemble, and every step routes its range through
+/// the [`LineIndex`] inverse exactly as incremental text-sync will — so ticket
+/// perf 01's reverse lookup is exercised end-to-end before any incremental code
+/// exists.
+///
+/// This is the **full-reparse arm**. The oracle issue 014 needs —
+/// `incremental(edits) ≡ full(final_text)`, the same tree, spans, and diagnostics
+/// — is the second arm: when an incremental parse/graph path lands (tickets perf
+/// 04 / 05), drive the same `(base, edits)` through it and assert byte-for-byte
+/// equality against the from-scratch reparse this function already pins. Both
+/// arms share this entry point, so the `fuzz_edits` target and the property suite
+/// that call it gain the equivalence check without changing shape, and the two
+/// suites cannot drift (per `AGENTS.md`: the assertions are the product).
+pub fn assert_edit_sequence_stable(base: &str, edits: &[Edit]) {
+    assert_document_invariants(base);
+    let mut text = base.to_string();
+    for edit in edits {
+        let index = LineIndex::new(&text);
+        text = apply_lsp_edit(&text, &index, edit);
+        assert_document_invariants(&text);
     }
 }

@@ -74,3 +74,10 @@ path = "fuzz_targets/fuzz_inlines.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fuzz_edits"
+path = "fuzz_targets/fuzz_edits.rs"
+test = false
+doc = false
+bench = false

@@ -57,9 +57,9 @@ use crate::block::{self, Tree};
 use crate::fm;
 use crate::html::{self, HtmlTag};
 use crate::invariants::{
-    assert_block_wellformed, assert_frontmatter_scalar_fidelity, assert_html_tag_in_bounds,
-    assert_inline_resource_fidelity, assert_line_index_agrees, assert_tree_wellformed,
-    collect_scalars, detect_frontmatter,
+    Edit, assert_block_wellformed, assert_edit_sequence_stable, assert_frontmatter_scalar_fidelity,
+    assert_html_tag_in_bounds, assert_inline_resource_fidelity, assert_line_index_agrees,
+    assert_tree_wellformed, collect_scalars, detect_frontmatter,
 };
 use crate::line_index::LineIndex;
 use crate::{inline, json, toml, yaml};
@@ -556,6 +556,65 @@ fn maybe_corrupt(base: impl Strategy<Value = String>) -> impl Strategy<Value = S
 }
 
 // ---------------------------------------------------------------------------
+// Generators — edits (perf ticket 03)
+// ---------------------------------------------------------------------------
+
+/// Replacement text for a random edit. Mixes ordinary inline text with the
+/// non-local cascade triggers issue 014 names — fence openers/closers, setext
+/// underlines, thematic breaks, link-reference and footnote definitions, HTML
+/// container tags — and a few encoding-axis characters, so a single edit can
+/// flip a *distant* line's block role rather than only a local one.
+fn edit_text() -> impl Strategy<Value = String> {
+    prop_oneof![
+        inline_text(20),
+        Just("```\n".to_string()),
+        Just("```rust\n".to_string()),
+        Just("~~~\n".to_string()),
+        Just("===\n".to_string()),
+        Just("---\n".to_string()),
+        Just("\n".to_string()),
+        Just("[r]: ./target.md\n".to_string()),
+        Just("[^f]: a footnote\n".to_string()),
+        Just("<div>\n".to_string()),
+        Just("</div>\n".to_string()),
+        Just("> quote\n".to_string()),
+        Just("café 🎉\u{200b}\n".to_string()),
+        Just(String::new()),
+    ]
+}
+
+/// A single edit coordinate: mostly small (so it lands inside a generated
+/// document and produces a meaningful splice), with an occasional far-past-EOF
+/// value to exercise the `LineIndex::offset` clamp.
+fn edit_coord() -> impl Strategy<Value = u32> {
+    prop_oneof![
+        8 => 0u32..30,
+        1 => 100u32..5000,
+        1 => Just(u32::MAX),
+    ]
+}
+
+/// A single `{range, text}` edit. The range may be empty (an insertion), span
+/// columns (a same-line replacement), or span lines (a multi-line deletion);
+/// `apply_lsp_edit` orders the endpoints, so a reversed range is still valid.
+fn edit() -> impl Strategy<Value = Edit> {
+    (
+        edit_coord(),
+        edit_coord(),
+        edit_coord(),
+        edit_coord(),
+        edit_text(),
+    )
+        .prop_map(|(start_line, start_char, end_line, end_char, text)| Edit {
+            start_line,
+            start_char,
+            end_line,
+            end_char,
+            text,
+        })
+}
+
+// ---------------------------------------------------------------------------
 // Properties — block tree
 // ---------------------------------------------------------------------------
 
@@ -765,6 +824,37 @@ proptest! {
 }
 
 // ---------------------------------------------------------------------------
+// Properties — differential edit-sequence oracle (perf ticket 03)
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #![proptest_config(config())]
+
+    /// Applying a random sequence of `{range, text}` edits to a base document
+    /// keeps every full-pipeline invariant holding after each edit, and maps
+    /// each range through the `LineIndex` inverse (ticket perf 01) exactly as
+    /// incremental text-sync will. This is the differential oracle of perf
+    /// ticket 03 — today a parser-stability net over edited documents the static
+    /// generators never assemble, and the gate for the incremental parse/graph
+    /// work (tickets perf 04 / 05), which will add the
+    /// `incremental(edits) ≡ full(final_text)` arm to the same entry point.
+    #[test]
+    fn edit_sequence_preserves_invariants(
+        base in prop_oneof![
+            markdown_document(),
+            (markdown_document(), 0u8..4, any::<bool>())
+                .prop_map(|(d, style, bom)| line_ending_variant(d, style, bom)),
+            yaml_frontmatter(),
+            toml_frontmatter(),
+            json_frontmatter(),
+        ],
+        edits in proptest::collection::vec(edit(), 0..8),
+    ) {
+        assert_edit_sequence_stable(&base, &edits);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Properties — HTML tokenizer
 // ---------------------------------------------------------------------------
 
@@ -933,4 +1023,66 @@ fn flow_collection_recovery_terminates() {
             let _ = fm::extract_backlinks(&block, case);
         }
     }
+}
+
+#[test]
+fn edit_sequences_cover_cascade_classes() {
+    // The three cascade classes from issue 014 — an edit changing the parse of
+    // distant lines — exercised deterministically, mirroring the `fuzz_edits`
+    // seed corpus. `assert_edit_sequence_stable` re-checks every full-pipeline
+    // invariant after each edit, so reaching the end proves each intermediate
+    // document parsed cleanly and the `LineIndex` range→offset map round-tripped.
+
+    // A far-past-EOF insertion (clamped to the document end).
+    let eof_insert = |text: &str| Edit {
+        start_line: 9999,
+        start_char: 0,
+        end_line: 9999,
+        end_char: 0,
+        text: text.to_string(),
+    };
+
+    // 1. Open-ended forward construct: a later edit closes an open fence,
+    //    flipping every line between code and markdown.
+    assert_edit_sequence_stable("```\nlet x = 1;\n", &[eof_insert("```\nafter\n")]);
+
+    // 2. Backward / contextual dependence: inserting `===` under a line promotes
+    //    the line *above* to a setext heading.
+    assert_edit_sequence_stable(
+        "Title\nbody\n",
+        &[Edit {
+            start_line: 1,
+            start_char: 0,
+            end_line: 1,
+            end_char: 0,
+            text: "===\n".to_string(),
+        }],
+    );
+
+    // 3. Document-global, order-independent: a definition appended at the bottom
+    //    resolves a reference / footnote at the top.
+    assert_edit_sequence_stable("[ref][r]\n\nbody\n", &[eof_insert("[r]: ./x.md\n")]);
+    assert_edit_sequence_stable("text[^f]\n", &[eof_insert("[^f]: a footnote\n")]);
+
+    // A column-spanning deletion that removes an inline link (empty replacement).
+    assert_edit_sequence_stable(
+        "see [link](./a.md \"references\") here\n",
+        &[Edit {
+            start_line: 0,
+            start_char: 4,
+            end_line: 0,
+            end_char: 31,
+            text: String::new(),
+        }],
+    );
+
+    // A multi-edit chain that builds a fenced block around multibyte text.
+    assert_edit_sequence_stable(
+        "# Heading\n",
+        &[
+            eof_insert("```\n"),
+            eof_insert("café 🎉\u{200b}\n"),
+            eof_insert("```\n"),
+        ],
+    );
 }
