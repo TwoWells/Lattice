@@ -171,10 +171,18 @@ fn format_diagnostic(diag: &Diagnostic) -> String {
 mod tests {
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::Mutex;
 
     use tempfile::TempDir;
 
     use super::*;
+
+    /// Serializes tests that mutate the process-global current working
+    /// directory. `std::env::set_current_dir` affects the whole process, so two
+    /// CWD-mutating tests running concurrently (plain `cargo test` shares the
+    /// process) would race. Poison-tolerant: a panic in one CWD test must not
+    /// wedge the others.
+    static CWD_LOCK: Mutex<()> = Mutex::new(());
 
     /// Create a workspace with the given files and return the temp dir.
     fn setup(files: &[(&str, &str)]) -> TempDir {
@@ -482,6 +490,70 @@ mod tests {
                 form.display()
             );
         }
+    }
+
+    #[test]
+    fn scoped_lint_bare_relative_from_cwd_reports_and_fails() {
+        // Issue 024 (reopened): the dangerous half. A path genuinely relative to
+        // the process CWD with no leading `./` (`sub`, `sub/`, `sub/dir/file.md`)
+        // used to make root discovery walk up to the empty path and lint zero
+        // files — exit 0, no output, a silent false-clean. With the scan root
+        // absolutized, each bare-relative spelling must report the in-scope error
+        // and exit 1.
+        //
+        // The pre-existing `scoped_lint_reports_in_scope_error_under_every_path_form`
+        // does `dir.path().join(form)`, making every form absolute — so this
+        // genuinely-relative-from-CWD branch was never exercised. This test sets
+        // the CWD to the fixture root and lints relative spellings directly.
+        let dir = setup(&[
+            (".lattice.toml", ""),
+            ("sub/dir/file.md", "[broken](nope.md \"references\")\n"),
+            ("other/sibling.md", "[gone](missing.md \"references\")\n"),
+            ("clean/ok.md", "# All good\n"),
+        ]);
+
+        let _guard = CWD_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let original = std::env::current_dir().expect("read original cwd");
+        std::env::set_current_dir(dir.path()).expect("chdir to fixture root");
+
+        // Bare-relative directory and single-file spellings — none carry `./`.
+        let forms = ["sub", "sub/", "sub/dir/file.md"];
+        let mut results = Vec::new();
+        for form in forms {
+            results.push((form, run_lint_start(Path::new(form))));
+        }
+        // A clean bare-relative scope must still exit 0 (the empty-path branch
+        // must never read as either a false-clean *or* a spurious failure).
+        let clean = run_lint_start(Path::new("clean"));
+
+        std::env::set_current_dir(&original).expect("restore original cwd");
+
+        for (form, (failed, output)) in results {
+            assert!(
+                failed,
+                "bare-relative scope `{form}` contains an error and must exit non-zero: {output}"
+            );
+            assert!(
+                output.contains("file.md:1:"),
+                "bare-relative scope `{form}` must surface the in-scope error: {output}"
+            );
+            assert!(
+                !output.contains("sibling.md"),
+                "bare-relative scope `{form}` must not leak the out-of-scope sibling: {output}"
+            );
+        }
+
+        let (clean_failed, clean_output) = clean;
+        assert!(
+            !clean_failed,
+            "a clean bare-relative scope must exit zero, not false-clean nor spurious-fail: {clean_output}"
+        );
+        assert!(
+            !clean_output.contains("sibling.md"),
+            "a clean bare-relative scope must not leak the out-of-scope sibling: {clean_output}"
+        );
     }
 
     #[test]

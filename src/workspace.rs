@@ -165,6 +165,21 @@ impl Workspace {
     /// resolved to a directory. Individual file read errors are collected
     /// but do not abort the scan.
     pub fn scan(start: &Path) -> Result<Self, WorkspaceError> {
+        // Absolutize `start` before root discovery. A bare single-component
+        // relative path (`archive`) has `Path::parent() == Some("")` — an empty
+        // path — so the walk-up loop in `find_workspace_root` would step to `""`,
+        // match `.lattice.toml`/`.git` relative to the process CWD, and return an
+        // empty root that `discover_markdown_files` walks to zero files (a silent
+        // false-clean — issue 024). Canonicalizing here makes every spelling
+        // (`archive`, `archive/`, `tickets/misc`, `./archive/`, the absolute
+        // form) resolve to the same absolute root, and matches the canonicalized
+        // form `lint::scope_relative_to_root` strips the scope against, so
+        // discovery and scoping stay consistent. The scan path must exist on disk
+        // for the lint to be meaningful, so canonicalize is safe; on failure we
+        // fall back to `start` unchanged so behavior never regresses below the
+        // pre-fix state.
+        let start = std::fs::canonicalize(start).unwrap_or_else(|_| start.to_path_buf());
+        let start = start.as_path();
         let root = find_workspace_root(start).ok_or_else(|| WorkspaceError::NoRoot {
             start: start.to_path_buf(),
         })?;
@@ -532,8 +547,16 @@ fn discover_markdown_files(root: &Path) -> Vec<PathBuf> {
 #[allow(clippy::expect_used, reason = "tests use expect for clarity")]
 mod tests {
     use std::fs;
+    use std::sync::Mutex;
 
     use super::*;
+
+    /// Serializes tests that mutate the process-global current working
+    /// directory. `std::env::set_current_dir` affects the whole process, so two
+    /// CWD-mutating tests running concurrently (plain `cargo test` shares the
+    /// process; `cargo nextest` does not) would race. The lock is intentionally
+    /// poison-tolerant: a panic in one CWD test must not wedge the others.
+    static CWD_LOCK: Mutex<()> = Mutex::new(());
 
     /// Create a temp directory with `.git` marker and optional files.
     fn workspace_with_files(files: &[(&str, &str)]) -> tempfile::TempDir {
@@ -624,6 +647,43 @@ mod tests {
             ws.root(),
             dir.path(),
             "root should be found by walking up to .git"
+        );
+    }
+
+    #[test]
+    fn bare_relative_subdir_from_cwd_discovers_root_and_files() {
+        // Issue 024 (reopened): a bare single-component relative directory
+        // (`docs`, no leading `./`) used to make `find_workspace_root` walk up to
+        // the empty path `""` — which `join`s relative to the process CWD and
+        // matched `.git`/`.lattice.toml`, returning an empty root that
+        // discovers zero files (a silent false-clean). With `start` absolutized
+        // the bare-relative form must discover the real root and its files.
+        //
+        // This must run with the process CWD at the fixture root and lint a path
+        // genuinely relative to CWD — the existing `workspace_root_from_subdirectory`
+        // joins onto an absolute temp path, so it never exercised this branch.
+        let dir = workspace_with_files(&[("README.md", "# Root"), ("docs/guide.md", "# Guide")]);
+
+        let _guard = CWD_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let original = std::env::current_dir().expect("read original cwd");
+        std::env::set_current_dir(dir.path()).expect("chdir to fixture root");
+
+        // `Path::new("docs").parent()` is `Some("")`, the empty-path trap.
+        let scanned = Workspace::scan(Path::new("docs"));
+
+        std::env::set_current_dir(&original).expect("restore original cwd");
+
+        let ws = scanned.expect("bare-relative scan should succeed");
+        assert!(
+            ws.file(Path::new("docs/guide.md")).is_some(),
+            "bare-relative `docs` must discover the file under it, not zero files"
+        );
+        assert_eq!(
+            ws.files().len(),
+            2,
+            "bare-relative scan must walk the real tree, not an empty path"
         );
     }
 
