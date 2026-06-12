@@ -486,13 +486,14 @@ pub struct BarePath {
     pub path: String,
 }
 
-/// An explicit in-page anchor target defined by a raw-HTML `<a>` tag.
+/// An explicit in-page anchor target defined by a raw-HTML open tag.
 ///
-/// A standard GFM "explicit anchor" — `<a id="x"></a>` or `<a name="x"></a>`
-/// placed before a heading — gives an in-page link `[text](#x)` a stable,
-/// clean fragment target. Such an `<a>` is a link *target*, not a link
-/// *source*: it legitimately carries no `href`. Each `id`/`name` value on a
-/// harvested `<a>` becomes one entry, so `<a id="a" name="b">` yields both.
+/// A fragment `#x` resolves against any element bearing `id="x"`
+/// (`<div id="x">`, `<section id="x">`, `<a id="x">`, …) and against the legacy
+/// `<a name="x"></a>` idiom — matching GitHub. Such an element is a link
+/// *target*, not a link *source*; an anchor-only `<a>` legitimately carries no
+/// `href`. Each harvested `id`/`name` value becomes one entry, so a single
+/// `<a id="a" name="b">` yields both.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Anchor {
     /// 1-based line number in the source.
@@ -4659,19 +4660,26 @@ impl Tree {
         headings
     }
 
-    /// Extract explicit in-page anchor targets from raw-HTML `<a>` tags.
+    /// Extract explicit in-page anchor targets from raw-HTML open tags.
     ///
-    /// Harvests the `id` and `name` attribute values of every `<a>` open tag,
+    /// Harvests anchor `id`/`name` attribute values from raw-HTML open tags,
     /// covering both opaque HTML blocks ([`ElementKind::HtmlBlock`]) and inline
     /// raw HTML ([`Syntax::Html`] nodes) — the same node surface the structural
     /// HTML pass walks, so the fragment resolver and the `<a>` `href` check
-    /// agree on what an anchor is. Each value becomes one [`Anchor`]; an
-    /// `<a id="a" name="b">` yields both `a` and `b`. Empty values are skipped.
+    /// agree on what an anchor is. Each harvested value becomes one [`Anchor`];
+    /// a single `<a id="a" name="b">` yields both `a` and `b`. Closing tags
+    /// (`</a>`) and empty values are skipped.
     ///
-    /// This is the minimum standard idiom — `<a id="…">` and `<a name="…">`.
-    /// GitHub additionally resolves `#x` against *any* element bearing
-    /// `id="x"` (e.g. `<div id>`); broadening to that is a deliberate scope
-    /// decision and is intentionally not done here.
+    /// This matches GitHub: a fragment `#x` resolves against *any* element that
+    /// bears `id="x"` — `<div id>`, `<span id>`, `<section id>`, `<a id>`, … —
+    /// so `id` is harvested from any open tag. The legacy `<a name="x">` anchor
+    /// idiom is `<a>`-specific (a `name` on a non-`<a>` element is not an
+    /// anchor), so `name` is harvested only from `<a>` tags.
+    ///
+    /// The inline raw-HTML node surface materializes only `<a>` and `<img>`
+    /// tags (the inline scanner skips other tags without emitting a node), so a
+    /// non-`<a>` `id` is harvested only when it appears as a standalone HTML
+    /// block. This mirrors the structural HTML pass exactly.
     #[must_use]
     pub fn anchors(&self) -> Vec<Anchor> {
         let mut anchors = Vec::new();
@@ -4692,16 +4700,18 @@ impl Tree {
                 raw.trim()
             };
 
+            // `tokenize_tag` returns `Open` only for open tags, so closing tags
+            // (`</div>`) are skipped here.
             let Some(HtmlTag::Open { name, attrs, .. }) = html::tokenize_tag(tag_text, 0) else {
                 continue;
             };
-            if name != "a" {
-                continue;
-            }
 
             let line = byte_offset_to_line(&self.source, node.span.start);
             for attr in &attrs {
-                if (attr.name == "id" || attr.name == "name")
+                // `id` is an anchor on any element; `name` is an anchor only on
+                // `<a>` (the legacy `<a name>` idiom).
+                let is_anchor_attr = attr.name == "id" || (attr.name == "name" && name == "a");
+                if is_anchor_attr
                     && let Some(value) = &attr.value
                     && !value.is_empty()
                 {
@@ -5045,15 +5055,40 @@ mod tests {
     }
 
     #[test]
-    fn anchors_ignore_non_anchor_elements_with_id() {
-        // Scope: the minimum idiom harvests only `<a>` ids, not `<div id>` —
-        // broadening to "any element with id" is a deliberate, separate
-        // decision (issue 025).
-        let tree = parse("<div id=\"section\">\n\ncontent\n\n</div>\n");
+    fn anchors_harvest_id_from_any_element_but_name_only_from_a() {
+        // Issue 025 (broadened to GitHub parity): a fragment `#x` resolves
+        // against any element bearing `id="x"`, so `id` is harvested from a
+        // `<div>`, `<span>`, and `<section>` — not only `<a>`. The legacy
+        // `name`-as-anchor idiom stays `<a>`-specific: a `name` on a non-`<a>`
+        // element is not an anchor.
+        let tree = parse(
+            "<div id=\"div-id\">\n\ncontent\n\n</div>\n\n\
+             <span id=\"span-id\"></span>\n\n\
+             <section id=\"section-id\">\n\nmore\n\n</section>\n\n\
+             <div name=\"div-name\"></div>\n",
+        );
+        let anchors = tree.anchors();
+        let ids: Vec<&str> = anchors.iter().map(|a| a.id.as_str()).collect();
         assert!(
-            tree.anchors().is_empty(),
-            "a `<div id>` is not harvested as an anchor: {:?}",
-            tree.anchors()
+            ids.contains(&"div-id"),
+            "a `<div id>` is harvested as an anchor: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"span-id"),
+            "a `<span id>` is harvested as an anchor: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"section-id"),
+            "a `<section id>` is harvested as an anchor: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"div-name"),
+            "a `name` on a non-`<a>` element is not harvested: {ids:?}"
+        );
+        assert_eq!(
+            ids.len(),
+            3,
+            "only the three element `id`s are harvested, not the `<div name>`: {ids:?}"
         );
     }
 

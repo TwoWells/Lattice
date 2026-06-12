@@ -1684,6 +1684,27 @@ fragments = \"gitlab\"
     }
 
     #[test]
+    fn same_document_anchor_resolves_to_element_id() {
+        // Issue 025 (broadened to GitHub parity): `[x](#d)` resolves against any
+        // element bearing `id="d"` — `<div id>` and `<section id>`, not only
+        // `<a id>`.
+        let (_dir, ws) = setup_workspace(&[(
+            "index.md",
+            "[a](#div-anchor)\n\
+             [b](#section-anchor)\n\n\
+             <div id=\"div-anchor\">\n\nbody\n\n</div>\n\n\
+             <section id=\"section-anchor\">\n\nmore\n\n</section>\n\n\
+             ## Real Heading\n",
+        )]);
+
+        let diags = validate_forward_links(&ws);
+        assert!(
+            diags.is_empty(),
+            "no errors when same-doc anchor matches an element `id`: {diags:?}"
+        );
+    }
+
+    #[test]
     fn same_document_html_anchor_does_not_mask_missing_fragment() {
         // Issue 025 repro: explicit `<a id>`/`<a name>` and a heading slug all
         // resolve, while a genuinely missing `#does-not-exist` still errors —
