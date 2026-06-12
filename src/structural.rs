@@ -926,6 +926,18 @@ fn emit_missing_blank_line_diagnostics(tree: &Tree, rel_path: &Path, out: &mut V
         }
 
         let before = &source[..start];
+        // Inside a blockquote the block's source span starts *after* its line's
+        // container prefix, so `before` ends mid-line with that prefix (e.g.
+        // `"> "`, or `"> > "` when nested) instead of a line terminator. Strip
+        // that leading-marker suffix so the prev-line scan lands on the real
+        // physical line above the block rather than the block's own prefix
+        // (issue 022). Only when `before` does not already end in a terminator,
+        // i.e. when the block did not start on a fresh line.
+        let before = if before.ends_with(['\n', '\r']) {
+            before
+        } else {
+            before.trim_end_matches(['>', ' ', '\t'])
+        };
         // Strip only the single terminator ending the line before the block
         // (\r\n, \n, or bare \r). Stripping *all* trailing newlines collapses a
         // blank separator line and misreports it as missing.
@@ -939,12 +951,18 @@ fn emit_missing_blank_line_diagnostics(tree: &Tree, rel_path: &Path, out: &mut V
             .rsplit_once(['\n', '\r'])
             .map_or(before, |(_, line)| line);
 
-        if prev_line.trim().is_empty() {
+        // Strip the previous line's own `>`/whitespace container markers before
+        // the emptiness test, so a `>`-only blank separator inside a blockquote
+        // counts as the blank line it is (issue 022). At top level this is a
+        // no-op.
+        let prev_content = strip_blockquote_markers(prev_line);
+
+        if prev_content.trim().is_empty() {
             continue;
         }
 
         // Don't flag after a frontmatter closing delimiter.
-        if prev_line.trim() == "---" && start < 100 {
+        if prev_content.trim() == "---" && start < 100 {
             continue;
         }
 
@@ -956,6 +974,23 @@ fn emit_missing_blank_line_diagnostics(tree: &Tree, rel_path: &Path, out: &mut V
             message: missing_blank_message(&node.kind, source, node.span),
             span: Some(node.span),
         });
+    }
+}
+
+/// Strip the leading blockquote container markers (`>` and surrounding
+/// whitespace) from a single source line, repeated for nested quotes
+/// (`> > content` → `content`). Used to normalize a line's container prefix
+/// before testing whether it is empty, so a `>`-only line reads as the blank
+/// separator it is. A line with no quote markers is returned with only its
+/// leading whitespace trimmed; the caller's `trim()` handles the rest.
+fn strip_blockquote_markers(line: &str) -> &str {
+    let mut rest = line;
+    loop {
+        let trimmed = rest.trim_start_matches([' ', '\t']);
+        match trimmed.strip_prefix('>') {
+            Some(after) => rest = after,
+            None => return trimmed,
+        }
     }
 }
 
@@ -1642,6 +1677,127 @@ mod tests {
                 .contains("type 2 HTML block start: comment"),
             "nameless opener should report its type and kind, got: {}",
             hints[0].message
+        );
+    }
+
+    // -- Missing blank line inside a blockquote (issue 022) --
+    //
+    // The prev-line guard scanned raw source, so inside a blockquote it
+    // resolved `prev_line` to the block line's own `> ` container prefix
+    // instead of the physical line above. Every blockquote-nested block thus
+    // flagged unconditionally and the hint was unsatisfiable while the block
+    // stayed quoted. A block correctly separated by a `>`-only blank line must
+    // NOT flag; a block flush against quote content must flag exactly once.
+
+    fn missing_blank_count(content: &str) -> usize {
+        count_matching(&diagnose(content), Severity::Hint, "missing blank line")
+    }
+
+    #[test]
+    fn blockquote_list_after_quote_blank_no_missing_blank_hint() {
+        assert_eq!(
+            missing_blank_count("> intro paragraph here:\n>\n> - alpha\n"),
+            0,
+            "list separated by a `>`-only blank line should not flag",
+        );
+    }
+
+    #[test]
+    fn blockquote_list_flush_against_quote_flags_missing_blank() {
+        assert_eq!(
+            missing_blank_count("> intro paragraph here:\n> - gamma\n"),
+            1,
+            "list flush against quote content should flag exactly once",
+        );
+    }
+
+    #[test]
+    fn blockquote_heading_after_quote_blank_no_missing_blank_hint() {
+        assert_eq!(
+            missing_blank_count("> intro paragraph here:\n>\n> ## Section\n"),
+            0,
+            "heading separated by a `>`-only blank line should not flag",
+        );
+    }
+
+    #[test]
+    fn blockquote_heading_flush_against_quote_flags_missing_blank() {
+        assert_eq!(
+            missing_blank_count("> intro paragraph here:\n> ## Section\n"),
+            1,
+            "heading flush against quote content should flag exactly once",
+        );
+    }
+
+    #[test]
+    fn blockquote_code_block_after_quote_blank_no_missing_blank_hint() {
+        assert_eq!(
+            missing_blank_count("> some text here:\n>\n> ```rust\n> let x = 1;\n> ```\n"),
+            0,
+            "code block separated by a `>`-only blank line should not flag",
+        );
+    }
+
+    #[test]
+    fn blockquote_code_block_flush_against_quote_flags_missing_blank() {
+        assert_eq!(
+            missing_blank_count("> some text here:\n> ```rust\n> let x = 1;\n> ```\n"),
+            1,
+            "code block flush against quote content should flag exactly once",
+        );
+    }
+
+    #[test]
+    fn blockquote_table_after_quote_blank_no_missing_blank_hint() {
+        assert_eq!(
+            missing_blank_count(
+                "> intro paragraph here:\n>\n> | a | b |\n> | - | - |\n> | 1 | 2 |\n"
+            ),
+            0,
+            "table separated by a `>`-only blank line should not flag",
+        );
+    }
+
+    // The parser does not recognize a GFM table whose header row is flush
+    // against a preceding paragraph (the paragraph absorbs it) — this holds
+    // both at top level and inside a blockquote — so a flush table produces no
+    // Table node and has no flush-flags arm to test. The separated case above
+    // is the table arm of the regression matrix: the false positive the bug
+    // produced inside a blockquote.
+
+    #[test]
+    fn nested_blockquote_list_after_quote_blank_no_missing_blank_hint() {
+        assert_eq!(
+            missing_blank_count("> > intro paragraph here:\n> >\n> > - alpha\n"),
+            0,
+            "nested-quote list separated by a `> >`-only blank line should not flag",
+        );
+    }
+
+    #[test]
+    fn nested_blockquote_list_flush_against_quote_flags_missing_blank() {
+        assert_eq!(
+            missing_blank_count("> > intro paragraph here:\n> > - gamma\n"),
+            1,
+            "nested-quote list flush against quote content should flag exactly once",
+        );
+    }
+
+    #[test]
+    fn blockquote_list_after_quote_blank_crlf_no_missing_blank_hint() {
+        assert_eq!(
+            missing_blank_count("> intro paragraph here:\r\n>\r\n> - alpha\r\n"),
+            0,
+            "CRLF list separated by a `>`-only blank line should not flag",
+        );
+    }
+
+    #[test]
+    fn blockquote_list_flush_against_quote_crlf_flags_missing_blank() {
+        assert_eq!(
+            missing_blank_count("> intro paragraph here:\r\n> - gamma\r\n"),
+            1,
+            "CRLF list flush against quote content should flag exactly once",
         );
     }
 }
