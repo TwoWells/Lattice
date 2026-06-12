@@ -489,19 +489,37 @@ fn strip_backtick_delimiters(s: &str) -> &str {
 }
 
 /// Check if a string looks like a file path (has an extension we recognize).
+///
+/// A protocol-relative reference (`//host/path`) is a URL, not a workspace
+/// path — a renderer resolves it against the current scheme and host, never
+/// the repository root — so it is never path-shaped (issue 028). A single
+/// leading `/` is root-relative and stays path-shaped (resolved at the
+/// workspace root by [`resolve_relative`]).
 fn looks_like_path(s: &str) -> bool {
     const PATH_EXTENSIONS: &[&str] = &[
         ".md", ".png", ".jpg", ".svg", ".pdf", ".toml", ".yaml", ".yml", ".json", ".txt", ".xml",
         ".rs", ".ts", ".js",
     ];
     !s.is_empty()
+        && !s.starts_with("//")
         && !s.contains(' ')
         && (s.contains('/') || s.contains('.'))
         && PATH_EXTENSIONS.iter().any(|ext| s.ends_with(ext))
 }
 
-/// Resolve a relative path against a file's directory.
+/// Resolve a path-shaped reference to a workspace-relative path.
+///
+/// A leading single `/` is **root-relative**: GitHub and web renderers resolve
+/// `/foo.md` against the repository (workspace) root, so the leading `/` is
+/// stripped and the remainder taken as a workspace-relative path (issue 028).
+/// This also keeps the reference inside the workspace — it can never escape to
+/// an absolute filesystem path. Every other reference resolves against the
+/// source file's parent directory, matching the link-target classifier so the
+/// dark-matter hint and the `[x](…)` validator agree on existence.
 fn resolve_relative(file_path: &Path, target: &str) -> std::path::PathBuf {
+    if let Some(rooted) = target.strip_prefix('/') {
+        return std::path::PathBuf::from(rooted);
+    }
     file_path
         .parent()
         .map_or_else(|| std::path::PathBuf::from(target), |dir| dir.join(target))
@@ -978,11 +996,24 @@ mod tests {
     }
 
     fn diagnose_with_files(content: &str, existing: &[&str]) -> Vec<Diagnostic> {
+        diagnose_at_path_with_files("test.md", content, existing)
+    }
+
+    /// Like `diagnose_with_files`, but treats the document as living at
+    /// `rel_path` (a workspace-relative path), so path-shaped references
+    /// resolve relative to that location — and root-relative `/` references
+    /// resolve at the workspace root regardless of `rel_path`'s depth.
+    /// `existing` lists workspace-relative paths that exist.
+    fn diagnose_at_path_with_files(
+        rel_path: &str,
+        content: &str,
+        existing: &[&str],
+    ) -> Vec<Diagnostic> {
         let fm = yaml::parse_frontmatter_block(content);
         let fm_span = fm.as_ref().map(|b| b.span);
         let tree = block::parse_tree(content, fm_span);
         let config = Config::default();
-        let rel_path = std::path::Path::new("test.md");
+        let rel_path = std::path::Path::new(rel_path);
         let existing_set: HashSet<&str> = existing.iter().copied().collect();
         collect(&tree, rel_path, &config, &|p| {
             existing_set.contains(p.to_str().unwrap_or(""))
@@ -1471,6 +1502,75 @@ mod tests {
         assert!(
             !has_any(&diags, "backticked path"),
             "no hint when file doesn't exist: {diags:?}"
+        );
+    }
+
+    // -- Root-relative `/` dark-matter resolution (issue 028) --
+
+    #[test]
+    fn backticked_root_relative_path_resolves_at_workspace_root() {
+        // From a nested file, `` `/README.md` `` resolves at the workspace
+        // root, so an existing `<root>/README.md` draws the make-it-a-link
+        // hint — not silence (the path was previously read as filesystem
+        // absolute and missed).
+        let diags = diagnose_at_path_with_files(
+            "a/b/c.md",
+            "See `/README.md` for details.\n",
+            &["README.md"],
+        );
+        assert_eq!(
+            count_matching(&diags, Severity::Hint, "backticked path"),
+            1,
+            "root-relative backticked path resolves at the workspace root: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn backticked_root_relative_resolution_independent_of_depth() {
+        // The same `/README.md` reference resolves identically from the root
+        // and from a deep subdirectory.
+        let root = diagnose_at_path_with_files("root.md", "See `/README.md`.\n", &["README.md"]);
+        let deep =
+            diagnose_at_path_with_files("a/b/c/d/deep.md", "See `/README.md`.\n", &["README.md"]);
+        assert_eq!(
+            count_matching(&root, Severity::Hint, "backticked path"),
+            count_matching(&deep, Severity::Hint, "backticked path"),
+            "root-relative resolution is depth-independent: root={root:?} deep={deep:?}"
+        );
+        assert_eq!(
+            count_matching(&deep, Severity::Hint, "backticked path"),
+            1,
+            "the deep reference still resolves at the workspace root: {deep:?}"
+        );
+    }
+
+    #[test]
+    fn backticked_root_relative_missing_file_no_hint() {
+        // A root-relative reference whose target does not exist draws no
+        // make-it-a-link hint (the missing-quadrant warning is part 2).
+        let diags = diagnose_at_path_with_files(
+            "a/b/c.md",
+            "See `/nope.md` for details.\n",
+            &["README.md"],
+        );
+        assert!(
+            !has_any(&diags, "backticked path"),
+            "no hint for a missing root-relative target: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn protocol_relative_backticked_path_not_treated_as_workspace_path() {
+        // `//host/lib.md` is a protocol-relative URL, not a workspace path:
+        // even if a same-named file existed it must not draw a path hint.
+        let diags = diagnose_at_path_with_files(
+            "a/b/c.md",
+            "See `//cdn.example.com/lib.md` for details.\n",
+            &["cdn.example.com/lib.md", "lib.md"],
+        );
+        assert!(
+            !has_any(&diags, "backticked path"),
+            "protocol-relative `//host` is external, not a workspace path: {diags:?}"
         );
     }
 

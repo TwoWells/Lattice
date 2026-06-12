@@ -969,6 +969,100 @@ predicates = \"required\"
         );
     }
 
+    // --- Root-relative `/` resolution (issue 028) ---
+
+    #[test]
+    fn root_relative_link_resolves_at_workspace_root() {
+        // GitHub resolves `/README.md` against the repository root, not the
+        // filesystem root or the source file's directory. From a deeply nested
+        // file, `[x](/README.md)` must therefore find `<root>/README.md`.
+        let (_dir, ws) = setup_workspace(&[
+            ("a/b/c.md", r#"[x](/README.md "references")"#),
+            ("README.md", "# README\n"),
+        ]);
+
+        let diags = validate_forward_links(&ws);
+        assert!(
+            diags.iter().all(|d| d.severity != Severity::Error),
+            "root-relative `/README.md` from a nested file resolves at the workspace root: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn root_relative_link_to_missing_target_errors() {
+        // A root-relative target that does not exist still errors — now
+        // reported against the root-resolved path.
+        let (_dir, ws) = setup_workspace(&[("a/b/c.md", r#"[x](/nope.md "references")"#)]);
+
+        let diags = validate_forward_links(&ws);
+        let errors: Vec<_> = diags
+            .iter()
+            .filter(|d| d.severity == Severity::Error)
+            .collect();
+
+        assert_eq!(
+            errors.len(),
+            1,
+            "a missing root-relative target still errors: {diags:?}"
+        );
+        assert!(
+            errors[0].message.contains("does not exist"),
+            "message reports the missing target: {}",
+            errors[0].message
+        );
+    }
+
+    #[test]
+    fn root_relative_resolution_independent_of_nesting_depth() {
+        // The same `/README.md` resolves identically from the root and from a
+        // deep subdirectory — root-anchoring is depth-independent.
+        let (_dir, ws) = setup_workspace(&[
+            ("root.md", r#"[x](/README.md "references")"#),
+            ("a/b/c/d/deep.md", r#"[x](/README.md "references")"#),
+            ("README.md", "# README\n"),
+        ]);
+
+        let diags = validate_forward_links(&ws);
+        assert!(
+            diags.iter().all(|d| d.severity != Severity::Error),
+            "root-relative `/README.md` resolves the same at every depth: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn root_relative_non_markdown_link_resolves_at_root() {
+        // A root-relative non-markdown target resolves at the workspace root on
+        // disk too (and cannot escape it), so an existing `<root>/logo.png`
+        // referenced as `/logo.png` from a nested file does not error.
+        let (_dir, ws) =
+            setup_workspace(&[("a/b/c.md", "[logo](/logo.png)"), ("logo.png", "fake png")]);
+
+        let diags = validate_forward_links(&ws);
+        assert!(
+            diags.iter().all(|d| d.severity != Severity::Error),
+            "root-relative non-markdown target resolves at the workspace root: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn protocol_relative_and_http_links_stay_external() {
+        // `http(s)://` and protocol-relative `//host/...` are URLs, never
+        // workspace paths: they must classify as external and produce no
+        // target-existence error.
+        let (_dir, ws) = setup_workspace(&[(
+            "a/b/c.md",
+            "[h](https://example.com/README.md) \
+             [p](//cdn.example.com/lib.md) \
+             [q](http://example.com/x.md)",
+        )]);
+
+        let diags = validate_forward_links(&ws);
+        assert!(
+            diags.is_empty(),
+            "external and protocol-relative links are not workspace paths: {diags:?}"
+        );
+    }
+
     // --- Backlink validation ---
 
     #[test]

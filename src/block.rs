@@ -4183,8 +4183,40 @@ pub fn normalize_path(path: &Path) -> PathBuf {
 }
 
 /// Check whether a URL is external (http/https/mailto).
+///
+/// A protocol-relative URL (`//host/path`) is external too: a renderer
+/// resolves it against the current scheme and host, never against the
+/// repository root, so it must not be read as a root-relative workspace path
+/// (issue 028).
 fn is_external(url: &str) -> bool {
-    url.starts_with("http://") || url.starts_with("https://") || url.starts_with("mailto:")
+    url.starts_with("http://")
+        || url.starts_with("https://")
+        || url.starts_with("mailto:")
+        || url.starts_with("//")
+}
+
+/// Resolve a link target path string to a workspace-relative [`PathBuf`].
+///
+/// A leading single `/` is **root-relative**: GitHub and web renderers
+/// resolve `/foo.md` against the repository (workspace) root, not the
+/// filesystem root, so the leading `/` is stripped and the remainder is taken
+/// verbatim as a workspace-relative path (issue 028). Stripping the `/` also
+/// keeps such a target inside the workspace — it can never escape to an
+/// absolute filesystem path. Every other path is resolved relative to the
+/// source file's parent directory, as before. The result is normalized in
+/// both cases.
+fn resolve_target_path(path_str: &str, file_path: &Path) -> PathBuf {
+    // `//host/...` is handled as external before this point; a single leading
+    // `/` here is unambiguously root-relative — strip it and take the
+    // remainder as a workspace-relative path. Otherwise resolve against the
+    // source file's parent directory.
+    path_str.strip_prefix('/').map_or_else(
+        || {
+            let parent = file_path.parent().unwrap_or_else(|| Path::new(""));
+            normalize_path(&parent.join(path_str))
+        },
+        |rooted| normalize_path(Path::new(rooted)),
+    )
 }
 
 /// Split a URL into path and optional fragment.
@@ -4248,8 +4280,7 @@ fn classify_link(
         }
     } else {
         let (path_str, fragment) = split_url_fragment(url);
-        let parent = file_path.parent().unwrap_or_else(|| Path::new(""));
-        let target = normalize_path(&parent.join(path_str));
+        let target = resolve_target_path(path_str, file_path);
 
         if is_markdown_ext(&target) {
             let explicit_predicate = !title.is_empty();
@@ -4274,8 +4305,7 @@ fn classify_link(
 
 /// Classify an import directive path into a [`Link`].
 fn classify_import(path: &str, file_path: &Path, line: usize, span: Span) -> Link {
-    let parent = file_path.parent().unwrap_or_else(|| Path::new(""));
-    let target = normalize_path(&parent.join(path));
+    let target = resolve_target_path(path, file_path);
     let kind = if is_markdown_ext(&target) {
         LinkKind::IntraProject {
             target,
@@ -7053,6 +7083,66 @@ mod tests {
             .iter()
             .any(|&id| matches!(tree.node(id).kind, ElementKind::Link { .. }));
         assert!(has_link, "cell should contain a link from inline parsing");
+    }
+
+    // --- Root-relative `/` link classification (issue 028) ---
+
+    #[test]
+    fn root_relative_link_target_is_workspace_root_anchored() {
+        // `[x](/README.md)` from a nested file resolves at the workspace root,
+        // so the stored target is the workspace-relative `README.md` (not an
+        // absolute `/README.md`), independent of the source file's depth.
+        let tree = parse("[x](/README.md)\n");
+        let links = tree.links(Path::new("a/b/c.md"));
+        assert_eq!(links.len(), 1, "one link extracted: {links:?}");
+        match &links[0].kind {
+            LinkKind::IntraProject { target, .. } => {
+                assert_eq!(
+                    target,
+                    Path::new("README.md"),
+                    "root-relative `/README.md` resolves to the workspace-relative `README.md`",
+                );
+            }
+            other => panic!("expected an intra-project markdown link, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn root_relative_link_does_not_escape_workspace() {
+        // A `/`-rooted target must resolve under the workspace root, never to a
+        // real filesystem-absolute path: the result carries no `RootDir`
+        // component.
+        let tree = parse("[x](/etc/passwd.md)\n");
+        let links = tree.links(Path::new("a/b/c.md"));
+        assert_eq!(links.len(), 1, "one link extracted: {links:?}");
+        match &links[0].kind {
+            LinkKind::IntraProject { target, .. } => {
+                assert!(
+                    !target.has_root(),
+                    "root-relative target stays workspace-relative (no filesystem root): {target:?}",
+                );
+                assert_eq!(
+                    target,
+                    Path::new("etc/passwd.md"),
+                    "the `/` is stripped to a workspace-relative path: {target:?}",
+                );
+            }
+            other => panic!("expected an intra-project markdown link, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn protocol_relative_link_classifies_as_external() {
+        // `//host/path` is protocol-relative — a URL, not a workspace path —
+        // so it classifies as External and is never resolved against the root.
+        let tree = parse("[x](//cdn.example.com/lib.md)\n");
+        let links = tree.links(Path::new("a/b/c.md"));
+        assert_eq!(links.len(), 1, "one link extracted: {links:?}");
+        assert!(
+            matches!(&links[0].kind, LinkKind::External { .. }),
+            "protocol-relative `//host` is external, not a workspace path: {:?}",
+            links[0].kind,
+        );
     }
 
     // --- Tables: edge cases ---
