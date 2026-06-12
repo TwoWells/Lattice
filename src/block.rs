@@ -4460,9 +4460,20 @@ const IMPORT_EXTENSIONS: &[&str] = &[".json", ".md", ".toml", ".txt", ".xml", ".
 /// edge, so it is the only path-shape worth nudging into a link. A trailing
 /// `#fragment` is stripped before the extension check, so `foo.md#section`
 /// (a genuine anchored reference) is recognized just like `foo.md`.
+///
+/// Three shapes are not workspace paths and are rejected outright: a
+/// `~`-leading token (home-relative, out of the repo), a token containing `<`
+/// or `>` (a placeholder), and a token containing `*` (a glob). These mirror
+/// the same exclusions in the prose path scan ([`crate::structural`]).
 fn is_bare_path(s: &str) -> bool {
     let path = split_path_fragment(s).0;
-    !is_import_directive(path) && path.contains('/') && is_markdown_ext(Path::new(path))
+    !is_import_directive(path)
+        && !path.starts_with('~')
+        && !path.contains('<')
+        && !path.contains('>')
+        && !path.contains('*')
+        && path.contains('/')
+        && is_markdown_ext(Path::new(path))
 }
 
 /// Split a path-shaped token into its path and optional `#fragment`.

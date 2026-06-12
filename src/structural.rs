@@ -96,9 +96,7 @@ fn emit_tree_bare_paths(
 ) {
     let bare_paths = tree.bare_paths();
     for bare in &bare_paths {
-        let target = resolve_relative(rel_path, &bare.path);
-
-        if file_exists(&target) {
+        if resolves_under_any_base(rel_path, &bare.path, file_exists) {
             if config.policy.bare_paths == BarePathPolicy::Disabled {
                 continue;
             }
@@ -365,9 +363,8 @@ fn emit_bare_path_diagnostics(
                 // Resolve the path part only; the `#fragment` is the heading
                 // anchor and does not affect file existence.
                 let path = split_path_fragment(inner).0;
-                let target = resolve_relative(rel_path, path);
                 let line = block::byte_offset_to_line(source, child.span.start);
-                if file_exists(&target) {
+                if resolves_under_any_base(rel_path, path, file_exists) {
                     if policy != BarePathPolicy::Disabled {
                         out.push(Diagnostic {
                             file: rel_path.to_path_buf(),
@@ -516,8 +513,7 @@ fn scan_line_for_quoted_paths(
                     // Resolve the path part only; the `#fragment` is the
                     // heading anchor and does not affect file existence.
                     let path = split_path_fragment(inner).0;
-                    let target = resolve_relative(rel_path, path);
-                    if file_exists(&target) {
+                    if resolves_under_any_base(rel_path, path, file_exists) {
                         if policy != BarePathPolicy::Disabled {
                             out.push(Diagnostic {
                                 file: rel_path.to_path_buf(),
@@ -567,12 +563,22 @@ fn strip_backtick_delimiters(s: &str) -> &str {
 /// path — a renderer resolves it against the current scheme and host, never
 /// the repository root — so it is never path-shaped. A single leading `/` is
 /// root-relative and stays path-shaped (resolved at the workspace root by
-/// [`resolve_relative`]).
+/// [`resolves_under_any_base`]).
+///
+/// Three shapes are not workspace paths at all, so they are rejected outright
+/// (no make-it-a-link hint, no stale-reference warning): a `~`-leading token
+/// (home-relative, out of the repo, e.g. `~/Projects/Catenary/AGENTS.md`); a
+/// token containing `<` or `>` (a placeholder, e.g. `<name>/SKILL.md`); and a
+/// token containing `*` (a glob, e.g. `NN_*.md`).
 fn looks_like_path(s: &str) -> bool {
     let path = split_path_fragment(s).0;
     !path.is_empty()
         && !path.starts_with("//")
+        && !path.starts_with('~')
         && !path.contains(' ')
+        && !path.contains('<')
+        && !path.contains('>')
+        && !path.contains('*')
         && (path.contains('/') || path.contains('.'))
         && Path::new(path).extension().is_some_and(|ext| ext == "md")
 }
@@ -592,22 +598,63 @@ fn split_path_fragment(s: &str) -> (&str, Option<&str>) {
     }
 }
 
-/// Resolve a path-shaped reference to a workspace-relative path.
+/// Resolve a path-shaped reference against both candidate bases, normalized,
+/// and report whether it exists in the workspace.
 ///
-/// A leading single `/` is **root-relative**: GitHub and web renderers resolve
-/// `/foo.md` against the repository (workspace) root, so the leading `/` is
-/// stripped and the remainder taken as a workspace-relative path (issue 028).
-/// This also keeps the reference inside the workspace — it can never escape to
-/// an absolute filesystem path. Every other reference resolves against the
-/// source file's parent directory, matching the link-target classifier so the
-/// dark-matter hint and the `[x](…)` validator agree on existence.
-fn resolve_relative(file_path: &Path, target: &str) -> std::path::PathBuf {
+/// A `.md` reference written in prose can be either **dir-relative** (resolved
+/// against the source file's parent, like a markdown link target) or
+/// **root-relative** (a full repo-path citation, the way people cite docs in
+/// prose). The dark-matter scan accepts either: the reference "resolves" if a
+/// file exists under *either* base. The leading-`/` form is unambiguously
+/// root-relative, so only that base is tried for it (issue 028).
+///
+/// Each candidate is lexically normalized (collapsing `.`/`..` by pure path-
+/// component arithmetic, no filesystem access) before the existence check, so
+/// a `../sibling.md` reference matches the clean workspace key. A candidate
+/// that escapes the workspace root after normalization (i.e. begins with `..`)
+/// is not a valid workspace path and is not checked.
+///
+/// This drives both branches of the same decision: the make-it-a-link hint
+/// fires when it resolves under either base, and the stale-reference warning
+/// fires only when it resolves under neither.
+fn resolves_under_any_base(
+    file_path: &Path,
+    target: &str,
+    file_exists: &dyn Fn(&Path) -> bool,
+) -> bool {
+    // A leading single `/` is unambiguously root-relative (GitHub and web
+    // renderers resolve `/foo.md` against the repository root). Try only the
+    // root base for it.
     if let Some(rooted) = target.strip_prefix('/') {
-        return std::path::PathBuf::from(rooted);
+        return candidate_exists(Path::new(rooted), file_exists);
     }
-    file_path
+
+    // Dir-relative: against the source file's parent directory.
+    let dir_relative = file_path
         .parent()
-        .map_or_else(|| std::path::PathBuf::from(target), |dir| dir.join(target))
+        .map_or_else(|| std::path::PathBuf::from(target), |dir| dir.join(target));
+    if candidate_exists(&dir_relative, file_exists) {
+        return true;
+    }
+
+    // Root-relative: the target taken as a workspace-relative path.
+    candidate_exists(Path::new(target), file_exists)
+}
+
+/// Lexically normalize a candidate path and check it against the workspace.
+///
+/// Returns `false` for a candidate that escapes the workspace root after
+/// normalization (its first component is `..`): such a path is not a valid
+/// workspace-relative reference, so it is never a resolution.
+fn candidate_exists(candidate: &Path, file_exists: &dyn Fn(&Path) -> bool) -> bool {
+    let normalized = block::normalize_path(candidate);
+    if matches!(
+        normalized.components().next(),
+        Some(std::path::Component::ParentDir)
+    ) {
+        return false;
+    }
+    file_exists(&normalized)
 }
 
 // ---------------------------------------------------------------------------
@@ -1909,6 +1956,162 @@ mod tests {
         assert!(
             !has_any(&diags, "backticked path"),
             "protocol-relative `//host` is external, not a workspace path: {diags:?}"
+        );
+    }
+
+    // -- Both-bases resolution + `..` normalization + shape exclusions
+    //    (issue 028 false-positive flood) --
+
+    #[test]
+    fn dir_relative_dotdot_is_normalized_no_stale() {
+        // Bug 2 repro: a backtick `../claude_code/PostToolUse.md` in
+        // `architecture/catenary/Hook.md` joins to
+        // `architecture/catenary/../claude_code/PostToolUse.md`, which must
+        // normalize (collapse `..`) to the clean workspace key
+        // `architecture/claude_code/PostToolUse.md` — so the reference resolves
+        // and draws the make-it-a-link hint, not a stale-reference warning.
+        let diags = diagnose_at_path_with_files(
+            "architecture/catenary/Hook.md",
+            "See `../claude_code/PostToolUse.md` for details.\n",
+            &["architecture/claude_code/PostToolUse.md"],
+        );
+        assert!(
+            !has_any(&diags, "stale reference"),
+            "a `..`-relative reference that resolves after normalization is not stale: {diags:?}"
+        );
+        assert_eq!(
+            count_matching(&diags, Severity::Hint, "backticked path"),
+            1,
+            "the normalized dir-relative reference draws the make-it-a-link hint: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn repo_root_relative_citation_resolves_at_root_no_stale() {
+        // Bug 1 repro: a full repo-path citation `tickets/acquire/DESIGN.md`
+        // inside `tickets/acquire/v2_01_cleanup.md` must resolve at the
+        // workspace root (where the file lives), not at the source file's
+        // parent (which would yield `tickets/acquire/tickets/acquire/...`).
+        let diags = diagnose_at_path_with_files(
+            "tickets/acquire/v2_01_cleanup.md",
+            "See `tickets/acquire/DESIGN.md` for details.\n",
+            &["tickets/acquire/DESIGN.md"],
+        );
+        assert!(
+            !has_any(&diags, "stale reference"),
+            "a repo-root-relative citation that exists at root is not stale: {diags:?}"
+        );
+        assert_eq!(
+            count_matching(&diags, Severity::Hint, "backticked path"),
+            1,
+            "the root-resolved citation draws the make-it-a-link hint: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn genuine_dangling_under_neither_base_is_stale() {
+        // A reference that exists under neither the dir base nor the root base
+        // is a genuine dangling reference and still draws the stale warning.
+        let diags = diagnose_at_path_with_files(
+            "tickets/x/note.md",
+            "See `tickets/correlation/missing.md` for details.\n",
+            &["tickets/acquire/DESIGN.md"],
+        );
+        assert!(
+            !has_any(&diags, "backticked path"),
+            "a reference resolving under no base draws no make-it-a-link hint: {diags:?}"
+        );
+        assert_eq!(
+            count_matching(&diags, Severity::Warning, "stale reference"),
+            1,
+            "a reference resolving under neither base is a genuine stale reference: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn excluded_path_shapes_draw_no_diagnostic() {
+        // `~`-leading (home/out-of-repo), `<>`-bearing (placeholder), and
+        // `*`-bearing (glob) tokens are not workspace paths at all: no
+        // make-it-a-link hint and no stale-reference warning, whether or not a
+        // same-named file exists.
+        for token in [
+            "~/Projects/Catenary/AGENTS.md",
+            "<name>/SKILL.md",
+            "NN_*.md",
+        ] {
+            let backtick = format!("See `{token}` for details.\n");
+            // Once with nothing present, once with the literal token present.
+            let dangling = diagnose(&backtick);
+            let with_file = diagnose_with_files(&backtick, &[token]);
+            for diags in [&dangling, &with_file] {
+                assert!(
+                    !has_any(diags, "backticked path")
+                        && !has_any(diags, "stale reference")
+                        && !has_any(diags, "convert to a markdown link"),
+                    "excluded shape `{token}` draws no dark-matter diagnostic: {diags:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn excluded_glob_bare_path_draws_no_diagnostic() {
+        // A bare (unbackticked) glob path with a directory component must also
+        // be excluded by the tree-level scanner (`is_bare_path`).
+        let diags = diagnose("See docs/NN_*.md for details.\n");
+        assert!(
+            !has_any(&diags, "stale reference") && !has_any(&diags, "convert to a markdown link"),
+            "a bare glob path draws no dark-matter diagnostic: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn plain_in_dir_dangling_still_warns() {
+        // Regression: a plain in-dir `.md` that exists under neither base is
+        // still a genuine stale reference (the both-bases change must not
+        // suppress real dangles).
+        let diags = diagnose_at_path_with_files("docs/note.md", "See `gone.md`.\n", &[]);
+        assert_eq!(
+            count_matching(&diags, Severity::Warning, "stale reference"),
+            1,
+            "a plain in-dir dangling `.md` still warns: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn root_file_still_resolves_via_root_base() {
+        // Regression: `/README.md` with `<root>/README.md` present still
+        // resolves at the root (no stale warning, make-it-a-link hint fires).
+        let diags = diagnose_at_path_with_files("a/b/c.md", "See `/README.md`.\n", &["README.md"]);
+        assert_eq!(
+            count_matching(&diags, Severity::Hint, "backticked path"),
+            1,
+            "a root-relative `/README.md` with the root file present still resolves: {diags:?}"
+        );
+        assert!(
+            !has_any(&diags, "stale reference"),
+            "the resolving root file draws no stale warning: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn dotdot_escaping_root_is_not_a_resolution() {
+        // A `..` chain that escapes the workspace root after normalization is
+        // not a valid workspace candidate, so an existing same-stem key must
+        // not falsely resolve it; from a top-level file it is a genuine dangle.
+        let diags = diagnose_at_path_with_files(
+            "note.md",
+            "See `../outside.md` for details.\n",
+            &["outside.md"],
+        );
+        assert!(
+            !has_any(&diags, "backticked path"),
+            "an escaping `..` reference draws no make-it-a-link hint: {diags:?}"
+        );
+        assert_eq!(
+            count_matching(&diags, Severity::Warning, "stale reference"),
+            1,
+            "an escaping `..` reference is a genuine stale reference: {diags:?}"
         );
     }
 
