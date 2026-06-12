@@ -374,7 +374,7 @@ fn emit_bare_path_diagnostics(
                             line,
                             severity: bare_path_severity(policy, Severity::Hint),
                             message: format!(
-                                "backticked path `{inner}` refers to an existing file: consider making it a link"
+                                "backticked path `{inner}` refers to an existing file: make it a link, or drop the extension if you only mean the file's name"
                             ),
                             span: Some(child.span),
                         });
@@ -1578,6 +1578,16 @@ mod tests {
             count_matching(&diags, Severity::Hint, "backticked path"),
             1,
             "one hint for backticked path: {diags:?}"
+        );
+        // The hint teaches both honest resolutions (suggestion 001): make it a
+        // link if it's a reference, or drop the extension if it's only a name.
+        assert!(
+            has_matching(&diags, Severity::Hint, "make it a link"),
+            "the hint offers the make-it-a-link resolution: {diags:?}"
+        );
+        assert!(
+            has_matching(&diags, Severity::Hint, "drop the extension"),
+            "the hint offers the drop-the-extension resolution for a name: {diags:?}"
         );
     }
 
