@@ -950,7 +950,20 @@ fn emit_missing_blank_line_diagnostics(tree: &Tree, rel_path: &Path, out: &mut V
         // physical line above the block rather than the block's own prefix
         // (issue 022). Only when `before` does not already end in a terminator,
         // i.e. when the block did not start on a fresh line.
-        let before = if before.ends_with(['\n', '\r']) {
+        //
+        // Restrict that stripping to a *blockquote* prefix: only when the
+        // block's own line prefix (the text after the last terminator in
+        // `before`) actually contains a `>` marker. A block nested inside a
+        // list item also starts mid-line, but its prefix is bare continuation
+        // indentation with no `>`. Stripping that indentation would collapse it
+        // to the list item's own marker line and falsely flag every tight
+        // nested list / list-nested fenced block (issue 027). Leaving the
+        // indentation intact lets `prev_line` resolve to the block's (empty)
+        // indentation, which correctly suppresses the hint.
+        let line_prefix = before
+            .rsplit_once(['\n', '\r'])
+            .map_or(before, |(_, line)| line);
+        let before = if before.ends_with(['\n', '\r']) || !line_prefix.contains('>') {
             before
         } else {
             before.trim_end_matches(['>', ' ', '\t'])
@@ -1971,6 +1984,84 @@ mod tests {
             missing_blank_count("> intro paragraph here:\r\n> - gamma\r\n"),
             1,
             "CRLF list flush against quote content should flag exactly once",
+        );
+    }
+
+    // -- Missing blank line nested inside a list item (issue 027) --
+    //
+    // The issue-022 blockquote fix stripped the block line's leading
+    // container-marker suffix (`> ` etc.) from `before`. That stripping also
+    // ate the *bare continuation indentation* of a block nested inside a list
+    // item, collapsing `before` onto the list item's own marker line and
+    // falsely flagging every tight nested list / list-nested fenced block. The
+    // stripping is now gated to prefixes that actually contain a `>`, so a
+    // block nested only by list indentation no longer flags, while the
+    // blockquote cases above still behave.
+
+    #[test]
+    fn tight_nested_list_no_missing_blank_hint() {
+        // Case A: a child bullet under a parent bullet.
+        assert_eq!(
+            missing_blank_count("- parent\n  - child\n"),
+            0,
+            "tight nested list (child bullet) should not flag",
+        );
+    }
+
+    #[test]
+    fn list_nested_code_fence_no_missing_blank_hint() {
+        // Case B: a fenced code block as the first block of a list item's
+        // continuation.
+        assert_eq!(
+            missing_blank_count("- item\n  ```rust\n  let x = 1;\n  ```\n"),
+            0,
+            "fenced code nested inside a list item should not flag",
+        );
+    }
+
+    #[test]
+    fn nested_list_under_numbered_item_no_missing_blank_hint() {
+        // Case C: a nested bullet list under an ordered-list item.
+        assert_eq!(
+            missing_blank_count("1. step one\n   - detail\n"),
+            0,
+            "nested list under a numbered item should not flag",
+        );
+    }
+
+    #[test]
+    fn top_level_list_after_paragraph_flags_missing_blank() {
+        // Case D (control): a list interrupting a preceding paragraph at the
+        // top level is a legitimate hint and must still fire exactly once.
+        assert_eq!(
+            missing_blank_count("Some intro paragraph text.\n- a\n- b\n"),
+            1,
+            "top-level list flush against a paragraph should flag exactly once",
+        );
+    }
+
+    #[test]
+    fn combined_blockquote_and_list_containers_guard_both_variants() {
+        // Guard both container variants at once: a blockquote list flush
+        // against quote content (issue 022, one hint) alongside a tight nested
+        // list and a list-nested fence (issue 027, silent). The blockquote
+        // flush is the only legitimate hint in the fixture.
+        let content = "\
+> intro paragraph here:
+> - gamma
+
+- parent
+  - child
+
+- item
+  ```rust
+  let x = 1;
+  ```
+";
+        assert_eq!(
+            missing_blank_count(content),
+            1,
+            "only the blockquote flush should flag; list-nested blocks stay silent",
         );
     }
 }
