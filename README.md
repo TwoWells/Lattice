@@ -82,6 +82,12 @@ bare_paths = "warn"        # or "deny", "disabled"
 # fragments = "github"    # or "gitlab", "vscode"; omit to try all
 # connectivity = "off"    # or "no-orphans", "no-islands", "reachable"
 # roots = ["README.md"]   # entry points for "reachable"; default = root README
+
+# Opt-in convention checks (off by default — they flag valid CommonMark, not defects):
+# code_block_language = "disabled"  # or "hint", "warn", "deny" — flag untagged code fences
+# multiple_h1 = false               # flag more than one H1 heading
+# skipped_heading_level = false     # flag a skipped heading level (e.g. H1 -> H3)
+# image_empty_alt = false           # flag images with empty alt text
 ```
 
 ## Agent instructions

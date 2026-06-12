@@ -80,16 +80,21 @@ pub enum AdmonitionPolicy {
 }
 
 /// Code block language tag policy.
+///
+/// Per decision 009 the default is [`Disabled`](Self::Disabled): an untagged
+/// fence is valid `CommonMark` with a render-neutral non-fix, so it produces no
+/// diagnostic by default. Opt in via `[policy] code_block_language = "hint"`
+/// (or `"warn"` / `"deny"`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CodeBlockLanguagePolicy {
     /// Code blocks without language tags get a hint.
-    #[default]
     Hint,
     /// Warning severity.
     Warn,
     /// Error severity.
     Deny,
-    /// No diagnostic.
+    /// No diagnostic (default).
+    #[default]
     Disabled,
 }
 
@@ -124,6 +129,10 @@ pub enum FragmentAlgorithm {
 }
 
 /// Policy settings that control diagnostic behavior.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each bool is an independent on/off toggle for a distinct opt-in diagnostic, not a state machine"
+)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Policy {
     /// Whether predicates are required on links.
@@ -138,6 +147,24 @@ pub struct Policy {
     pub admonitions: AdmonitionPolicy,
     /// Code block language tag policy.
     pub code_block_language: CodeBlockLanguagePolicy,
+    /// Whether to flag multiple H1 headings in one document.
+    ///
+    /// A convention check, not a defect: multiple H1s are valid `CommonMark`
+    /// and render fine. Per decision 009 it is opt-in (default `false`); enable
+    /// with `[policy] multiple_h1 = true`.
+    pub multiple_h1: bool,
+    /// Whether to flag a skipped heading level (e.g. H1 directly to H3).
+    ///
+    /// A convention check, not a defect: skipped levels are valid `CommonMark`
+    /// and render fine. Per decision 009 it is opt-in (default `false`);
+    /// enable with `[policy] skipped_heading_level = true`.
+    pub skipped_heading_level: bool,
+    /// Whether to flag images with empty alt text.
+    ///
+    /// A convention check, not a defect: empty alt text is valid (and the
+    /// correct choice for decorative images). Per decision 009 it is opt-in
+    /// (default `false`); enable with `[policy] image_empty_alt = true`.
+    pub image_empty_alt: bool,
     /// Graph connectivity (topology) check level.
     pub connectivity: ConnectivityPolicy,
     /// Entry-point documents for connectivity checks.
@@ -158,6 +185,9 @@ impl Default for Policy {
             fragments: None,
             admonitions: AdmonitionPolicy::default(),
             code_block_language: CodeBlockLanguagePolicy::default(),
+            multiple_h1: false,
+            skipped_heading_level: false,
+            image_empty_alt: false,
             connectivity: ConnectivityPolicy::default(),
             roots: vec![PathBuf::from("README.md")],
         }
@@ -284,6 +314,15 @@ impl Config {
                         }
                     })?;
             }
+            if let Some(multiple_h1) = policy.multiple_h1 {
+                config.policy.multiple_h1 = multiple_h1;
+            }
+            if let Some(skipped_heading_level) = policy.skipped_heading_level {
+                config.policy.skipped_heading_level = skipped_heading_level;
+            }
+            if let Some(image_empty_alt) = policy.image_empty_alt {
+                config.policy.image_empty_alt = image_empty_alt;
+            }
             if let Some(ref value) = policy.connectivity {
                 config.policy.connectivity =
                     parse_connectivity_policy(value).ok_or_else(|| ConfigError::Invalid {
@@ -375,6 +414,9 @@ struct RawPolicy {
     fragments: Option<String>,
     admonitions: Option<String>,
     code_block_language: Option<String>,
+    multiple_h1: Option<bool>,
+    skipped_heading_level: Option<bool>,
+    image_empty_alt: Option<bool>,
     connectivity: Option<String>,
     roots: Option<Vec<String>>,
 }
@@ -758,6 +800,79 @@ fragments = "gitlab"
         let err = Config::load(dir.path()).expect_err("should fail");
         let msg = err.to_string();
         assert!(msg.contains("bitbucket"), "mentions bad value: {msg}");
+    }
+
+    #[test]
+    fn convention_flags_default_false() {
+        let dir = temp_dir_with(None);
+        fs::create_dir(dir.path().join(".git")).expect("create .git");
+
+        let config = Config::load(dir.path()).expect("load should succeed");
+
+        assert!(
+            !config.policy.multiple_h1,
+            "multiple_h1 defaults off (decision 009)"
+        );
+        assert!(
+            !config.policy.skipped_heading_level,
+            "skipped_heading_level defaults off (decision 009)"
+        );
+        assert!(
+            !config.policy.image_empty_alt,
+            "image_empty_alt defaults off (decision 009)"
+        );
+    }
+
+    #[test]
+    fn convention_flags_parse_true() {
+        let dir = temp_dir_with(Some(
+            r"
+[policy]
+multiple_h1 = true
+skipped_heading_level = true
+image_empty_alt = true
+",
+        ));
+
+        let config = Config::load(dir.path()).expect("load should succeed");
+
+        assert!(
+            config.policy.multiple_h1,
+            "multiple_h1 = true enables the check"
+        );
+        assert!(
+            config.policy.skipped_heading_level,
+            "skipped_heading_level = true enables the check"
+        );
+        assert!(
+            config.policy.image_empty_alt,
+            "image_empty_alt = true enables the check"
+        );
+    }
+
+    #[test]
+    fn code_block_language_defaults_disabled() {
+        let dir = temp_dir_with(None);
+        fs::create_dir(dir.path().join(".git")).expect("create .git");
+
+        let config = Config::load(dir.path()).expect("load should succeed");
+
+        assert_eq!(
+            config.policy.code_block_language,
+            CodeBlockLanguagePolicy::Disabled,
+            "code_block_language defaults to disabled (decision 009)"
+        );
+    }
+
+    #[test]
+    fn code_block_language_parses_hint() {
+        let dir = temp_dir_with(Some("[policy]\ncode_block_language = \"hint\""));
+        let config = Config::load(dir.path()).expect("load should succeed");
+        assert_eq!(
+            config.policy.code_block_language,
+            CodeBlockLanguagePolicy::Hint,
+            "code_block_language = \"hint\" enables the hint"
+        );
     }
 
     #[test]

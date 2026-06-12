@@ -6391,10 +6391,10 @@ mod tests {
 
     #[test]
     fn diffing_first_publish_skips_clean_files() {
-        // a.md has a skipped heading level (structural, config-independent);
+        // a.md has a duplicate heading slug (structural, config-independent);
         // b.md and c.md are clean.
         let dir = workspace_with_files(&[
-            ("a.md", "# A\n\n### C\n"),
+            ("a.md", "# A\n\n# A\n"),
             ("b.md", "# B\n"),
             ("c.md", "# C\n"),
         ]);
@@ -6419,7 +6419,7 @@ mod tests {
 
     #[test]
     fn diffing_skips_unchanged_on_resync() {
-        let dir = workspace_with_files(&[("a.md", "# A\n\n### C\n"), ("b.md", "# B\n")]);
+        let dir = workspace_with_files(&[("a.md", "# A\n\n# A\n"), ("b.md", "# B\n")]);
         let mut workspaces = scan_workspaces(&dir);
 
         let first = diff_diagnostics(&mut workspaces, None);
@@ -6440,7 +6440,7 @@ mod tests {
         let first = diff_diagnostics(&mut workspaces, None);
         assert!(first.is_empty(), "clean file publishes nothing: {first:?}");
 
-        edit(&mut workspaces, "a.md", "# A\n\n### C\n");
+        edit(&mut workspaces, "a.md", "# A\n\n# A\n");
         let second = diff_diagnostics(&mut workspaces, None);
         assert_eq!(second.len(), 1, "introducing a diagnostic republishes a.md");
         assert_eq!(
@@ -6453,7 +6453,7 @@ mod tests {
 
     #[test]
     fn diffing_clears_file_that_became_clean() {
-        let dir = workspace_with_files(&[("a.md", "# A\n\n### C\n")]);
+        let dir = workspace_with_files(&[("a.md", "# A\n\n# A\n")]);
         let mut workspaces = scan_workspaces(&dir);
 
         let first = diff_diagnostics(&mut workspaces, None);
@@ -6485,7 +6485,7 @@ mod tests {
 
     #[test]
     fn diffing_clears_removed_file() {
-        let dir = workspace_with_files(&[("a.md", "# A\n\n### C\n"), ("b.md", "# B\n")]);
+        let dir = workspace_with_files(&[("a.md", "# A\n\n# A\n"), ("b.md", "# B\n")]);
         let mut workspaces = scan_workspaces(&dir);
 
         let first = diff_diagnostics(&mut workspaces, None);
@@ -6582,8 +6582,8 @@ mod tests {
         // expects `superseded_by: index.md` in a's frontmatter, and the
         // missing-backlink warning is reported on the *source* (index.md).
         let steps: &[(&str, &str)] = &[
-            // add a skipped-heading diagnostic on a.md
-            ("a.md", "# A\n\n### C\n"),
+            // add a duplicate-heading-slug diagnostic on a.md
+            ("a.md", "# A\n\n# A\n"),
             // forward link expects a backlink on a.md -> warns on index.md
             ("index.md", "[a](a.md \"supersedes\")\n"),
             // satisfy the backlink and drop the heading diagnostic
@@ -6638,7 +6638,7 @@ mod tests {
         // didChange-style edits that add, move, and clear diagnostics across
         // different files — each published via the per-file incremental path.
         let steps: &[(&str, &str)] = &[
-            ("a.md", "# A\n\n### C\n"),             // add a skipped-heading diagnostic
+            ("a.md", "# A\n\n# A\n"),               // add a duplicate-slug diagnostic
             ("b.md", "Visit docs/page.md here.\n"), // add a bare-path hint
             ("a.md", "# A\n"),                      // clear a.md's diagnostic
             ("c.md", "trailing \n"),                // add trailing whitespace on c.md

@@ -4292,7 +4292,7 @@ fn classify_import(path: &str, file_path: &Path, line: usize, span: Span) -> Lin
 // --- Slug algorithms ---
 
 /// GitHub heading slug ([github-slugger] compatible).
-fn github_slug(text: &str) -> String {
+pub fn github_slug(text: &str) -> String {
     text.to_lowercase()
         .chars()
         .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-' || *c == ' ')
@@ -4301,7 +4301,7 @@ fn github_slug(text: &str) -> String {
 }
 
 /// GitLab heading slug.
-fn gitlab_slug(text: &str) -> String {
+pub fn gitlab_slug(text: &str) -> String {
     let raw: String = text
         .to_lowercase()
         .chars()
@@ -4313,7 +4313,7 @@ fn gitlab_slug(text: &str) -> String {
 }
 
 /// VS Code heading slug.
-fn vscode_slug(text: &str) -> String {
+pub fn vscode_slug(text: &str) -> String {
     let raw: String = text
         .trim()
         .to_lowercase()

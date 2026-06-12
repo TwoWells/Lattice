@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::block::{self, ElementKind, Syntax, Tree};
-use crate::config::{BarePathPolicy, CodeBlockLanguagePolicy, Config};
+use crate::config::{BarePathPolicy, CodeBlockLanguagePolicy, Config, FragmentAlgorithm};
 use crate::html;
 use crate::span::Span;
 use crate::validation::{Diagnostic, Severity};
@@ -35,7 +35,7 @@ pub fn collect(
     let source = tree.source();
 
     emit_parser_diagnostics(tree, rel_path, &mut diagnostics);
-    emit_heading_diagnostics(tree, rel_path, &mut diagnostics);
+    emit_heading_diagnostics(tree, rel_path, config, &mut diagnostics);
     emit_tree_bare_paths(tree, rel_path, config, file_exists, &mut diagnostics);
     emit_bare_path_diagnostics(
         tree,
@@ -47,7 +47,7 @@ pub fn collect(
     emit_html_diagnostics(tree, rel_path, &mut diagnostics);
     check_markdown_in_opaque_html(tree, rel_path, &mut diagnostics);
     emit_code_block_diagnostics(tree, rel_path, config, &mut diagnostics);
-    emit_image_diagnostics(tree, rel_path, &mut diagnostics);
+    emit_image_diagnostics(tree, rel_path, config, &mut diagnostics);
     emit_trailing_whitespace_diagnostics(source, rel_path, tree, &mut diagnostics);
 
     diagnostics.sort_by(|a, b| a.file.cmp(&b.file).then(a.line.cmp(&b.line)));
@@ -122,13 +122,22 @@ fn emit_tree_bare_paths(
 // Heading diagnostics
 // ---------------------------------------------------------------------------
 
-/// Emit heading diagnostics: skipped levels, multiple H1, duplicate text,
-/// empty headings.
-fn emit_heading_diagnostics(tree: &Tree, rel_path: &Path, out: &mut Vec<Diagnostic>) {
+/// Emit heading diagnostics: empty headings and duplicate slugs fire on by
+/// default (both are genuine defects per decision 009). Skipped levels and
+/// multiple H1 are convention checks, gated behind opt-in policy flags
+/// (`config.policy.skipped_heading_level` / `config.policy.multiple_h1`).
+fn emit_heading_diagnostics(
+    tree: &Tree,
+    rel_path: &Path,
+    config: &Config,
+    out: &mut Vec<Diagnostic>,
+) {
     let source = tree.source();
     let mut prev_level: Option<u8> = None;
     let mut h1_count = 0u32;
-    let mut seen_texts: HashMap<String, usize> = HashMap::new();
+    // Maps a base slug to the line of its first heading, to flag genuine slug
+    // collisions (where `#slug` resolves only to the first heading).
+    let mut seen_slugs: HashMap<String, usize> = HashMap::new();
 
     for node in tree.nodes() {
         let ElementKind::Heading { level } = &node.kind else {
@@ -141,6 +150,8 @@ fn emit_heading_diagnostics(tree: &Tree, rel_path: &Path, out: &mut Vec<Diagnost
         let text = heading_display_text(raw, node.syntax);
 
         if text.trim().is_empty() {
+            // An empty heading produces a degenerate (empty) slug — a defect,
+            // so it fires on by default.
             out.push(Diagnostic {
                 file: rel_path.to_path_buf(),
                 line,
@@ -152,7 +163,7 @@ fn emit_heading_diagnostics(tree: &Tree, rel_path: &Path, out: &mut Vec<Diagnost
             continue;
         }
 
-        if level == 1 {
+        if config.policy.multiple_h1 && level == 1 {
             h1_count += 1;
             if h1_count == 2 {
                 out.push(Diagnostic {
@@ -165,7 +176,8 @@ fn emit_heading_diagnostics(tree: &Tree, rel_path: &Path, out: &mut Vec<Diagnost
             }
         }
 
-        if let Some(prev) = prev_level
+        if config.policy.skipped_heading_level
+            && let Some(prev) = prev_level
             && level > prev + 1
         {
             out.push(Diagnostic {
@@ -179,20 +191,28 @@ fn emit_heading_diagnostics(tree: &Tree, rel_path: &Path, out: &mut Vec<Diagnost
 
         prev_level = Some(level);
 
-        let normalized = text.trim().to_lowercase();
-        if let Some(&first_line) = seen_texts.get(&normalized) {
+        // Collision is on the *base* slug, before `block::deduplicate` appends
+        // a `-1`/`-2` suffix: two headings whose bases match means `#base`
+        // resolves only to the first. When no fragment algorithm is configured
+        // default to GitHub — the dominant renderer, and what the old
+        // lowercase proxy approximated.
+        let slug = match config.policy.fragments {
+            Some(FragmentAlgorithm::Github) | None => block::github_slug(&text),
+            Some(FragmentAlgorithm::Gitlab) => block::gitlab_slug(&text),
+            Some(FragmentAlgorithm::Vscode) => block::vscode_slug(&text),
+        };
+        if let Some(&first_line) = seen_slugs.get(&slug) {
             out.push(Diagnostic {
                 file: rel_path.to_path_buf(),
                 line,
                 severity: Severity::Warning,
                 message: format!(
-                    "duplicate heading text `{}` (first at line {first_line})",
-                    text.trim()
+                    "duplicate heading slug `{slug}` (first at line {first_line}) — `#{slug}` resolves only to the first"
                 ),
                 span: Some(node.span),
             });
         } else {
-            seen_texts.insert(normalized, line);
+            seen_slugs.insert(slug, line);
         }
     }
 }
@@ -824,7 +844,20 @@ fn emit_code_block_diagnostics(
 // ---------------------------------------------------------------------------
 
 /// Emit diagnostics for images with empty alt text.
-fn emit_image_diagnostics(tree: &Tree, rel_path: &Path, out: &mut Vec<Diagnostic>) {
+///
+/// A convention check, not a defect (empty alt is the correct choice for
+/// decorative images), so per decision 009 it is gated behind the opt-in
+/// `config.policy.image_empty_alt` flag and off by default.
+fn emit_image_diagnostics(
+    tree: &Tree,
+    rel_path: &Path,
+    config: &Config,
+    out: &mut Vec<Diagnostic>,
+) {
+    if !config.policy.image_empty_alt {
+        return;
+    }
+
     let source = tree.source();
 
     for node in tree.nodes() {
@@ -932,12 +965,16 @@ mod tests {
     use crate::yaml;
 
     fn diagnose(content: &str) -> Vec<Diagnostic> {
+        let config = Config::default();
+        diagnose_with_config(content, &config)
+    }
+
+    fn diagnose_with_config(content: &str, config: &Config) -> Vec<Diagnostic> {
         let fm = yaml::parse_frontmatter_block(content);
         let fm_span = fm.as_ref().map(|b| b.span);
         let tree = block::parse_tree(content, fm_span);
-        let config = Config::default();
         let rel_path = std::path::Path::new("test.md");
-        collect(&tree, rel_path, &config, &|_| false)
+        collect(&tree, rel_path, config, &|_| false)
     }
 
     fn diagnose_with_files(content: &str, existing: &[&str]) -> Vec<Diagnostic> {
@@ -1013,12 +1050,25 @@ mod tests {
     // -- Heading diagnostics --
 
     #[test]
-    fn skipped_heading_level() {
+    fn skipped_heading_level_silent_by_default() {
+        // Decision 009: a skipped level is a convention check, not a defect, so
+        // it does not fire by default.
         let diags = diagnose("# H1\n\n### H3\n");
+        assert!(
+            !has_any(&diags, "skipped heading level"),
+            "no skipped-level warning by default: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn skipped_heading_level_fires_when_enabled() {
+        let mut config = Config::default();
+        config.policy.skipped_heading_level = true;
+        let diags = diagnose_with_config("# H1\n\n### H3\n", &config);
         assert_eq!(
             count_matching(&diags, Severity::Warning, "skipped heading level"),
             1,
-            "one warning for skipped heading: {diags:?}"
+            "one warning for skipped heading when enabled: {diags:?}"
         );
         assert!(
             has_any(&diags, "H1 to H3"),
@@ -1027,22 +1077,67 @@ mod tests {
     }
 
     #[test]
-    fn multiple_h1() {
+    fn multiple_h1_silent_by_default() {
+        // Decision 009: multiple H1 is a convention check, not a defect.
         let diags = diagnose("# First\n\n# Second\n");
-        assert_eq!(
-            count_matching(&diags, Severity::Warning, "multiple H1"),
-            1,
-            "one warning for multiple H1: {diags:?}"
+        assert!(
+            !has_any(&diags, "multiple H1"),
+            "no multiple-H1 warning by default: {diags:?}"
         );
     }
 
     #[test]
-    fn duplicate_heading_text() {
+    fn multiple_h1_fires_when_enabled() {
+        let mut config = Config::default();
+        config.policy.multiple_h1 = true;
+        let diags = diagnose_with_config("# First\n\n# Second\n", &config);
+        assert_eq!(
+            count_matching(&diags, Severity::Warning, "multiple H1"),
+            1,
+            "one warning for multiple H1 when enabled: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn duplicate_heading_exact() {
+        // An exact-duplicate heading slugs identically — a real collision that
+        // fires on by default.
         let diags = diagnose("## Overview\n\n## Overview\n");
         assert_eq!(
-            count_matching(&diags, Severity::Warning, "duplicate heading text"),
+            count_matching(
+                &diags,
+                Severity::Warning,
+                "duplicate heading slug `overview`"
+            ),
             1,
-            "one warning for duplicate heading: {diags:?}"
+            "one warning for exact duplicate heading: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn duplicate_heading_punctuation_collision() {
+        // `Hello, World` and `Hello World` both slug to `hello-world`, so
+        // `#hello-world` resolves only to the first — a genuine collision the
+        // old lowercase proxy missed.
+        let diags = diagnose("# Hello, World\n\n# Hello World\n");
+        assert_eq!(
+            count_matching(
+                &diags,
+                Severity::Warning,
+                "duplicate heading slug `hello-world`"
+            ),
+            1,
+            "one warning for punctuation/spacing slug collision: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn distinct_heading_slugs_no_duplicate() {
+        // Two headings with distinct slugs do not collide.
+        let diags = diagnose("## Overview\n\n## Details\n");
+        assert!(
+            !has_any(&diags, "duplicate heading slug"),
+            "no duplicate warning for distinct slugs: {diags:?}"
         );
     }
 
@@ -1058,7 +1153,11 @@ mod tests {
 
     #[test]
     fn sequential_headings_no_warning() {
-        let diags = diagnose("# H1\n\n## H2\n\n### H3\n");
+        // Even with the opt-in skipped-level check on, sequential headings
+        // (H1→H2→H3) draw no warning.
+        let mut config = Config::default();
+        config.policy.skipped_heading_level = true;
+        let diags = diagnose_with_config("# H1\n\n## H2\n\n### H3\n", &config);
         assert!(
             !has_matching(&diags, Severity::Warning, "skipped"),
             "no warnings for sequential headings: {diags:?}"
@@ -1068,16 +1167,43 @@ mod tests {
     // -- Code block language --
 
     #[test]
-    fn code_block_without_language() {
+    fn code_block_without_language_silent_by_default() {
+        // Decision 009: an untagged fence is valid CommonMark with a
+        // render-neutral non-fix, so `code_block_language` defaults to
+        // Disabled and produces no diagnostic by default.
         let diags = diagnose("```\ncode\n```\n");
-        assert_eq!(
-            count_matching(&diags, Severity::Hint, "without a language tag"),
-            1,
-            "one hint for missing language: {diags:?}"
+        assert!(
+            !has_any(&diags, "language tag"),
+            "no missing-language diagnostic by default: {diags:?}"
         );
-        // Issue 020: the hint must name the `text` escape hatch so authors of
+    }
+
+    #[test]
+    fn code_block_without_language_fires_when_enabled() {
+        // When opted in to `hint`, the untagged fence draws a hint that names
+        // the `text` escape hatch (issue 020). `warn`/`deny` are covered by
+        // their own tests below.
+        for (policy, severity) in [
+            (CodeBlockLanguagePolicy::Hint, Severity::Hint),
+            (CodeBlockLanguagePolicy::Warn, Severity::Warning),
+            (CodeBlockLanguagePolicy::Deny, Severity::Error),
+        ] {
+            let mut config = Config::default();
+            config.policy.code_block_language = policy;
+            let diags = diagnose_with_config("```\ncode\n```\n", &config);
+            assert_eq!(
+                count_matching(&diags, severity, "without a language tag"),
+                1,
+                "one {policy:?} diagnostic for missing language: {diags:?}"
+            );
+        }
+
+        // The hint variant must name the `text` escape hatch so authors of
         // non-code blocks (output, diagrams, trees) tag them deliberately
         // instead of guessing a language.
+        let mut config = Config::default();
+        config.policy.code_block_language = CodeBlockLanguagePolicy::Hint;
+        let diags = diagnose_with_config("```\ncode\n```\n", &config);
         assert!(
             has_matching(&diags, Severity::Hint, "`text`"),
             "missing-language hint should point at the `text` escape hatch: {diags:?}"
@@ -1096,18 +1222,35 @@ mod tests {
     // -- Image --
 
     #[test]
-    fn image_empty_alt_text() {
+    fn image_empty_alt_text_silent_by_default() {
+        // Decision 009: empty alt text is a convention check, not a defect (it
+        // is the correct choice for decorative images), so it is off by
+        // default.
         let diags = diagnose("![](image.png)\n");
+        assert!(
+            !has_any(&diags, "empty alt text"),
+            "no empty-alt warning by default: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn image_empty_alt_text_fires_when_enabled() {
+        let mut config = Config::default();
+        config.policy.image_empty_alt = true;
+        let diags = diagnose_with_config("![](image.png)\n", &config);
         assert_eq!(
             count_matching(&diags, Severity::Warning, "empty alt text"),
             1,
-            "one warning for empty alt: {diags:?}"
+            "one warning for empty alt when enabled: {diags:?}"
         );
     }
 
     #[test]
     fn image_with_alt_text_no_diagnostic() {
-        let diags = diagnose("![a logo](image.png)\n");
+        // Even with the opt-in flag on, a non-empty alt draws no warning.
+        let mut config = Config::default();
+        config.policy.image_empty_alt = true;
+        let diags = diagnose_with_config("![a logo](image.png)\n", &config);
         assert!(
             !has_any(&diags, "empty alt text"),
             "no warning for image with alt: {diags:?}"
