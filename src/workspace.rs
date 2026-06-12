@@ -934,12 +934,24 @@ mod tests {
         }
     }
 
-    /// Severity of the bare-path diagnostic on `path`, if any.
+    /// Severity of the make-it-a-link bare-path diagnostic on `path`, if any.
     fn bare_path_severity(ws: &Workspace, path: &Path) -> Option<crate::validation::Severity> {
         ws.file(path)?
             .structural
             .iter()
             .find(|d| d.message.contains("convert to a markdown link"))
+            .map(|d| d.severity)
+    }
+
+    /// Severity of the stale-reference diagnostic on `path`, if any.
+    fn stale_reference_severity(
+        ws: &Workspace,
+        path: &Path,
+    ) -> Option<crate::validation::Severity> {
+        ws.file(path)?
+            .structural
+            .iter()
+            .find(|d| d.message.contains("stale reference"))
             .map(|d| d.severity)
     }
 
@@ -979,23 +991,34 @@ mod tests {
 
     #[test]
     fn bare_path_severity_flips_when_target_added() {
-        // a.md references docs/page.md as a bare path. With the target absent
-        // it is a hint; adding the target must flip a.md's cached diagnostic to
-        // a warning even though a.md itself never changed — the membership
-        // recompute path.
+        // a.md references docs/page.md as a bare path. With the target absent it
+        // is a dangling reference — the stale-reference warning (issue 028, no
+        // make-it-a-link nudge yet); adding the target must flip a.md's cached
+        // diagnostic to the make-it-a-link warning even though a.md itself never
+        // changed — the membership recompute path.
         let dir = workspace_with_files(&[("a.md", "See docs/page.md for details.\n")]);
         let mut ws = Workspace::scan(dir.path()).expect("scan should succeed");
         assert_eq!(
+            stale_reference_severity(&ws, Path::new("a.md")),
+            Some(crate::validation::Severity::Warning),
+            "absent target should be the stale-reference warning"
+        );
+        assert_eq!(
             bare_path_severity(&ws, Path::new("a.md")),
-            Some(crate::validation::Severity::Hint),
-            "absent target should be a hint"
+            None,
+            "absent target draws no make-it-a-link nudge"
         );
 
         ws.update_content(Path::new("docs/page.md"), "# Page\n");
         assert_eq!(
             bare_path_severity(&ws, Path::new("a.md")),
             Some(crate::validation::Severity::Warning),
-            "adding the target should flip the source's bare-path to a warning"
+            "adding the target should flip the source's bare-path to the make-it-a-link warning"
+        );
+        assert_eq!(
+            stale_reference_severity(&ws, Path::new("a.md")),
+            None,
+            "a resolving target draws no stale-reference warning"
         );
     }
 

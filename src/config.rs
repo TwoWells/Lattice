@@ -98,6 +98,32 @@ pub enum CodeBlockLanguagePolicy {
     Disabled,
 }
 
+/// Stale path-shaped reference policy.
+///
+/// Controls the diagnostic for a `.md`-shaped reference (backtick or bare,
+/// `#fragment` stripped) that resolves to **no file** — the missing-quadrant
+/// mirror of the `link target does not exist` error (issue 028). Decoupled
+/// from [`BarePathPolicy`]: "don't nudge me to linkify bare paths" and "don't
+/// tell me my references dangle" are different wants.
+///
+/// Per issue 028 the default is [`Warn`](Self::Warn): a dangling reference is a
+/// defect, and the resolving sibling already warns. Set via
+/// `[policy] stale_references = "warn"` (or `"hint"` / `"deny"` / `"disabled"`).
+/// [`Disabled`](Self::Disabled) suppresses only this diagnostic; the
+/// make-it-a-link resolve hint (gated by [`BarePathPolicy`]) still fires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StaleReferencePolicy {
+    /// Dangling `.md` references get a hint.
+    Hint,
+    /// Warning severity (default).
+    #[default]
+    Warn,
+    /// Error severity.
+    Deny,
+    /// No diagnostic.
+    Disabled,
+}
+
 /// Graph connectivity (topology) check level.
 ///
 /// An escalating ladder where each level flags a superset of the previous
@@ -141,6 +167,8 @@ pub struct Policy {
     pub backlinks: bool,
     /// How bare paths are handled.
     pub bare_paths: BarePathPolicy,
+    /// How stale (dangling) `.md`-shaped references are handled.
+    pub stale_references: StaleReferencePolicy,
     /// Slug algorithm for fragment validation. `None` tries all.
     pub fragments: Option<FragmentAlgorithm>,
     /// Admonition syntax policy.
@@ -182,6 +210,7 @@ impl Default for Policy {
             predicates: PredicatePolicy::Optional,
             backlinks: true,
             bare_paths: BarePathPolicy::Warn,
+            stale_references: StaleReferencePolicy::default(),
             fragments: None,
             admonitions: AdmonitionPolicy::default(),
             code_block_language: CodeBlockLanguagePolicy::default(),
@@ -262,79 +291,7 @@ impl Config {
         }
 
         if let Some(policy) = raw.policy {
-            if let Some(ref value) = policy.predicates {
-                config.policy.predicates =
-                    parse_predicate_policy(value).ok_or_else(|| ConfigError::Invalid {
-                        path: path.clone(),
-                        message: format!(
-                            "unknown predicates policy '{value}': expected 'optional' or 'required'"
-                        ),
-                    })?;
-            }
-            if let Some(backlinks) = policy.backlinks {
-                config.policy.backlinks = backlinks;
-            }
-            if let Some(ref value) = policy.bare_paths {
-                config.policy.bare_paths =
-                    parse_bare_path_policy(value).ok_or_else(|| ConfigError::Invalid {
-                        path: path.clone(),
-                        message: format!(
-                            "unknown bare_paths policy '{value}': expected 'warn', 'deny', or 'disabled'"
-                        ),
-                    })?;
-            }
-            if let Some(ref value) = policy.fragments {
-                config.policy.fragments =
-                    Some(parse_fragment_algorithm(value).ok_or_else(|| {
-                        ConfigError::Invalid {
-                            path: path.clone(),
-                            message: format!(
-                                "unknown fragments algorithm '{value}': expected 'github', 'gitlab', or 'vscode'"
-                            ),
-                        }
-                    })?);
-            }
-            if let Some(ref value) = policy.admonitions {
-                config.policy.admonitions =
-                    parse_admonition_policy(value).ok_or_else(|| ConfigError::Invalid {
-                        path: path.clone(),
-                        message: format!(
-                            "unknown admonitions policy '{value}': expected 'portable', 'github', 'gitlab', or 'disabled'"
-                        ),
-                    })?;
-            }
-            if let Some(ref value) = policy.code_block_language {
-                config.policy.code_block_language =
-                    parse_code_block_language_policy(value).ok_or_else(|| {
-                        ConfigError::Invalid {
-                            path: path.clone(),
-                            message: format!(
-                                "unknown code_block_language policy '{value}': expected 'hint', 'warn', 'deny', or 'disabled'"
-                            ),
-                        }
-                    })?;
-            }
-            if let Some(multiple_h1) = policy.multiple_h1 {
-                config.policy.multiple_h1 = multiple_h1;
-            }
-            if let Some(skipped_heading_level) = policy.skipped_heading_level {
-                config.policy.skipped_heading_level = skipped_heading_level;
-            }
-            if let Some(image_empty_alt) = policy.image_empty_alt {
-                config.policy.image_empty_alt = image_empty_alt;
-            }
-            if let Some(ref value) = policy.connectivity {
-                config.policy.connectivity =
-                    parse_connectivity_policy(value).ok_or_else(|| ConfigError::Invalid {
-                        path: path.clone(),
-                        message: format!(
-                            "unknown connectivity policy '{value}': expected 'off', 'no-orphans', 'no-islands', or 'reachable'"
-                        ),
-                    })?;
-            }
-            if let Some(roots) = policy.roots {
-                config.policy.roots = roots.iter().map(PathBuf::from).collect();
-            }
+            apply_policy(&mut config.policy, policy, &path)?;
         }
 
         if let Some(format) = raw.format {
@@ -411,6 +368,7 @@ struct RawPolicy {
     predicates: Option<String>,
     backlinks: Option<bool>,
     bare_paths: Option<String>,
+    stale_references: Option<String>,
     fragments: Option<String>,
     admonitions: Option<String>,
     code_block_language: Option<String>,
@@ -460,6 +418,85 @@ fn find_config_file(start: &Path) -> Option<PathBuf> {
     }
 }
 
+/// Merge a raw `[policy]` table onto resolved defaults.
+///
+/// Each field overrides its default when present; an unrecognized enum value
+/// produces [`ConfigError::Invalid`] naming the offending value and the
+/// accepted set.
+fn apply_policy(policy: &mut Policy, raw: RawPolicy, path: &Path) -> Result<(), ConfigError> {
+    let invalid = |message: String| ConfigError::Invalid {
+        path: path.to_path_buf(),
+        message,
+    };
+
+    if let Some(ref value) = raw.predicates {
+        policy.predicates = parse_predicate_policy(value).ok_or_else(|| {
+            invalid(format!(
+                "unknown predicates policy '{value}': expected 'optional' or 'required'"
+            ))
+        })?;
+    }
+    if let Some(backlinks) = raw.backlinks {
+        policy.backlinks = backlinks;
+    }
+    if let Some(ref value) = raw.bare_paths {
+        policy.bare_paths = parse_bare_path_policy(value).ok_or_else(|| {
+            invalid(format!(
+                "unknown bare_paths policy '{value}': expected 'warn', 'deny', or 'disabled'"
+            ))
+        })?;
+    }
+    if let Some(ref value) = raw.stale_references {
+        policy.stale_references = parse_stale_reference_policy(value).ok_or_else(|| {
+            invalid(format!(
+                "unknown stale_references policy '{value}': expected 'hint', 'warn', 'deny', or 'disabled'"
+            ))
+        })?;
+    }
+    if let Some(ref value) = raw.fragments {
+        policy.fragments = Some(parse_fragment_algorithm(value).ok_or_else(|| {
+            invalid(format!(
+                "unknown fragments algorithm '{value}': expected 'github', 'gitlab', or 'vscode'"
+            ))
+        })?);
+    }
+    if let Some(ref value) = raw.admonitions {
+        policy.admonitions = parse_admonition_policy(value).ok_or_else(|| {
+            invalid(format!(
+                "unknown admonitions policy '{value}': expected 'portable', 'github', 'gitlab', or 'disabled'"
+            ))
+        })?;
+    }
+    if let Some(ref value) = raw.code_block_language {
+        policy.code_block_language = parse_code_block_language_policy(value).ok_or_else(|| {
+            invalid(format!(
+                "unknown code_block_language policy '{value}': expected 'hint', 'warn', 'deny', or 'disabled'"
+            ))
+        })?;
+    }
+    if let Some(multiple_h1) = raw.multiple_h1 {
+        policy.multiple_h1 = multiple_h1;
+    }
+    if let Some(skipped_heading_level) = raw.skipped_heading_level {
+        policy.skipped_heading_level = skipped_heading_level;
+    }
+    if let Some(image_empty_alt) = raw.image_empty_alt {
+        policy.image_empty_alt = image_empty_alt;
+    }
+    if let Some(ref value) = raw.connectivity {
+        policy.connectivity = parse_connectivity_policy(value).ok_or_else(|| {
+            invalid(format!(
+                "unknown connectivity policy '{value}': expected 'off', 'no-orphans', 'no-islands', or 'reachable'"
+            ))
+        })?;
+    }
+    if let Some(roots) = raw.roots {
+        policy.roots = roots.iter().map(PathBuf::from).collect();
+    }
+
+    Ok(())
+}
+
 fn parse_predicate_policy(s: &str) -> Option<PredicatePolicy> {
     match s {
         "optional" => Some(PredicatePolicy::Optional),
@@ -473,6 +510,16 @@ fn parse_bare_path_policy(s: &str) -> Option<BarePathPolicy> {
         "warn" => Some(BarePathPolicy::Warn),
         "deny" => Some(BarePathPolicy::Deny),
         "disabled" => Some(BarePathPolicy::Disabled),
+        _ => None,
+    }
+}
+
+fn parse_stale_reference_policy(s: &str) -> Option<StaleReferencePolicy> {
+    match s {
+        "hint" => Some(StaleReferencePolicy::Hint),
+        "warn" => Some(StaleReferencePolicy::Warn),
+        "deny" => Some(StaleReferencePolicy::Deny),
+        "disabled" => Some(StaleReferencePolicy::Disabled),
         _ => None,
     }
 }
@@ -563,6 +610,11 @@ mod tests {
             config.policy.bare_paths,
             BarePathPolicy::Warn,
             "default bare_paths"
+        );
+        assert_eq!(
+            config.policy.stale_references,
+            StaleReferencePolicy::Warn,
+            "default stale_references is warn (issue 028)"
         );
         assert!(
             config.policy.fragments.is_none(),
@@ -872,6 +924,49 @@ image_empty_alt = true
             config.policy.code_block_language,
             CodeBlockLanguagePolicy::Hint,
             "code_block_language = \"hint\" enables the hint"
+        );
+    }
+
+    #[test]
+    fn stale_references_defaults_warn() {
+        let dir = temp_dir_with(None);
+        fs::create_dir(dir.path().join(".git")).expect("create .git");
+
+        let config = Config::load(dir.path()).expect("load should succeed");
+
+        assert_eq!(
+            config.policy.stale_references,
+            StaleReferencePolicy::Warn,
+            "stale_references defaults to warn (issue 028)"
+        );
+    }
+
+    #[test]
+    fn stale_references_levels_parse() {
+        for (value, expected) in [
+            ("hint", StaleReferencePolicy::Hint),
+            ("warn", StaleReferencePolicy::Warn),
+            ("deny", StaleReferencePolicy::Deny),
+            ("disabled", StaleReferencePolicy::Disabled),
+        ] {
+            let dir = temp_dir_with(Some(&format!("[policy]\nstale_references = \"{value}\"")));
+            let config = Config::load(dir.path()).expect("load should succeed");
+            assert_eq!(
+                config.policy.stale_references, expected,
+                "stale_references = {value:?} parses"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_stale_references_policy() {
+        let dir = temp_dir_with(Some("[policy]\nstale_references = \"error\""));
+        let err = Config::load(dir.path()).expect_err("should fail");
+        let msg = err.to_string();
+        assert!(msg.contains("error"), "mentions bad value: {msg}");
+        assert!(
+            msg.contains("hint") && msg.contains("disabled"),
+            "lists valid options: {msg}"
         );
     }
 

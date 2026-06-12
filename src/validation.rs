@@ -927,6 +927,30 @@ predicates = \"required\"
         );
     }
 
+    // Issue 028: narrowing the dark-matter *hints* to `.md` must not touch
+    // link-existence validation — a broken `[x](main.rs)` link still errors.
+    #[test]
+    fn broken_non_markdown_link_still_errors_after_md_narrowing() {
+        let (_dir, ws) = setup_workspace(&[("index.md", "[code](main.rs)")]);
+
+        let diags = validate_forward_links(&ws);
+        let errors: Vec<_> = diags
+            .iter()
+            .filter(|d| d.severity == Severity::Error)
+            .collect();
+
+        assert_eq!(
+            errors.len(),
+            1,
+            "a broken non-`.md` link still errors: {diags:?}"
+        );
+        assert!(
+            errors[0].message.contains("does not exist"),
+            "message mentions non-existence: {}",
+            errors[0].message
+        );
+    }
+
     #[test]
     fn diagnostics_sorted_by_file_and_line() {
         let (_dir, ws) = setup_workspace(&[

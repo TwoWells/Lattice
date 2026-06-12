@@ -4451,16 +4451,30 @@ fn deduplicate(base: String, slugs: &mut HashMap<String, usize>) -> String {
 
 // --- Bare path detection ---
 
-const BARE_PATH_EXTENSIONS: &[&str] = &[".md", ".png", ".jpg", ".svg", ".pdf"];
-
 /// File extensions recognized in `@path` import directives.
 const IMPORT_EXTENSIONS: &[&str] = &[".json", ".md", ".toml", ".txt", ".xml", ".yaml", ".yml"];
 
-/// Check whether a string looks like a bare file path.
+/// Check whether a string looks like a bare markdown path.
+///
+/// Scoped to `.md` only (issue 028): `.md` is the extension that forms a graph
+/// edge, so it is the only path-shape worth nudging into a link. A trailing
+/// `#fragment` is stripped before the extension check, so `foo.md#section`
+/// (a genuine anchored reference) is recognized just like `foo.md`.
 fn is_bare_path(s: &str) -> bool {
-    !is_import_directive(s)
-        && s.contains('/')
-        && BARE_PATH_EXTENSIONS.iter().any(|ext| s.ends_with(ext))
+    let path = split_path_fragment(s).0;
+    !is_import_directive(path) && path.contains('/') && is_markdown_ext(Path::new(path))
+}
+
+/// Split a path-shaped token into its path and optional `#fragment`.
+///
+/// Mirrors the link-target classifier's fragment handling (issue 028): a
+/// markdown link can target `path#fragment`, so the dark-matter scan must
+/// strip the fragment before resolving the path part for existence.
+fn split_path_fragment(s: &str) -> (&str, Option<&str>) {
+    match s.split_once('#') {
+        Some((path, frag)) => (path, Some(frag)),
+        None => (s, None),
+    }
 }
 
 /// Check whether a string is an `@path` import directive.
@@ -4488,9 +4502,12 @@ fn scan_bare_paths_in_text(text: &str, base_line: usize, out: &mut Vec<BarePath>
                 .trim_end_matches([',', '.', ';', ':', '!', '?', ')', ']', '"', '\'']);
 
             if is_bare_path(cleaned) {
+                // Store the fragment-stripped path so existence resolution and
+                // the emitted message agree on the file the reference targets.
+                let path = split_path_fragment(cleaned).0;
                 out.push(BarePath {
                     line: base_line + line_idx,
-                    path: cleaned.to_string(),
+                    path: path.to_string(),
                 });
             }
         }

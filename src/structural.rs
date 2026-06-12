@@ -11,7 +11,9 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::block::{self, ElementKind, Syntax, Tree};
-use crate::config::{BarePathPolicy, CodeBlockLanguagePolicy, Config, FragmentAlgorithm};
+use crate::config::{
+    BarePathPolicy, CodeBlockLanguagePolicy, Config, FragmentAlgorithm, StaleReferencePolicy,
+};
 use crate::html;
 use crate::span::Span;
 use crate::validation::{Diagnostic, Severity};
@@ -37,13 +39,7 @@ pub fn collect(
     emit_parser_diagnostics(tree, rel_path, &mut diagnostics);
     emit_heading_diagnostics(tree, rel_path, config, &mut diagnostics);
     emit_tree_bare_paths(tree, rel_path, config, file_exists, &mut diagnostics);
-    emit_bare_path_diagnostics(
-        tree,
-        rel_path,
-        config.policy.bare_paths,
-        file_exists,
-        &mut diagnostics,
-    );
+    emit_bare_path_diagnostics(tree, rel_path, config, file_exists, &mut diagnostics);
     emit_html_diagnostics(tree, rel_path, &mut diagnostics);
     check_markdown_in_opaque_html(tree, rel_path, &mut diagnostics);
     emit_code_block_diagnostics(tree, rel_path, config, &mut diagnostics);
@@ -83,8 +79,14 @@ fn emit_parser_diagnostics(tree: &Tree, rel_path: &Path, out: &mut Vec<Diagnosti
 // Bare path diagnostics (from tree)
 // ---------------------------------------------------------------------------
 
-/// Emit diagnostics for bare file paths detected by the tree's `bare_paths()`
-/// scanner. Severity depends on the `bare_paths` policy and file existence.
+/// Emit diagnostics for bare `.md` paths detected by the tree's `bare_paths()`
+/// scanner.
+///
+/// A resolving bare path draws the make-it-a-link nudge (gated by `bare_paths`,
+/// `Deny` escalating it to an error); a dangling one draws the stale-reference
+/// diagnostic instead (gated by `stale_references`, issue 028). The two policies
+/// are independent, so a missing reference is still reported when `bare_paths`
+/// is `Disabled`, and vice versa.
 fn emit_tree_bare_paths(
     tree: &Tree,
     rel_path: &Path,
@@ -92,29 +94,32 @@ fn emit_tree_bare_paths(
     file_exists: &dyn Fn(&Path) -> bool,
     out: &mut Vec<Diagnostic>,
 ) {
-    if config.policy.bare_paths == BarePathPolicy::Disabled {
-        return;
-    }
-
     let bare_paths = tree.bare_paths();
     for bare in &bare_paths {
         let target = resolve_relative(rel_path, &bare.path);
-        let exists = file_exists(&target);
 
-        let severity = match (exists, config.policy.bare_paths) {
-            (true, BarePathPolicy::Deny) => Severity::Error,
-            (true, _) => Severity::Warning,
-            (false, _) => Severity::Hint,
-        };
-
-        out.push(Diagnostic {
-            file: rel_path.to_path_buf(),
-            line: bare.line,
-            severity,
-            message: format!("bare path `{}`: convert to a markdown link", bare.path),
-            // `BarePath` carries only a line; fall back to a whole-line range.
-            span: None,
-        });
+        if file_exists(&target) {
+            if config.policy.bare_paths == BarePathPolicy::Disabled {
+                continue;
+            }
+            out.push(Diagnostic {
+                file: rel_path.to_path_buf(),
+                line: bare.line,
+                severity: bare_path_severity(config.policy.bare_paths, Severity::Warning),
+                message: format!("bare path `{}`: convert to a markdown link", bare.path),
+                // `BarePath` carries only a line; fall back to a whole-line range.
+                span: None,
+            });
+        } else {
+            emit_stale_reference(
+                config.policy.stale_references,
+                rel_path,
+                bare.line,
+                None,
+                &bare.path,
+                out,
+            );
+        }
     }
 }
 
@@ -261,23 +266,59 @@ const fn bare_path_severity(policy: BarePathPolicy, base: Severity) -> Severity 
     }
 }
 
+/// Emit the stale-reference diagnostic for a dangling `.md`-shaped reference.
+///
+/// Closes the missing quadrant (issue 028): a `.md` reference — backtick or
+/// bare, `#fragment` already stripped — that resolves to no file is a defect,
+/// the mirror of the `link target does not exist` *error*. Both forms share one
+/// severity here, governed solely by [`StaleReferencePolicy`]:
+/// [`Disabled`](StaleReferencePolicy::Disabled) suppresses it (the make-it-a-
+/// link resolve hint, gated by [`BarePathPolicy`], still fires); `Hint`/`Warn`/
+/// `Deny` set the severity. `reference` is the displayed reference text `X`.
+fn emit_stale_reference(
+    policy: StaleReferencePolicy,
+    rel_path: &Path,
+    line: usize,
+    span: Option<Span>,
+    reference: &str,
+    out: &mut Vec<Diagnostic>,
+) {
+    let severity = match policy {
+        StaleReferencePolicy::Disabled => return,
+        StaleReferencePolicy::Hint => Severity::Hint,
+        StaleReferencePolicy::Warn => Severity::Warning,
+        StaleReferencePolicy::Deny => Severity::Error,
+    };
+
+    out.push(Diagnostic {
+        file: rel_path.to_path_buf(),
+        line,
+        severity,
+        message: format!(
+            "stale reference: `{reference}` looks like a markdown path but no such file exists"
+        ),
+        span,
+    });
+}
+
 /// Emit diagnostics for bare URLs, quoted paths, and backticked paths found in
 /// inline-host text — paragraphs and table cells alike, matching the cells the
 /// link/edge extractor already walks.
 ///
-/// Honors the `bare_paths` policy: `Disabled` suppresses all of these, `Deny`
-/// escalates them to errors (mirroring `emit_tree_bare_paths`).
+/// The bare-URL and make-it-a-link (resolving path) nudges honor the
+/// `bare_paths` policy: `Disabled` suppresses them, `Deny` escalates them to
+/// errors. A dangling `.md` reference instead draws the stale-reference
+/// diagnostic, governed independently by `stale_references` (issue 028), so it
+/// fires even when `bare_paths` is `Disabled`.
 fn emit_bare_path_diagnostics(
     tree: &Tree,
     rel_path: &Path,
-    policy: BarePathPolicy,
+    config: &Config,
     file_exists: &dyn Fn(&Path) -> bool,
     out: &mut Vec<Diagnostic>,
 ) {
-    if policy == BarePathPolicy::Disabled {
-        return;
-    }
-
+    let policy = config.policy.bare_paths;
+    let stale = config.policy.stale_references;
     let source = tree.source();
 
     // Scan the same inline hosts the inline pass populates with children
@@ -305,22 +346,29 @@ fn emit_bare_path_diagnostics(
             source,
             rel_path,
             policy,
+            stale,
             file_exists,
             &excluded,
             out,
         );
 
-        // Check InlineCode children for backticked paths.
+        // Check InlineCode children for backticked `.md` paths.
         for &child_id in &node.children {
             let child = tree.node(child_id);
             if matches!(child.kind, ElementKind::InlineCode) {
                 let code_text = &source[child.span.start..child.span.end];
                 // Strip backticks to get inner content.
                 let inner = strip_backtick_delimiters(code_text);
-                if looks_like_path(inner) {
-                    let target = resolve_relative(rel_path, inner);
-                    if file_exists(&target) {
-                        let line = block::byte_offset_to_line(source, child.span.start);
+                if !looks_like_path(inner) {
+                    continue;
+                }
+                // Resolve the path part only; the `#fragment` is the heading
+                // anchor and does not affect file existence.
+                let path = split_path_fragment(inner).0;
+                let target = resolve_relative(rel_path, path);
+                let line = block::byte_offset_to_line(source, child.span.start);
+                if file_exists(&target) {
+                    if policy != BarePathPolicy::Disabled {
                         out.push(Diagnostic {
                             file: rel_path.to_path_buf(),
                             line,
@@ -331,6 +379,8 @@ fn emit_bare_path_diagnostics(
                             span: Some(child.span),
                         });
                     }
+                } else {
+                    emit_stale_reference(stale, rel_path, line, Some(child.span), inner, out);
                 }
             }
         }
@@ -348,6 +398,7 @@ fn scan_text_for_paths(
     source: &str,
     rel_path: &Path,
     policy: BarePathPolicy,
+    stale: StaleReferencePolicy,
     file_exists: &dyn Fn(&Path) -> bool,
     excluded: &[Span],
     out: &mut Vec<Diagnostic>,
@@ -361,15 +412,21 @@ fn scan_text_for_paths(
                 .map_or(0, |(i, _)| i + 1);
         let line_num = block::byte_offset_to_line(source, line_start);
 
-        scan_line_for_bare_urls(
-            line_text, line_start, line_num, rel_path, policy, excluded, out,
-        );
+        // Bare URLs are governed solely by `bare_paths`; suppress them when it
+        // is `Disabled`. Quoted `.md` paths still scan, because a dangling one
+        // draws the stale-reference diagnostic (governed by `stale_references`).
+        if policy != BarePathPolicy::Disabled {
+            scan_line_for_bare_urls(
+                line_text, line_start, line_num, rel_path, policy, excluded, out,
+            );
+        }
         scan_line_for_quoted_paths(
             line_text,
             line_start,
             line_num,
             rel_path,
             policy,
+            stale,
             file_exists,
             excluded,
             out,
@@ -439,6 +496,7 @@ fn scan_line_for_quoted_paths(
     line_num: usize,
     rel_path: &Path,
     policy: BarePathPolicy,
+    stale: StaleReferencePolicy,
     file_exists: &dyn Fn(&Path) -> bool,
     excluded: &[Span],
     out: &mut Vec<Diagnostic>,
@@ -453,18 +511,26 @@ fn scan_line_for_quoted_paths(
                 let abs_pos = line_start + i;
 
                 if !is_excluded(abs_pos, excluded) && looks_like_path(inner) {
-                    let target = resolve_relative(rel_path, inner);
+                    // Span the whole quoted token, both quotes included.
+                    let span = Span::new(abs_pos, line_start + start + end + 1);
+                    // Resolve the path part only; the `#fragment` is the
+                    // heading anchor and does not affect file existence.
+                    let path = split_path_fragment(inner).0;
+                    let target = resolve_relative(rel_path, path);
                     if file_exists(&target) {
-                        out.push(Diagnostic {
-                            file: rel_path.to_path_buf(),
-                            line: line_num,
-                            severity: bare_path_severity(policy, Severity::Hint),
-                            message: format!(
-                                "quoted path `\"{inner}\"`: use backticks or make a markdown link"
-                            ),
-                            // Span the whole quoted token, both quotes included.
-                            span: Some(Span::new(abs_pos, line_start + start + end + 1)),
-                        });
+                        if policy != BarePathPolicy::Disabled {
+                            out.push(Diagnostic {
+                                file: rel_path.to_path_buf(),
+                                line: line_num,
+                                severity: bare_path_severity(policy, Severity::Hint),
+                                message: format!(
+                                    "quoted path `\"{inner}\"`: use backticks or make a markdown link"
+                                ),
+                                span: Some(span),
+                            });
+                        }
+                    } else {
+                        emit_stale_reference(stale, rel_path, line_num, Some(span), inner, out);
                     }
                 }
                 i = start + end + 1;
@@ -488,23 +554,42 @@ fn strip_backtick_delimiters(s: &str) -> &str {
     &s[tick_count..end]
 }
 
-/// Check if a string looks like a file path (has an extension we recognize).
+/// Check if a string looks like a markdown path-shaped reference.
+///
+/// Scoped to the markdown link-target grammar — `path[#fragment]`, ending in
+/// `.md` (issue 028). `.md` is the one extension that forms a graph edge, so it
+/// is the only path-shape the dark-matter scan nudges into a link; the render-
+/// changing nudge on a `.rs`/`.toml`/image path fixes no graph defect (decision
+/// 009). Non-`.md` *link existence* validation is separate (in `validation.rs`)
+/// and unaffected.
 ///
 /// A protocol-relative reference (`//host/path`) is a URL, not a workspace
 /// path — a renderer resolves it against the current scheme and host, never
-/// the repository root — so it is never path-shaped (issue 028). A single
-/// leading `/` is root-relative and stays path-shaped (resolved at the
-/// workspace root by [`resolve_relative`]).
+/// the repository root — so it is never path-shaped. A single leading `/` is
+/// root-relative and stays path-shaped (resolved at the workspace root by
+/// [`resolve_relative`]).
 fn looks_like_path(s: &str) -> bool {
-    const PATH_EXTENSIONS: &[&str] = &[
-        ".md", ".png", ".jpg", ".svg", ".pdf", ".toml", ".yaml", ".yml", ".json", ".txt", ".xml",
-        ".rs", ".ts", ".js",
-    ];
-    !s.is_empty()
-        && !s.starts_with("//")
-        && !s.contains(' ')
-        && (s.contains('/') || s.contains('.'))
-        && PATH_EXTENSIONS.iter().any(|ext| s.ends_with(ext))
+    let path = split_path_fragment(s).0;
+    !path.is_empty()
+        && !path.starts_with("//")
+        && !path.contains(' ')
+        && (path.contains('/') || path.contains('.'))
+        && Path::new(path).extension().is_some_and(|ext| ext == "md")
+}
+
+/// Split a path-shaped token into its path and optional `#fragment`.
+///
+/// Mirrors the link-target classifier (issue 028): a markdown link can target
+/// `path#fragment`, so the dark-matter scan strips the fragment before the
+/// `.md` check and existence resolution. The fragment is the heading anchor —
+/// once the reference is linked, the existing fragment check validates it; the
+/// make-it-a-link hint and the stale-reference warning need only file
+/// existence on the path part.
+fn split_path_fragment(s: &str) -> (&str, Option<&str>) {
+    match s.split_once('#') {
+        Some((path, frag)) => (path, Some(frag)),
+        None => (s, None),
+    }
 }
 
 /// Resolve a path-shaped reference to a workspace-relative path.
@@ -1498,10 +1583,247 @@ mod tests {
 
     #[test]
     fn backticked_path_no_file() {
+        // A dangling backtick `.md` draws no make-it-a-link hint, but does
+        // draw the stale-reference warning (issue 028, default `warn`).
         let diags = diagnose("See `other.md` for details.\n");
         assert!(
             !has_any(&diags, "backticked path"),
-            "no hint when file doesn't exist: {diags:?}"
+            "no make-it-a-link hint when file doesn't exist: {diags:?}"
+        );
+        assert_eq!(
+            count_matching(&diags, Severity::Warning, "stale reference"),
+            1,
+            "a dangling backtick `.md` draws the stale-reference warning: {diags:?}"
+        );
+    }
+
+    // -- Path-shaped reference detection: `.md`-scope, fragments, missing
+    //    quadrant (issue 028) --
+
+    #[test]
+    fn quoted_path_no_file_is_stale_reference() {
+        // The quoted form mirrors the backtick form: a dangling `.md` draws
+        // the stale-reference warning, not the make-it-a-link hint.
+        let diags = diagnose("See \"other.md\" for details.\n");
+        assert!(
+            !has_any(&diags, "quoted path"),
+            "no make-it-a-link hint for a dangling quoted path: {diags:?}"
+        );
+        assert_eq!(
+            count_matching(&diags, Severity::Warning, "stale reference"),
+            1,
+            "a dangling quoted `.md` draws the stale-reference warning: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn bare_path_no_file_is_stale_reference() {
+        // The bare (unbackticked, unquoted) form, with a directory component,
+        // draws the stale-reference warning when its target is missing.
+        let diags = diagnose("See docs/other.md for details.\n");
+        assert!(
+            !has_any(&diags, "convert to a markdown link"),
+            "no make-it-a-link nudge for a dangling bare path: {diags:?}"
+        );
+        assert_eq!(
+            count_matching(&diags, Severity::Warning, "stale reference"),
+            1,
+            "a dangling bare `.md` draws the stale-reference warning: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn bare_path_existing_file_is_make_it_a_link() {
+        // A resolving bare path keeps the make-it-a-link nudge and draws no
+        // stale-reference warning.
+        let diags = diagnose_with_files("See docs/other.md for details.\n", &["docs/other.md"]);
+        assert_eq!(
+            count_matching(&diags, Severity::Warning, "convert to a markdown link"),
+            1,
+            "a resolving bare path keeps the make-it-a-link nudge: {diags:?}"
+        );
+        assert!(
+            !has_any(&diags, "stale reference"),
+            "a resolving bare path draws no stale-reference warning: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn backticked_fragment_existing_file_make_it_a_link() {
+        // `` `foo.md#section` `` with `foo.md` present: the fragment is
+        // stripped and the make-it-a-link hint fires on the file.
+        let diags = diagnose_with_files("See `other.md#intro` for details.\n", &["other.md"]);
+        assert_eq!(
+            count_matching(&diags, Severity::Hint, "backticked path"),
+            1,
+            "an anchored backtick path resolves the file (fragment stripped): {diags:?}"
+        );
+    }
+
+    #[test]
+    fn backticked_fragment_missing_file_is_stale_reference() {
+        // `` `foo.md#section` `` with `foo.md` absent draws the stale-reference
+        // warning (fragment stripped, path part resolved).
+        let diags = diagnose("See `other.md#intro` for details.\n");
+        assert_eq!(
+            count_matching(&diags, Severity::Warning, "stale reference"),
+            1,
+            "an anchored backtick to a missing file is stale: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn quoted_fragment_existing_file_make_it_a_link() {
+        let diags = diagnose_with_files("See \"other.md#intro\" for details.\n", &["other.md"]);
+        assert_eq!(
+            count_matching(&diags, Severity::Hint, "quoted path"),
+            1,
+            "an anchored quoted path resolves the file (fragment stripped): {diags:?}"
+        );
+    }
+
+    #[test]
+    fn non_md_extensions_draw_no_dark_matter() {
+        // `.rs`/`.toml`/image paths are not `.md`, so they form no graph edge:
+        // neither a resolving nor a dangling one draws any dark-matter
+        // diagnostic (decision 009). Link-existence validation is separate and
+        // untouched (see `validation.rs`).
+        for path in ["src/main.rs", "Cargo.toml", "docs/logo.png"] {
+            let backtick = format!("See `{path}` for details.\n");
+            let resolving = diagnose_with_files(&backtick, &[path]);
+            let dangling = diagnose(&backtick);
+            for diags in [&resolving, &dangling] {
+                assert!(
+                    !has_any(diags, "backticked path")
+                        && !has_any(diags, "stale reference")
+                        && !has_any(diags, "convert to a markdown link"),
+                    "non-`.md` path `{path}` draws no dark-matter diagnostic: {diags:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn stem_without_extension_is_silent() {
+        // A stem (`README`, `docs/README`) has no recognized extension, so it
+        // is plain prose — out of the graph, no diagnostic either way.
+        for stem in ["README", "docs/README"] {
+            let diags = diagnose_with_files(&format!("See `{stem}` for details.\n"), &[stem]);
+            assert!(
+                !has_any(&diags, "backticked path")
+                    && !has_any(&diags, "stale reference")
+                    && !has_any(&diags, "convert to a markdown link"),
+                "a bare stem `{stem}` is silent: {diags:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn file_line_syntax_is_silent() {
+        // `foo.md:102` is editor `file:line` syntax, not a markdown reference
+        // form — it is never recognized.
+        let diags = diagnose("See docs/foo.md:102 for details.\n");
+        assert!(
+            !has_any(&diags, "stale reference")
+                && !has_any(&diags, "convert to a markdown link")
+                && !has_any(&diags, "backticked path"),
+            "`file:line` syntax is not a reference form: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn root_relative_existing_file_make_it_a_link() {
+        // `/README.md` from a nested file with `<root>/README.md` present draws
+        // the make-it-a-link hint (resolved at the workspace root).
+        let diags = diagnose_at_path_with_files("a/b/c.md", "See `/README.md`.\n", &["README.md"]);
+        assert_eq!(
+            count_matching(&diags, Severity::Hint, "backticked path"),
+            1,
+            "root-relative `.md` resolves at the workspace root: {diags:?}"
+        );
+        assert!(
+            !has_any(&diags, "stale reference"),
+            "a resolving root-relative path draws no stale-reference: {diags:?}"
+        );
+    }
+
+    // -- stale_references policy (issue 028) --
+
+    fn diagnose_with_stale_policy(
+        content: &str,
+        existing: &[&str],
+        stale: StaleReferencePolicy,
+    ) -> Vec<Diagnostic> {
+        let fm = yaml::parse_frontmatter_block(content);
+        let fm_span = fm.as_ref().map(|b| b.span);
+        let tree = block::parse_tree(content, fm_span);
+        let mut config = Config::default();
+        config.policy.stale_references = stale;
+        let rel_path = std::path::Path::new("test.md");
+        let existing_set: HashSet<&str> = existing.iter().copied().collect();
+        collect(&tree, rel_path, &config, &|p| {
+            existing_set.contains(p.to_str().unwrap_or(""))
+        })
+    }
+
+    #[test]
+    fn stale_references_disabled_silences_only_the_stale_warning() {
+        // `disabled` silences the stale-reference warning but leaves the
+        // make-it-a-link hint intact for resolving references.
+        let dangling =
+            diagnose_with_stale_policy("See `gone.md`.\n", &[], StaleReferencePolicy::Disabled);
+        assert!(
+            !has_any(&dangling, "stale reference"),
+            "disabled silences the stale-reference warning: {dangling:?}"
+        );
+
+        let resolving = diagnose_with_stale_policy(
+            "See `other.md`.\n",
+            &["other.md"],
+            StaleReferencePolicy::Disabled,
+        );
+        assert_eq!(
+            count_matching(&resolving, Severity::Hint, "backticked path"),
+            1,
+            "disabling stale_references leaves the make-it-a-link hint intact: {resolving:?}"
+        );
+    }
+
+    #[test]
+    fn stale_references_deny_is_error() {
+        let diags = diagnose_with_stale_policy("See `gone.md`.\n", &[], StaleReferencePolicy::Deny);
+        assert_eq!(
+            count_matching(&diags, Severity::Error, "stale reference"),
+            1,
+            "deny escalates the stale-reference to an error: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn stale_references_hint_is_hint() {
+        let diags = diagnose_with_stale_policy("See `gone.md`.\n", &[], StaleReferencePolicy::Hint);
+        assert_eq!(
+            count_matching(&diags, Severity::Hint, "stale reference"),
+            1,
+            "hint downgrades the stale-reference to a hint: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn stale_reference_fires_even_when_bare_paths_disabled() {
+        // The two policies are decoupled: disabling `bare_paths` (the
+        // make-it-a-link nudge) must not silence the stale-reference warning.
+        let fm = yaml::parse_frontmatter_block("See `gone.md`.\n");
+        let fm_span = fm.as_ref().map(|b| b.span);
+        let tree = block::parse_tree("See `gone.md`.\n", fm_span);
+        let mut config = Config::default();
+        config.policy.bare_paths = BarePathPolicy::Disabled;
+        let rel_path = std::path::Path::new("test.md");
+        let diags = collect(&tree, rel_path, &config, &|_| false);
+        assert_eq!(
+            count_matching(&diags, Severity::Warning, "stale reference"),
+            1,
+            "stale_references is independent of bare_paths: {diags:?}"
         );
     }
 
@@ -1547,7 +1869,8 @@ mod tests {
     #[test]
     fn backticked_root_relative_missing_file_no_hint() {
         // A root-relative reference whose target does not exist draws no
-        // make-it-a-link hint (the missing-quadrant warning is part 2).
+        // make-it-a-link hint, but does draw the stale-reference warning
+        // (issue 028, the missing-quadrant default).
         let diags = diagnose_at_path_with_files(
             "a/b/c.md",
             "See `/nope.md` for details.\n",
@@ -1555,7 +1878,12 @@ mod tests {
         );
         assert!(
             !has_any(&diags, "backticked path"),
-            "no hint for a missing root-relative target: {diags:?}"
+            "no make-it-a-link hint for a missing root-relative target: {diags:?}"
+        );
+        assert_eq!(
+            count_matching(&diags, Severity::Warning, "stale reference"),
+            1,
+            "a missing root-relative `.md` draws the stale-reference warning: {diags:?}"
         );
     }
 
