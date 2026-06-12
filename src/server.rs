@@ -405,6 +405,7 @@ fn element_symbol_kind(kind: &ElementKind) -> Option<u32> {
         | ElementKind::HtmlBlock
         | ElementKind::InlineCode
         | ElementKind::InlineMath
+        | ElementKind::InlineHtml
         | ElementKind::FootnoteRef { .. }
         | ElementKind::ReferenceDef { .. }
         | ElementKind::DetailsSummary

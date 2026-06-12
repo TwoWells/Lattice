@@ -1580,6 +1580,39 @@ mod tests {
         );
     }
 
+    // -- Duplicate id (inline + block, issue 026) --
+
+    #[test]
+    fn duplicate_id_across_block_and_mid_paragraph_inline() {
+        // Issue 026: harvesting mid-paragraph id-bearing inline tags as
+        // `InlineHtml` nodes puts them on the same `Syntax::Html` surface the
+        // duplicate-id pass walks, so a block `<div id>` and a mid-paragraph
+        // `<span id>` sharing the same id now collide (invalid HTML — GitHub
+        // anchors only the first).
+        let diags = diagnose(
+            "<div id=\"shared\"></div>\n\n\
+             Paragraph with an <span id=\"shared\"></span> inline target.\n",
+        );
+        assert_eq!(
+            count_matching(&diags, Severity::Error, "duplicate `id` attribute `shared`"),
+            1,
+            "one error for the inline id duplicating the block id: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn distinct_mid_paragraph_inline_id_no_duplicate() {
+        // A mid-paragraph inline id distinct from every other id is not flagged.
+        let diags = diagnose(
+            "<div id=\"block\"></div>\n\n\
+             Paragraph with an <span id=\"inline\"></span> inline target.\n",
+        );
+        assert!(
+            !has_any(&diags, "duplicate `id`"),
+            "distinct ids do not collide: {diags:?}"
+        );
+    }
+
     // -- Config: code_block_language --
 
     #[test]

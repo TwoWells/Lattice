@@ -341,9 +341,27 @@ fn scan_inlines(
                             );
                             i += len;
                         }
-                        HtmlTag::Open { len, .. }
-                        | HtmlTag::Close { len, .. }
-                        | HtmlTag::Comment { len, .. } => {
+                        HtmlTag::Open { ref attrs, len, .. } => {
+                            // A non-`<a>`/`<img>` open tag is otherwise folded
+                            // into text. Materialize a generic raw-HTML node
+                            // only when it carries an anchor `id`, so the tag is
+                            // visible to the same `Syntax::Html` surface that
+                            // `Tree::anchors()` and the structural duplicate-id
+                            // pass already walk — a mid-paragraph `<span id="x">`
+                            // becomes a resolvable `#x` target (issue 026).
+                            if attrs.iter().any(|a| {
+                                a.name == "id" && a.value.as_deref().is_some_and(|v| !v.is_empty())
+                            }) {
+                                tree.add_child(
+                                    parent,
+                                    ElementKind::InlineHtml,
+                                    Syntax::Html,
+                                    Span::new(base + i, base + i + len),
+                                );
+                            }
+                            i += len;
+                        }
+                        HtmlTag::Close { len, .. } | HtmlTag::Comment { len, .. } => {
                             i += len;
                         }
                     }
@@ -1598,6 +1616,47 @@ mod tests {
         let children = root_children(&tree);
         assert_eq!(children.len(), 1, "one paragraph");
         assert_kind(&tree, children[0], &ElementKind::Paragraph);
+    }
+
+    #[test]
+    fn inline_formatting_tag_without_id_still_skipped() {
+        // Issue 026: a non-`<a>`/`<img>` inline tag is materialized *only* when
+        // it bears an anchor `id`. A plain `<span>` carries none, so it is still
+        // folded into text — no `InlineHtml` node.
+        let tree = parse("Some <span>styled</span> text.\n");
+        let inline_html = find_nodes(&tree, |k| matches!(k, ElementKind::InlineHtml));
+        assert!(
+            inline_html.is_empty(),
+            "an id-less inline tag produces no InlineHtml node: {inline_html:?}"
+        );
+    }
+
+    #[test]
+    fn inline_span_id_materializes_inline_html_node() {
+        // Issue 026: a mid-paragraph id-bearing inline tag becomes an
+        // `InlineHtml` node on the `Syntax::Html` surface, so `Tree::anchors()`
+        // and the structural duplicate-id pass both see it.
+        let tree = parse("text <span id=\"x\"></span> text\n");
+        let inline_html = find_nodes(&tree, |k| matches!(k, ElementKind::InlineHtml));
+        assert_eq!(
+            inline_html.len(),
+            1,
+            "one InlineHtml node for the id-bearing span: {inline_html:?}"
+        );
+        let node = tree.node(inline_html[0]);
+        assert_eq!(
+            node.syntax,
+            Syntax::Html,
+            "the materialized inline node carries Syntax::Html"
+        );
+        // The node spans exactly the open tag (`<span id="x">`), not the close.
+        let raw = &tree.source()[node.span.start..node.span.end];
+        assert_eq!(
+            raw, "<span id=\"x\">",
+            "the InlineHtml span covers the open tag only"
+        );
+        // The new node must preserve the tree-wellformedness invariant.
+        crate::invariants::assert_tree_wellformed(&tree);
     }
 
     // --- Pathological inline input (ticket 20) ---

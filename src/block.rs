@@ -118,6 +118,15 @@ pub enum ElementKind {
     InlineCode,
     /// Inline math span (`$...$`, content skipped).
     InlineMath,
+    /// Generic inline raw-HTML open tag bearing an anchor `id` (e.g. a
+    /// mid-paragraph `<span id="x">`). Materialized so the tag's `id` is
+    /// visible to the same `Syntax::Html` surface that anchor resolution and
+    /// the structural duplicate-`id` pass already walk — `<a>`/`<img>` keep
+    /// their richer [`Link`]/[`Image`] kinds.
+    ///
+    /// [`Link`]: ElementKind::Link
+    /// [`Image`]: ElementKind::Image
+    InlineHtml,
     /// Import directive (`@path`).
     Import {
         /// The import path (without leading `@`).
@@ -5089,6 +5098,26 @@ mod tests {
             ids.len(),
             3,
             "only the three element `id`s are harvested, not the `<div name>`: {ids:?}"
+        );
+    }
+
+    #[test]
+    fn anchors_harvest_mid_paragraph_inline_element_id() {
+        // Issue 026: a non-`<a>` `id` that appears mid-paragraph (inline raw
+        // HTML, not a standalone block) is now materialized as an `InlineHtml`
+        // node and harvested — closing the gap left by issue 025, which only
+        // covered `<a>` and standalone HTML blocks.
+        let tree = parse("Paragraph with an <span id=\"inline-anchor\"></span> target.\n");
+        let anchors = tree.anchors();
+        let ids: Vec<&str> = anchors.iter().map(|a| a.id.as_str()).collect();
+        assert!(
+            ids.contains(&"inline-anchor"),
+            "a mid-paragraph `<span id>` is harvested as an anchor: {ids:?}"
+        );
+        assert_eq!(
+            ids.len(),
+            1,
+            "exactly the one mid-paragraph inline id is harvested: {ids:?}"
         );
     }
 

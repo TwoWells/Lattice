@@ -1739,6 +1739,40 @@ fragments = \"gitlab\"
     }
 
     #[test]
+    fn same_document_anchor_resolves_to_mid_paragraph_inline_id() {
+        // Issue 026: `[x](#s)` resolves against a non-`<a>` `id` that appears
+        // mid-paragraph as inline raw HTML — the gap issue 025 left open. The
+        // block-level `<div id>` resolves as before, the mid-paragraph
+        // `<span id>` now resolves too, and a genuinely missing `#z` still
+        // errors with exactly one diagnostic.
+        let (_dir, ws) = setup_workspace(&[(
+            "index.md",
+            "- [a](#block-anchor)\n\
+             - [b](#inline-anchor)\n\
+             - [c](#does-not-exist)\n\n\
+             <div id=\"block-anchor\"></div>\n\n\
+             Paragraph with an <span id=\"inline-anchor\"></span> inline target.\n",
+        )]);
+
+        let diags = validate_forward_links(&ws);
+        let errors: Vec<_> = diags
+            .iter()
+            .filter(|d| d.severity == Severity::Error)
+            .collect();
+        assert_eq!(
+            errors.len(),
+            1,
+            "only the genuinely missing fragment errors; block and mid-paragraph \
+             inline ids both resolve: {errors:?}"
+        );
+        assert!(
+            errors[0].message.contains("#does-not-exist"),
+            "the one error names the missing fragment: {}",
+            errors[0].message
+        );
+    }
+
+    #[test]
     fn same_document_top_idioms_are_valid() {
         // `#` and `#top` (any case) are back-to-top idioms — never flagged,
         // even with no matching heading (issue 021).
