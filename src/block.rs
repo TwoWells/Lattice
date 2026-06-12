@@ -4644,13 +4644,18 @@ impl Tree {
         headings
     }
 
-    /// Scan paragraphs for bare file paths.
+    /// Scan inline hosts (paragraphs and table cells) for bare file paths.
+    ///
+    /// Table cells are scanned so this dark-matter surface matches the inline
+    /// hosts the link/edge extractor walks; a bare path in a cell is otherwise
+    /// invisible to the nudge that would convert it, yet becomes a real edge
+    /// once linked.
     #[must_use]
     pub fn bare_paths(&self) -> Vec<BarePath> {
         let mut bare_paths = Vec::new();
 
         for (id, node) in self.nodes.iter().enumerate() {
-            if !matches!(node.kind, ElementKind::Paragraph) {
+            if !matches!(node.kind, ElementKind::Paragraph | ElementKind::TableCell) {
                 continue;
             }
             self.scan_bare_paths_in_node(id, &mut bare_paths);
@@ -4696,7 +4701,8 @@ impl Tree {
         }
     }
 
-    /// Scan a paragraph node for bare paths, excluding inline children.
+    /// Scan an inline host (paragraph or table cell) for bare paths,
+    /// excluding inline children.
     fn scan_bare_paths_in_node(&self, node_id: NodeId, out: &mut Vec<BarePath>) {
         let node = &self.nodes[node_id];
 

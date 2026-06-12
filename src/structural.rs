@@ -242,8 +242,9 @@ const fn bare_path_severity(policy: BarePathPolicy, base: Severity) -> Severity 
     }
 }
 
-/// Emit diagnostics for bare paths, bare URLs, quoted paths, and backticked
-/// paths found in paragraph text.
+/// Emit diagnostics for bare URLs, quoted paths, and backticked paths found in
+/// inline-host text — paragraphs and table cells alike, matching the cells the
+/// link/edge extractor already walks.
 ///
 /// Honors the `bare_paths` policy: `Disabled` suppresses all of these, `Deny`
 /// escalates them to errors (mirroring `emit_tree_bare_paths`).
@@ -260,8 +261,13 @@ fn emit_bare_path_diagnostics(
 
     let source = tree.source();
 
+    // Scan the same inline hosts the inline pass populates with children
+    // (`Paragraph` and `TableCell`), so dark-matter detection covers table
+    // cells — the very cells the link/edge extractor already walks. Without
+    // the `TableCell` arm, a backticked existing-file path in a cell forms a
+    // first-class graph edge once linked yet draws no "make it a link" hint.
     for node in tree.nodes() {
-        if !matches!(node.kind, ElementKind::Paragraph) {
+        if !matches!(node.kind, ElementKind::Paragraph | ElementKind::TableCell) {
             continue;
         }
 
@@ -1404,6 +1410,80 @@ mod tests {
         assert!(
             !has_any(&diags, "backticked path"),
             "no hint when file doesn't exist: {diags:?}"
+        );
+    }
+
+    // -- Table-cell dark-matter coverage (issue 023) --
+
+    // A backticked existing-file path inside a GFM table cell must emit the
+    // same "make it a link" hint as the identical path in prose, anchored at
+    // the cell's row — the link/edge extractor already walks these cells.
+    #[test]
+    fn backticked_path_in_table_cell_emits_hint() {
+        let content = "| # | Tracker |\n|---|---------|\n| 1 | `tickets/foo/README.md` |\n";
+        let diags = diagnose_with_files(content, &["tickets/foo/README.md"]);
+
+        let hits: Vec<&Diagnostic> = diags
+            .iter()
+            .filter(|d| d.severity == Severity::Hint && d.message.contains("backticked path"))
+            .collect();
+        assert_eq!(
+            hits.len(),
+            1,
+            "exactly one backticked-path hint for the cell: {diags:?}"
+        );
+        // The cell sits on the third line of the document (1-based).
+        assert_eq!(
+            hits[0].line, 3,
+            "hint is anchored at the table cell's row (line 3): {diags:?}"
+        );
+    }
+
+    // The hint must agree with prose: a path that exists only in a cell is
+    // surfaced; one that does not exist is not.
+    #[test]
+    fn backticked_path_in_table_cell_no_file() {
+        let content = "| # | Tracker |\n|---|---------|\n| 1 | `tickets/foo/README.md` |\n";
+        let diags = diagnose(content);
+        assert!(
+            !has_any(&diags, "backticked path"),
+            "no hint for a non-existent cell path: {diags:?}"
+        );
+    }
+
+    // Sibling dark-matter surfaces extended for parity with the edge extractor
+    // (issue 023, fix point 4): bare URL, quoted path, and tree-level bare path
+    // inside a table cell must each surface just as they do in prose.
+    #[test]
+    fn bare_url_in_table_cell_emits_warning() {
+        let content = "| Site |\n|------|\n| https://example.com/page |\n";
+        let diags = diagnose(content);
+        assert_eq!(
+            count_matching(&diags, Severity::Warning, "bare URL"),
+            1,
+            "one bare-URL warning for the cell: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn quoted_path_in_table_cell_emits_hint() {
+        let content = "| Ref |\n|-----|\n| \"other.md\" |\n";
+        let diags = diagnose_with_files(content, &["other.md"]);
+        assert_eq!(
+            count_matching(&diags, Severity::Hint, "quoted path"),
+            1,
+            "one quoted-path hint for the cell: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn bare_path_in_table_cell_emits_diagnostic() {
+        let content = "| Ref |\n|-----|\n| docs/page.md |\n";
+        let diags = diagnose_with_files(content, &["docs/page.md"]);
+        assert_eq!(
+            count_matching(&diags, Severity::Warning, "convert to a markdown link"),
+            1,
+            "one bare-path diagnostic for the cell: {diags:?}"
         );
     }
 
