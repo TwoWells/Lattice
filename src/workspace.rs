@@ -81,6 +81,15 @@ pub struct FileData {
     /// reciprocal-link validators read it instead of re-walking and
     /// re-classifying every link on each sync (ticket perf 06).
     pub links: Vec<block::Link>,
+    /// Cached explicit in-page anchor targets (`Tree::anchors()` output) —
+    /// `id`/`name` values harvested from this file's raw-HTML `<a>` tags.
+    ///
+    /// Like `headings`/`links`, a pure function of this file's own tree, rebuilt
+    /// only on reparse. Same-document fragment validation resolves `[…](#x)`
+    /// against this set in addition to heading slugs, so an explicit
+    /// `<a id="x"></a>` / `<a name="x">` anchor is a valid `#x` target (issue
+    /// 025).
+    pub anchors: Vec<block::Anchor>,
     /// Cached byte-offset ↔ LSP-position map for this file's source.
     ///
     /// Built from `tree.source()` once per parse, so it refreshes exactly when
@@ -435,6 +444,10 @@ pub fn parse_content(content: &str, rel_path: &Path, config: &Config) -> FileDat
     // post-insertion workspace step is needed, unlike `structural`.
     let headings = tree.headings();
     let links = tree.links(rel_path);
+    // Explicit in-page anchors (`<a id>` / `<a name>`) — cached like
+    // headings/links so same-document fragment validation resolves `[…](#x)`
+    // against explicit anchors as well as heading slugs (issue 025).
+    let anchors = tree.anchors();
 
     // Build the byte↔position index from the same source the tree carries, so it
     // refreshes exactly when the file reparses (ticket perf 01).
@@ -451,6 +464,7 @@ pub fn parse_content(content: &str, rel_path: &Path, config: &Config) -> FileDat
         structural: Vec::new(),
         headings,
         links,
+        anchors,
         line_index,
     }
 }
@@ -943,6 +957,12 @@ mod tests {
                 file_data.links,
                 file_data.tree.links(path),
                 "cached links for {} drifted from a fresh extraction",
+                path.display()
+            );
+            assert_eq!(
+                file_data.anchors,
+                file_data.tree.anchors(),
+                "cached anchors for {} drifted from a fresh extraction",
                 path.display()
             );
         }

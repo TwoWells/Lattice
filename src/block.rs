@@ -486,6 +486,21 @@ pub struct BarePath {
     pub path: String,
 }
 
+/// An explicit in-page anchor target defined by a raw-HTML `<a>` tag.
+///
+/// A standard GFM "explicit anchor" — `<a id="x"></a>` or `<a name="x"></a>`
+/// placed before a heading — gives an in-page link `[text](#x)` a stable,
+/// clean fragment target. Such an `<a>` is a link *target*, not a link
+/// *source*: it legitimately carries no `href`. Each `id`/`name` value on a
+/// harvested `<a>` becomes one entry, so `<a id="a" name="b">` yields both.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Anchor {
+    /// 1-based line number in the source.
+    pub line: usize,
+    /// The anchor's fragment id (the `id` or `name` attribute value).
+    pub id: String,
+}
+
 /// An explicit `{#id}` attribute on an ATX heading.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AtxId {
@@ -4644,6 +4659,63 @@ impl Tree {
         headings
     }
 
+    /// Extract explicit in-page anchor targets from raw-HTML `<a>` tags.
+    ///
+    /// Harvests the `id` and `name` attribute values of every `<a>` open tag,
+    /// covering both opaque HTML blocks ([`ElementKind::HtmlBlock`]) and inline
+    /// raw HTML ([`Syntax::Html`] nodes) — the same node surface the structural
+    /// HTML pass walks, so the fragment resolver and the `<a>` `href` check
+    /// agree on what an anchor is. Each value becomes one [`Anchor`]; an
+    /// `<a id="a" name="b">` yields both `a` and `b`. Empty values are skipped.
+    ///
+    /// This is the minimum standard idiom — `<a id="…">` and `<a name="…">`.
+    /// GitHub additionally resolves `#x` against *any* element bearing
+    /// `id="x"` (e.g. `<div id>`); broadening to that is a deliberate scope
+    /// decision and is intentionally not done here.
+    #[must_use]
+    pub fn anchors(&self) -> Vec<Anchor> {
+        let mut anchors = Vec::new();
+
+        for node in &self.nodes {
+            let is_html_node = node.syntax == Syntax::Html;
+            let is_html_block = matches!(node.kind, ElementKind::HtmlBlock);
+            if !is_html_node && !is_html_block {
+                continue;
+            }
+
+            let raw = &self.source[node.span.start..node.span.end];
+            // For an opaque HTML block the tag is on the first line; an inline
+            // raw-HTML node is the tag itself. Mirror the structural pass.
+            let tag_text = if is_html_block {
+                raw.lines().next().unwrap_or("").trim()
+            } else {
+                raw.trim()
+            };
+
+            let Some(HtmlTag::Open { name, attrs, .. }) = html::tokenize_tag(tag_text, 0) else {
+                continue;
+            };
+            if name != "a" {
+                continue;
+            }
+
+            let line = byte_offset_to_line(&self.source, node.span.start);
+            for attr in &attrs {
+                if (attr.name == "id" || attr.name == "name")
+                    && let Some(value) = &attr.value
+                    && !value.is_empty()
+                {
+                    anchors.push(Anchor {
+                        line,
+                        id: value.clone(),
+                    });
+                }
+            }
+        }
+
+        anchors
+    }
+
     /// Scan inline hosts (paragraphs and table cells) for bare file paths.
     ///
     /// Table cells are scanned so this dark-matter surface matches the inline
@@ -4920,6 +4992,68 @@ mod tests {
             3,
             "bare CR must separate the three headings, got {}",
             headings.len()
+        );
+    }
+
+    #[test]
+    fn anchors_harvest_a_id_and_name_block_and_inline() {
+        // Issue 025: `Tree::anchors()` harvests `id`/`name` from `<a>` tags in
+        // both opaque HTML blocks and inline raw HTML, and ignores `<a>` tags
+        // without an anchor-defining attribute.
+        let tree = parse(
+            "<a id=\"block-id\"></a>\n\n\
+             <a name=\"block-name\"></a>\n\n\
+             A paragraph with an inline <a id=\"inline-id\"></a> anchor.\n\n\
+             <a href=\"https://example.com\">a link, not a target</a>\n",
+        );
+        let anchors = tree.anchors();
+        let ids: Vec<&str> = anchors.iter().map(|a| a.id.as_str()).collect();
+        assert!(
+            ids.contains(&"block-id"),
+            "block-level `<a id>` is harvested: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"block-name"),
+            "block-level `<a name>` is harvested: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"inline-id"),
+            "inline `<a id>` is harvested: {ids:?}"
+        );
+        assert_eq!(
+            ids.len(),
+            3,
+            "an `<a href>` with no id/name contributes no anchor: {ids:?}"
+        );
+    }
+
+    #[test]
+    fn anchors_harvest_both_id_and_name_on_one_tag_and_skip_empty() {
+        // A single `<a id="x" name="y">` yields both; an empty value is skipped.
+        let tree = parse("<a id=\"x\" name=\"y\"></a>\n\n<a id=\"\"></a>\n");
+        let anchors = tree.anchors();
+        let ids: Vec<&str> = anchors.iter().map(|a| a.id.as_str()).collect();
+        assert!(
+            ids.contains(&"x") && ids.contains(&"y"),
+            "both id and name on one tag are harvested: {ids:?}"
+        );
+        assert_eq!(
+            ids.len(),
+            2,
+            "an empty `id` value contributes no anchor: {ids:?}"
+        );
+    }
+
+    #[test]
+    fn anchors_ignore_non_anchor_elements_with_id() {
+        // Scope: the minimum idiom harvests only `<a>` ids, not `<div id>` —
+        // broadening to "any element with id" is a deliberate, separate
+        // decision (issue 025).
+        let tree = parse("<div id=\"section\">\n\ncontent\n\n</div>\n");
+        assert!(
+            tree.anchors().is_empty(),
+            "a `<div id>` is not harvested as an anchor: {:?}",
+            tree.anchors()
         );
     }
 

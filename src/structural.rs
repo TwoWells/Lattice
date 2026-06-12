@@ -633,6 +633,12 @@ fn check_markdown_in_opaque_html(tree: &Tree, rel_path: &Path, out: &mut Vec<Dia
 }
 
 /// Check for missing required attributes on HTML elements.
+///
+/// An `<a>` carrying `id` or `name` (and no `href`) is a valid explicit
+/// anchor *target*, not a link *source* — the standard GFM idiom for a stable
+/// `#fragment` (issue 025). Such a tag legitimately omits `href`, so it is not
+/// flagged. An `<a>` with neither `href` nor an anchor-defining attribute is
+/// still flagged.
 fn check_required_attrs(
     tag: &str,
     attrs: &[html::Attribute],
@@ -640,6 +646,11 @@ fn check_required_attrs(
     line: usize,
     out: &mut Vec<Diagnostic>,
 ) {
+    // A target `<a>` (bearing `id`/`name`) does not require `href`.
+    if tag == "a" && attrs.iter().any(|a| a.name == "id" || a.name == "name") {
+        return;
+    }
+
     let required: &[&str] = match tag {
         "img" => &["alt"],
         "a" => &["href"],
@@ -1242,6 +1253,55 @@ mod tests {
         assert!(
             !has_any(&diags, "empty alt text"),
             "no warning for image with alt: {diags:?}"
+        );
+    }
+
+    // -- Anchor `<a>` href requirement (issue 025) --
+
+    #[test]
+    fn anchor_with_id_no_href_no_warning() {
+        // `<a id="a"></a>` is an explicit anchor target, not a link source;
+        // it legitimately carries no `href` and must not be flagged.
+        let diags = diagnose("<a id=\"a\"></a>\n");
+        assert!(
+            !has_any(&diags, "missing required attribute `href`"),
+            "no missing-href warning for an `<a id>` anchor target: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn anchor_with_name_no_href_no_warning() {
+        // `<a name="a">` is the legacy anchor-target form — also exempt.
+        let diags = diagnose("<a name=\"a\"></a>\n");
+        assert!(
+            !has_any(&diags, "missing required attribute `href`"),
+            "no missing-href warning for an `<a name>` anchor target: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn anchor_without_href_or_anchor_attr_still_warns() {
+        // The relaxation must not over-suppress: an `<a>` with neither `href`
+        // nor an anchor-defining attribute is still flagged.
+        let diags = diagnose("<a class=\"x\"></a>\n");
+        assert_eq!(
+            count_matching(
+                &diags,
+                Severity::Warning,
+                "missing required attribute `href`"
+            ),
+            1,
+            "an `<a>` with no href and no id/name still warns: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn anchor_with_href_no_warning() {
+        // A normal linking `<a href>` is unaffected by the relaxation.
+        let diags = diagnose("<a href=\"https://example.com\">x</a>\n");
+        assert!(
+            !has_any(&diags, "missing required attribute `href`"),
+            "no missing-href warning for a normal linking `<a href>`: {diags:?}"
         );
     }
 

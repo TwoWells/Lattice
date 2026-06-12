@@ -509,7 +509,7 @@ fn check_fragment(
     let algorithm = config.policy.fragments;
     let headings = &target_data.headings;
 
-    let found = headings.iter().any(|heading| match &heading.id {
+    let found_heading = headings.iter().any(|heading| match &heading.id {
         HeadingId::Explicit(id) => id == fragment,
         HeadingId::Computed {
             github,
@@ -522,6 +522,16 @@ fn check_fragment(
             None => github == fragment || gitlab == fragment || vscode == fragment,
         },
     });
+
+    // A fragment also resolves against an explicit raw-HTML anchor target —
+    // `<a id="x"></a>` or `<a name="x">` — defined anywhere in the document.
+    // Such anchors are link targets, not link sources, and `#x` resolves to
+    // them exactly as it does to a heading slug (issue 025).
+    let found = found_heading
+        || target_data
+            .anchors
+            .iter()
+            .any(|anchor| anchor.id == fragment);
 
     if !found {
         diagnostics.push(Diagnostic {
@@ -1638,6 +1648,71 @@ fragments = \"gitlab\"
         assert!(
             errors[0].message.contains("#nonexistent"),
             "message includes the fragment: {}",
+            errors[0].message
+        );
+    }
+
+    #[test]
+    fn same_document_anchor_resolves_to_explicit_html_id() {
+        // Issue 025: `[x](#a)` resolves to a preceding `<a id="a"></a>` target,
+        // not just a heading slug.
+        let (_dir, ws) = setup_workspace(&[(
+            "index.md",
+            "[go](#explicit-anchor)\n\n<a id=\"explicit-anchor\"></a>\n\n## Real Heading\n",
+        )]);
+
+        let diags = validate_forward_links(&ws);
+        assert!(
+            diags.is_empty(),
+            "no errors when same-doc anchor matches an explicit `<a id>`: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn same_document_anchor_resolves_to_explicit_html_name() {
+        // Issue 025: `<a name="a">` is equally a valid `#a` target.
+        let (_dir, ws) = setup_workspace(&[(
+            "index.md",
+            "[go](#name-anchor)\n\n<a name=\"name-anchor\"></a>\n\n## Real Heading\n",
+        )]);
+
+        let diags = validate_forward_links(&ws);
+        assert!(
+            diags.is_empty(),
+            "no errors when same-doc anchor matches an explicit `<a name>`: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn same_document_html_anchor_does_not_mask_missing_fragment() {
+        // Issue 025 repro: explicit `<a id>`/`<a name>` and a heading slug all
+        // resolve, while a genuinely missing `#does-not-exist` still errors —
+        // harvesting anchors must not over-suppress the control.
+        let (_dir, ws) = setup_workspace(&[(
+            "index.md",
+            "- [a](#explicit-anchor)\n\
+             - [b](#real-heading)\n\
+             - [c](#name-anchor)\n\
+             - [d](#does-not-exist)\n\n\
+             <a id=\"explicit-anchor\"></a>\n\n\
+             ## Real Heading\n\n\
+             <a name=\"name-anchor\"></a>\n\n\
+             Body text.\n",
+        )]);
+
+        let diags = validate_forward_links(&ws);
+        let errors: Vec<_> = diags
+            .iter()
+            .filter(|d| d.severity == Severity::Error)
+            .collect();
+        assert_eq!(
+            errors.len(),
+            1,
+            "only the genuinely missing fragment errors: {errors:?}"
+        );
+        assert!(
+            errors[0].message.contains("#does-not-exist"),
+            "the one error names the missing fragment: {}",
             errors[0].message
         );
     }
