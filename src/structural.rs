@@ -705,7 +705,79 @@ fn scan_line_for_bare_urls(
     }
 }
 
-/// Scan a line for quoted paths (`"foo.md"`).
+/// Whether byte offset `i` sits at a left boundary for an opening quote: the
+/// char immediately before it is whitespace or an opening paren `(`, or `i` is
+/// the line start.
+///
+/// `(` is allowed so a quoted path in a parenthetical (`('docs/x.md')`,
+/// `(see 'docs/x.md')`) opens; `[` is deliberately *not* allowed — it is markdown
+/// link / reference syntax and would clash. `i` must be a char boundary; the
+/// look-behind decodes the preceding char from the string slice (never a raw
+/// byte), so it is Unicode-correct and panic-free on multi-byte input.
+fn prev_is_boundary(line: &str, i: usize) -> bool {
+    line[..i]
+        .chars()
+        .next_back()
+        .is_none_or(|c| c.is_whitespace() || c == '(')
+}
+
+/// Whether the char immediately *after* byte offset `i` is alphanumeric.
+///
+/// `i` must be a char boundary; the look-ahead decodes the following char from
+/// the string slice (never a raw byte). The end of the line counts as a
+/// non-alphanumeric boundary (no following char).
+fn next_is_alphanumeric(line: &str, i: usize) -> bool {
+    line[i..].chars().next().is_some_and(char::is_alphanumeric)
+}
+
+/// Whether a `'` at byte offset `i` is a quote delimiter rather than an
+/// apostrophe.
+///
+/// `'` doubles as an apostrophe, so it is a delimiter only at a boundary: an
+/// *opening* `'` requires whitespace, an opening paren `(`, or the line start
+/// immediately before it; a *closing* `'` requires a non-alphanumeric char (or
+/// line end) immediately after it. The opening side is the stricter of the two on
+/// purpose — a `'` preceded by a letter (`it's`) or most punctuation
+/// (`example_'s`) is apostrophe-ish and must not open a span. `(` is the one
+/// non-whitespace opener allowed, so a parenthetical path (`('docs/x.md')`) is
+/// caught; `[` is excluded because it is markdown link syntax. A closing quote
+/// may be followed by punctuation (`'path'.`, `'path')`). `"` is unambiguous and
+/// never takes this guard.
+fn is_quote_delimiter(line: &str, i: usize, quote: u8, opening: bool) -> bool {
+    if quote == b'"' {
+        return true;
+    }
+    if opening {
+        prev_is_boundary(line, i)
+    } else {
+        // `i` is the byte offset of the `'`; the look-ahead inspects the char
+        // after it (one byte past, since `'` is ASCII and one byte wide).
+        !next_is_alphanumeric(line, i + 1)
+    }
+}
+
+/// Find the next closing `quote` at or after byte offset `from`, honoring the
+/// word-boundary guard so an apostrophe inside a word does not close the span.
+///
+/// Returns the byte offset of the closing quote within `line`. The search
+/// iterates char indices (never raw bytes), so it is char-boundary-safe on
+/// multi-byte input.
+fn find_closing_quote(line: &str, from: usize, quote: u8) -> Option<usize> {
+    let quote_char = char::from(quote);
+    line[from..].char_indices().find_map(|(off, c)| {
+        let abs = from + off;
+        (c == quote_char && is_quote_delimiter(line, abs, quote, false)).then_some(abs)
+    })
+}
+
+/// Scan a line for quoted paths (`"foo.md"` and `'foo.md'`).
+///
+/// Both quote styles are first-class and share identical downstream handling
+/// (issue 032): the external-namespace resolution (issue 030),
+/// make-it-a-link / stale-reference classification, and the exception-lookup
+/// suppression (issue 031). `"` pairs unconditionally; `'` is treated as a
+/// delimiter only at a word boundary (see [`is_quote_delimiter`]) so an
+/// apostrophe is never mistaken for a quote.
 #[allow(
     clippy::too_many_arguments,
     reason = "scan context parameters are distinct concerns"
@@ -727,15 +799,18 @@ fn scan_line_for_quoted_paths(
     let bytes = line.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'"' {
+        let quote = bytes[i];
+        // `"` and `'` are both ASCII (one byte), so byte indexing into `bytes`
+        // here lands on a char boundary and the slice operations below are safe.
+        if (quote == b'"' || quote == b'\'') && is_quote_delimiter(line, i, quote, true) {
             let start = i + 1;
-            if let Some(end) = line[start..].find('"') {
-                let inner = &line[start..start + end];
+            if let Some(end_abs) = find_closing_quote(line, start, quote) {
+                let inner = &line[start..end_abs];
                 let abs_pos = line_start + i;
 
                 if !is_excluded(abs_pos, excluded) && looks_like_path(inner) {
                     // Span the whole quoted token, both quotes included.
-                    let span = Span::new(abs_pos, line_start + start + end + 1);
+                    let span = Span::new(abs_pos, line_start + end_abs + 1);
                     // Resolve the path part only; the `#fragment` is the
                     // heading anchor and does not affect file existence.
                     let path = split_path_fragment(inner).0;
@@ -745,19 +820,20 @@ fn scan_line_for_quoted_paths(
                         if is_stale && !lookup.suppress(ExceptionLint::StaleReferences, inner) {
                             emit_stale_reference(stale, rel_path, line_num, Some(span), inner, out);
                         }
-                        i = start + end + 1;
+                        i = end_abs + 1;
                         continue;
                     }
                     if resolves_under_any_base(rel_path, path, file_exists) {
                         if policy != BarePathPolicy::Disabled
                             && !lookup.suppress(ExceptionLint::BarePaths, inner)
                         {
+                            let q = char::from(quote);
                             out.push(Diagnostic {
                                 file: rel_path.to_path_buf(),
                                 line: line_num,
                                 severity: bare_path_severity(policy, Severity::Hint),
                                 message: format!(
-                                    "quoted path `\"{inner}\"`: use backticks or make a markdown link"
+                                    "quoted path `{q}{inner}{q}`: use backticks or make a markdown link"
                                 ),
                                 span: Some(span),
                             });
@@ -766,7 +842,7 @@ fn scan_line_for_quoted_paths(
                         emit_stale_reference(stale, rel_path, line_num, Some(span), inner, out);
                     }
                 }
-                i = start + end + 1;
+                i = end_abs + 1;
             } else {
                 i += 1;
             }
@@ -2040,6 +2116,236 @@ mod tests {
         );
     }
 
+    // -- Quoted dir-bearing path: single owner (issue 032) --
+
+    #[test]
+    fn quoted_dir_path_dangling_emits_one_stale() {
+        // A quoted token carrying a directory component is seen by the quoted
+        // scanner and — before issue 032 — also by the bare-path scanner, which
+        // trimmed the surrounding quotes. The bare scanner now leaves quoted
+        // content to its single owner, so a dangling `"docs/gone.md"` draws
+        // exactly one stale-reference diagnostic.
+        let diags = diagnose("See \"docs/gone.md\" for details.\n");
+        assert_eq!(
+            count_matching(&diags, Severity::Warning, "stale reference"),
+            1,
+            "a dangling quoted dir-bearing `.md` is stale exactly once: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn quoted_external_dir_path_dangling_emits_one_stale() {
+        // The `{Name}/…` quoted form (present alias dir, missing file) is the
+        // external-namespace variant of the same shape: exactly one stale
+        // diagnostic, not two.
+        let config = config_with_catenary_alias();
+        let diags = diagnose_with_external(
+            "See \"{Catenary}/gone.md\" for details.\n",
+            &config,
+            &["/ext/Catenary"],
+        );
+        assert_eq!(
+            count_matching(&diags, Severity::Warning, "stale reference"),
+            1,
+            "a quoted external dir-bearing `.md` is stale exactly once: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn quoted_dir_path_resolving_emits_one_make_it_a_link() {
+        // The other double-emit variant: a quoted dir-bearing token that
+        // *resolves* drew both the quoted scanner's make-it-a-link hint and the
+        // bare scanner's "convert to a markdown link" nudge. With quoted spans
+        // single-owned, only the quoted-path hint fires, and no bare-path nudge.
+        let diags = diagnose_with_files("See \"docs/other.md\" for details.\n", &["docs/other.md"]);
+        assert_eq!(
+            count_matching(&diags, Severity::Hint, "quoted path"),
+            1,
+            "a resolving quoted dir-bearing path draws one make-it-a-link hint: {diags:?}"
+        );
+        assert!(
+            !has_any(&diags, "convert to a markdown link"),
+            "the bare-path nudge does not also fire on quoted content: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn two_distinct_quoted_dir_paths_each_emit_once() {
+        // Single-ownership must not over-suppress: two *different* quoted
+        // dir-bearing dangling paths on one line still each emit once.
+        let diags = diagnose("See \"docs/a.md\" and \"docs/b.md\" for details.\n");
+        assert_eq!(
+            count_matching(&diags, Severity::Warning, "stale reference"),
+            2,
+            "two distinct quoted dir-bearing paths each emit one stale: {diags:?}"
+        );
+    }
+
+    // -- Single-quoted paths: first-class, identical to double quotes
+    //    (issue 032, Option C) --
+
+    #[test]
+    fn single_quoted_dangling_path_emits_one_stale() {
+        // A single-quoted dangling `.md` is a first-class quoted path: exactly
+        // one stale-reference diagnostic, mirroring the double-quote form.
+        let diags = diagnose("See 'docs/gone.md' for details.\n");
+        assert_eq!(
+            count_matching(&diags, Severity::Warning, "stale reference"),
+            1,
+            "a dangling single-quoted `.md` is stale exactly once: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn single_quoted_resolving_path_emits_one_make_it_a_link() {
+        // A single-quoted resolving path draws exactly one make-it-a-link hint,
+        // with the message reflecting the actual quote character.
+        let diags = diagnose_with_files("See 'docs/other.md' for details.\n", &["docs/other.md"]);
+        assert_eq!(
+            count_matching(&diags, Severity::Hint, "quoted path"),
+            1,
+            "a resolving single-quoted path draws one make-it-a-link hint: {diags:?}"
+        );
+        assert!(
+            has_any(&diags, "`'docs/other.md'`"),
+            "the hint reflects the single-quote character: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn double_quoted_dangling_path_still_one_stale_no_regression() {
+        // The double-quote form is unchanged by adding single-quote support.
+        let diags = diagnose("See \"docs/gone.md\" for details.\n");
+        assert_eq!(
+            count_matching(&diags, Severity::Warning, "stale reference"),
+            1,
+            "a dangling double-quoted `.md` is still stale exactly once: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn apostrophe_not_treated_as_quote() {
+        // A `'` flanked by alphanumerics is an apostrophe, never a quote
+        // delimiter: contractions, possessives, and `'n'` draw no path
+        // diagnostic. (There is no `.md`-shaped path here, but the guard must
+        // also not pair the apostrophes into a span at all.)
+        for content in ["it's a test\n", "the dogs' bowls\n", "rock 'n' roll\n"] {
+            let diags = diagnose(content);
+            assert!(
+                !has_any(&diags, "quoted path") && !has_any(&diags, "stale reference"),
+                "an apostrophe is not a quote delimiter in {content:?}: {diags:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn opening_single_quote_requires_whitespace_before() {
+        // The opening `'` must have whitespace (or line start, or `(`) before
+        // it, not merely a non-alphanumeric char — `_`/`-` are non-alphanumeric
+        // but not boundaries. In `set value_'docs/gone.md' now`, the `_`-preceded
+        // `'` is apostrophe-ish (cf. `example_'s`) and must not open a span, even
+        // though the bytes after it look like a path.
+        let glued = diagnose("set value_'docs/gone.md' now\n");
+        assert!(
+            !has_any(&glued, "stale reference") && !has_any(&glued, "quoted path"),
+            "a non-whitespace-preceded `'` must not open a quoted span: {glued:?}"
+        );
+        // The user's pathological prose: underscores and possessives make
+        // several apostrophe-`'`s; none open.
+        let prose = diagnose("the function example_'s parameters' types are typed\n");
+        assert!(
+            !has_any(&prose, "stale reference") && !has_any(&prose, "quoted path"),
+            "apostrophe-heavy prose opens no quoted span: {prose:?}"
+        );
+    }
+
+    #[test]
+    fn paren_opens_single_quote_but_bracket_does_not() {
+        // `(` is allowed before an opening `'` so a quoted path in a
+        // parenthetical is caught; `[` is not, because it is markdown link
+        // syntax and would clash.
+        let paren = diagnose("see the example ('docs/gone.md') here\n");
+        assert_eq!(
+            count_matching(&paren, Severity::Warning, "stale reference"),
+            1,
+            "a `(`-preceded `'` opens a quoted path: {paren:?}"
+        );
+        let bracket = diagnose("see the example ['docs/gone.md'] here\n");
+        assert!(
+            !has_any(&bracket, "stale reference") && !has_any(&bracket, "quoted path"),
+            "a `[`-preceded `'` does not open (markdown link clash): {bracket:?}"
+        );
+    }
+
+    #[test]
+    fn contraction_before_single_quoted_path_is_caught() {
+        // The whole reason the closing-search must also skip apostrophe
+        // candidates: in `it's in 'docs/gone.md' today`, the apostrophe of
+        // `it's` must not be consumed as an opening quote, and the real
+        // single-quoted path is still found exactly once.
+        let diags = diagnose("it's in 'docs/gone.md' today\n");
+        assert_eq!(
+            count_matching(&diags, Severity::Warning, "stale reference"),
+            1,
+            "a contraction before a single-quoted path does not hide it: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn multibyte_before_single_quote_is_caught_no_panic() {
+        // A multi-byte char immediately before the opening `'` must not panic
+        // (the look-behind decodes a char, never a raw byte) and the path is
+        // still caught: `é` is alphanumeric, but a space separates it from the
+        // quote, so the quote is at a word boundary.
+        let diags = diagnose("café 'docs/gone.md'\n");
+        assert_eq!(
+            count_matching(&diags, Severity::Warning, "stale reference"),
+            1,
+            "a multibyte char before a single-quoted path: caught, no panic: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn single_quoted_external_dir_path_dangling_emits_one_stale() {
+        // The `{Name}/…` external form in single quotes (defined alias, missing
+        // file) is stale exactly once.
+        let config = config_with_catenary_alias();
+        let diags = diagnose_with_external(
+            "See '{Catenary}/gone.md' for details.\n",
+            &config,
+            &["/ext/Catenary"],
+        );
+        assert_eq!(
+            count_matching(&diags, Severity::Warning, "stale reference"),
+            1,
+            "a single-quoted external dir-bearing `.md` is stale exactly once: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn two_distinct_single_quoted_paths_each_emit_once() {
+        // Single-quote support must not over-suppress: two *different*
+        // single-quoted dangling paths on one line still each emit once.
+        let diags = diagnose("See 'docs/a.md' and 'docs/b.md' for details.\n");
+        assert_eq!(
+            count_matching(&diags, Severity::Warning, "stale reference"),
+            2,
+            "two distinct single-quoted dir-bearing paths each emit one stale: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn mixed_quote_styles_with_multibyte_each_emit_once() {
+        // A double- and a single-quoted path on one line, with multibyte
+        // content, each emit exactly one stale — no double-emit, no panic.
+        let diags = diagnose("See \"docs/other.md\" and 'docs/外部.md' for café details.\n");
+        assert_eq!(
+            count_matching(&diags, Severity::Warning, "stale reference"),
+            2,
+            "one double- and one single-quoted path each emit one stale: {diags:?}"
+        );
+    }
+
     #[test]
     fn bare_path_no_file_is_stale_reference() {
         // The bare (unbackticked, unquoted) form, with a directory component,
@@ -2607,21 +2913,22 @@ mod tests {
     #[test]
     fn external_reference_quoted_and_bare_forms() {
         // The `{Name}/…` shape is recognized on every citation surface 028
-        // covers: quoted and bare-with-dir, not only backtick. A quoted
-        // dir-bearing token is seen by *both* the quoted scanner and the
-        // bare-path scanner (which trims surrounding quotes) — a pre-existing
-        // double-detection independent of issue 030 — so the quoted surface
-        // asserts "at least one stale," the bare surface "exactly one."
+        // covers: quoted and bare-with-dir, not only backtick. The quoted
+        // dir-bearing token now yields exactly one stale diagnostic — issue 032
+        // gave quoted spans a single owner (the structural quoted scanner), so
+        // the bare-path surface no longer claims the inner string. Both surfaces
+        // therefore assert "exactly one."
         let config = config_with_catenary_alias();
-        for (content, min_stale) in [
-            ("See \"{Catenary}/docs/configuration.md\" for details.\n", 1),
-            ("See {Catenary}/docs/configuration.md for details.\n", 1),
+        for content in [
+            "See \"{Catenary}/docs/configuration.md\" for details.\n",
+            "See {Catenary}/docs/configuration.md for details.\n",
         ] {
             // Present dir, missing file → stale (tier 4).
             let stale = diagnose_with_external(content, &config, &["/ext/Catenary"]);
-            assert!(
-                count_matching(&stale, Severity::Warning, "stale reference") >= min_stale,
-                "missing external file is stale on this surface: {stale:?}"
+            assert_eq!(
+                count_matching(&stale, Severity::Warning, "stale reference"),
+                1,
+                "missing external file is stale exactly once on this surface: {stale:?}"
             );
             // Undefined alias → exempt (tier 1) on the same surface.
             let exempt = diagnose(content);

@@ -4505,12 +4505,21 @@ fn is_import_path(path: &str) -> bool {
 }
 
 /// Scan a text segment for bare file paths.
+///
+/// Quote characters are deliberately **not** trimmed (issue 032): a quoted
+/// dir-bearing token like `"docs/x.md"` is owned by the structural quoted-path
+/// scanner ([`crate::structural`]), the sole owner of quoted content. Trimming
+/// the quotes here would let the bare-path surface also claim the inner string,
+/// double-emitting the stale-reference (or make-it-a-link) diagnostic. Leaving
+/// the quotes attached makes the token fail the extension check, so the two
+/// surfaces partition the text instead of overlapping. Only prose-adjacent
+/// punctuation and bracketing are stripped.
 fn scan_bare_paths_in_text(text: &str, base_line: usize, out: &mut Vec<BarePath>) {
     for (line_idx, line_text) in text.split('\n').enumerate() {
         for word in line_text.split_whitespace() {
             let cleaned = word
-                .trim_start_matches(['(', '[', '"', '\''])
-                .trim_end_matches([',', '.', ';', ':', '!', '?', ')', ']', '"', '\'']);
+                .trim_start_matches(['(', '['])
+                .trim_end_matches([',', '.', ';', ':', '!', '?', ')', ']']);
 
             if is_bare_path(cleaned) {
                 // Store the fragment-stripped path so existence resolution and
