@@ -81,3 +81,10 @@ path = "fuzz_targets/fuzz_edits.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fuzz_structural"
+path = "fuzz_targets/fuzz_structural.rs"
+test = false
+doc = false
+bench = false

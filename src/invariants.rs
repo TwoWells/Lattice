@@ -36,11 +36,12 @@ use std::path::Path;
 
 use crate::block::{ElementKind, Syntax, Tree};
 use crate::config::Config;
-use crate::fm::{FmNode, FmValue, FrontmatterBlock, ScalarSpan};
+use crate::fm::{Exceptions, FmNode, FmValue, FrontmatterBlock, ScalarSpan};
 use crate::html::HtmlTag;
 use crate::line_index::LineIndex;
+use crate::validation::Diagnostic;
 use crate::workspace::parse_content;
-use crate::{json, lsp, toml, yaml};
+use crate::{json, lsp, structural, toml, yaml};
 
 // ---------------------------------------------------------------------------
 // Full-pipeline helper
@@ -547,4 +548,138 @@ pub fn assert_edit_sequence_stable(base: &str, edits: &[Edit]) {
         text = apply_lsp_edit(&text, &index, edit);
         assert_document_invariants(&text);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Structural diagnostic pass (issue 033)
+// ---------------------------------------------------------------------------
+
+/// Run the structural diagnostic pass over `source`, exactly as the workspace
+/// loader does after a file is (re)parsed and inserted.
+///
+/// Mirrors [`crate::workspace::Workspace::recompute_structural`]: it parses the
+/// content (so the `exceptions` frontmatter block, the 030 external-resolution
+/// and 031 exception-reconciliation paths are all exercised, not just the
+/// quoted-path scanner), then calls [`structural::collect`] with **deterministic**
+/// existence oracles so a given input always yields the same diagnostics.
+///
+/// Both oracles answer existence from the path's own bytes via [`path_exists_oracle`]
+/// rather than the filesystem or workspace membership, so a fuzzed reference can
+/// land on either branch of every existence-gated check — the "make it a link"
+/// hint when present and the dangling / stale path when absent — without any
+/// I/O. `rel_path` is fixed to `fuzz.md` so resolution is reproducible across runs.
+#[must_use]
+pub fn collect_structural(source: &str) -> Vec<Diagnostic> {
+    let rel_path = Path::new("fuzz.md");
+    let config = Config::default();
+    let file = parse_content(source, rel_path, &config);
+    let empty_exceptions = Exceptions::default();
+    let exceptions = file
+        .frontmatter
+        .as_ref()
+        .map_or(&empty_exceptions, |fm| &fm.exceptions);
+    let file_exists = |target: &Path| path_exists_oracle(target);
+    let external_exists = |target: &Path| path_exists_oracle(target);
+    structural::collect(
+        &file.tree,
+        rel_path,
+        &config,
+        &file_exists,
+        &external_exists,
+        exceptions,
+    )
+}
+
+/// Deterministic existence oracle for the structural harness.
+///
+/// Answers "does this path exist" purely from the path's bytes — no filesystem,
+/// no workspace state — so a run is reproducible. The parity of the byte sum
+/// splits the path space roughly evenly, so a fuzzed reference reaches both the
+/// present branch (`true`) and the absent branch (`false`) of every
+/// existence-gated structural check.
+#[must_use]
+fn path_exists_oracle(path: &Path) -> bool {
+    let sum: u32 = path
+        .as_os_str()
+        .as_encoded_bytes()
+        .iter()
+        .map(|&b| u32::from(b))
+        .sum();
+    sum.is_multiple_of(2)
+}
+
+/// Assert every structural diagnostic carries a location the LSP layer can
+/// materialize without panicking or producing a corrupt range.
+///
+/// For a diagnostic with a byte `span` (the precise-underline path through
+/// [`crate::server`]'s `span_to_lsp_range`): the span must be ordered, within
+/// `[0, source.len()]`, and on UTF-8 char boundaries at both ends — and each
+/// endpoint must round-trip `byte → LSP position → byte` through the same
+/// position machinery [`assert_position_round_trip`] checks, excluding the one
+/// `\r\n`-interior offset that is not a stable round-trip point. This is the
+/// invariant that catches the byte-index class of bug the issue 032 single-quote
+/// guard is exposed to: an off-by-one or non-boundary offset into the source
+/// would either fail to slice or map to the wrong column.
+///
+/// For a line-only diagnostic (`span: None`, the whole-line fallback): only the
+/// 1-based `line` anchor is load-bearing — the materializer clamps a past-EOF
+/// line to an empty range at end-of-source — so the assertion requires `line >= 1`
+/// and nothing more, matching exactly what the fallback consumes.
+pub fn assert_structural_diagnostics_valid(source: &str, diagnostics: &[Diagnostic]) {
+    let len = source.len();
+    let bytes = source.as_bytes();
+    for diag in diagnostics {
+        let Some(span) = diag.span else {
+            assert!(
+                diag.line >= 1,
+                "line-only structural diagnostic must carry a 1-based line, found {} ({:?})",
+                diag.line,
+                diag.message
+            );
+            continue;
+        };
+        assert!(
+            span.start <= span.end && span.end <= len,
+            "structural diagnostic span {span:?} out of bounds for source length {len} ({:?})",
+            diag.message
+        );
+        assert!(
+            source.is_char_boundary(span.start),
+            "structural diagnostic span start {} is not a UTF-8 char boundary ({:?})",
+            span.start,
+            diag.message
+        );
+        assert!(
+            source.is_char_boundary(span.end),
+            "structural diagnostic span end {} is not a UTF-8 char boundary ({:?})",
+            span.end,
+            diag.message
+        );
+        for off in [span.start, span.end] {
+            // Skip the one degenerate offset strictly inside a `\r\n` pair: like
+            // the tree/line-index round-trips, it is not a stable round-trip
+            // target, and a span endpoint there is still a valid char boundary.
+            if off > 0 && bytes[off - 1] == b'\r' && bytes.get(off) == Some(&b'\n') {
+                continue;
+            }
+            let pos = crate::server::byte_offset_to_lsp_position(source, off);
+            let back = crate::server::lsp_position_to_byte_offset(source, pos);
+            assert_eq!(
+                back, off,
+                "structural diagnostic span endpoint {off} must round-trip \
+                 byte → LSP position → byte (position {pos:?} mapped back to {back}) ({:?})",
+                diag.message
+            );
+        }
+    }
+}
+
+/// Run the structural pass over `source` and assert it never panics and that
+/// every emitted diagnostic span is a valid, char-boundary, round-tripping byte
+/// range (or, for a line-only diagnostic, a 1-based line). Bundled so the
+/// `fuzz_structural` target and the property suite share one entry point and
+/// cannot drift (per `AGENTS.md`: the assertions are the product).
+pub fn assert_structural_invariants(source: &str) {
+    let diagnostics = collect_structural(source);
+    assert_structural_diagnostics_valid(source, &diagnostics);
 }

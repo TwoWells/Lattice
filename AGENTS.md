@@ -81,6 +81,13 @@ toolchain; `make fuzz` forces it.
   range→offset inverse. It is the gate for the incremental parse/graph work
   (perf tickets 04 / 05), which will extend it with the
   `incremental(edits) ≡ full(final_text)` arm.
+  Plus `fuzz_structural` (issue 033) — drives the structural diagnostic layer
+  (`structural::collect`) the way the workspace loader does: parse frontmatter +
+  tree + exceptions, then run the dark-matter / quoted / bare / backtick
+  reference scanners, headings, raw HTML, and code-block checks under a
+  deterministic existence oracle, asserting every emitted diagnostic span is a
+  valid char-boundary byte range that round-trips through the LSP position
+  mapping.
 
 **The assertions are the product, the fuzzer is the input generator.** Each
 target embeds the same invariants as the property suite — tree

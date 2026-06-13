@@ -59,7 +59,7 @@ use crate::html::{self, HtmlTag};
 use crate::invariants::{
     Edit, assert_block_wellformed, assert_edit_sequence_stable, assert_frontmatter_scalar_fidelity,
     assert_html_tag_in_bounds, assert_inline_resource_fidelity, assert_line_index_agrees,
-    assert_tree_wellformed, collect_scalars, detect_frontmatter,
+    assert_structural_invariants, assert_tree_wellformed, collect_scalars, detect_frontmatter,
 };
 use crate::line_index::LineIndex;
 use crate::{inline, json, toml, yaml};
@@ -855,6 +855,97 @@ proptest! {
 }
 
 // ---------------------------------------------------------------------------
+// Generators — structural surface (issue 033)
+// ---------------------------------------------------------------------------
+
+/// A reference fragment shaped to reach the structural reference scanners: bare
+/// paths, quoted paths (single and double — the issue 032 apostrophe surface),
+/// backtick-wrapped paths, dangling `.md` references with fragments, and
+/// `{Name}/…` external-namespace forms. Mixes contractions, possessives,
+/// multibyte, and zero-width characters so the quoted-path byte-scanner is
+/// exercised against the encoding axis.
+fn structural_reference_fragment() -> impl Strategy<Value = String> {
+    prop_oneof![
+        Just("See ./docs/guide.md for details.\n".to_string()),
+        Just("Refer to \"notes/plan.md\" please.\n".to_string()),
+        Just("It's in 'tasks/today.md' now.\n".to_string()),
+        Just("The team's `archive/old.md` file.\n".to_string()),
+        Just("Dangling [link](./missing.md#section).\n".to_string()),
+        Just("Cross to {Design}/spec.md#overview here.\n".to_string()),
+        Just("O'Brien's notes 'café/résumé.md' moved.\n".to_string()),
+        Just("Zero\u{200b}width 'a\u{200b}b.md' path.\n".to_string()),
+        Just("Unbalanced 'quote path.md continues.\n".to_string()),
+        Just("Possessive's \"don't.md\" tricky.\n".to_string()),
+    ]
+}
+
+/// A structural fragment of any kind that drives `structural::collect`: heading
+/// hierarchy, raw HTML, a language-less code fence, and the reference scanners.
+fn structural_fragment() -> impl Strategy<Value = String> {
+    prop_oneof![
+        heading_fragment(),
+        html_tag_fragment(),
+        Just("```\nno language fence\n```\n".to_string()),
+        Just("```rust\nfn main() {}\n```\n".to_string()),
+        structural_reference_fragment(),
+        paragraph_fragment(),
+        blank_fragment(),
+    ]
+}
+
+/// A document assembled from structural fragments, optionally carrying an
+/// `exceptions` frontmatter block so the 031 reconciliation path runs.
+fn structural_document() -> impl Strategy<Value = String> {
+    (
+        proptest::option::of(exceptions_frontmatter()),
+        proptest::collection::vec(structural_fragment(), 0..20),
+    )
+        .prop_map(|(fm, frags)| format!("{}{}", fm.unwrap_or_default(), frags.concat()))
+}
+
+/// A YAML `exceptions:` frontmatter block (issue 031) over the path-shaped
+/// lints, so the structural pass reconciles suppressions and unused exceptions.
+fn exceptions_frontmatter() -> impl Strategy<Value = String> {
+    prop_oneof![
+        Just(
+            "---\nexceptions:\n  bare_paths:\n    \"./missing.md\": gone on purpose\n---\n"
+                .to_string()
+        ),
+        Just("---\nexceptions:\n  stale_references:\n    \"old.md\": legacy\n---\n".to_string()),
+        Just("---\nexceptions:\n  bare_paths:\n    \"unmatched.md\":\n---\n".to_string()),
+    ]
+}
+
+// ---------------------------------------------------------------------------
+// Properties — structural diagnostic pass (issue 033)
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #![proptest_config(config())]
+
+    /// The structural pass never panics and every emitted diagnostic span is a
+    /// valid, char-boundary byte range that round-trips through the LSP position
+    /// mapping (or, for a line-only diagnostic, a 1-based line). Drives the same
+    /// pipeline the workspace loader does — frontmatter + tree + exceptions +
+    /// deterministic existence oracle — across structured references, headings,
+    /// raw HTML, and language-less fences, plus arbitrary UTF-8 and every
+    /// line-ending variant. This is the assertion the `fuzz_structural` target
+    /// shares, so the two suites cannot drift (issue 033).
+    #[test]
+    fn structural_diagnostics_valid(
+        source in prop_oneof![
+            structural_document(),
+            (structural_document(), 0u8..4, any::<bool>())
+                .prop_map(|(d, style, bom)| line_ending_variant(d, style, bom)),
+            arbitrary_string(300),
+            markdown_document(),
+        ]
+    ) {
+        assert_structural_invariants(&source);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Properties — HTML tokenizer
 // ---------------------------------------------------------------------------
 
@@ -1022,6 +1113,34 @@ fn flow_collection_recovery_terminates() {
             assert_block_wellformed(&block, case);
             let _ = fm::extract_backlinks(&block, case);
         }
+    }
+}
+
+#[test]
+fn structural_diagnostics_valid_on_known_inputs() {
+    // The structural surface, exercised deterministically: dark-matter / bare /
+    // quoted / backtick reference shapes (the issue 032 apostrophe surface),
+    // dangling `.md` references, `{Name}/…` external forms, headings, raw HTML,
+    // a language-less fence, and an `exceptions` frontmatter block (issue 031).
+    // `assert_structural_invariants` runs the full pass and checks every emitted
+    // span is a valid, round-tripping char-boundary byte range.
+    let cases = [
+        "",
+        "# Heading\n\nSee ./docs/guide.md here.\n",
+        "It's the team's 'tasks/today.md' file.\n",
+        "O'Brien's \"don't.md\" and café/résumé.md paths.\n",
+        "Zero\u{200b}width 'a\u{200b}b.md' reference.\n",
+        "Unbalanced 'quote that never closes.md\n",
+        "Cross to {Design}/spec.md#overview here.\n",
+        "Dangling [link](./missing.md#frag).\n",
+        "```\nfence without a language\n```\n",
+        "<div>raw <span>html</span></div>\n",
+        "\u{feff}# BOM\r\nWith CRLF and a 'path.md' ref.\r\n",
+        "---\nexceptions:\n  bare_paths:\n    \"./missing.md\": gone\n---\nSee ./missing.md\n",
+        "---\nexceptions:\n  stale_references:\n    \"old.md\": legacy\n---\nbody\n",
+    ];
+    for case in cases {
+        assert_structural_invariants(case);
     }
 }
 
