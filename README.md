@@ -99,6 +99,32 @@ stale_references = "warn"  # or "hint", "deny", "disabled" — dangling `.md` re
 # Catenary = "../Catenary"
 ```
 
+### Per-reference exceptions
+
+A path-shaped string that is deliberately not a live reference (a worked
+example, a counterexample, a knowingly-dead link) can be excepted from the
+`stale_references` / `bare_paths` lints in the document's own frontmatter,
+keyed by the literal reference with a required reason as the value:
+
+```yaml
+---
+exceptions:
+  stale_references:
+    "tickets/acquire/DESIGN.md": "hypothetical path in the worked example"
+    "{Catenary}/old/layout.md": "pre-refactor path, kept for the changelog note"
+  bare_paths:
+    "README.md": "naming the file, deliberately not a link"
+---
+```
+
+Exceptions are reconciled like backlinks, not silenced: an entry that matches
+no live diagnostic — its reference gone, or now resolving — is itself flagged
+as an *unused exception* whose message echoes the stored reason, and an entry
+with an empty reason is flagged too. Lattice flags, never auto-removes — the
+reason is the surviving record of a vanished reference's intent. A `{Name}/…`
+key flows through identically. An exception is never a graph edge and imposes
+no backlink obligation.
+
 ## Agent instructions
 
 Add this to your project's `AGENTS.md` or `CLAUDE.md`:

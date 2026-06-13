@@ -7,6 +7,7 @@
 //! artifact, independent of Lattice's predicate graph. They run on every
 //! file regardless of whether `.lattice.toml` is present.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -14,6 +15,7 @@ use crate::block::{self, ElementKind, Syntax, Tree};
 use crate::config::{
     BarePathPolicy, CodeBlockLanguagePolicy, Config, FragmentAlgorithm, StaleReferencePolicy,
 };
+use crate::fm::{ExceptionEntry, ExceptionLint, Exceptions};
 use crate::html;
 use crate::span::Span;
 use crate::validation::{Diagnostic, Severity};
@@ -33,15 +35,33 @@ use crate::validation::{Diagnostic, Severity};
 /// 030, decision 010). Unlike `file_exists`, which answers workspace membership,
 /// `external_exists` reaches outside the workspace to the configured alias
 /// directory — but only ever to `stat`, never to read or index.
+///
+/// `exceptions` is this file's parsed `exceptions` frontmatter block (issue 031,
+/// decision 011): a path-shaped diagnostic whose reference matches an entry in
+/// the corresponding `exceptions.<lint>` namespace is **suppressed**, and an
+/// entry that matches no live diagnostic is reconciled afterward — flagged as an
+/// *unused exception* echoing its reason, or as a missing-reason defect.
 pub fn collect(
     tree: &Tree,
     rel_path: &Path,
     config: &Config,
     file_exists: &dyn Fn(&Path) -> bool,
     external_exists: &dyn Fn(&Path) -> bool,
+    exceptions: &Exceptions,
 ) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
     let source = tree.source();
+
+    // Build the reconciliation lever once and thread it through the path-shaped
+    // emit sites. A lint whose policy is `Disabled` is excluded so its
+    // exceptions are neither consulted nor flagged as unused — there are no live
+    // diagnostics to reconcile against, and flagging them all would be a false
+    // unused-exception flood (issue 031).
+    let lookup = ExceptionLookup::new(
+        exceptions,
+        config.policy.stale_references != StaleReferencePolicy::Disabled,
+        config.policy.bare_paths != BarePathPolicy::Disabled,
+    );
 
     emit_parser_diagnostics(tree, rel_path, &mut diagnostics);
     emit_heading_diagnostics(tree, rel_path, config, &mut diagnostics);
@@ -51,6 +71,7 @@ pub fn collect(
         config,
         file_exists,
         external_exists,
+        &lookup,
         &mut diagnostics,
     );
     emit_bare_path_diagnostics(
@@ -59,6 +80,7 @@ pub fn collect(
         config,
         file_exists,
         external_exists,
+        &lookup,
         &mut diagnostics,
     );
     emit_html_diagnostics(tree, rel_path, &mut diagnostics);
@@ -67,8 +89,143 @@ pub fn collect(
     emit_image_diagnostics(tree, rel_path, config, &mut diagnostics);
     emit_trailing_whitespace_diagnostics(source, rel_path, tree, &mut diagnostics);
 
+    // Reconcile: after every live diagnostic has had a chance to match, flag the
+    // exceptions that matched nothing (issue 031, decision 011 — flag, never
+    // auto-remove).
+    lookup.emit_unmatched(rel_path, &mut diagnostics);
+
     diagnostics.sort_by(|a, b| a.file.cmp(&b.file).then(a.line.cmp(&b.line)));
     diagnostics
+}
+
+// ---------------------------------------------------------------------------
+// Exception reconciliation (issue 031, decision 011)
+// ---------------------------------------------------------------------------
+
+/// Per-lint exception entries paired with a matched flag.
+///
+/// Interior mutability (`Cell<bool>`) lets the emit pass record matches behind a
+/// shared reference, so the lookup can be threaded as `&self` alongside the
+/// `&mut Vec<Diagnostic>` the emitters already carry.
+struct LintBucket<'a> {
+    /// Whether this lint is active (policy not `Disabled`). When `false` the
+    /// bucket is inert: it suppresses nothing and is never flagged as unused.
+    active: bool,
+    /// The declared entries, in source order.
+    entries: &'a [ExceptionEntry],
+    /// Parallel matched flags — set the first time an entry's reference matches
+    /// a live diagnostic this pass.
+    matched: Vec<Cell<bool>>,
+}
+
+impl<'a> LintBucket<'a> {
+    fn new(entries: &'a [ExceptionEntry], active: bool) -> Self {
+        Self {
+            active,
+            entries,
+            matched: entries.iter().map(|_| Cell::new(false)).collect(),
+        }
+    }
+
+    /// Suppress a live diagnostic whose reference matches an active entry,
+    /// recording the match. Returns `true` when the diagnostic should be
+    /// suppressed. The key is matched **verbatim** (issue 031): the full
+    /// reference string, including any leading `{Name}/…` and any `#fragment`,
+    /// with no normalization.
+    fn suppress(&self, reference: &str) -> bool {
+        if !self.active {
+            return false;
+        }
+        let mut suppressed = false;
+        for (entry, flag) in self.entries.iter().zip(&self.matched) {
+            if entry.reference == reference {
+                flag.set(true);
+                suppressed = true;
+            }
+        }
+        suppressed
+    }
+}
+
+/// The per-file exception reconciliation lever (issue 031, decision 011).
+///
+/// Holds both lint buckets and the matched-flag state. The path-shaped emitters
+/// call [`suppress`](Self::suppress) before pushing a diagnostic; after the
+/// pass, [`emit_unmatched`](Self::emit_unmatched) flags every entry that matched
+/// no live diagnostic.
+struct ExceptionLookup<'a> {
+    stale_references: LintBucket<'a>,
+    bare_paths: LintBucket<'a>,
+}
+
+impl<'a> ExceptionLookup<'a> {
+    fn new(exceptions: &'a Exceptions, stale_active: bool, bare_active: bool) -> Self {
+        Self {
+            stale_references: LintBucket::new(
+                exceptions.entries(ExceptionLint::StaleReferences),
+                stale_active,
+            ),
+            bare_paths: LintBucket::new(exceptions.entries(ExceptionLint::BarePaths), bare_active),
+        }
+    }
+
+    fn bucket(&self, lint: ExceptionLint) -> &LintBucket<'a> {
+        match lint {
+            ExceptionLint::StaleReferences => &self.stale_references,
+            ExceptionLint::BarePaths => &self.bare_paths,
+        }
+    }
+
+    /// Whether a live `lint` diagnostic on `reference` is excepted (and record
+    /// the match). See [`LintBucket::suppress`].
+    fn suppress(&self, lint: ExceptionLint, reference: &str) -> bool {
+        self.bucket(lint).suppress(reference)
+    }
+
+    /// Flag every exception entry that matched no live diagnostic this pass.
+    ///
+    /// An entry with an empty or missing reason is flagged as a missing-reason
+    /// defect (decision 011: the required reason is the epitaph); a non-empty
+    /// entry that matched nothing is flagged as an *unused exception* whose
+    /// message echoes the stored reason. Each entry yields at most one
+    /// reconciliation diagnostic, anchored at the offending key. Inactive
+    /// buckets (a `Disabled` lint) are skipped entirely.
+    fn emit_unmatched(&self, rel_path: &Path, out: &mut Vec<Diagnostic>) {
+        for (lint, bucket) in [
+            (ExceptionLint::StaleReferences, &self.stale_references),
+            (ExceptionLint::BarePaths, &self.bare_paths),
+        ] {
+            if !bucket.active {
+                continue;
+            }
+            for (entry, flag) in bucket.entries.iter().zip(&bucket.matched) {
+                if entry.reason.trim().is_empty() {
+                    out.push(Diagnostic {
+                        file: rel_path.to_path_buf(),
+                        line: entry.line,
+                        severity: Severity::Warning,
+                        message: format!(
+                            "exception `{}` under `exceptions.{}` has no reason — add one explaining why this is not a live reference",
+                            entry.reference,
+                            lint.key()
+                        ),
+                        span: Some(entry.key_span),
+                    });
+                } else if !flag.get() {
+                    out.push(Diagnostic {
+                        file: rel_path.to_path_buf(),
+                        line: entry.line,
+                        severity: Severity::Warning,
+                        message: format!(
+                            "unused exception: `{}` (reason: \"{}\") — no longer in the document. Drop the exception if its removal was intended; restore the reference if it wasn't",
+                            entry.reference, entry.reason
+                        ),
+                        span: Some(entry.key_span),
+                    });
+                }
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -114,6 +271,7 @@ fn emit_tree_bare_paths(
     config: &Config,
     file_exists: &dyn Fn(&Path) -> bool,
     external_exists: &dyn Fn(&Path) -> bool,
+    lookup: &ExceptionLookup,
     out: &mut Vec<Diagnostic>,
 ) {
     let bare_paths = tree.bare_paths();
@@ -121,7 +279,7 @@ fn emit_tree_bare_paths(
         // An external-namespace reference (`{Name}/…`) is resolved existence-
         // only against its alias directory, never dir/root-joined (issue 030).
         if let Some(stale) = external_is_stale(config, external_exists, &bare.path) {
-            if stale {
+            if stale && !lookup.suppress(ExceptionLint::StaleReferences, &bare.path) {
                 emit_stale_reference(
                     config.policy.stale_references,
                     rel_path,
@@ -134,7 +292,9 @@ fn emit_tree_bare_paths(
             continue;
         }
         if resolves_under_any_base(rel_path, &bare.path, file_exists) {
-            if config.policy.bare_paths == BarePathPolicy::Disabled {
+            if config.policy.bare_paths == BarePathPolicy::Disabled
+                || lookup.suppress(ExceptionLint::BarePaths, &bare.path)
+            {
                 continue;
             }
             out.push(Diagnostic {
@@ -145,7 +305,7 @@ fn emit_tree_bare_paths(
                 // `BarePath` carries only a line; fall back to a whole-line range.
                 span: None,
             });
-        } else {
+        } else if !lookup.suppress(ExceptionLint::StaleReferences, &bare.path) {
             emit_stale_reference(
                 config.policy.stale_references,
                 rel_path,
@@ -356,6 +516,7 @@ fn emit_bare_path_diagnostics(
     config: &Config,
     file_exists: &dyn Fn(&Path) -> bool,
     external_exists: &dyn Fn(&Path) -> bool,
+    lookup: &ExceptionLookup,
     out: &mut Vec<Diagnostic>,
 ) {
     let policy = config.policy.bare_paths;
@@ -391,6 +552,7 @@ fn emit_bare_path_diagnostics(
             file_exists,
             external_exists,
             config,
+            lookup,
             &excluded,
             out,
         );
@@ -412,13 +574,15 @@ fn emit_bare_path_diagnostics(
                 // An external-namespace reference (`{Name}/…`) is resolved
                 // existence-only against its alias directory (issue 030).
                 if let Some(is_stale) = external_is_stale(config, external_exists, path) {
-                    if is_stale {
+                    if is_stale && !lookup.suppress(ExceptionLint::StaleReferences, inner) {
                         emit_stale_reference(stale, rel_path, line, Some(child.span), inner, out);
                     }
                     continue;
                 }
                 if resolves_under_any_base(rel_path, path, file_exists) {
-                    if policy != BarePathPolicy::Disabled {
+                    if policy != BarePathPolicy::Disabled
+                        && !lookup.suppress(ExceptionLint::BarePaths, inner)
+                    {
                         out.push(Diagnostic {
                             file: rel_path.to_path_buf(),
                             line,
@@ -429,7 +593,7 @@ fn emit_bare_path_diagnostics(
                             span: Some(child.span),
                         });
                     }
-                } else {
+                } else if !lookup.suppress(ExceptionLint::StaleReferences, inner) {
                     emit_stale_reference(stale, rel_path, line, Some(child.span), inner, out);
                 }
             }
@@ -452,6 +616,7 @@ fn scan_text_for_paths(
     file_exists: &dyn Fn(&Path) -> bool,
     external_exists: &dyn Fn(&Path) -> bool,
     config: &Config,
+    lookup: &ExceptionLookup,
     excluded: &[Span],
     out: &mut Vec<Diagnostic>,
 ) {
@@ -482,6 +647,7 @@ fn scan_text_for_paths(
             file_exists,
             external_exists,
             config,
+            lookup,
             excluded,
             out,
         );
@@ -554,6 +720,7 @@ fn scan_line_for_quoted_paths(
     file_exists: &dyn Fn(&Path) -> bool,
     external_exists: &dyn Fn(&Path) -> bool,
     config: &Config,
+    lookup: &ExceptionLookup,
     excluded: &[Span],
     out: &mut Vec<Diagnostic>,
 ) {
@@ -575,14 +742,16 @@ fn scan_line_for_quoted_paths(
                     // An external-namespace reference (`{Name}/…`) resolves
                     // existence-only against its alias directory (issue 030).
                     if let Some(is_stale) = external_is_stale(config, external_exists, path) {
-                        if is_stale {
+                        if is_stale && !lookup.suppress(ExceptionLint::StaleReferences, inner) {
                             emit_stale_reference(stale, rel_path, line_num, Some(span), inner, out);
                         }
                         i = start + end + 1;
                         continue;
                     }
                     if resolves_under_any_base(rel_path, path, file_exists) {
-                        if policy != BarePathPolicy::Disabled {
+                        if policy != BarePathPolicy::Disabled
+                            && !lookup.suppress(ExceptionLint::BarePaths, inner)
+                        {
                             out.push(Diagnostic {
                                 file: rel_path.to_path_buf(),
                                 line: line_num,
@@ -593,7 +762,7 @@ fn scan_line_for_quoted_paths(
                                 span: Some(span),
                             });
                         }
-                    } else {
+                    } else if !lookup.suppress(ExceptionLint::StaleReferences, inner) {
                         emit_stale_reference(stale, rel_path, line_num, Some(span), inner, out);
                     }
                 }
@@ -1269,6 +1438,7 @@ mod tests {
     use super::*;
     use crate::block;
     use crate::config::Config;
+    use crate::fm;
     use crate::yaml;
 
     fn diagnose(content: &str) -> Vec<Diagnostic> {
@@ -1276,12 +1446,21 @@ mod tests {
         diagnose_with_config(content, &config)
     }
 
+    /// Parse `content`'s frontmatter and extract its `exceptions` block (issue
+    /// 031). Returns the empty default when there is no frontmatter.
+    fn exceptions_of(content: &str) -> Exceptions {
+        yaml::parse_frontmatter_block(content)
+            .map(|block| fm::extract_exceptions(&block, content))
+            .unwrap_or_default()
+    }
+
     fn diagnose_with_config(content: &str, config: &Config) -> Vec<Diagnostic> {
         let fm = yaml::parse_frontmatter_block(content);
         let fm_span = fm.as_ref().map(|b| b.span);
         let tree = block::parse_tree(content, fm_span);
         let rel_path = std::path::Path::new("test.md");
-        collect(&tree, rel_path, config, &|_| false, &|_| false)
+        let exceptions = exceptions_of(content);
+        collect(&tree, rel_path, config, &|_| false, &|_| false, &exceptions)
     }
 
     /// Like [`diagnose_with_config`], but with an explicit external-existence
@@ -1298,9 +1477,15 @@ mod tests {
         let tree = block::parse_tree(content, fm_span);
         let rel_path = std::path::Path::new("test.md");
         let present: HashSet<&str> = external_present.iter().copied().collect();
-        collect(&tree, rel_path, config, &|_| false, &|p| {
-            present.contains(p.to_str().unwrap_or(""))
-        })
+        let exceptions = exceptions_of(content);
+        collect(
+            &tree,
+            rel_path,
+            config,
+            &|_| false,
+            &|p| present.contains(p.to_str().unwrap_or("")),
+            &exceptions,
+        )
     }
 
     fn diagnose_with_files(content: &str, existing: &[&str]) -> Vec<Diagnostic> {
@@ -1323,12 +1508,14 @@ mod tests {
         let config = Config::default();
         let rel_path = std::path::Path::new(rel_path);
         let existing_set: HashSet<&str> = existing.iter().copied().collect();
+        let exceptions = exceptions_of(content);
         collect(
             &tree,
             rel_path,
             &config,
             &|p| existing_set.contains(p.to_str().unwrap_or("")),
             &|_| false,
+            &exceptions,
         )
     }
 
@@ -1998,12 +2185,14 @@ mod tests {
         config.policy.stale_references = stale;
         let rel_path = std::path::Path::new("test.md");
         let existing_set: HashSet<&str> = existing.iter().copied().collect();
+        let exceptions = exceptions_of(content);
         collect(
             &tree,
             rel_path,
             &config,
             &|p| existing_set.contains(p.to_str().unwrap_or("")),
             &|_| false,
+            &exceptions,
         )
     }
 
@@ -2060,7 +2249,14 @@ mod tests {
         let mut config = Config::default();
         config.policy.bare_paths = BarePathPolicy::Disabled;
         let rel_path = std::path::Path::new("test.md");
-        let diags = collect(&tree, rel_path, &config, &|_| false, &|_| false);
+        let diags = collect(
+            &tree,
+            rel_path,
+            &config,
+            &|_| false,
+            &|_| false,
+            &Exceptions::default(),
+        );
         assert_eq!(
             count_matching(&diags, Severity::Warning, "stale reference"),
             1,
@@ -2613,7 +2809,14 @@ mod tests {
         let mut config = Config::default();
         config.policy.code_block_language = CodeBlockLanguagePolicy::Disabled;
         let rel_path = std::path::Path::new("test.md");
-        let diags = collect(&tree, rel_path, &config, &|_| false, &|_| false);
+        let diags = collect(
+            &tree,
+            rel_path,
+            &config,
+            &|_| false,
+            &|_| false,
+            &Exceptions::default(),
+        );
         assert!(
             !has_any(&diags, "language tag"),
             "no diagnostic when disabled: {diags:?}"
@@ -2628,7 +2831,14 @@ mod tests {
         let mut config = Config::default();
         config.policy.code_block_language = CodeBlockLanguagePolicy::Deny;
         let rel_path = std::path::Path::new("test.md");
-        let diags = collect(&tree, rel_path, &config, &|_| false, &|_| false);
+        let diags = collect(
+            &tree,
+            rel_path,
+            &config,
+            &|_| false,
+            &|_| false,
+            &Exceptions::default(),
+        );
         assert_eq!(
             count_matching(&diags, Severity::Error, "without a language tag"),
             1,
@@ -2650,12 +2860,14 @@ mod tests {
         config.policy.bare_paths = policy;
         let rel_path = std::path::Path::new("test.md");
         let existing_set: HashSet<&str> = existing.iter().copied().collect();
+        let exceptions = exceptions_of(content);
         collect(
             &tree,
             rel_path,
             &config,
             &|p| existing_set.contains(p.to_str().unwrap_or("")),
             &|_| false,
+            &exceptions,
         )
     }
 
@@ -2770,6 +2982,245 @@ mod tests {
             ),
             1,
             "one warning for markdown in opaque HTML: {diags:?}"
+        );
+    }
+
+    // -- Frontmatter `exceptions` (issue 031, decision 011) --
+
+    #[test]
+    fn exception_suppresses_unresolved_stale_reference() {
+        // An exception keyed by the still-unresolved reference suppresses its
+        // stale-reference diagnostic — and, having matched, is not flagged as
+        // unused.
+        let content = "---\n\
+            exceptions:\n  \
+              stale_references:\n    \
+                \"gone.md\": \"hypothetical path in the worked example\"\n\
+            ---\n\
+            See `gone.md` for details.\n";
+        let diags = diagnose_with_files(content, &[]);
+        assert!(
+            !has_any(&diags, "stale reference"),
+            "the exception suppresses the stale-reference diagnostic: {diags:?}"
+        );
+        assert!(
+            !has_any(&diags, "unused exception"),
+            "a matched exception is not flagged as unused: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn exception_with_no_live_diagnostic_is_unused_and_echoes_reason() {
+        // The reference is gone from the body, so the exception matches nothing
+        // — flagged as unused, echoing the stored reason (the epitaph).
+        let content = "---\n\
+            exceptions:\n  \
+              stale_references:\n    \
+                \"gone.md\": \"hypothetical path in the worked example\"\n\
+            ---\n\
+            Nothing references it now.\n";
+        let diags = diagnose_with_files(content, &[]);
+        assert_eq!(
+            count_matching(&diags, Severity::Warning, "unused exception: `gone.md`"),
+            1,
+            "an exception matching no live diagnostic is flagged as unused: {diags:?}"
+        );
+        assert!(
+            has_any(&diags, "hypothetical path in the worked example"),
+            "the unused-exception message echoes the stored reason: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn exception_with_empty_reason_is_a_diagnostic() {
+        // A required reason: an empty reason is itself a defect, anchored at the
+        // key — even though the suppression still applies.
+        let content = "---\n\
+            exceptions:\n  \
+              stale_references:\n    \
+                \"gone.md\": \"\"\n\
+            ---\n\
+            See `gone.md` here.\n";
+        let diags = diagnose_with_files(content, &[]);
+        assert_eq!(
+            count_matching(&diags, Severity::Warning, "has no reason"),
+            1,
+            "an empty-reason exception is a diagnostic: {diags:?}"
+        );
+        // An empty-reason entry that matched a live diagnostic does not *also*
+        // get flagged as unused — exactly one reconciliation diagnostic.
+        assert!(
+            !has_any(&diags, "unused exception"),
+            "a matched empty-reason entry is not also flagged unused: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn external_alias_keyed_exception_suppresses_present_missing_stale() {
+        // A `{Name}/…`-keyed exception flows through identically: a defined,
+        // present alias whose target file is missing is a stale reference, and
+        // the literal `{Name}/…` key suppresses it (decision 011).
+        let config = config_with_catenary_alias();
+        let content = "---\n\
+            exceptions:\n  \
+              stale_references:\n    \
+                \"{Catenary}/old/layout.md\": \"pre-refactor path, kept for the changelog note\"\n\
+            ---\n\
+            See `{Catenary}/old/layout.md` for the old shape.\n";
+        // Alias directory present, file under it missing → tier 4 (stale).
+        let diags = diagnose_with_external(content, &config, &["/ext/Catenary"]);
+        assert!(
+            !has_any(&diags, "stale reference"),
+            "a `{{Name}}/…`-keyed exception suppresses the present-missing stale: {diags:?}"
+        );
+        assert!(
+            !has_any(&diags, "unused exception"),
+            "the matched alias-keyed exception is not flagged unused: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn exception_scope_is_per_reference() {
+        // An exception for one reference does not suppress a *different*
+        // unresolved one.
+        let content = "---\n\
+            exceptions:\n  \
+              stale_references:\n    \
+                \"excepted.md\": \"deliberately not a live reference\"\n\
+            ---\n\
+            See `excepted.md` and also `other.md`.\n";
+        let diags = diagnose_with_files(content, &[]);
+        assert_eq!(
+            count_matching(&diags, Severity::Warning, "stale reference: `other.md`"),
+            1,
+            "the unexcepted reference still fires: {diags:?}"
+        );
+        assert!(
+            !has_any(&diags, "stale reference: `excepted.md`"),
+            "the excepted reference is suppressed: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn exception_is_never_a_graph_edge_or_backlink_obligation() {
+        // An `exceptions` block is a path-shaped-lint lever only: it must never
+        // appear in link/graph extraction (decision 011 — no edge, no backlink).
+        let content = "---\n\
+            exceptions:\n  \
+              stale_references:\n    \
+                \"gone.md\": \"deliberately dead\"\n\
+            ---\n\
+            Body text.\n";
+        let fm = yaml::parse_frontmatter_block(content);
+        let fm_span = fm.as_ref().map(|b| b.span);
+        let tree = block::parse_tree(content, fm_span);
+        let links = tree.links(std::path::Path::new("test.md"));
+        assert!(
+            links.is_empty(),
+            "an exception forms no graph edge: {links:?}"
+        );
+    }
+
+    #[test]
+    fn rename_flags_old_key_unused_while_new_name_fires() {
+        // On a rename the old exception key matches nothing (unused) while the
+        // renamed reference, lacking an exception, fires fresh — both present.
+        let content = "---\n\
+            exceptions:\n  \
+              stale_references:\n    \
+                \"old-name.md\": \"the design doc, since renamed\"\n\
+            ---\n\
+            See `new-name.md` for the design.\n";
+        let diags = diagnose_with_files(content, &[]);
+        assert_eq!(
+            count_matching(&diags, Severity::Warning, "unused exception: `old-name.md`"),
+            1,
+            "the renamed-away old key is flagged unused: {diags:?}"
+        );
+        assert_eq!(
+            count_matching(&diags, Severity::Warning, "stale reference: `new-name.md`"),
+            1,
+            "the new name fires a fresh stale reference: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn bare_paths_exception_suppresses_resolve_hint() {
+        // The `bare_paths` namespace suppresses the make-it-a-link nudge on a
+        // *resolving* path (the lint fires on resolution).
+        let content = "---\n\
+            exceptions:\n  \
+              bare_paths:\n    \
+                \"README.md\": \"naming the file, deliberately not a link\"\n\
+            ---\n\
+            See `README.md` for the overview.\n";
+        let diags = diagnose_with_files(content, &["README.md"]);
+        assert!(
+            !has_any(&diags, "backticked path"),
+            "the bare_paths exception suppresses the resolve hint: {diags:?}"
+        );
+        assert!(
+            !has_any(&diags, "unused exception"),
+            "the matched bare_paths exception is not flagged unused: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn exception_round_trips_both_namespaces_and_alias_keys() {
+        // A frontmatter exercising both namespaces, the map form, and a
+        // `{Name}/…` key parses into the two buckets with reasons retained.
+        let content = "---\n\
+            exceptions:\n  \
+              stale_references:\n    \
+                \"tickets/acquire/DESIGN.md\": \"hypothetical path in the worked example\"\n    \
+                \"{Catenary}/old/layout.md\": \"pre-refactor path\"\n  \
+              bare_paths:\n    \
+                \"README\": \"naming the file, deliberately not a link\"\n\
+            ---\n\
+            Body.\n";
+        let exceptions = exceptions_of(content);
+        assert_eq!(
+            exceptions.stale_references.len(),
+            2,
+            "two stale_references exceptions parsed: {exceptions:?}"
+        );
+        assert_eq!(
+            exceptions.bare_paths.len(),
+            1,
+            "one bare_paths exception parsed: {exceptions:?}"
+        );
+        assert_eq!(
+            exceptions.stale_references[0].reference, "tickets/acquire/DESIGN.md",
+            "the first stale key is the literal reference: {exceptions:?}"
+        );
+        assert_eq!(
+            exceptions.stale_references[1].reference, "{Catenary}/old/layout.md",
+            "the `{{Name}}/…` key is retained verbatim: {exceptions:?}"
+        );
+        assert_eq!(
+            exceptions.bare_paths[0].reference, "README",
+            "the bare_paths key is the literal reference: {exceptions:?}"
+        );
+        assert_eq!(
+            exceptions.stale_references[0].reason, "hypothetical path in the worked example",
+            "the reason is the map value: {exceptions:?}"
+        );
+    }
+
+    #[test]
+    fn exception_for_disabled_lint_is_not_flagged_unused() {
+        // When `stale_references` is `Disabled`, its exceptions are inert: no
+        // suppression is needed and no unused-exception flood is produced.
+        let content = "---\n\
+            exceptions:\n  \
+              stale_references:\n    \
+                \"gone.md\": \"deliberately dead\"\n\
+            ---\n\
+            Nothing references it.\n";
+        let diags = diagnose_with_stale_policy(content, &[], StaleReferencePolicy::Disabled);
+        assert!(
+            !has_any(&diags, "unused exception"),
+            "a disabled lint's exceptions are not flagged unused: {diags:?}"
         );
     }
 }

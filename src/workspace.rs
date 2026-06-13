@@ -114,6 +114,11 @@ pub struct Frontmatter {
     /// label is any known predicate — an inverse value or a forward label
     /// (decision 008).
     pub backlinks: HashMap<String, Vec<String>>,
+    /// Parsed `exceptions` block (issue 031, decision 011): per-reference,
+    /// reconciled suppressions over the path-shaped lints. Consumed by the
+    /// structural pass, which suppresses a matching live diagnostic and flags an
+    /// exception that matches none as unused.
+    pub exceptions: fm::Exceptions,
 }
 
 /// A diagnostic about a backlink predicate issue.
@@ -305,12 +310,22 @@ impl Workspace {
         // than consulting workspace membership (issue 030, decision 010). It
         // only ever `stat`s; the aliased repository is never read or indexed.
         let external_exists = |path: &Path| path.exists();
+        // The `exceptions` frontmatter block (issue 031) is per-file and lives
+        // in this file's own frontmatter; an empty default applies when there
+        // is no frontmatter. The structural pass suppresses a matching live
+        // diagnostic and reconciles the rest as unused.
+        let empty_exceptions = fm::Exceptions::default();
+        let exceptions = file_data
+            .frontmatter
+            .as_ref()
+            .map_or(&empty_exceptions, |fm| &fm.exceptions);
         let diagnostics = structural::collect(
             &file_data.tree,
             rel_path,
             &self.config,
             &file_exists,
             &external_exists,
+            exceptions,
         );
         if let Some(file_data) = self.files.get_mut(rel_path) {
             file_data.structural = diagnostics;
@@ -434,6 +449,7 @@ pub fn parse_content(content: &str, rel_path: &Path, config: &Config) -> FileDat
         let end_line = byte_offset_to_line(content, end_byte.saturating_sub(1));
 
         let backlinks = fm::extract_backlinks(block, content);
+        let exceptions = fm::extract_exceptions(block, content);
 
         // Validate backlink keys. A key may be any known predicate — an
         // inverse value or a forward label (decision 008) — since a forward
@@ -453,6 +469,7 @@ pub fn parse_content(content: &str, rel_path: &Path, config: &Config) -> FileDat
             start_line,
             end_line,
             backlinks,
+            exceptions,
         });
     }
 
@@ -735,6 +752,34 @@ mod tests {
     }
 
     #[test]
+    fn frontmatter_exception_suppresses_structural_diagnostic() {
+        // End-to-end (issue 031): an `exceptions.stale_references` entry parsed
+        // from a file's frontmatter is threaded into the structural pass and
+        // suppresses the matching dangling-reference diagnostic.
+        let dir = workspace_with_files(&[(
+            "doc.md",
+            "---\nexceptions:\n  stale_references:\n    \"gone.md\": \"deliberately dead\"\n---\nSee `gone.md` here.\n",
+        )]);
+
+        let ws = Workspace::scan(dir.path()).expect("scan should succeed");
+        let data = ws.file(Path::new("doc.md")).expect("should find doc.md");
+        let fm = data.frontmatter.as_ref().expect("should have frontmatter");
+        assert_eq!(
+            fm.exceptions.stale_references.len(),
+            1,
+            "the exceptions block parses into frontmatter"
+        );
+        assert!(
+            !data
+                .structural
+                .iter()
+                .any(|d| d.message.contains("stale reference")),
+            "the exception suppresses the stale-reference diagnostic: {:?}",
+            data.structural
+        );
+    }
+
+    #[test]
     fn frontmatter_error_partial_recovery() {
         let dir = workspace_with_files(&[("bad.md", "---\n: broken: yaml: [[\n---\n# Bad\n")]);
 
@@ -936,12 +981,18 @@ mod tests {
         for (path, file_data) in ws.files() {
             let file_exists = |target: &Path| ws.file(target).is_some();
             let external_exists = |p: &Path| p.exists();
+            let empty_exceptions = fm::Exceptions::default();
+            let exceptions = file_data
+                .frontmatter
+                .as_ref()
+                .map_or(&empty_exceptions, |fm| &fm.exceptions);
             let fresh = structural::collect(
                 &file_data.tree,
                 path,
                 ws.config(),
                 &file_exists,
                 &external_exists,
+                exceptions,
             );
             assert_eq!(
                 file_data.structural,

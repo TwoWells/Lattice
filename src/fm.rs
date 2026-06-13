@@ -236,6 +236,160 @@ pub fn extract_backlinks(
     backlinks
 }
 
+// ---------------------------------------------------------------------------
+// Exception extraction helper (issue 031, decision 011)
+// ---------------------------------------------------------------------------
+
+/// A path-shaped lint that an `exceptions` block may namespace over.
+///
+/// Exceptions apply only to the path-shaped lints — the 028 family
+/// (issue 031, decision 011); they are never a graph edge and impose no
+/// backlink obligation. The two variants are the two namespaces accepted under
+/// the `exceptions` frontmatter key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExceptionLint {
+    /// Excepts the `stale_references` (dangling `.md`) diagnostic on a
+    /// reference — including a leading `{Name}/…` external alias.
+    StaleReferences,
+    /// Excepts the `bare_paths` (resolving make-it-a-link / quoted / bare)
+    /// nudge on a reference.
+    BarePaths,
+}
+
+impl ExceptionLint {
+    /// The frontmatter namespace key (`exceptions.<lint>`) for this lint.
+    #[must_use]
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::StaleReferences => "stale_references",
+            Self::BarePaths => "bare_paths",
+        }
+    }
+}
+
+/// A single `exceptions.<lint>` entry: a reference, its declared reason, and the
+/// source position of the key (for reconciliation diagnostics).
+///
+/// The reason is an epitaph — the only surviving record of a vanished
+/// reference's intent — so the entry retains the key's span and line to anchor
+/// the unused-exception and empty-reason diagnostics at the offending key
+/// (decision 011).
+#[derive(Debug, Clone)]
+pub struct ExceptionEntry {
+    /// The literal reference string keyed in the frontmatter — matched
+    /// verbatim against a diagnostic's reference, including any leading
+    /// `{Name}/…` external alias (issue 031).
+    pub reference: String,
+    /// The declared reason. Empty when the value was missing, blank, or not a
+    /// scalar — which is itself a diagnostic (required-reason).
+    pub reason: String,
+    /// Byte span of the key token in the source.
+    pub key_span: Span,
+    /// 1-based line of the key token in the source.
+    pub line: usize,
+}
+
+/// Parsed `exceptions` frontmatter block (issue 031, decision 011).
+///
+/// Sibling to `backlinks`, lint-namespaced, keyed by the literal reference with
+/// the reason as the value. Entries preserve source order and retain per-key
+/// positions so reconciliation can anchor diagnostics at the offending key.
+#[derive(Debug, Default)]
+pub struct Exceptions {
+    /// Entries under `exceptions.stale_references`.
+    pub stale_references: Vec<ExceptionEntry>,
+    /// Entries under `exceptions.bare_paths`.
+    pub bare_paths: Vec<ExceptionEntry>,
+}
+
+impl Exceptions {
+    /// The entries declared for `lint`.
+    #[must_use]
+    pub fn entries(&self, lint: ExceptionLint) -> &[ExceptionEntry] {
+        match lint {
+            ExceptionLint::StaleReferences => &self.stale_references,
+            ExceptionLint::BarePaths => &self.bare_paths,
+        }
+    }
+}
+
+/// Extract the `exceptions` block from a parsed frontmatter block.
+///
+/// Walks for a top-level `exceptions` key whose value is a mapping of lint name
+/// (`stale_references` / `bare_paths`) → mapping of literal reference → reason.
+/// Reuses the same machinery as [`extract_backlinks`] (decision 011: `exceptions`
+/// is a sibling block in the same frontmatter), retaining each key's span and
+/// line so reconciliation can point a diagnostic at the offending entry.
+///
+/// A namespace whose value is not a mapping is skipped; an entry whose value is
+/// not a scalar yields an empty reason (the required-reason diagnostic fires on
+/// it downstream). Lint namespaces other than the two recognized ones are
+/// ignored — they cannot name a path-shaped lint, so they carry no obligation.
+#[must_use]
+pub fn extract_exceptions(block: &FrontmatterBlock, source: &str) -> Exceptions {
+    let mut exceptions = Exceptions::default();
+
+    for entry in &block.entries {
+        let FmNode::Mapping { key, value, .. } = entry else {
+            continue;
+        };
+        if key.text != "exceptions" {
+            continue;
+        }
+        let FmValue::Mapping(namespaces) = value else {
+            break;
+        };
+
+        for ns_entry in namespaces {
+            let FmNode::Mapping {
+                key: ns_key,
+                value: ns_value,
+                ..
+            } = ns_entry
+            else {
+                continue;
+            };
+            let lint = match ns_key.text.as_str() {
+                "stale_references" => ExceptionLint::StaleReferences,
+                "bare_paths" => ExceptionLint::BarePaths,
+                _ => continue,
+            };
+            let FmValue::Mapping(refs) = ns_value else {
+                continue;
+            };
+
+            let bucket = match lint {
+                ExceptionLint::StaleReferences => &mut exceptions.stale_references,
+                ExceptionLint::BarePaths => &mut exceptions.bare_paths,
+            };
+            for ref_entry in refs {
+                let FmNode::Mapping {
+                    key: ref_key,
+                    value: ref_value,
+                    ..
+                } = ref_entry
+                else {
+                    continue;
+                };
+                let reason = match ref_value {
+                    FmValue::Scalar(s) => s.text.clone(),
+                    _ => String::new(),
+                };
+                bucket.push(ExceptionEntry {
+                    reference: ref_key.text.clone(),
+                    reason,
+                    key_span: ref_key.span,
+                    line: byte_offset_to_line(source, ref_key.span.start),
+                });
+            }
+        }
+
+        break;
+    }
+
+    exceptions
+}
+
 /// Find the 1-based line number for a top-level key in the frontmatter.
 ///
 /// Searches for the `backlinks` → predicate key and returns its line
@@ -317,4 +471,93 @@ pub fn line_count(source: &str) -> usize {
 /// and bare `\r`.
 pub fn byte_offset_to_line(source: &str, offset: usize) -> usize {
     count_line_breaks(&source.as_bytes()[..offset.min(source.len())]) + 1
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[allow(clippy::expect_used, reason = "tests use expect for clarity")]
+mod tests {
+    use super::{ExceptionLint, extract_exceptions};
+    use crate::yaml::parse_frontmatter_block;
+
+    #[test]
+    fn extract_exceptions_both_namespaces() {
+        let source = "---\nexceptions:\n  stale_references:\n    \"a.md\": \"reason a\"\n  bare_paths:\n    \"b.md\": \"reason b\"\n---\n";
+        let block = parse_frontmatter_block(source).expect("should parse");
+        let ex = extract_exceptions(&block, source);
+        assert_eq!(
+            ex.stale_references.len(),
+            1,
+            "one stale_references entry: {ex:?}"
+        );
+        assert_eq!(ex.bare_paths.len(), 1, "one bare_paths entry: {ex:?}");
+        assert_eq!(
+            ex.stale_references[0].reference, "a.md",
+            "stale key is the reference: {ex:?}"
+        );
+        assert_eq!(
+            ex.stale_references[0].reason, "reason a",
+            "stale reason is the value: {ex:?}"
+        );
+        assert_eq!(
+            ex.entries(ExceptionLint::BarePaths)[0].reference,
+            "b.md",
+            "entries() returns the bare_paths bucket: {ex:?}"
+        );
+    }
+
+    #[test]
+    fn extract_exceptions_empty_reason_retained() {
+        // An empty/missing reason is retained as an empty string; the
+        // required-reason diagnostic fires on it downstream.
+        let source = "---\nexceptions:\n  stale_references:\n    \"a.md\": \"\"\n---\n";
+        let block = parse_frontmatter_block(source).expect("should parse");
+        let ex = extract_exceptions(&block, source);
+        assert_eq!(ex.stale_references.len(), 1, "one entry parsed: {ex:?}");
+        assert!(
+            ex.stale_references[0].reason.is_empty(),
+            "the empty reason is retained: {ex:?}"
+        );
+    }
+
+    #[test]
+    fn extract_exceptions_unknown_namespace_ignored() {
+        // A lint namespace that names no path-shaped lint is ignored — it
+        // carries no obligation.
+        let source = "---\nexceptions:\n  not_a_lint:\n    \"a.md\": \"r\"\n---\n";
+        let block = parse_frontmatter_block(source).expect("should parse");
+        let ex = extract_exceptions(&block, source);
+        assert!(
+            ex.stale_references.is_empty() && ex.bare_paths.is_empty(),
+            "an unknown lint namespace yields no entries: {ex:?}"
+        );
+    }
+
+    #[test]
+    fn extract_exceptions_records_key_line() {
+        // The key's 1-based line is retained for anchoring reconciliation
+        // diagnostics. `a.md` sits on line 4 (after `---`, `exceptions:`,
+        // `stale_references:`).
+        let source = "---\nexceptions:\n  stale_references:\n    \"a.md\": \"r\"\n---\n";
+        let block = parse_frontmatter_block(source).expect("should parse");
+        let ex = extract_exceptions(&block, source);
+        assert_eq!(
+            ex.stale_references[0].line, 4,
+            "the key's line is recorded: {ex:?}"
+        );
+    }
+
+    #[test]
+    fn extract_exceptions_absent_block_is_empty() {
+        let source = "---\ntitle: test\n---\n";
+        let block = parse_frontmatter_block(source).expect("should parse");
+        let ex = extract_exceptions(&block, source);
+        assert!(
+            ex.stale_references.is_empty() && ex.bare_paths.is_empty(),
+            "no exceptions block yields empty: {ex:?}"
+        );
+    }
 }
