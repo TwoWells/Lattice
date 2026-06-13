@@ -299,8 +299,19 @@ impl Workspace {
             return;
         };
         let file_exists = |target: &Path| self.files.contains_key(target);
-        let diagnostics =
-            structural::collect(&file_data.tree, rel_path, &self.config, &file_exists);
+        // External-namespace (`{Name}/…`) references resolve existence-only
+        // against the configured alias directories, which live *outside* the
+        // workspace index — so this oracle `stat`s the real filesystem rather
+        // than consulting workspace membership (issue 030, decision 010). It
+        // only ever `stat`s; the aliased repository is never read or indexed.
+        let external_exists = |path: &Path| path.exists();
+        let diagnostics = structural::collect(
+            &file_data.tree,
+            rel_path,
+            &self.config,
+            &file_exists,
+            &external_exists,
+        );
         if let Some(file_data) = self.files.get_mut(rel_path) {
             file_data.structural = diagnostics;
         }
@@ -924,7 +935,14 @@ mod tests {
     fn assert_cache_matches_recompute(ws: &Workspace) {
         for (path, file_data) in ws.files() {
             let file_exists = |target: &Path| ws.file(target).is_some();
-            let fresh = structural::collect(&file_data.tree, path, ws.config(), &file_exists);
+            let external_exists = |p: &Path| p.exists();
+            let fresh = structural::collect(
+                &file_data.tree,
+                path,
+                ws.config(),
+                &file_exists,
+                &external_exists,
+            );
             assert_eq!(
                 file_data.structural,
                 fresh,

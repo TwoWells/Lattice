@@ -232,6 +232,17 @@ pub struct Config {
     pub policy: Policy,
     /// External formatter command for `textDocument/formatting`.
     pub format_command: Option<String>,
+    /// External-namespace aliases: alias name → resolved directory.
+    ///
+    /// Populated from the `[external]` table in `.lattice.toml` (issue 030,
+    /// decision 010). Each value is resolved to an absolute path at load time:
+    /// a relative value (the preferred sibling-checkout form, e.g.
+    /// `../Catenary`) against the config file's directory, a `~`-leading value
+    /// against the home directory, and an absolute value verbatim. A
+    /// `{Name}/path` citation is checked **existence-only** against the matching
+    /// alias directory — never read, parsed, indexed, or treated as a graph edge.
+    /// An undefined alias, or one whose directory is absent, degrades to exempt.
+    pub external: BTreeMap<String, PathBuf>,
 }
 
 impl Default for Config {
@@ -240,6 +251,7 @@ impl Default for Config {
             predicates: default_predicates(),
             policy: Policy::default(),
             format_command: None,
+            external: BTreeMap::new(),
         }
     }
 }
@@ -296,6 +308,15 @@ impl Config {
 
         if let Some(format) = raw.format {
             config.format_command = format.command;
+        }
+
+        if let Some(external) = raw.external {
+            let base_dir = path.parent().unwrap_or_else(|| Path::new(""));
+            for (alias, dir) in external {
+                config
+                    .external
+                    .insert(alias, resolve_alias_dir(&dir, base_dir));
+            }
         }
 
         Ok(config)
@@ -356,6 +377,7 @@ struct RawConfig {
     predicates: Option<HashMap<String, String>>,
     policy: Option<RawPolicy>,
     format: Option<RawFormat>,
+    external: Option<HashMap<String, String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -392,6 +414,40 @@ fn default_predicates() -> BTreeMap<String, String> {
         ("references".into(), "referenced_by".into()),
         ("supersedes".into(), "superseded_by".into()),
     ])
+}
+
+/// Resolve an `[external]` alias directory value to an absolute path.
+///
+/// `dir` is the value as written in `.lattice.toml`; `base_dir` is the config
+/// file's directory (the workspace root in the normal case). Resolution follows
+/// the three accepted forms (issue 030):
+///
+/// - an **absolute** path (`/srv/Catenary`) is taken verbatim;
+/// - a **`~`-leading** path (`~/Projects/Catenary`) is expanded against the
+///   home directory — a machine-specific form the spec discourages but accepts;
+/// - a **relative** path (`../Catenary`, the preferred sibling-checkout form) is
+///   joined onto `base_dir`.
+///
+/// The result is not normalized or canonicalized: it is only ever `stat`-ed for
+/// existence (decision 010), so component arithmetic is unnecessary and a
+/// missing directory must remain a plain absent path (degrading to exempt)
+/// rather than erroring. When `~` cannot be expanded (no home directory), the
+/// `~` is left literal so the path simply fails to resolve — exempt, never a
+/// false break.
+fn resolve_alias_dir(dir: &str, base_dir: &Path) -> PathBuf {
+    if let Some(rest) = dir.strip_prefix("~/") {
+        return std::env::home_dir().map_or_else(|| PathBuf::from(dir), |home| home.join(rest));
+    }
+    if dir == "~" {
+        return std::env::home_dir().unwrap_or_else(|| PathBuf::from(dir));
+    }
+
+    let path = Path::new(dir);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base_dir.join(path)
+    }
 }
 
 /// Walk up from `start` looking for `.lattice.toml`.
@@ -967,6 +1023,93 @@ image_empty_alt = true
         assert!(
             msg.contains("hint") && msg.contains("disabled"),
             "lists valid options: {msg}"
+        );
+    }
+
+    // -- External-namespace aliases (issue 030) --
+
+    #[test]
+    fn external_defaults_empty() {
+        let dir = temp_dir_with(None);
+        fs::create_dir(dir.path().join(".git")).expect("create .git");
+
+        let config = Config::load(dir.path()).expect("load should succeed");
+
+        assert!(
+            config.external.is_empty(),
+            "no [external] table means no aliases (the exempt floor)"
+        );
+    }
+
+    #[test]
+    fn external_relative_alias_resolves_against_config_dir() {
+        // The preferred sibling-checkout form: a relative value resolves against
+        // the config file's directory.
+        let dir = temp_dir_with(Some("[external]\nCatenary = \"../Catenary\""));
+        let config = Config::load(dir.path()).expect("load should succeed");
+
+        assert_eq!(
+            config.external.get("Catenary"),
+            Some(&dir.path().join("../Catenary")),
+            "relative alias resolves against the config file's directory"
+        );
+    }
+
+    #[test]
+    fn external_absolute_alias_parses_verbatim() {
+        let dir = temp_dir_with(Some("[external]\nCatenary = \"/srv/Catenary\""));
+        let config = Config::load(dir.path()).expect("load should succeed");
+
+        assert_eq!(
+            config.external.get("Catenary"),
+            Some(&PathBuf::from("/srv/Catenary")),
+            "an absolute alias value is taken verbatim"
+        );
+    }
+
+    #[test]
+    fn external_home_alias_parses() {
+        // A `~`-leading value parses (machine-specific, discouraged, but
+        // accepted) and expands against the home directory when one is known.
+        let dir = temp_dir_with(Some("[external]\nCatenary = \"~/Projects/Catenary\""));
+        let config = Config::load(dir.path()).expect("load should succeed");
+
+        let resolved = config
+            .external
+            .get("Catenary")
+            .expect("home-relative alias parses");
+        if let Some(home) = std::env::home_dir() {
+            assert_eq!(
+                resolved,
+                &home.join("Projects/Catenary"),
+                "`~/` expands against the home directory"
+            );
+        } else {
+            assert_eq!(
+                resolved,
+                &PathBuf::from("~/Projects/Catenary"),
+                "with no home directory the `~` is left literal (resolves to absent → exempt)"
+            );
+        }
+    }
+
+    #[test]
+    fn external_table_round_trips_multiple_aliases() {
+        let dir = temp_dir_with(Some(
+            "[external]\nCatenary = \"../Catenary\"\nHedgeMaze = \"/opt/HedgeMaze\"",
+        ));
+        let config = Config::load(dir.path()).expect("load should succeed");
+
+        assert_eq!(config.external.len(), 2, "both aliases round-trip");
+        assert_eq!(
+            config.external.get("Catenary"),
+            Some(&dir.path().join("../Catenary")),
+            "relative alias preserved"
+        );
+        assert_eq!(
+            config.external.get("HedgeMaze"),
+            Some(&PathBuf::from("/opt/HedgeMaze")),
+            "absolute alias preserved"
         );
     }
 

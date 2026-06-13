@@ -27,19 +27,40 @@ use crate::validation::{Diagnostic, Severity};
 /// `rel_path` is the workspace-relative path, used for bare path existence
 /// checks via `file_exists`. `config` controls severity for configurable
 /// diagnostics (code block language, admonitions).
+///
+/// `external_exists` `stat`s an **absolute** filesystem path; it backs the
+/// existence-only resolution of `{Name}/…` external-namespace references (issue
+/// 030, decision 010). Unlike `file_exists`, which answers workspace membership,
+/// `external_exists` reaches outside the workspace to the configured alias
+/// directory — but only ever to `stat`, never to read or index.
 pub fn collect(
     tree: &Tree,
     rel_path: &Path,
     config: &Config,
     file_exists: &dyn Fn(&Path) -> bool,
+    external_exists: &dyn Fn(&Path) -> bool,
 ) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
     let source = tree.source();
 
     emit_parser_diagnostics(tree, rel_path, &mut diagnostics);
     emit_heading_diagnostics(tree, rel_path, config, &mut diagnostics);
-    emit_tree_bare_paths(tree, rel_path, config, file_exists, &mut diagnostics);
-    emit_bare_path_diagnostics(tree, rel_path, config, file_exists, &mut diagnostics);
+    emit_tree_bare_paths(
+        tree,
+        rel_path,
+        config,
+        file_exists,
+        external_exists,
+        &mut diagnostics,
+    );
+    emit_bare_path_diagnostics(
+        tree,
+        rel_path,
+        config,
+        file_exists,
+        external_exists,
+        &mut diagnostics,
+    );
     emit_html_diagnostics(tree, rel_path, &mut diagnostics);
     check_markdown_in_opaque_html(tree, rel_path, &mut diagnostics);
     emit_code_block_diagnostics(tree, rel_path, config, &mut diagnostics);
@@ -92,10 +113,26 @@ fn emit_tree_bare_paths(
     rel_path: &Path,
     config: &Config,
     file_exists: &dyn Fn(&Path) -> bool,
+    external_exists: &dyn Fn(&Path) -> bool,
     out: &mut Vec<Diagnostic>,
 ) {
     let bare_paths = tree.bare_paths();
     for bare in &bare_paths {
+        // An external-namespace reference (`{Name}/…`) is resolved existence-
+        // only against its alias directory, never dir/root-joined (issue 030).
+        if let Some(stale) = external_is_stale(config, external_exists, &bare.path) {
+            if stale {
+                emit_stale_reference(
+                    config.policy.stale_references,
+                    rel_path,
+                    bare.line,
+                    None,
+                    &bare.path,
+                    out,
+                );
+            }
+            continue;
+        }
         if resolves_under_any_base(rel_path, &bare.path, file_exists) {
             if config.policy.bare_paths == BarePathPolicy::Disabled {
                 continue;
@@ -273,6 +310,11 @@ const fn bare_path_severity(policy: BarePathPolicy, base: Severity) -> Severity 
 /// [`Disabled`](StaleReferencePolicy::Disabled) suppresses it (the make-it-a-
 /// link resolve hint, gated by [`BarePathPolicy`], still fires); `Hint`/`Warn`/
 /// `Deny` set the severity. `reference` is the displayed reference text `X`.
+///
+/// The message names the `{repo}/…` external-namespace escape (issue 030,
+/// following suggestion 001's self-documenting-message principle), so an agent
+/// learns from the diagnostic that a cross-repo reference should be written and
+/// aliased rather than left to dangle.
 fn emit_stale_reference(
     policy: StaleReferencePolicy,
     rel_path: &Path,
@@ -293,7 +335,7 @@ fn emit_stale_reference(
         line,
         severity,
         message: format!(
-            "stale reference: `{reference}` looks like a markdown path but no such file exists"
+            "stale reference: `{reference}` — no such markdown file under this root; fix the path if it moved, or write it as `{{repo}}/…` (and alias `repo` in .lattice.toml) if it's in another repo"
         ),
         span,
     });
@@ -313,6 +355,7 @@ fn emit_bare_path_diagnostics(
     rel_path: &Path,
     config: &Config,
     file_exists: &dyn Fn(&Path) -> bool,
+    external_exists: &dyn Fn(&Path) -> bool,
     out: &mut Vec<Diagnostic>,
 ) {
     let policy = config.policy.bare_paths;
@@ -346,6 +389,8 @@ fn emit_bare_path_diagnostics(
             policy,
             stale,
             file_exists,
+            external_exists,
+            config,
             &excluded,
             out,
         );
@@ -364,6 +409,14 @@ fn emit_bare_path_diagnostics(
                 // anchor and does not affect file existence.
                 let path = split_path_fragment(inner).0;
                 let line = block::byte_offset_to_line(source, child.span.start);
+                // An external-namespace reference (`{Name}/…`) is resolved
+                // existence-only against its alias directory (issue 030).
+                if let Some(is_stale) = external_is_stale(config, external_exists, path) {
+                    if is_stale {
+                        emit_stale_reference(stale, rel_path, line, Some(child.span), inner, out);
+                    }
+                    continue;
+                }
                 if resolves_under_any_base(rel_path, path, file_exists) {
                     if policy != BarePathPolicy::Disabled {
                         out.push(Diagnostic {
@@ -397,6 +450,8 @@ fn scan_text_for_paths(
     policy: BarePathPolicy,
     stale: StaleReferencePolicy,
     file_exists: &dyn Fn(&Path) -> bool,
+    external_exists: &dyn Fn(&Path) -> bool,
+    config: &Config,
     excluded: &[Span],
     out: &mut Vec<Diagnostic>,
 ) {
@@ -425,6 +480,8 @@ fn scan_text_for_paths(
             policy,
             stale,
             file_exists,
+            external_exists,
+            config,
             excluded,
             out,
         );
@@ -495,6 +552,8 @@ fn scan_line_for_quoted_paths(
     policy: BarePathPolicy,
     stale: StaleReferencePolicy,
     file_exists: &dyn Fn(&Path) -> bool,
+    external_exists: &dyn Fn(&Path) -> bool,
+    config: &Config,
     excluded: &[Span],
     out: &mut Vec<Diagnostic>,
 ) {
@@ -513,6 +572,15 @@ fn scan_line_for_quoted_paths(
                     // Resolve the path part only; the `#fragment` is the
                     // heading anchor and does not affect file existence.
                     let path = split_path_fragment(inner).0;
+                    // An external-namespace reference (`{Name}/…`) resolves
+                    // existence-only against its alias directory (issue 030).
+                    if let Some(is_stale) = external_is_stale(config, external_exists, path) {
+                        if is_stale {
+                            emit_stale_reference(stale, rel_path, line_num, Some(span), inner, out);
+                        }
+                        i = start + end + 1;
+                        continue;
+                    }
                     if resolves_under_any_base(rel_path, path, file_exists) {
                         if policy != BarePathPolicy::Disabled {
                             out.push(Diagnostic {
@@ -596,6 +664,95 @@ fn split_path_fragment(s: &str) -> (&str, Option<&str>) {
         Some((path, frag)) => (path, Some(frag)),
         None => (s, None),
     }
+}
+
+/// Recognize an external-namespace reference of the form `{<identifier>}/rest`.
+///
+/// Returns `(alias, rest)` — the bare alias name (inside the braces) and the
+/// path following the `}/` — when the token is shaped as an external reference
+/// (issue 030, decision 010). This is matched **before** the normal dir/root
+/// resolution so the literal `{Name}` component is never dir-joined and
+/// mis-flagged as a dangling intra-repo path.
+///
+/// An identifier is one or more of `[A-Za-z0-9_-]`; the braces must wrap a
+/// non-empty identifier and be immediately followed by `/` and a non-empty
+/// remainder. `{}/x`, `{ }/x`, `{a b}/x`, a bare `{Name}` with no trailing `/`,
+/// and `{Name}/` with no remainder are all rejected — they are not external
+/// references and fall through to ordinary handling.
+fn external_namespace(s: &str) -> Option<(&str, &str)> {
+    let after_brace = s.strip_prefix('{')?;
+    let close = after_brace.find('}')?;
+    let alias = &after_brace[..close];
+    let rest = after_brace[close + 1..].strip_prefix('/')?;
+    if alias.is_empty()
+        || rest.is_empty()
+        || !alias
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return None;
+    }
+    Some((alias, rest))
+}
+
+/// The disposition of an external-namespace reference under its alias.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExternalResolution {
+    /// The alias is undefined, or its directory is absent — exempt, unverified
+    /// (the floor and the CI / partial-checkout guard). No diagnostic.
+    Exempt,
+    /// The alias directory is present and the referenced file exists under it.
+    Valid,
+    /// The alias directory is present but the referenced file is missing — a
+    /// genuinely broken cross-repo reference.
+    Stale,
+}
+
+/// Resolve an external-namespace reference to its three-tier disposition.
+///
+/// `alias`/`rest` come from [`external_namespace`]; `external_exists` `stat`s an
+/// absolute filesystem path (decision 010 — existence-only, edge-free: the
+/// aliased directory is touched by `stat` alone, never read, parsed, or
+/// indexed). The tiers (issue 030):
+///
+/// 1. alias undefined → [`Exempt`](ExternalResolution::Exempt);
+/// 2. alias defined, its directory absent → [`Exempt`](ExternalResolution::Exempt);
+/// 3. alias defined, directory present, file present → [`Valid`](ExternalResolution::Valid);
+/// 4. alias defined, directory present, file missing → [`Stale`](ExternalResolution::Stale).
+fn resolve_external(
+    config: &Config,
+    external_exists: &dyn Fn(&Path) -> bool,
+    alias: &str,
+    rest: &str,
+) -> ExternalResolution {
+    let Some(dir) = config.external.get(alias) else {
+        return ExternalResolution::Exempt;
+    };
+    if !external_exists(dir) {
+        return ExternalResolution::Exempt;
+    }
+    if external_exists(&dir.join(rest)) {
+        ExternalResolution::Valid
+    } else {
+        ExternalResolution::Stale
+    }
+}
+
+/// Classify a path-shaped reference as external and report whether it should
+/// draw the stale-reference diagnostic, or `None` if it is not external.
+///
+/// Returns `Some(true)` for a defined-alias-but-missing-file external reference
+/// (tier 4 — emit stale), `Some(false)` for an exempt or valid external
+/// reference (tiers 1–3 — emit nothing), and `None` when the token is not an
+/// external reference at all (the caller falls through to ordinary resolution).
+/// `reference` is the path part with any `#fragment` already stripped.
+fn external_is_stale(
+    config: &Config,
+    external_exists: &dyn Fn(&Path) -> bool,
+    reference: &str,
+) -> Option<bool> {
+    let (alias, rest) = external_namespace(reference)?;
+    Some(resolve_external(config, external_exists, alias, rest) == ExternalResolution::Stale)
 }
 
 /// Resolve a path-shaped reference against both candidate bases, normalized,
@@ -1124,7 +1281,26 @@ mod tests {
         let fm_span = fm.as_ref().map(|b| b.span);
         let tree = block::parse_tree(content, fm_span);
         let rel_path = std::path::Path::new("test.md");
-        collect(&tree, rel_path, config, &|_| false)
+        collect(&tree, rel_path, config, &|_| false, &|_| false)
+    }
+
+    /// Like [`diagnose_with_config`], but with an explicit external-existence
+    /// oracle: `external_present` lists the absolute filesystem paths
+    /// (alias directories and their joined files) that `stat` finds, backing the
+    /// three-tier `{Name}/…` resolution (issue 030).
+    fn diagnose_with_external(
+        content: &str,
+        config: &Config,
+        external_present: &[&str],
+    ) -> Vec<Diagnostic> {
+        let fm = yaml::parse_frontmatter_block(content);
+        let fm_span = fm.as_ref().map(|b| b.span);
+        let tree = block::parse_tree(content, fm_span);
+        let rel_path = std::path::Path::new("test.md");
+        let present: HashSet<&str> = external_present.iter().copied().collect();
+        collect(&tree, rel_path, config, &|_| false, &|p| {
+            present.contains(p.to_str().unwrap_or(""))
+        })
     }
 
     fn diagnose_with_files(content: &str, existing: &[&str]) -> Vec<Diagnostic> {
@@ -1147,9 +1323,13 @@ mod tests {
         let config = Config::default();
         let rel_path = std::path::Path::new(rel_path);
         let existing_set: HashSet<&str> = existing.iter().copied().collect();
-        collect(&tree, rel_path, &config, &|p| {
-            existing_set.contains(p.to_str().unwrap_or(""))
-        })
+        collect(
+            &tree,
+            rel_path,
+            &config,
+            &|p| existing_set.contains(p.to_str().unwrap_or("")),
+            &|_| false,
+        )
     }
 
     fn count_matching(diags: &[Diagnostic], severity: Severity, substr: &str) -> usize {
@@ -1818,9 +1998,13 @@ mod tests {
         config.policy.stale_references = stale;
         let rel_path = std::path::Path::new("test.md");
         let existing_set: HashSet<&str> = existing.iter().copied().collect();
-        collect(&tree, rel_path, &config, &|p| {
-            existing_set.contains(p.to_str().unwrap_or(""))
-        })
+        collect(
+            &tree,
+            rel_path,
+            &config,
+            &|p| existing_set.contains(p.to_str().unwrap_or("")),
+            &|_| false,
+        )
     }
 
     #[test]
@@ -1876,7 +2060,7 @@ mod tests {
         let mut config = Config::default();
         config.policy.bare_paths = BarePathPolicy::Disabled;
         let rel_path = std::path::Path::new("test.md");
-        let diags = collect(&tree, rel_path, &config, &|_| false);
+        let diags = collect(&tree, rel_path, &config, &|_| false, &|_| false);
         assert_eq!(
             count_matching(&diags, Severity::Warning, "stale reference"),
             1,
@@ -2115,6 +2299,170 @@ mod tests {
         );
     }
 
+    // -- External-namespace `{Name}/…` references (issue 030, decision 010) --
+
+    /// A config with `Catenary` aliased to a fixed (test-only) directory.
+    fn config_with_catenary_alias() -> Config {
+        let mut config = Config::default();
+        config.external.insert(
+            "Catenary".to_string(),
+            std::path::PathBuf::from("/ext/Catenary"),
+        );
+        config
+    }
+
+    #[test]
+    fn external_namespace_recognizer() {
+        assert_eq!(
+            external_namespace("{Catenary}/docs/x.md"),
+            Some(("Catenary", "docs/x.md")),
+            "a leading `{{ident}}/` is recognized, splitting alias from the remainder"
+        );
+        assert_eq!(
+            external_namespace("{my_repo-2}/x.md"),
+            Some(("my_repo-2", "x.md")),
+            "alphanumerics, `_` and `-` are valid identifier characters"
+        );
+        // Not external references — these fall through to ordinary handling.
+        for token in [
+            "{Catenary}",         // no trailing `/`
+            "{Catenary}/",        // empty remainder
+            "{}/x.md",            // empty identifier
+            "{a b}/x.md",         // space (not an identifier)
+            "docs/{Catenary}.md", // brace not at the start
+            "Catenary/x.md",      // no braces
+        ] {
+            assert_eq!(
+                external_namespace(token),
+                None,
+                "`{token}` is not an external-namespace reference"
+            );
+        }
+    }
+
+    #[test]
+    fn external_undefined_alias_is_exempt() {
+        // Tier 1 (the exempt floor): with no `[external]` table, a `{Name}/…`
+        // citation is external and unverified — no diagnostic, no config needed.
+        let diags = diagnose("See `{Catenary}/docs/configuration.md` for details.\n");
+        assert!(
+            !has_any(&diags, "stale reference")
+                && !has_any(&diags, "backticked path")
+                && !has_any(&diags, "convert to a markdown link"),
+            "an undefined `{{Name}}/…` alias draws no diagnostic (exempt floor): {diags:?}"
+        );
+    }
+
+    #[test]
+    fn external_alias_dir_absent_is_exempt() {
+        // Tier 2 (the CI / partial-checkout guard): the alias is defined but its
+        // directory is not present on disk — exempt, never a false break.
+        let config = config_with_catenary_alias();
+        let diags = diagnose_with_external(
+            "See `{Catenary}/docs/configuration.md` for details.\n",
+            &config,
+            // Nothing present: not even the alias directory.
+            &[],
+        );
+        assert!(
+            !has_any(&diags, "stale reference"),
+            "a defined alias whose directory is absent is exempt: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn external_alias_dir_present_file_present_is_valid() {
+        // Tier 3: directory present and the referenced file exists under it —
+        // valid, no diagnostic. Notably no make-it-a-link nudge either: an
+        // external reference is never a local link.
+        let config = config_with_catenary_alias();
+        let diags = diagnose_with_external(
+            "See `{Catenary}/docs/configuration.md` for details.\n",
+            &config,
+            &["/ext/Catenary", "/ext/Catenary/docs/configuration.md"],
+        );
+        assert!(
+            !has_any(&diags, "stale reference")
+                && !has_any(&diags, "backticked path")
+                && !has_any(&diags, "convert to a markdown link"),
+            "a present external file is valid and draws no diagnostic: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn external_alias_dir_present_file_missing_is_stale() {
+        // Tier 4: directory present but the referenced file is missing — a
+        // genuinely broken cross-repo reference draws the stale-reference
+        // warning.
+        let config = config_with_catenary_alias();
+        let diags = diagnose_with_external(
+            "See `{Catenary}/docs/configuration.md` for details.\n",
+            &config,
+            // The alias directory exists; the file under it does not.
+            &["/ext/Catenary"],
+        );
+        assert_eq!(
+            count_matching(&diags, Severity::Warning, "stale reference"),
+            1,
+            "a missing file under a present alias directory is stale: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn external_reference_quoted_and_bare_forms() {
+        // The `{Name}/…` shape is recognized on every citation surface 028
+        // covers: quoted and bare-with-dir, not only backtick. A quoted
+        // dir-bearing token is seen by *both* the quoted scanner and the
+        // bare-path scanner (which trims surrounding quotes) — a pre-existing
+        // double-detection independent of issue 030 — so the quoted surface
+        // asserts "at least one stale," the bare surface "exactly one."
+        let config = config_with_catenary_alias();
+        for (content, min_stale) in [
+            ("See \"{Catenary}/docs/configuration.md\" for details.\n", 1),
+            ("See {Catenary}/docs/configuration.md for details.\n", 1),
+        ] {
+            // Present dir, missing file → stale (tier 4).
+            let stale = diagnose_with_external(content, &config, &["/ext/Catenary"]);
+            assert!(
+                count_matching(&stale, Severity::Warning, "stale reference") >= min_stale,
+                "missing external file is stale on this surface: {stale:?}"
+            );
+            // Undefined alias → exempt (tier 1) on the same surface.
+            let exempt = diagnose(content);
+            assert!(
+                !has_any(&exempt, "stale reference"),
+                "undefined alias is exempt on this surface: {exempt:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn external_reference_message_teaches_the_escape() {
+        // The stale-reference message names the `{repo}/…` escape (suggestion
+        // 001's self-documenting-message principle).
+        let diags = diagnose("See `gone/missing.md` for details.\n");
+        assert!(
+            has_matching(&diags, Severity::Warning, "{repo}/") && has_any(&diags, ".lattice.toml"),
+            "the stale message teaches the `{{repo}}/…` external escape: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn external_reference_is_never_a_graph_edge() {
+        // Decision 010: a `{Name}/…` citation imposes no graph obligation. It is
+        // a backtick/quoted/bare citation, not a markdown link, so it never
+        // appears in link extraction — assert nothing comes out of `links()`.
+        let tree = block::parse_tree(
+            "See `{Catenary}/docs/configuration.md` and {Catenary}/x.md.\n",
+            None,
+        );
+        let links = tree.links(std::path::Path::new("test.md"));
+        assert!(
+            links.is_empty(),
+            "an external `{{Name}}/…` citation forms no graph edge: {links:?}"
+        );
+    }
+
     // -- Table-cell dark-matter coverage (issue 023) --
 
     // A backticked existing-file path inside a GFM table cell must emit the
@@ -2265,7 +2613,7 @@ mod tests {
         let mut config = Config::default();
         config.policy.code_block_language = CodeBlockLanguagePolicy::Disabled;
         let rel_path = std::path::Path::new("test.md");
-        let diags = collect(&tree, rel_path, &config, &|_| false);
+        let diags = collect(&tree, rel_path, &config, &|_| false, &|_| false);
         assert!(
             !has_any(&diags, "language tag"),
             "no diagnostic when disabled: {diags:?}"
@@ -2280,7 +2628,7 @@ mod tests {
         let mut config = Config::default();
         config.policy.code_block_language = CodeBlockLanguagePolicy::Deny;
         let rel_path = std::path::Path::new("test.md");
-        let diags = collect(&tree, rel_path, &config, &|_| false);
+        let diags = collect(&tree, rel_path, &config, &|_| false, &|_| false);
         assert_eq!(
             count_matching(&diags, Severity::Error, "without a language tag"),
             1,
@@ -2302,9 +2650,13 @@ mod tests {
         config.policy.bare_paths = policy;
         let rel_path = std::path::Path::new("test.md");
         let existing_set: HashSet<&str> = existing.iter().copied().collect();
-        collect(&tree, rel_path, &config, &|p| {
-            existing_set.contains(p.to_str().unwrap_or(""))
-        })
+        collect(
+            &tree,
+            rel_path,
+            &config,
+            &|p| existing_set.contains(p.to_str().unwrap_or("")),
+            &|_| false,
+        )
     }
 
     // One paragraph exercising every bare-path emitter: a tree-level bare path

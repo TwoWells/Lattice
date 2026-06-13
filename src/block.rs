@@ -7173,6 +7173,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn external_namespace_link_keeps_strict_resolution() {
+        // Issue 030: the `{Name}/…` external-namespace escape applies only to
+        // *citations* (backtick/quoted/bare), never to markdown *links*. A
+        // clickable cross-repo link is not navigable on GitHub, so a
+        // `[x]({Catenary}/…)` link keeps strict intra-project resolution — the
+        // literal `{Catenary}` is dir-joined as an ordinary `.md` target, not
+        // exempted by any alias.
+        let tree = parse("[x]({Catenary}/docs/configuration.md)\n");
+        let links = tree.links(Path::new("a/b/c.md"));
+        assert_eq!(links.len(), 1, "one link extracted: {links:?}");
+        match &links[0].kind {
+            LinkKind::IntraProject { target, .. } => {
+                assert_eq!(
+                    target,
+                    Path::new("a/b/{Catenary}/docs/configuration.md"),
+                    "the `{{Catenary}}` link target is dir-joined verbatim, not aliased",
+                );
+            }
+            other => panic!("expected a strict intra-project markdown link, got {other:?}"),
+        }
+    }
+
     // --- Tables: edge cases ---
 
     #[test]

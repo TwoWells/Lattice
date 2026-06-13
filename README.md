@@ -79,6 +79,7 @@ references = "referenced_by"
 predicates = "optional"    # or "required"
 backlinks = true
 bare_paths = "warn"        # or "deny", "disabled"
+stale_references = "warn"  # or "hint", "deny", "disabled" — dangling `.md` references
 # fragments = "github"    # or "gitlab", "vscode"; omit to try all
 # connectivity = "off"    # or "no-orphans", "no-islands", "reachable"
 # roots = ["README.md"]   # entry points for "reachable"; default = root README
@@ -88,6 +89,14 @@ bare_paths = "warn"        # or "deny", "disabled"
 # multiple_h1 = false               # flag more than one H1 heading
 # skipped_heading_level = false     # flag a skipped heading level (e.g. H1 -> H3)
 # image_empty_alt = false           # flag images with empty alt text
+
+# Cross-repo references: a `{Name}/path` citation (backtick/quoted/bare, not a
+# link) is checked existence-only against an aliased directory — never read,
+# indexed, or treated as a graph edge. An undefined alias, or one whose
+# directory is absent, is exempt; a present directory with a missing file is a
+# stale reference. Relative (sibling-checkout) values are preferred.
+# [external]
+# Catenary = "../Catenary"
 ```
 
 ## Agent instructions
