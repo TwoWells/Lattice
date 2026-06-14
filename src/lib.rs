@@ -83,5 +83,19 @@ pub fn run() -> ExitCode {
                 ExitCode::from(1)
             }
         },
+        cli::Command::Config => {
+            // Print the reference to stdout via the same locked-handle +
+            // `writeln!` mechanism the rest of the CLI uses (`print_stdout` is
+            // denied). `config --help` / `help config` route through clap's
+            // `long_about`, which mirrors this same string.
+            let mut stdout = io::stdout().lock();
+            match writeln!(stdout, "{}", cli::CONFIG_REFERENCE) {
+                Ok(()) => ExitCode::from(0),
+                Err(e) => {
+                    let _ = writeln!(io::stderr().lock(), "error: {e:#}");
+                    ExitCode::from(1)
+                }
+            }
+        }
     }
 }

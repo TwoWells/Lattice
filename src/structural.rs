@@ -205,7 +205,7 @@ impl<'a> ExceptionLookup<'a> {
                         line: entry.line,
                         severity: Severity::Warning,
                         message: format!(
-                            "exception `{}` under `exceptions.{}` has no reason — add one explaining why this is not a live reference",
+                            "exception `{}` under `exceptions.{}` has no reason — add one explaining why this is not a live reference (see `lattice help config`)",
                             entry.reference,
                             lint.key()
                         ),
@@ -217,7 +217,7 @@ impl<'a> ExceptionLookup<'a> {
                         line: entry.line,
                         severity: Severity::Warning,
                         message: format!(
-                            "unused exception: `{}` (reason: \"{}\") — no longer in the document. Drop the exception if its removal was intended; restore the reference if it wasn't",
+                            "unused exception: `{}` (reason: \"{}\") — no longer in the document. Drop the exception if its removal was intended; restore the reference if it wasn't (see `lattice help config`)",
                             entry.reference, entry.reason
                         ),
                         span: Some(entry.key_span),
@@ -301,7 +301,10 @@ fn emit_tree_bare_paths(
                 file: rel_path.to_path_buf(),
                 line: bare.line,
                 severity: bare_path_severity(config.policy.bare_paths, Severity::Warning),
-                message: format!("bare path `{}`: convert to a markdown link", bare.path),
+                message: format!(
+                    "bare path `{}`: convert to a markdown link (see `lattice help config`)",
+                    bare.path
+                ),
                 // `BarePath` carries only a line; fall back to a whole-line range.
                 span: None,
             });
@@ -495,7 +498,7 @@ fn emit_stale_reference(
         line,
         severity,
         message: format!(
-            "stale reference: `{reference}` — no such markdown file under this root; fix the path if it moved, or write it as `{{repo}}/…` (and alias `repo` in .lattice.toml) if it's in another repo"
+            "stale reference: `{reference}` — no such markdown file under this root; fix the path if it moved, or write it as `{{repo}}/…` (and alias `repo` in .lattice.toml — see `lattice help config`) if it's in another repo"
         ),
         span,
     });
@@ -588,7 +591,7 @@ fn emit_bare_path_diagnostics(
                             line,
                             severity: bare_path_severity(policy, Severity::Hint),
                             message: format!(
-                                "backticked path `{inner}` refers to an existing file: make it a link, or drop the extension if you only mean the file's name"
+                                "backticked path `{inner}` refers to an existing file: make it a link, or drop the extension if you only mean the file's name, or add a frontmatter `exceptions.bare_paths` entry with a reason (see `lattice help config`)"
                             ),
                             span: Some(child.span),
                         });
@@ -833,7 +836,7 @@ fn scan_line_for_quoted_paths(
                                 line: line_num,
                                 severity: bare_path_severity(policy, Severity::Hint),
                                 message: format!(
-                                    "quoted path `{q}{inner}{q}`: use backticks or make a markdown link"
+                                    "quoted path `{q}{inner}{q}`: use backticks or make a markdown link (see `lattice help config`)"
                                 ),
                                 span: Some(span),
                             });
@@ -3528,6 +3531,112 @@ mod tests {
         assert!(
             !has_any(&diags, "unused exception"),
             "a disabled lint's exceptions are not flagged unused: {diags:?}"
+        );
+    }
+
+    // -- In-tool config pointer: messages close the loop in-context (issue 035) --
+
+    #[test]
+    fn stale_reference_message_points_at_config_help() {
+        // The stale-reference message routes the agent back to the config
+        // grammar from the diagnostic itself (issue 035).
+        let diags = diagnose("See `gone/missing.md` for details.\n");
+        assert!(
+            has_matching(&diags, Severity::Warning, "lattice help config"),
+            "the stale-reference message names `lattice help config`: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn make_it_a_link_message_names_both_escapes_and_config_help() {
+        // FU2 (issue 031, folded into 035): the make-it-a-link hint names BOTH
+        // escapes — drop the extension, OR a frontmatter `exceptions.bare_paths`
+        // entry with a reason — pointing to `lattice help config`.
+        let diags = diagnose_with_files("See `other.md` for details.\n", &["other.md"]);
+        assert!(
+            has_matching(&diags, Severity::Hint, "drop the extension"),
+            "the hint still offers drop-the-extension: {diags:?}"
+        );
+        assert!(
+            has_matching(&diags, Severity::Hint, "exceptions.bare_paths"),
+            "the hint names the frontmatter exception escape (FU2): {diags:?}"
+        );
+        assert!(
+            has_matching(&diags, Severity::Hint, "reason"),
+            "the exception escape mentions the required reason: {diags:?}"
+        );
+        assert!(
+            has_matching(&diags, Severity::Hint, "lattice help config"),
+            "the hint points at `lattice help config`: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn bare_path_make_it_a_link_message_points_at_config_help() {
+        // Every bare_paths-gated nudge routes to the config grammar (issue 035):
+        // the unbacticked resolving-path "convert to a markdown link" warning
+        // carries the `lattice help config` pointer too.
+        let diags = diagnose_with_files("See docs/other.md for details.\n", &["docs/other.md"]);
+        assert!(
+            has_matching(&diags, Severity::Warning, "convert to a markdown link"),
+            "the bare-path nudge still fires: {diags:?}"
+        );
+        assert!(
+            has_matching(&diags, Severity::Warning, "lattice help config"),
+            "the bare-path nudge points at `lattice help config`: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn quoted_path_message_points_at_config_help() {
+        // The quoted-path resolving hint is the third bare_paths-gated nudge; it
+        // carries the `lattice help config` pointer too (issue 035).
+        let diags = diagnose_with_files("See \"docs/other.md\" for details.\n", &["docs/other.md"]);
+        assert!(
+            has_matching(&diags, Severity::Hint, "quoted path"),
+            "the quoted-path hint still fires: {diags:?}"
+        );
+        assert!(
+            has_matching(&diags, Severity::Hint, "lattice help config"),
+            "the quoted-path hint points at `lattice help config`: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn unused_exception_message_points_at_config_help() {
+        let content = "---\n\
+            exceptions:\n  \
+              stale_references:\n    \
+                \"gone.md\": \"hypothetical path in the worked example\"\n\
+            ---\n\
+            Nothing references it now.\n";
+        let diags = diagnose_with_files(content, &[]);
+        assert!(
+            has_matching(&diags, Severity::Warning, "unused exception: `gone.md`",),
+            "the unused-exception message still fires: {diags:?}"
+        );
+        assert!(
+            has_matching(&diags, Severity::Warning, "lattice help config"),
+            "the unused-exception message points at `lattice help config`: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn empty_reason_message_points_at_config_help() {
+        let content = "---\n\
+            exceptions:\n  \
+              stale_references:\n    \
+                \"gone.md\": \"\"\n\
+            ---\n\
+            See `gone.md` here.\n";
+        let diags = diagnose_with_files(content, &[]);
+        assert!(
+            has_matching(&diags, Severity::Warning, "has no reason"),
+            "the empty-reason message still fires: {diags:?}"
+        );
+        assert!(
+            has_matching(&diags, Severity::Warning, "lattice help config"),
+            "the empty-reason message points at `lattice help config`: {diags:?}"
         );
     }
 }
