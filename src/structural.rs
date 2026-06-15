@@ -8,7 +8,7 @@
 //! file regardless of whether `.lattice.toml` is present.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
 use crate::block::{self, ElementKind, Syntax, Tree};
@@ -96,6 +96,7 @@ pub fn collect_with_suppressions(
     // count-key inert (issue 036).
     let lookup = ExceptionLookup::new(
         exceptions,
+        &config.artifacts,
         config.policy.stale_references != StaleReferencePolicy::Disabled,
         config.policy.bare_paths != BarePathPolicy::Disabled,
     );
@@ -228,9 +229,9 @@ pub struct ExceptionSuppression {
 /// file (issue 036, decision 012 part B).
 ///
 /// The CLI lint loop collects one of these per file and renders the workspace
-/// ledger from them. Issue 037 will add a third source (subtree overrides) as a
-/// sibling field, so the renderer iterates source kinds rather than hard-coding
-/// two.
+/// ledger from them. Issue 037 added a third source (subtree overrides), and
+/// issue 038 the fourth (the artifact glossary); the renderer iterates source
+/// kinds rather than hard-coding them.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FileSuppressions {
     /// The file these suppressions belong to (workspace-relative).
@@ -240,13 +241,19 @@ pub struct FileSuppressions {
     pub exceptions: Option<ExceptionSuppression>,
     /// The count-key rows for this file (at most one per lint namespace).
     pub count_keys: Vec<CountKeySuppression>,
+    /// The artifact glossary suppressions in this file, keyed by the artifact
+    /// name (issue 038, decision 013): each entry is one glossary member whose
+    /// bare/backticked/quoted mentions were filtered before the 028-family
+    /// machinery, tallied by severity. The CLI ledger aggregates these
+    /// repo-wide into one row per artifact name.
+    pub artifacts: BTreeMap<String, SeverityCounts>,
 }
 
 impl FileSuppressions {
     /// Whether this file suppressed nothing (no ledger rows).
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.exceptions.is_none() && self.count_keys.is_empty()
+        self.exceptions.is_none() && self.count_keys.is_empty() && self.artifacts.is_empty()
     }
 }
 
@@ -366,10 +373,26 @@ impl<'a> LintBucket<'a> {
 struct ExceptionLookup<'a> {
     stale_references: LintBucket<'a>,
     bare_paths: LintBucket<'a>,
+    /// The repo-level artifact glossary (issue 038, decision 013): known
+    /// external filenames whose exact dark-matter mentions are filtered before
+    /// any of the 028-family machinery. Empty when no `[graph] artifacts` is
+    /// configured (the common case), in which case the artifact check in
+    /// [`route`](Self::route) is a single set lookup that always misses.
+    artifacts: &'a BTreeSet<String>,
+    /// What the glossary swallowed this file, keyed by the matched artifact name
+    /// and tallied by severity — the honesty floor for the ledger (decision
+    /// 013): an artifact is not reconciled, so the ledger is the only place its
+    /// suppression is visible.
+    artifact_suppressed: RefCell<BTreeMap<String, SeverityCounts>>,
 }
 
 impl<'a> ExceptionLookup<'a> {
-    fn new(exceptions: &'a Exceptions, stale_active: bool, bare_active: bool) -> Self {
+    fn new(
+        exceptions: &'a Exceptions,
+        artifacts: &'a BTreeSet<String>,
+        stale_active: bool,
+        bare_active: bool,
+    ) -> Self {
         Self {
             stale_references: LintBucket::new(
                 exceptions.entries(ExceptionLint::StaleReferences),
@@ -381,6 +404,8 @@ impl<'a> ExceptionLookup<'a> {
                 exceptions.count_key(ExceptionLint::BarePaths),
                 bare_active,
             ),
+            artifacts,
+            artifact_suppressed: RefCell::new(BTreeMap::new()),
         }
     }
 
@@ -393,12 +418,17 @@ impl<'a> ExceptionLookup<'a> {
 
     /// Route a would-be `lint` diagnostic on `reference` through the lookup.
     ///
-    /// Three outcomes, in order: a matching literal key **suppresses** it
-    /// (tallied, dropped — literal keys win and are carved out of the residual
-    /// first, decision 012); otherwise an active count-key **buffers** it for the
-    /// later residual decision; otherwise it passes straight through to `out`.
-    /// `reference` is matched verbatim against literal keys, exactly as the old
-    /// inline `suppress` call did.
+    /// Outcomes, in order: an **artifact-glossary** member is filtered first —
+    /// before literal suppression and the count-key residual buffer (decision
+    /// 013, issue 038): an artifact is "not a reference at all," so it is tallied
+    /// by artifact name (for the ledger) and dropped, never entering an
+    /// exception, a count-key residual, or an `expect` aggregate, and is not
+    /// exceptable. Otherwise a matching literal key **suppresses** it (tallied,
+    /// dropped — literal keys win and are carved out of the residual first,
+    /// decision 012); otherwise an active count-key **buffers** it for the later
+    /// residual decision; otherwise it passes straight through to `out`.
+    /// `reference` is matched verbatim — against the artifact glossary and the
+    /// literal keys alike — exactly as the old inline `suppress` call did.
     fn route(
         &self,
         lint: ExceptionLint,
@@ -406,6 +436,18 @@ impl<'a> ExceptionLookup<'a> {
         diag: Diagnostic,
         out: &mut Vec<Diagnostic>,
     ) {
+        // Artifact glossary filters first: a bare/backticked/quoted reference
+        // whose literal string is a glossary member is outside the graph
+        // boundary (decision 013), so it never reaches the 028-family
+        // exception / count-key / override machinery.
+        if self.artifacts.contains(reference) {
+            self.artifact_suppressed
+                .borrow_mut()
+                .entry(reference.to_string())
+                .or_default()
+                .record(diag.severity);
+            return;
+        }
         let bucket = self.bucket(lint);
         if bucket.suppress_literal(reference, diag.severity) {
             return;
@@ -546,12 +588,14 @@ impl<'a> ExceptionLookup<'a> {
         }
     }
 
-    /// Consume the lookup's tallies into the file's ledger entry (issue 036).
+    /// Consume the lookup's tallies into the file's ledger entry (issue 036,
+    /// issue 038).
     ///
     /// One literal-exceptions row per file (folding both lint namespaces, since
     /// the ledger keys exceptions by file) carrying the count of distinct entries
-    /// that matched, and one count-key row per namespace whose residual actually
-    /// suppressed (`M == N`).
+    /// that matched, one count-key row per namespace whose residual actually
+    /// suppressed (`M == N`), and the per-artifact-name glossary tally (decision
+    /// 013) for the workspace-wide artifact rows.
     fn into_suppressions(self, rel_path: &Path) -> FileSuppressions {
         let mut exception_counts = SeverityCounts::default();
         let mut matched_entries = 0;
@@ -582,6 +626,7 @@ impl<'a> ExceptionLookup<'a> {
             file: rel_path.to_path_buf(),
             exceptions,
             count_keys,
+            artifacts: self.artifact_suppressed.into_inner(),
         }
     }
 }
@@ -4347,6 +4392,169 @@ mod tests {
             classify_028_lint("duplicate heading slug `x`"),
             None,
             "another non-028 message maps to neither lint"
+        );
+    }
+
+    // -- Artifact glossary (issue 038, decision 013) --
+
+    /// A [`Config`] whose `[graph] artifacts` glossary lists `names`.
+    fn config_with_artifacts(names: &[&str]) -> Config {
+        Config {
+            artifacts: names.iter().map(|s| (*s).to_string()).collect(),
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn artifact_name_resolving_draws_no_make_it_a_link_hint() {
+        // The bare artifact name coincides with this repo's own root file, so it
+        // would normally draw the make-it-a-link hint — the glossary swallows it.
+        let config = config_with_artifacts(&["AGENTS.md"]);
+        let (diags, sup) =
+            diagnose_full("See `AGENTS.md` for the hooks.\n", &config, &["AGENTS.md"]);
+        assert!(
+            !has_any(&diags, "make it a link"),
+            "a glossary artifact draws no make-it-a-link hint even when it resolves: {diags:?}"
+        );
+        assert!(
+            !has_any(&diags, "AGENTS.md"),
+            "no diagnostic mentions the artifact at all: {diags:?}"
+        );
+        assert_eq!(
+            sup.artifacts.get("AGENTS.md").map(|c| c.hints),
+            Some(1),
+            "the swallowed hint is recorded in the ledger tally: {sup:?}"
+        );
+    }
+
+    #[test]
+    fn artifact_name_dangling_draws_no_stale_reference() {
+        // The bare artifact name resolves to no file in this repo, so it would
+        // normally draw a stale_references warning — the glossary swallows it.
+        let config = config_with_artifacts(&["GEMINI.md"]);
+        let (diags, sup) = diagnose_full("Put hooks in `GEMINI.md`.\n", &config, &[]);
+        assert!(
+            !has_any(&diags, "stale reference"),
+            "a glossary artifact draws no stale-reference diagnostic when it dangles: {diags:?}"
+        );
+        assert_eq!(
+            sup.artifacts.get("GEMINI.md").map(|c| c.warnings),
+            Some(1),
+            "the swallowed stale-reference warning is recorded in the ledger tally: {sup:?}"
+        );
+    }
+
+    #[test]
+    fn artifact_exact_match_only_path_qualified_still_flags() {
+        // `AGENTS.md` is a glossary member; `dir/AGENTS.md` is a DIFFERENT
+        // reference and is not matched — it still draws its normal diagnostic.
+        let config = config_with_artifacts(&["AGENTS.md"]);
+        let (diags, sup) = diagnose_full("See `dir/AGENTS.md`.\n", &config, &[]);
+        assert!(
+            has_matching(
+                &diags,
+                Severity::Warning,
+                "stale reference: `dir/AGENTS.md`"
+            ),
+            "a path-qualified reference is not the bare artifact and still flags: {diags:?}"
+        );
+        assert!(
+            sup.artifacts.is_empty(),
+            "the path-qualified reference produced no artifact suppression: {sup:?}"
+        );
+    }
+
+    #[test]
+    fn artifact_quoted_and_backticked_both_filtered() {
+        // Both dark-matter shapes — a quoted path and a backticked path — are
+        // filtered by the glossary.
+        let config = config_with_artifacts(&["CLAUDE.md"]);
+        let (diags, sup) =
+            diagnose_full("Edit \"CLAUDE.md\" and also `CLAUDE.md`.\n", &config, &[]);
+        assert!(
+            !has_any(&diags, "CLAUDE.md"),
+            "neither the quoted nor the backticked artifact mention is flagged: {diags:?}"
+        );
+        assert_eq!(
+            sup.artifacts.get("CLAUDE.md").map(|c| c.warnings),
+            Some(2),
+            "both dark-matter mentions are tallied: {sup:?}"
+        );
+    }
+
+    #[test]
+    fn artifact_filtered_before_count_key_residual() {
+        // The artifact is removed before the count-key sees it: a count-key of
+        // N = 2 over the two genuine dangling references suppresses cleanly, with
+        // no drift — the artifact never entered the residual.
+        let content = "---\n\
+            exceptions:\n  \
+              stale_references:\n    \
+                \"2\": \"the two genuine dangling references\"\n\
+            ---\n\
+            See `AGENTS.md`, `a.md`, and `b.md`.\n";
+        let config = config_with_artifacts(&["AGENTS.md"]);
+        let (diags, sup) = diagnose_full(content, &config, &[]);
+        assert!(
+            !has_any(&diags, "stale reference"),
+            "the count-key of 2 covers the two genuine refs; the artifact was filtered first: {diags:?}"
+        );
+        assert!(
+            !has_any(&diags, "expected"),
+            "no drift — the artifact never entered the residual, so the residual is exactly 2: {diags:?}"
+        );
+        assert_eq!(
+            sup.count_keys.first().map(|c| c.counts.warnings),
+            Some(2),
+            "the count-key residual is the two genuine refs, not three: {sup:?}"
+        );
+        assert_eq!(
+            sup.artifacts.get("AGENTS.md").map(|c| c.warnings),
+            Some(1),
+            "the artifact is tallied as its own source, not folded into the count-key: {sup:?}"
+        );
+    }
+
+    #[test]
+    fn artifact_is_not_exceptable() {
+        // An artifact filters before the exception machinery, so a frontmatter
+        // `stale_references` exception keyed on the artifact name matches
+        // nothing live and is flagged as unused — it is not the lever.
+        let content = "---\n\
+            exceptions:\n  \
+              stale_references:\n    \
+                \"SKILL.md\": \"trying (wrongly) to except the artifact here\"\n\
+            ---\n\
+            See `SKILL.md`.\n";
+        let config = config_with_artifacts(&["SKILL.md"]);
+        let (diags, sup) = diagnose_full(content, &config, &[]);
+        assert!(
+            has_matching(&diags, Severity::Warning, "unused exception: `SKILL.md`"),
+            "the exception keyed on the artifact matches nothing live (the glossary filtered it first): {diags:?}"
+        );
+        assert!(
+            sup.exceptions.is_none(),
+            "the artifact was not suppressed by the exception: {sup:?}"
+        );
+        assert_eq!(
+            sup.artifacts.get("SKILL.md").map(|c| c.warnings),
+            Some(1),
+            "the artifact suppression is recorded under the artifact source: {sup:?}"
+        );
+    }
+
+    #[test]
+    fn no_glossary_keeps_current_behaviour() {
+        // With an empty glossary the artifact name flags exactly as before.
+        let config = Config::default();
+        let (diags, sup) = diagnose_full("See `AGENTS.md`.\n", &config, &[]);
+        assert!(
+            has_matching(&diags, Severity::Warning, "stale reference: `AGENTS.md`"),
+            "an empty glossary leaves the name to flag normally: {diags:?}"
+        );
+        assert!(
+            sup.artifacts.is_empty(),
+            "an empty glossary records no artifact suppression: {sup:?}"
         );
     }
 }

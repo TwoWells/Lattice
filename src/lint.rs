@@ -212,8 +212,9 @@ fn format_diagnostic(diag: &Diagnostic) -> String {
 
 /// The suppression source a ledger row reports.
 ///
-/// Issue 037 adds the third variant (subtree overrides); the renderer iterates
-/// rows by kind, so each source slots in without restructuring the output.
+/// Issue 037 adds the subtree-override variant and issue 038 the artifact
+/// variant; the renderer iterates rows by kind, so each source slots in without
+/// restructuring the output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LedgerSource {
     /// A file's frontmatter literal exceptions.
@@ -222,6 +223,9 @@ enum LedgerSource {
     CountKey,
     /// A `[[override]]` subtree entry (freeze or matched `expect = N`).
     Override,
+    /// A `[graph] artifacts` glossary member (decision 013, issue 038),
+    /// aggregated repo-wide by artifact name.
+    Artifact,
 }
 
 impl LedgerSource {
@@ -231,6 +235,7 @@ impl LedgerSource {
             Self::Exceptions => "exceptions",
             Self::CountKey => "count-key",
             Self::Override => "overrides",
+            Self::Artifact => "artifacts",
         }
     }
 }
@@ -254,10 +259,18 @@ struct LedgerRow {
 ///
 /// One row per in-scope file with matched literal exceptions (labeled by path)
 /// and one row per in-scope count-key that suppressed its residual (labeled by
-/// its shared reason). Files in source order (the workspace is a `BTreeMap`), so
-/// the ledger is deterministic.
+/// its shared reason). The artifact-glossary suppressions (decision 013, issue
+/// 038) are **aggregated repo-wide** into one row per artifact name (labeled by
+/// the name), since artifact names scatter across folders rather than cluster in
+/// one file. Files in source order (the workspace is a `BTreeMap`), so the ledger
+/// is deterministic.
 fn collect_ledger_rows(workspace: &Workspace, scope: Option<&Path>) -> Vec<LedgerRow> {
     let mut rows = Vec::new();
+    // Artifact suppressions are not per-file rows: a glossary name recurs across
+    // dozens of files, so the ledger shows one row per name folding every
+    // in-scope file's tally for it (decision 013's grain).
+    let mut artifact_totals: std::collections::BTreeMap<String, SeverityCounts> =
+        std::collections::BTreeMap::new();
     for (path, file_data) in workspace.files() {
         if !in_scope(path, scope) {
             continue;
@@ -282,6 +295,22 @@ fn collect_ledger_rows(workspace: &Workspace, scope: Option<&Path>) -> Vec<Ledge
                 detail: format!("count-key ({})", ck.raw),
             });
         }
+        for (name, counts) in &sup.artifacts {
+            artifact_totals
+                .entry(name.clone())
+                .or_default()
+                .add(*counts);
+        }
+    }
+    // Emit the aggregated artifact rows after the per-file rows, in name order
+    // (the `BTreeMap` is sorted) so the ledger stays deterministic.
+    for (name, counts) in artifact_totals {
+        rows.push(LedgerRow {
+            source: LedgerSource::Artifact,
+            label: name,
+            counts,
+            detail: "artifact".to_string(),
+        });
     }
     rows
 }
@@ -596,6 +625,7 @@ fn write_ledger(rows: &[LedgerRow], out: &mut impl Write) -> Result<()> {
         LedgerSource::Override,
         LedgerSource::CountKey,
         LedgerSource::Exceptions,
+        LedgerSource::Artifact,
     ] {
         let n = rows.iter().filter(|r| r.source == source).count();
         if n > 0 {
@@ -1489,6 +1519,55 @@ mod tests {
         assert!(
             output.contains("sweep/**") && output.contains("override (expect=1)"),
             "the matched expect override contributes a labelled ledger row: {output}"
+        );
+    }
+
+    // -- Artifact glossary ledger (issue 038, decision 013) --
+
+    #[test]
+    fn ledger_reports_artifact_suppressions_by_severity() {
+        // Two files each mention `AGENTS.md` (a glossary member that dangles in
+        // this repo, so a stale-reference warning each). The ledger aggregates
+        // them repo-wide into one artifact row by name, tallying two warnings.
+        let dir = setup(&[
+            (
+                ".lattice.toml",
+                "[graph]\nartifacts = [\"AGENTS.md\", \"CLAUDE.md\"]\n",
+            ),
+            ("intro.md", "Put hooks in `AGENTS.md`.\n"),
+            ("docs/guide.md", "Also see `AGENTS.md`.\n"),
+        ]);
+        let (_failed, output) = run_lint_with_ledger(&dir);
+        assert!(
+            output.contains("suppressed: 2 warnings  (1 artifacts)"),
+            "the header tallies the two repo-wide artifact suppressions as one artifact source: {output}"
+        );
+        assert!(
+            output.contains("AGENTS.md") && output.contains("artifact"),
+            "the artifact row is labelled by the name with the `artifact` detail: {output}"
+        );
+        // The make-it-a-link / stale-reference diagnostics themselves are gone.
+        assert!(
+            !output.contains("stale reference"),
+            "no artifact mention surfaces as a diagnostic: {output}"
+        );
+    }
+
+    #[test]
+    fn quiet_drops_the_artifact_ledger() {
+        let dir = setup(&[
+            (".lattice.toml", "[graph]\nartifacts = [\"AGENTS.md\"]\n"),
+            ("intro.md", "Put hooks in `AGENTS.md`.\n"),
+        ]);
+        let (_f1, with_ledger) = run_lint_with_ledger(&dir);
+        assert!(
+            with_ledger.contains("suppressed:") && with_ledger.contains("artifact"),
+            "the artifact ledger prints by default: {with_ledger}"
+        );
+        let (_f2, quiet) = run_lint(&dir);
+        assert!(
+            !quiet.contains("suppressed:"),
+            "--quiet drops the artifact ledger: {quiet}"
         );
     }
 

@@ -6,7 +6,7 @@
 //! Loads `.lattice.toml` if present, merging with built-in defaults.
 //! Produces a resolved [`Config`] consumed by the rest of the system.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use glob::Pattern;
@@ -341,6 +341,21 @@ pub struct Config {
     /// when two entries match the same file the last one wins. A frontmatter
     /// declaration on a file wins over any override matching it.
     pub overrides: Vec<Override>,
+    /// The artifact glossary: known external filenames (decision 013, issue
+    /// 038).
+    ///
+    /// Populated from the `[graph] artifacts` list in `.lattice.toml`. A
+    /// dark-matter reference (bare, backticked, or quoted) whose literal string
+    /// is an **exact** member of this set is an *artifact* — a reference outside
+    /// the graph boundary, reached by bare filename rather than by `{Name}/…`
+    /// alias (decision 010's exempt tier): it is never resolved, linkified,
+    /// flagged, or edged, and is filtered before the exception / count-key /
+    /// override machinery (it is "not a reference at all"). The match is on the
+    /// full reference string, so `AGENTS.md` exempts the bare `AGENTS.md` but not
+    /// a path-qualified `dir/AGENTS.md`; an actual markdown link `[x](AGENTS.md)`
+    /// is unaffected. A set, so membership is O(1) and order/dupes are irrelevant.
+    /// Absent / empty table → no artifacts (the current behaviour).
+    pub artifacts: BTreeSet<String>,
 }
 
 impl Default for Config {
@@ -351,6 +366,7 @@ impl Default for Config {
             format_command: None,
             external: BTreeMap::new(),
             overrides: Vec::new(),
+            artifacts: BTreeSet::new(),
         }
     }
 }
@@ -422,6 +438,12 @@ impl Config {
             for raw_override in overrides {
                 config.overrides.push(parse_override(raw_override, &path)?);
             }
+        }
+
+        if let Some(graph) = raw.graph
+            && let Some(artifacts) = graph.artifacts
+        {
+            config.artifacts = artifacts.into_iter().collect();
         }
 
         Ok(config)
@@ -529,11 +551,19 @@ struct RawConfig {
     external: Option<HashMap<String, String>>,
     #[serde(rename = "override")]
     overrides: Option<Vec<RawOverride>>,
+    graph: Option<RawGraph>,
 }
 
 #[derive(Debug, Deserialize)]
 struct RawFormat {
     command: Option<String>,
+}
+
+/// The raw `[graph]` table (issue 038): repo-level graph settings. Currently
+/// only the artifact glossary.
+#[derive(Debug, Deserialize)]
+struct RawGraph {
+    artifacts: Option<Vec<String>>,
 }
 
 /// A raw `[[override]]` array-of-tables entry (issue 037).
@@ -1784,6 +1814,58 @@ image_empty_alt = true
         assert!(
             err.to_string().contains("at least 1"),
             "the error names the expect>=1 rule: {err}"
+        );
+    }
+
+    // -- Artifact glossary (issue 038, decision 013) --
+
+    #[test]
+    fn artifacts_default_empty() {
+        let dir = temp_dir_with(None);
+        fs::create_dir(dir.path().join(".git")).expect("create .git");
+
+        let config = Config::load(dir.path()).expect("load should succeed");
+
+        assert!(
+            config.artifacts.is_empty(),
+            "no [graph] table means no artifacts (the current behaviour)"
+        );
+    }
+
+    #[test]
+    fn artifacts_list_parses_into_a_set() {
+        let dir = temp_dir_with(Some(
+            "[graph]\nartifacts = [\"AGENTS.md\", \"CLAUDE.md\", \"GEMINI.md\", \"SKILL.md\"]\n",
+        ));
+        let config = Config::load(dir.path()).expect("load should succeed");
+
+        assert_eq!(config.artifacts.len(), 4, "all four artifacts round-trip");
+        assert!(
+            config.artifacts.contains("AGENTS.md"),
+            "the glossary contains AGENTS.md"
+        );
+        assert!(
+            config.artifacts.contains("SKILL.md"),
+            "the glossary contains SKILL.md"
+        );
+        assert!(
+            !config.artifacts.contains("dir/AGENTS.md"),
+            "a path-qualified name is not a glossary member (exact match only)"
+        );
+    }
+
+    #[test]
+    fn artifacts_dedupe_in_the_set() {
+        // Order and duplicates are irrelevant — the set collapses them.
+        let dir = temp_dir_with(Some(
+            "[graph]\nartifacts = [\"AGENTS.md\", \"AGENTS.md\", \"CLAUDE.md\"]\n",
+        ));
+        let config = Config::load(dir.path()).expect("load should succeed");
+
+        assert_eq!(
+            config.artifacts.len(),
+            2,
+            "the duplicate AGENTS.md collapses to one set member"
         );
     }
 }

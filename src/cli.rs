@@ -116,6 +116,34 @@ sibling checkout never produces a false break; only a present alias directory
 with a genuinely missing target (tier 4) is flagged.
 
 
+[graph] artifacts — known external-filename glossary
+----------------------------------------------------
+
+The bare-filename sibling of the [external] alias model: a repo-level glossary
+of known external host/plugin filenames (per-host agent-instruction and skill
+files like `AGENTS.md`, `CLAUDE.md`) whose bare/backticked/quoted mentions name
+an artifact in the installed HOST layout, not a document in this graph.
+
+    [graph]
+    artifacts = [\"AGENTS.md\", \"CLAUDE.md\", \"GEMINI.md\", \"SKILL.md\"]
+
+  - Exact-match, repo-wide. A reference whose literal string is a glossary
+    member is treated as outside the graph everywhere: never resolved,
+    linkified, flagged, or edged — decision 010's exempt tier reached by bare
+    filename instead of by `{Name}/…` alias, and not even existence-checked.
+    `AGENTS.md` exempts the bare `AGENTS.md`; a path-qualified `dir/AGENTS.md`
+    is a DIFFERENT reference and still draws its normal diagnostic.
+  - Dark-matter only. Affects only the bare/backticked/quoted path scanners; an
+    actual markdown link `[x](AGENTS.md)` is UNAFFECTED — it resolves and edges
+    normally.
+  - A vocabulary, not a reconciled suppression. Unlike exceptions and overrides
+    the glossary is NOT reconciled — there is no \"unused artifact\" flag; you
+    list host artifact names regardless of which appear in the current tree.
+  - Ledger-visible. Artifact suppressions appear in the suppression ledger as
+    their own source (one row per artifact name, aggregated repo-wide), so a
+    swallowed make-it-a-link hint is never silent.
+
+
 frontmatter `exceptions` — per-reference, reconciled
 ----------------------------------------------------
 
@@ -336,6 +364,31 @@ mod tests {
         assert!(
             CONFIG_REFERENCE.contains("Existence-only") && CONFIG_REFERENCE.contains("edge-free"),
             "the reference notes the existence-only, edge-free contract"
+        );
+    }
+
+    #[test]
+    fn reference_documents_artifact_glossary() {
+        // Issue 038: the [graph] artifacts glossary — the bare-filename external
+        // model. Exact-match / repo-wide, dark-matter-only, ledger-visible.
+        assert!(
+            CONFIG_REFERENCE.contains("[graph] artifacts")
+                && CONFIG_REFERENCE.contains("artifacts = ["),
+            "the reference shows the [graph] artifacts table"
+        );
+        assert!(
+            CONFIG_REFERENCE.contains("Exact-match, repo-wide")
+                && CONFIG_REFERENCE.contains("dir/AGENTS.md"),
+            "the reference states exact-match / repo-wide and the path-qualified counterexample"
+        );
+        assert!(
+            CONFIG_REFERENCE.contains("Dark-matter only")
+                && CONFIG_REFERENCE.contains("UNAFFECTED"),
+            "the reference notes dark-matter-only and that markdown links are unaffected"
+        );
+        assert!(
+            CONFIG_REFERENCE.contains("Ledger-visible"),
+            "the reference notes the ledger visibility"
         );
     }
 
