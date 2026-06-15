@@ -704,7 +704,7 @@ fn emit_tree_bare_paths(
                 line: bare.line,
                 severity: bare_path_severity(config.policy.bare_paths, Severity::Warning),
                 message: format!(
-                    "bare path `{}`: convert to a markdown link (see `lattice help config`)",
+                    "bare path `{}`: would moving the target update this mention? if so it's a reference — convert to a markdown link; if not it's an example — except it (see `lattice help config`)",
                     bare.path
                 ),
                 // `BarePath` carries only a line; fall back to a whole-line range.
@@ -878,7 +878,9 @@ const fn bare_path_severity(policy: BarePathPolicy, base: Severity) -> Severity 
 /// link resolve hint, gated by [`BarePathPolicy`], still fires); `Hint`/`Warn`/
 /// `Deny` set the severity. `reference` is the displayed reference text `X`.
 ///
-/// The message names the `{repo}/…` external-namespace escape (issue 030,
+/// The message frames the choice as decision 014's move test (issue 039) — a
+/// dangling mention is a reference only if moving the target would force this
+/// update — and names the `{repo}/…` external-namespace escape (issue 030,
 /// following suggestion 001's self-documenting-message principle), so an agent
 /// learns from the diagnostic that a cross-repo reference should be written and
 /// aliased rather than left to dangle.
@@ -901,7 +903,7 @@ fn build_stale_reference(
         line,
         severity,
         message: format!(
-            "stale reference: `{reference}` — no such markdown file under this root; fix the path if it moved, or write it as `{{repo}}/…` (and alias `repo` in .lattice.toml — see `lattice help config`) if it's in another repo"
+            "stale reference: `{reference}` — no such markdown file under this root; would moving the target update this mention? if so it's a reference — fix the path (or write it as `{{repo}}/…` and alias `repo` in .lattice.toml if it's in another repo); if not it's an example — except it (see `lattice help config`)"
         ),
         span,
     })
@@ -1021,7 +1023,7 @@ fn emit_bare_path_diagnostics(
                             line,
                             severity: bare_path_severity(policy, Severity::Hint),
                             message: format!(
-                                "backticked path `{inner}` refers to an existing file: make it a link, or drop the extension if you only mean the file's name, or add a frontmatter `exceptions.bare_paths` entry with a reason (see `lattice help config`)"
+                                "backticked path `{inner}` refers to an existing file: would moving it update this mention? if so it's a reference — make it a link; if not it's an example — drop the extension (a name) or except it with a reason (see `lattice help config`)"
                             ),
                             span: Some(child.span),
                         };
@@ -1281,7 +1283,7 @@ fn scan_line_for_quoted_paths(
                                 line: line_num,
                                 severity: bare_path_severity(policy, Severity::Hint),
                                 message: format!(
-                                    "quoted path `{q}{inner}{q}`: use backticks or make a markdown link (see `lattice help config`)"
+                                    "quoted path `{q}{inner}{q}`: would moving the target update this mention? if so it's a reference — make it a markdown link; if not it's an example — except it (see `lattice help config`)"
                                 ),
                                 span: Some(span),
                             };
@@ -4003,25 +4005,71 @@ mod tests {
 
     #[test]
     fn make_it_a_link_message_names_both_escapes_and_config_help() {
-        // FU2 (issue 031, folded into 035): the make-it-a-link hint names BOTH
-        // escapes — drop the extension, OR a frontmatter `exceptions.bare_paths`
-        // entry with a reason — pointing to `lattice help config`.
+        // FU2 (issue 031, folded into 035; reframed by 039): the make-it-a-link
+        // hint names BOTH example escapes — drop the extension, OR except it with
+        // a reason — under the move-test framing, pointing to `lattice help
+        // config` (the literal `exceptions.bare_paths` namespace lives in the
+        // config reference now, not in the per-occurrence message).
         let diags = diagnose_with_files("See `other.md` for details.\n", &["other.md"]);
         assert!(
             has_matching(&diags, Severity::Hint, "drop the extension"),
             "the hint still offers drop-the-extension: {diags:?}"
         );
         assert!(
-            has_matching(&diags, Severity::Hint, "exceptions.bare_paths"),
-            "the hint names the frontmatter exception escape (FU2): {diags:?}"
-        );
-        assert!(
-            has_matching(&diags, Severity::Hint, "reason"),
-            "the exception escape mentions the required reason: {diags:?}"
+            has_matching(&diags, Severity::Hint, "except it with a reason"),
+            "the hint names the frontmatter exception escape with its required reason (FU2): {diags:?}"
         );
         assert!(
             has_matching(&diags, Severity::Hint, "lattice help config"),
             "the hint points at `lattice help config`: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn stale_reference_message_frames_the_move_test() {
+        // Issue 039 / decision 014: the stale-reference message states the choice
+        // as the move test ("would a move update this?"), not just a flat list of
+        // knobs, while keeping the `lattice help config` pointer.
+        let diags = diagnose("See `gone.md` here.\n");
+        assert!(
+            has_matching(&diags, Severity::Warning, "stale reference: `gone.md`"),
+            "the stale-reference message still fires: {diags:?}"
+        );
+        assert!(
+            has_matching(
+                &diags,
+                Severity::Warning,
+                "would moving the target update this"
+            ),
+            "the stale-reference message frames the choice as the move test: {diags:?}"
+        );
+        assert!(
+            has_matching(&diags, Severity::Warning, "lattice help config"),
+            "the stale-reference message keeps the config pointer: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn make_it_a_link_message_frames_the_move_test() {
+        // The resolving backticked-path (make-it-a-link) message frames link-vs-
+        // example as the move test, keeps the make-it-a-link resolution, and the
+        // config pointer.
+        let diags = diagnose_with_files("See `other.md` here.\n", &["other.md"]);
+        assert!(
+            has_matching(&diags, Severity::Hint, "backticked path `other.md`"),
+            "the make-it-a-link hint still fires: {diags:?}"
+        );
+        assert!(
+            has_matching(&diags, Severity::Hint, "would moving it update this"),
+            "the make-it-a-link hint frames the choice as the move test: {diags:?}"
+        );
+        assert!(
+            has_matching(&diags, Severity::Hint, "make it a link"),
+            "the make-it-a-link hint keeps the link resolution: {diags:?}"
+        );
+        assert!(
+            has_matching(&diags, Severity::Hint, "lattice help config"),
+            "the make-it-a-link hint keeps the config pointer: {diags:?}"
         );
     }
 

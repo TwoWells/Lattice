@@ -17,6 +17,16 @@ use crate::structural::{self, SeverityCounts};
 use crate::validation::{self, Diagnostic, Severity};
 use crate::workspace::Workspace;
 
+/// The move-test preamble (issue 039, decision 014).
+///
+/// Led in front of a dirty `lattice lint` run whenever the emitted, in-scope
+/// diagnostics include an 028-family (path-shaped) one, so the rule that decides
+/// link-vs-example is in front of the agent at the moment of the decision. A
+/// `note:` line — like the no-config note and the suppression ledger — that the
+/// full rule in `lattice help config` and the per-occurrence path-shaped
+/// messages both point at.
+const MOVE_TEST_NOTE: &str = "note: a path is a link if moving the target would force you to update the mention; otherwise it's an example — write it as a link, or exempt it (see `lattice help config`).";
+
 /// Run all validation checks on the workspace, scoped to `start`.
 ///
 /// `start` is both the discovery hint and the lint scope. The workspace root
@@ -39,6 +49,12 @@ use crate::workspace::Workspace;
 /// should fail the exit code: any in-scope error-level diagnostic, or — when
 /// `strict` is set — any in-scope warning-level diagnostic. Info/hint
 /// diagnostics never fail the exit code.
+///
+/// When the emitted, in-scope set carries at least one 028-family (path-shaped)
+/// diagnostic, the run is led by the **move-test preamble** ([`MOVE_TEST_NOTE`],
+/// issue 039, decision 014): the rule that decides link-vs-example, in front of
+/// the agent at the moment of the decision. It survives `--quiet` (it frames
+/// diagnostics that still print).
 ///
 /// After the diagnostics, unless `quiet` is set, prints the **suppression
 /// ledger** (issue 036, decision 012): a summary of what each suppression source
@@ -111,6 +127,24 @@ pub fn run(start: &Path, strict: bool, quiet: bool, out: &mut impl Write) -> Res
     let override_outcome = apply_subtree_overrides(&workspace, &mut diagnostics);
 
     diagnostics.sort_by(|a, b| a.file.cmp(&b.file).then(a.line.cmp(&b.line)));
+
+    // The move-test preamble (issue 039, decision 014). If the emitted, in-scope
+    // set carries at least one 028-family (path-shaped) diagnostic — a stale
+    // reference or a bare/quoted/backticked path — lead the run with the rule
+    // that decides link-vs-example, so the agent meets it at the moment of the
+    // decision. Gated on the path-shaped lints specifically (classified via the
+    // same `structural::classify_028_lint` the override pass uses, issue 037):
+    // a run whose only finding is, say, a heading error carries no path
+    // guidance. It prints before the diagnostic loop, and survives `--quiet`
+    // (the ledger is the only thing `--quiet` drops; the preamble frames
+    // diagnostics that still print).
+    let has_028_family = diagnostics.iter().any(|diag| {
+        in_scope(&diag.file, scope.as_deref())
+            && structural::classify_028_lint(&diag.message).is_some()
+    });
+    if has_028_family {
+        writeln!(out, "{MOVE_TEST_NOTE}")?;
+    }
 
     for diag in &diagnostics {
         // Filter by the file the diagnostic is anchored on (issue 024). A
@@ -930,6 +964,60 @@ mod tests {
         assert!(
             output.contains("no .lattice.toml found"),
             "output should note that graph validation is disabled: {output}"
+        );
+    }
+
+    // -- Move-test preamble (issue 039, decision 014) --
+
+    #[test]
+    fn move_test_note_leads_when_an_028_family_diagnostic_fires() {
+        // A dangling backticked `.md` reference is a stale_references (028-family)
+        // diagnostic. The move-test note must lead the run, before any
+        // `path:line:` line, so the rule is in front of the agent at the decision.
+        let dir = setup(&[("a.md", "See `gone.md` for details.\n")]);
+        let (_failed, output) = run_lint(&dir);
+        assert!(
+            output.contains("stale reference"),
+            "the fixture must produce the 028-family diagnostic: {output}"
+        );
+        let note_pos = output
+            .find("note: a path is a link if moving the target")
+            .expect("the move-test note must be present");
+        let diag_pos = output
+            .find("a.md:")
+            .expect("the diagnostic line must be present");
+        assert!(
+            note_pos < diag_pos,
+            "the move-test note must print before the diagnostics: {output}"
+        );
+    }
+
+    #[test]
+    fn move_test_note_absent_when_only_non_028_diagnostics_fire() {
+        // An empty heading is a warning, but it is NOT an 028-family (path-shaped)
+        // diagnostic — so the move-test note must not print. A run whose only
+        // finding is a heading error carries no path guidance.
+        let dir = setup(&[("a.md", "## \n\nbody\n")]);
+        let (_failed, output) = run_lint(&dir);
+        assert!(
+            output.contains("empty heading"),
+            "the fixture must produce the non-028 heading diagnostic: {output}"
+        );
+        assert!(
+            !output.contains("note: a path is a link if moving the target"),
+            "the move-test note must not print for a non-028-only run: {output}"
+        );
+    }
+
+    #[test]
+    fn move_test_note_survives_quiet() {
+        // `--quiet` drops only the suppression ledger; the preamble frames
+        // diagnostics that still print, so it stays. `run_lint` runs with quiet.
+        let dir = setup(&[("a.md", "See `gone.md` for details.\n")]);
+        let (_failed, output) = run_lint(&dir);
+        assert!(
+            output.contains("note: a path is a link if moving the target"),
+            "--quiet must keep the move-test preamble: {output}"
         );
     }
 

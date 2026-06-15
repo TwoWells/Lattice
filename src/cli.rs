@@ -62,8 +62,9 @@ pub enum Command {
     /// frontmatter-exceptions reference to stdout; `lattice config --help` and
     /// `lattice help config` surface the identical text (the same
     /// [`CONFIG_REFERENCE`] string backs both). The reference is self-contained:
-    /// it documents the `[external]` alias model, per-reference `exceptions`, and
-    /// every `[policy]` knob without requiring the repository.
+    /// it states the reference-vs-example move test (decision 014), and documents
+    /// the `[external]` alias model, per-reference `exceptions`, and every
+    /// `[policy]` knob without requiring the repository.
     #[command(long_about = CONFIG_REFERENCE)]
     Config,
 }
@@ -84,6 +85,42 @@ Lattice reads an optional `.lattice.toml` at the project root (discovered by
 walking up from the linted path, stopping at the git root). Per-document
 `exceptions` live in each file's YAML frontmatter. Everything below is the
 defaults Lattice ships with — a config file only overrides what it names.
+
+
+references vs. examples — the move test
+---------------------------------------
+
+Lattice flags path-shaped strings (bare, backticked, or quoted `.md` mentions).
+Each has two honest dispositions, and one test decides which:
+
+    A path-shaped mention is a REFERENCE if moving the target file would force
+    you to update the mention. Otherwise it is an EXAMPLE — exempt it.
+
+\"Would a move ripple here?\" is the same question as \"is this a graph edge?\" —
+an edge is the maintenance obligation that breaks when its target moves. Apply
+it per MENTION, not per file: the same file can be a link in a living index and
+an example in a closed record. The judgment it localizes is one question — is
+this document a maintained reference, or a frozen record? A historical note
+(\"the drift was in `parser/README.md`\") is an example even though the file is
+real, because you do not maintain a closed record against current paths.
+
+The two outcomes map onto the mechanisms documented below:
+
+  - YES, a move would force an update -> a REFERENCE:
+      same repo     -> a markdown link (full reconciliation; the move is caught).
+      another repo  -> `{Name}/path`  (the [external] alias model, existence-
+                       checked across the graph boundary).
+  - NO, a move would change nothing here -> an EXAMPLE / dead / historical
+    mention -> exempt:
+      a recurring known external-artifact filename -> the [graph] artifacts
+                       glossary.
+      a one-off, dead, or historical mention -> a frontmatter `exceptions`
+                       entry, or a count-key for a document that path-quotes by
+                       nature.
+
+The dirty-lint preamble leads with this rule whenever a path-shaped diagnostic
+fires, and each path-shaped message restates it tersely; the full statement
+lives here.
 
 
 [external] — cross-repo alias model
@@ -344,6 +381,30 @@ mod tests {
         assert!(
             help.contains("[policy]"),
             "config --help documents the [policy] knobs: {help}"
+        );
+    }
+
+    #[test]
+    fn reference_documents_the_move_test_and_disposition_map() {
+        // Issue 039 / decision 014: the reference states the move test and the
+        // disposition map the preamble and per-message text point at.
+        assert!(
+            CONFIG_REFERENCE.contains("references vs. examples")
+                && CONFIG_REFERENCE.contains("moving the target file would force"),
+            "the reference states the move test as a named section"
+        );
+        // The disposition map: link (same repo) / {Name}/path (cross-repo) /
+        // artifact glossary (external filename) / exception·count-key (one-off).
+        assert!(
+            CONFIG_REFERENCE.contains("markdown link")
+                && CONFIG_REFERENCE.contains("{Name}/path")
+                && CONFIG_REFERENCE.contains("artifacts")
+                && CONFIG_REFERENCE.contains("count-key"),
+            "the reference enumerates the four dispositions the move test selects among"
+        );
+        assert!(
+            CONFIG_REFERENCE.contains("per MENTION, not per file"),
+            "the reference notes the rule applies per mention, not per file"
         );
     }
 
