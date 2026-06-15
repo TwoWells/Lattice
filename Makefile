@@ -7,7 +7,7 @@
 #   make release-major   # 0.1.0 -> 1.0.0
 #   make release V=0.2.0 # explicit version
 
-.PHONY: build-release check deny fuzz soak machete mutants setup setup-hooks setup-tools test release release-patch release-minor release-major publish tag-current
+.PHONY: build-release check deny fuzz soak machete metadata mutants setup setup-hooks setup-tools test release release-patch release-minor release-major publish tag-current
 
 # Get current version from Cargo.toml
 CURRENT_VERSION := $(shell grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
@@ -93,6 +93,13 @@ deny:
 
 machete:
 	@cargo machete --skip-target-dir
+
+# Emit `cargo metadata` JSON WITHOUT mutating the lockfile: `--locked` makes
+# cargo error rather than update if Cargo.lock is out of date, so this both
+# verifies the lock is consistent (`make metadata >/dev/null`) and feeds tools
+# like jq. Unlike `make check` (which runs `cargo update`), it never bumps deps.
+metadata:
+	@cargo metadata --locked --format-version 1
 
 # --- Test ---
 
