@@ -4,16 +4,56 @@
 //! Command-line interface for Lattice.
 
 use std::path::PathBuf;
+use std::sync::LazyLock;
 
 use clap::{Parser, Subcommand};
 
 /// A markdown predicate linter and backlink reconciler.
 #[derive(Debug, Parser)]
-#[command(name = "lattice", version, about)]
+#[command(name = "lattice", version = VERSION.as_str(), about)]
 pub struct Cli {
     /// Subcommand to execute.
     #[command(subcommand)]
     pub command: Command,
+}
+
+/// The composed `--version` string, evaluated once.
+///
+/// clap's `version` wants a `'static` string; the composition is a runtime
+/// `String` (it stitches the crate version with the build-time git suffix), so
+/// it is memoized here and borrowed for `'static`. The composition logic itself
+/// lives in the pure, unit-tested [`compose_version`].
+static VERSION: LazyLock<String> = LazyLock::new(version_string);
+
+/// Compose the `--version` string from its parts.
+///
+/// Pure and unit-tested so the format is verifiable without a build script.
+/// `git_hash` is `None` for a build with no git information (a crates.io /
+/// tarball build), in which case the bare crate version is returned. When a
+/// hash is present it is shown in parentheses, with a `dirty` marker appended
+/// whenever the working tree had uncommitted changes at build time:
+///
+/// - clean:  `lattice 0.1.0 (79f739a)`
+/// - dirty:  `lattice 0.1.0 (79f739a-dirty)`
+/// - no git: `lattice 0.1.0`
+fn compose_version(crate_version: &str, git_hash: Option<&str>, dirty: bool) -> String {
+    match git_hash {
+        Some(hash) if dirty => format!("{crate_version} ({hash}-dirty)"),
+        Some(hash) => format!("{crate_version} ({hash})"),
+        None => crate_version.to_owned(),
+    }
+}
+
+/// The composed `--version` string, fed to clap's `version` attribute.
+///
+/// Reads the git metadata stamped by `build.rs` (`LATTICE_GIT_HASH` /
+/// `LATTICE_GIT_DIRTY`) via `option_env!`; both are absent for a build with no
+/// git information, in which case [`compose_version`] yields the bare crate
+/// version.
+fn version_string() -> String {
+    let git_hash = option_env!("LATTICE_GIT_HASH");
+    let dirty = matches!(option_env!("LATTICE_GIT_DIRTY"), Some("1"));
+    compose_version(env!("CARGO_PKG_VERSION"), git_hash, dirty)
 }
 
 /// Available subcommands.
@@ -325,7 +365,56 @@ Example `[policy]` block:
 mod tests {
     use clap::CommandFactory;
 
-    use super::{CONFIG_REFERENCE, Cli};
+    use super::{CONFIG_REFERENCE, Cli, compose_version};
+
+    #[test]
+    fn compose_version_clean_shows_hash_without_marker() {
+        assert_eq!(
+            compose_version("0.1.0", Some("79f739a"), false),
+            "0.1.0 (79f739a)",
+            "a clean build shows the short hash in parentheses, no dirty marker"
+        );
+    }
+
+    #[test]
+    fn compose_version_dirty_shows_dirty_marker() {
+        let composed = compose_version("0.1.0", Some("79f739a"), true);
+        assert_eq!(
+            composed, "0.1.0 (79f739a-dirty)",
+            "a dirty build shows the short hash with a dirty marker"
+        );
+        assert!(
+            composed.contains("dirty"),
+            "the dirty marker must be present for an uncommitted tree: {composed}"
+        );
+    }
+
+    #[test]
+    fn compose_version_no_git_falls_back_to_bare_version() {
+        // A crates.io / tarball build has no git info; the dirty flag is
+        // irrelevant and must not leak into the bare crate version.
+        assert_eq!(
+            compose_version("0.1.0", None, false),
+            "0.1.0",
+            "no git info falls back to the bare crate version"
+        );
+        assert_eq!(
+            compose_version("0.1.0", None, true),
+            "0.1.0",
+            "the dirty flag is ignored when there is no git hash"
+        );
+    }
+
+    #[test]
+    fn version_contains_crate_version() {
+        // The clap-rendered `--version` always carries the crate version,
+        // whatever git suffix the build stamped on (or didn't).
+        let version = Cli::command().render_version();
+        assert!(
+            version.contains(env!("CARGO_PKG_VERSION")),
+            "--version output contains the crate version: {version}"
+        );
+    }
 
     /// The top-level `--help` / `help` output, as clap renders it.
     fn top_level_help() -> String {
