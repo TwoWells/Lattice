@@ -166,7 +166,11 @@ pub struct SeverityCounts {
 
 impl SeverityCounts {
     /// Record one suppressed diagnostic of `severity`.
-    fn record(&mut self, severity: Severity) {
+    ///
+    /// Used by the per-file exception/count-key tallies here and by the
+    /// workspace subtree-override aggregate in `lint` (issue 037), which counts
+    /// freeze- and `expect`-suppressed diagnostics into one of these tallies.
+    pub fn record(&mut self, severity: Severity) {
         match severity {
             Severity::Error => self.errors += 1,
             Severity::Warning => self.warnings += 1,
@@ -243,6 +247,33 @@ impl FileSuppressions {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.exceptions.is_none() && self.count_keys.is_empty()
+    }
+}
+
+/// Classify an emitted diagnostic message as one of the 028-family lints
+/// (`stale_references` / `bare_paths`), or `None` if it belongs to neither.
+///
+/// The subtree-override expect-aggregate pass (issue 037) needs to identify the
+/// live diagnostics of a given 028-family lint across the files a glob matches,
+/// but [`Diagnostic`] carries no lint tag (issue 036 deliberately kept the type
+/// unchanged). This is the single owner of that message → lint mapping, keyed on
+/// the fixed message prefixes the emitters above produce: `stale reference: …`
+/// for [`ExceptionLint::StaleReferences`], and the four `bare_paths` nudges
+/// (`bare path …`, `bare URL …`, `quoted path …`, `backticked path …`) for
+/// [`ExceptionLint::BarePaths`]. It is colocated with those emitters so the two
+/// cannot drift, and is exercised directly by a unit test.
+#[must_use]
+pub fn classify_028_lint(message: &str) -> Option<ExceptionLint> {
+    if message.starts_with("stale reference:") {
+        Some(ExceptionLint::StaleReferences)
+    } else if message.starts_with("bare path ")
+        || message.starts_with("bare URL ")
+        || message.starts_with("quoted path ")
+        || message.starts_with("backticked path ")
+    {
+        Some(ExceptionLint::BarePaths)
+    } else {
+        None
     }
 }
 
@@ -4282,6 +4313,40 @@ mod tests {
             sup.count_keys.first().map(|c| c.counts.warnings),
             Some(1),
             "the `1` sentinel claims the single residual: {sup:?}"
+        );
+    }
+
+    // -- 028-family lint classifier (issue 037) --
+
+    #[test]
+    fn classify_028_lint_maps_each_message_family() {
+        // The exact production message prefixes the emitters above produce.
+        assert_eq!(
+            classify_028_lint("stale reference: `gone.md` — no such markdown file"),
+            Some(ExceptionLint::StaleReferences),
+            "the stale-reference message maps to StaleReferences"
+        );
+        for bare in [
+            "bare path `docs/x.md`: convert to a markdown link",
+            "bare URL `https://x` : wrap in angle brackets",
+            "quoted path `\"x.md\"`: use backticks",
+            "backticked path `x.md` refers to an existing file",
+        ] {
+            assert_eq!(
+                classify_028_lint(bare),
+                Some(ExceptionLint::BarePaths),
+                "a bare_paths-family message maps to BarePaths: {bare}"
+            );
+        }
+        assert_eq!(
+            classify_028_lint("empty heading"),
+            None,
+            "a non-028 message maps to neither lint"
+        );
+        assert_eq!(
+            classify_028_lint("duplicate heading slug `x`"),
+            None,
+            "another non-028 message maps to neither lint"
         );
     }
 }

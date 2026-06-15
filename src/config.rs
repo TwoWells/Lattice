@@ -9,6 +9,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
+use glob::Pattern;
 use serde::Deserialize;
 use thiserror::Error;
 
@@ -223,6 +224,96 @@ impl Default for Policy {
     }
 }
 
+/// How a `[[override]]` entry sets one 028-family lint for its glob (decision
+/// 012 part 2, issue 037).
+///
+/// A per-lint key in an override is **either** a level string **or** an inline
+/// `{ expect = N }` table — two distinct mechanisms:
+///
+/// - [`Level`](Self::Level) is a **per-file policy override**: a file matching
+///   the glob resolves that lint to this level *instead of* the repo-wide one
+///   (it may lower or raise — `warn` → `deny`). [`disabled`](BarePathPolicy::Disabled)
+///   is the deliberate *freeze* (lint off for those files, no reconciliation).
+/// - [`Expect`](Self::Expect) is a **workspace-level aggregate tripwire**: the
+///   lint stays at its base level per file, but across *all* files the override
+///   matches, the live diagnostics of that lint (after frontmatter carve-outs)
+///   are summed — total `== N` suppresses them all (they become ledger rows),
+///   total `!= N` resurfaces them all plus one drift flag naming the override.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StaleReferenceOverride {
+    /// A per-file level override (lowers or raises, including the `disabled`
+    /// freeze).
+    Level(StaleReferencePolicy),
+    /// A workspace-aggregate `{ expect = N }` tripwire over the override's glob.
+    Expect(usize),
+}
+
+/// How a `[[override]]` entry sets the `bare_paths` lint for its glob.
+///
+/// The `bare_paths` counterpart of [`StaleReferenceOverride`]: a per-file level
+/// override (lower/raise/freeze) or a workspace-aggregate `{ expect = N }`
+/// tripwire. See [`StaleReferenceOverride`] for the two-mechanism semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BarePathOverride {
+    /// A per-file level override.
+    Level(BarePathPolicy),
+    /// A workspace-aggregate `{ expect = N }` tripwire over the override's glob.
+    Expect(usize),
+}
+
+/// A `[[override]]` entry from `.lattice.toml` (decision 012 part 2, issue 037).
+///
+/// Sets the 028-family policy (`stale_references` / `bare_paths`) per path-glob,
+/// generalizing the repo-wide knob to per-path. A file matching one of the
+/// entry's [`paths`](Self::paths) globs resolves the named lints to the entry's
+/// policy instead of the repo-wide one. When two entries match the same file the
+/// **last** one wins (decision 012). A **frontmatter** declaration (per-reference
+/// exception or count-key) wins over any override on the same file.
+#[derive(Debug, Clone)]
+pub struct Override {
+    /// The compiled globs, matched against workspace-relative paths.
+    pub paths: Vec<Pattern>,
+    /// The globs as written, for the unused-override / ledger messages.
+    pub raw_paths: Vec<String>,
+    /// The `stale_references` mode this entry sets, if any.
+    pub stale_references: Option<StaleReferenceOverride>,
+    /// The `bare_paths` mode this entry sets, if any.
+    pub bare_paths: Option<BarePathOverride>,
+    /// The optional hint (no required reason — decision 012; honesty is the
+    /// ledger).
+    pub hint: Option<String>,
+}
+
+impl Override {
+    /// Whether any of this entry's globs matches the workspace-relative
+    /// `rel_path`.
+    #[must_use]
+    pub fn matches(&self, rel_path: &Path) -> bool {
+        self.paths.iter().any(|p| p.matches_path(rel_path))
+    }
+
+    /// A display label for diagnostics and the ledger — the entry's globs joined
+    /// by `, ` (e.g. `archive/**, *_bak.md`).
+    #[must_use]
+    pub fn label(&self) -> String {
+        self.raw_paths.join(", ")
+    }
+
+    /// The optional hint as a trailing ` — <hint>` suffix for ledger rows and
+    /// messages, or the empty string when no hint was declared.
+    ///
+    /// Decision 012 makes the hint the config-grain honesty signal: it is
+    /// surfaced at lint time (in the ledger and in the override flags) rather
+    /// than enforced as a required reason. This is the single owner of that
+    /// rendering.
+    #[must_use]
+    pub fn hint_suffix(&self) -> String {
+        self.hint
+            .as_deref()
+            .map_or_else(String::new, |h| format!(" — {h}"))
+    }
+}
+
 /// Resolved Lattice configuration.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -243,6 +334,13 @@ pub struct Config {
     /// alias directory — never read, parsed, indexed, or treated as a graph edge.
     /// An undefined alias, or one whose directory is absent, degrades to exempt.
     pub external: BTreeMap<String, PathBuf>,
+    /// Per-subtree policy overrides (decision 012 part 2, issue 037).
+    ///
+    /// Each `[[override]]` entry sets the 028-family policy
+    /// (`stale_references` / `bare_paths`) for its path-globs, in source order;
+    /// when two entries match the same file the last one wins. A frontmatter
+    /// declaration on a file wins over any override matching it.
+    pub overrides: Vec<Override>,
 }
 
 impl Default for Config {
@@ -252,6 +350,7 @@ impl Default for Config {
             policy: Policy::default(),
             format_command: None,
             external: BTreeMap::new(),
+            overrides: Vec::new(),
         }
     }
 }
@@ -319,6 +418,12 @@ impl Config {
             }
         }
 
+        if let Some(overrides) = raw.overrides {
+            for raw_override in overrides {
+                config.overrides.push(parse_override(raw_override, &path)?);
+            }
+        }
+
         Ok(config)
     }
 
@@ -368,6 +473,50 @@ impl Config {
         self.inverse_of(predicate)
             .or_else(|| self.forward_of(predicate))
     }
+
+    /// Resolve the effective `Policy` for the file at workspace-relative
+    /// `rel_path`, applying any matching subtree overrides (issue 037).
+    ///
+    /// Only the 028-family levels (`stale_references` / `bare_paths`) are
+    /// adjusted, and only by an override entry that sets that lint as a **level**
+    /// ([`StaleReferenceOverride::Level`] / [`BarePathOverride::Level`]). An
+    /// `{ expect = N }` mode is a workspace-level aggregate, not a per-file level,
+    /// so it leaves the per-file policy at its base value — the lint stays active
+    /// at its repo-wide level and its live diagnostics are summed by the lint
+    /// loop's expect pass instead. Last matching entry wins (decision 012).
+    ///
+    /// Every other policy field is copied from the repo-wide policy unchanged.
+    #[must_use]
+    pub fn effective_policy(&self, rel_path: &Path) -> Policy {
+        let mut policy = self.policy.clone();
+        // Resolve each 028-family lint independently by the LAST matching entry
+        // that names it (decision 012's last-match-wins). A later `{ expect = N }`
+        // entry beats an earlier level entry for the same lint: expect keeps the
+        // lint at its base level (the aggregate is the lint loop's concern), so a
+        // winning expect must reset the level even if an earlier entry lowered or
+        // raised it. Walking forward and overwriting on each match yields exactly
+        // "last winner".
+        for ov in &self.overrides {
+            if !ov.matches(rel_path) {
+                continue;
+            }
+            match ov.stale_references {
+                Some(StaleReferenceOverride::Level(level)) => policy.stale_references = level,
+                Some(StaleReferenceOverride::Expect(_)) => {
+                    policy.stale_references = self.policy.stale_references;
+                }
+                None => {}
+            }
+            match ov.bare_paths {
+                Some(BarePathOverride::Level(level)) => policy.bare_paths = level,
+                Some(BarePathOverride::Expect(_)) => {
+                    policy.bare_paths = self.policy.bare_paths;
+                }
+                None => {}
+            }
+        }
+        policy
+    }
 }
 
 // --- Raw deserialization types ---
@@ -378,11 +527,38 @@ struct RawConfig {
     policy: Option<RawPolicy>,
     format: Option<RawFormat>,
     external: Option<HashMap<String, String>>,
+    #[serde(rename = "override")]
+    overrides: Option<Vec<RawOverride>>,
 }
 
 #[derive(Debug, Deserialize)]
 struct RawFormat {
     command: Option<String>,
+}
+
+/// A raw `[[override]]` array-of-tables entry (issue 037).
+#[derive(Debug, Deserialize)]
+struct RawOverride {
+    paths: Vec<String>,
+    stale_references: Option<RawOverrideLint>,
+    bare_paths: Option<RawOverrideLint>,
+    hint: Option<String>,
+}
+
+/// A per-lint override value: a level string (`"disabled"` etc.) **or** an
+/// inline `{ expect = N }` table. The two are the distinct mechanisms of issue
+/// 037 (per-file level vs workspace-aggregate tripwire), disambiguated by serde
+/// shape: a TOML string vs an inline table.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RawOverrideLint {
+    /// A level string.
+    Level(String),
+    /// An `{ expect = N }` aggregate tripwire.
+    Expect {
+        /// The expected aggregate live-diagnostic count over the glob.
+        expect: usize,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -550,6 +726,114 @@ fn apply_policy(policy: &mut Policy, raw: RawPolicy, path: &Path) -> Result<(), 
         policy.roots = roots.iter().map(PathBuf::from).collect();
     }
 
+    Ok(())
+}
+
+/// Resolve a raw `[[override]]` entry into an [`Override`] (issue 037).
+///
+/// Compiles each glob (an invalid glob is [`ConfigError::Invalid`]), and parses
+/// each per-lint value as either a level string (the same accepted set as the
+/// repo-wide knob) or an `{ expect = N }` aggregate (`N >= 1`). An entry with no
+/// globs, or one that names neither lint, is rejected — it can never match or do
+/// anything, so it is a config mistake worth surfacing at load time.
+fn parse_override(raw: RawOverride, path: &Path) -> Result<Override, ConfigError> {
+    let invalid = |message: String| ConfigError::Invalid {
+        path: path.to_path_buf(),
+        message,
+    };
+
+    if raw.paths.is_empty() {
+        return Err(invalid(
+            "an [[override]] entry must list at least one path glob".to_string(),
+        ));
+    }
+
+    let mut paths = Vec::with_capacity(raw.paths.len());
+    for glob in &raw.paths {
+        let pattern = Pattern::new(glob)
+            .map_err(|e| invalid(format!("invalid override glob '{glob}': {e}")))?;
+        paths.push(pattern);
+    }
+
+    let stale_references = raw
+        .stale_references
+        .map(|lint| parse_stale_reference_override(lint, &invalid))
+        .transpose()?;
+    let bare_paths = raw
+        .bare_paths
+        .map(|lint| parse_bare_path_override(lint, &invalid))
+        .transpose()?;
+
+    if stale_references.is_none() && bare_paths.is_none() {
+        return Err(invalid(format!(
+            "[[override]] entry for '{}' sets neither stale_references nor bare_paths",
+            raw.paths.join(", ")
+        )));
+    }
+
+    Ok(Override {
+        paths,
+        raw_paths: raw.paths,
+        stale_references,
+        bare_paths,
+        hint: raw.hint,
+    })
+}
+
+/// Parse a per-lint override value for `stale_references` (issue 037): a level
+/// string or an `{ expect = N }` aggregate.
+fn parse_stale_reference_override(
+    raw: RawOverrideLint,
+    invalid: &impl Fn(String) -> ConfigError,
+) -> Result<StaleReferenceOverride, ConfigError> {
+    match raw {
+        RawOverrideLint::Level(value) => parse_stale_reference_policy(&value)
+            .map(StaleReferenceOverride::Level)
+            .ok_or_else(|| {
+                invalid(format!(
+                    "unknown override stale_references level '{value}': expected 'hint', 'warn', 'deny', 'disabled', or {{ expect = N }}"
+                ))
+            }),
+        RawOverrideLint::Expect { expect } => {
+            check_expect(expect, "stale_references", invalid)?;
+            Ok(StaleReferenceOverride::Expect(expect))
+        }
+    }
+}
+
+/// Parse a per-lint override value for `bare_paths` (issue 037): a level string
+/// or an `{ expect = N }` aggregate.
+fn parse_bare_path_override(
+    raw: RawOverrideLint,
+    invalid: &impl Fn(String) -> ConfigError,
+) -> Result<BarePathOverride, ConfigError> {
+    match raw {
+        RawOverrideLint::Level(value) => parse_bare_path_policy(&value)
+            .map(BarePathOverride::Level)
+            .ok_or_else(|| {
+                invalid(format!(
+                    "unknown override bare_paths level '{value}': expected 'warn', 'deny', 'disabled', or {{ expect = N }}"
+                ))
+            }),
+        RawOverrideLint::Expect { expect } => {
+            check_expect(expect, "bare_paths", invalid)?;
+            Ok(BarePathOverride::Expect(expect))
+        }
+    }
+}
+
+/// Validate an `{ expect = N }` aggregate count: `N` must be at least 1 (a
+/// zero-count tripwire is a config mistake — there is nothing to reconcile).
+fn check_expect(
+    expect: usize,
+    lint: &str,
+    invalid: &impl Fn(String) -> ConfigError,
+) -> Result<(), ConfigError> {
+    if expect == 0 {
+        return Err(invalid(format!(
+            "override {lint} {{ expect = 0 }} must be at least 1"
+        )));
+    }
     Ok(())
 }
 
@@ -1271,6 +1555,235 @@ image_empty_alt = true
             config.opposite_of("invented"),
             None,
             "neither direction returns None"
+        );
+    }
+
+    // -- Subtree overrides (issue 037, decision 012 part 2) --
+
+    #[test]
+    fn no_override_table_means_no_overrides() {
+        let dir = temp_dir_with(None);
+        fs::create_dir(dir.path().join(".git")).expect("create .git");
+        let config = Config::load(dir.path()).expect("load should succeed");
+        assert!(
+            config.overrides.is_empty(),
+            "no [[override]] table means no overrides"
+        );
+    }
+
+    #[test]
+    fn override_level_string_parses() {
+        let dir = temp_dir_with(Some(
+            "[[override]]\npaths = [\"archive/**\", \"*_bak.md\"]\nstale_references = \"disabled\"\nhint = \"frozen docs\"\n",
+        ));
+        let config = Config::load(dir.path()).expect("load should succeed");
+        assert_eq!(config.overrides.len(), 1, "one override entry parses");
+        let ov = &config.overrides[0];
+        assert_eq!(
+            ov.stale_references,
+            Some(StaleReferenceOverride::Level(
+                StaleReferencePolicy::Disabled
+            )),
+            "a level string parses to a Level override"
+        );
+        assert_eq!(ov.bare_paths, None, "bare_paths unset on this entry");
+        assert_eq!(
+            ov.hint.as_deref(),
+            Some("frozen docs"),
+            "the optional hint round-trips"
+        );
+        assert_eq!(
+            ov.raw_paths,
+            vec!["archive/**".to_string(), "*_bak.md".to_string()],
+            "the raw globs round-trip for the label"
+        );
+    }
+
+    #[test]
+    fn override_expect_table_parses() {
+        let dir = temp_dir_with(Some(
+            "[[override]]\npaths = [\"tickets/sweep/**\"]\nstale_references = { expect = 40 }\n",
+        ));
+        let config = Config::load(dir.path()).expect("load should succeed");
+        assert_eq!(
+            config.overrides[0].stale_references,
+            Some(StaleReferenceOverride::Expect(40)),
+            "an inline {{ expect = N }} table parses to an Expect override"
+        );
+    }
+
+    #[test]
+    fn override_raise_level_parses() {
+        // bare_paths raised from the default warn to deny on a strict subtree.
+        let dir = temp_dir_with(Some(
+            "[[override]]\npaths = [\"strict/**\"]\nbare_paths = \"deny\"\n",
+        ));
+        let config = Config::load(dir.path()).expect("load should succeed");
+        assert_eq!(
+            config.overrides[0].bare_paths,
+            Some(BarePathOverride::Level(BarePathPolicy::Deny)),
+            "a raise to deny parses"
+        );
+    }
+
+    #[test]
+    fn override_glob_matches_workspace_relative_paths() {
+        let dir = temp_dir_with(Some(
+            "[[override]]\npaths = [\"archive/**\", \"*_bak.md\"]\nstale_references = \"disabled\"\n",
+        ));
+        let config = Config::load(dir.path()).expect("load should succeed");
+        let ov = &config.overrides[0];
+        assert!(
+            ov.matches(Path::new("archive/old/cli.md")),
+            "a nested path under archive/ matches archive/**"
+        );
+        assert!(
+            ov.matches(Path::new("notes_bak.md")),
+            "a top-level *_bak.md path matches"
+        );
+        assert!(
+            !ov.matches(Path::new("archived/x.md")),
+            "a sibling sharing a name prefix must not match archive/**"
+        );
+        assert!(
+            !ov.matches(Path::new("docs/live.md")),
+            "an unrelated path must not match"
+        );
+    }
+
+    #[test]
+    fn effective_policy_applies_matching_level_override() {
+        let dir = temp_dir_with(Some(
+            "[[override]]\npaths = [\"archive/**\"]\nstale_references = \"disabled\"\n",
+        ));
+        let config = Config::load(dir.path()).expect("load should succeed");
+        assert_eq!(
+            config
+                .effective_policy(Path::new("archive/old.md"))
+                .stale_references,
+            StaleReferencePolicy::Disabled,
+            "a matching file resolves the lint to the override level"
+        );
+        assert_eq!(
+            config
+                .effective_policy(Path::new("docs/live.md"))
+                .stale_references,
+            StaleReferencePolicy::Warn,
+            "a non-matching file keeps the repo-wide level"
+        );
+    }
+
+    #[test]
+    fn effective_policy_expect_keeps_base_level() {
+        let dir = temp_dir_with(Some(
+            "[[override]]\npaths = [\"sweep/**\"]\nstale_references = { expect = 5 }\n",
+        ));
+        let config = Config::load(dir.path()).expect("load should succeed");
+        assert_eq!(
+            config
+                .effective_policy(Path::new("sweep/audit.md"))
+                .stale_references,
+            StaleReferencePolicy::Warn,
+            "an expect override leaves the per-file level at its base value"
+        );
+    }
+
+    #[test]
+    fn effective_policy_last_match_wins() {
+        // Two entries match the same file: a freeze, then a raise. Last wins.
+        let dir = temp_dir_with(Some(
+            "[[override]]\npaths = [\"x/**\"]\nbare_paths = \"disabled\"\n\n[[override]]\npaths = [\"x/strict/**\"]\nbare_paths = \"deny\"\n",
+        ));
+        let config = Config::load(dir.path()).expect("load should succeed");
+        assert_eq!(
+            config
+                .effective_policy(Path::new("x/strict/a.md"))
+                .bare_paths,
+            BarePathPolicy::Deny,
+            "the last matching entry's level wins for an overlapping file"
+        );
+        assert_eq!(
+            config.effective_policy(Path::new("x/other.md")).bare_paths,
+            BarePathPolicy::Disabled,
+            "a file matched only by the first entry keeps that entry's level"
+        );
+    }
+
+    #[test]
+    fn effective_policy_later_expect_resets_earlier_level() {
+        // An earlier level entry then a later expect entry on the same lint/file:
+        // expect wins (last-match) and resets the per-file level to base.
+        let dir = temp_dir_with(Some(
+            "[[override]]\npaths = [\"a/**\"]\nstale_references = \"disabled\"\n\n[[override]]\npaths = [\"a/**\"]\nstale_references = { expect = 3 }\n",
+        ));
+        let config = Config::load(dir.path()).expect("load should succeed");
+        assert_eq!(
+            config
+                .effective_policy(Path::new("a/x.md"))
+                .stale_references,
+            StaleReferencePolicy::Warn,
+            "a later expect entry resets the lint to its base level (the earlier freeze loses)"
+        );
+    }
+
+    #[test]
+    fn override_with_no_paths_is_invalid() {
+        let dir = temp_dir_with(Some(
+            "[[override]]\npaths = []\nstale_references = \"disabled\"\n",
+        ));
+        let err = Config::load(dir.path()).expect_err("empty paths should fail");
+        assert!(
+            err.to_string().contains("at least one path glob"),
+            "the error names the empty-paths problem: {err}"
+        );
+    }
+
+    #[test]
+    fn override_naming_no_lint_is_invalid() {
+        let dir = temp_dir_with(Some("[[override]]\npaths = [\"x/**\"]\nhint = \"oops\"\n"));
+        let err = Config::load(dir.path()).expect_err("an override naming no lint should fail");
+        assert!(
+            err.to_string()
+                .contains("neither stale_references nor bare_paths"),
+            "the error names the no-lint problem: {err}"
+        );
+    }
+
+    #[test]
+    fn override_invalid_glob_is_reported() {
+        let dir = temp_dir_with(Some(
+            "[[override]]\npaths = [\"a/[\"]\nstale_references = \"disabled\"\n",
+        ));
+        let err = Config::load(dir.path()).expect_err("a malformed glob should fail");
+        assert!(
+            err.to_string().contains("invalid override glob"),
+            "the error names the bad glob: {err}"
+        );
+    }
+
+    #[test]
+    fn override_invalid_level_is_reported() {
+        let dir = temp_dir_with(Some(
+            "[[override]]\npaths = [\"x/**\"]\nstale_references = \"loud\"\n",
+        ));
+        let err = Config::load(dir.path()).expect_err("a bad level should fail");
+        let msg = err.to_string();
+        assert!(msg.contains("loud"), "mentions the bad value: {msg}");
+        assert!(
+            msg.contains("expect = N"),
+            "the error names the expect alternative: {msg}"
+        );
+    }
+
+    #[test]
+    fn override_expect_zero_is_invalid() {
+        let dir = temp_dir_with(Some(
+            "[[override]]\npaths = [\"x/**\"]\nbare_paths = { expect = 0 }\n",
+        ));
+        let err = Config::load(dir.path()).expect_err("expect = 0 should fail");
+        assert!(
+            err.to_string().contains("at least 1"),
+            "the error names the expect>=1 rule: {err}"
         );
     }
 }

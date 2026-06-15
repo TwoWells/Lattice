@@ -55,6 +55,7 @@ fuzzing = []
 anyhow = "1"
 phf = { version = "0.11", features = ["macros"] }
 clap = { version = "4", features = ["derive"] }
+glob = "0.3"
 ignore = "0.4"
 lsp-server = "0.7"
 serde = { version = "1", features = ["derive"] }

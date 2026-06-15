@@ -325,10 +325,29 @@ impl Workspace {
             .frontmatter
             .as_ref()
             .map_or(&empty_exceptions, |fm| &fm.exceptions);
+        // Resolve this file's effective 028-family policy by applying any
+        // matching `[[override]]` level entries (issue 037, decision 012). Only
+        // an override that sets `stale_references` / `bare_paths` as a *level*
+        // changes the per-file collect (a `disabled` freeze, or a raise such as
+        // `warn` → `deny`); an `{ expect = N }` aggregate leaves the per-file
+        // level alone and is reconciled later by the lint loop's expect pass.
+        // The clone is taken only when an override actually moves this file's
+        // policy — the common no-override file reuses the base config directly.
+        let effective_policy = self.config.effective_policy(rel_path);
+        let effective_config;
+        let config: &Config = if effective_policy == self.config.policy {
+            &self.config
+        } else {
+            effective_config = Config {
+                policy: effective_policy,
+                ..self.config.clone()
+            };
+            &effective_config
+        };
         let (diagnostics, suppressions) = structural::collect_with_suppressions(
             &file_data.tree,
             rel_path,
-            &self.config,
+            config,
             &file_exists,
             &external_exists,
             exceptions,

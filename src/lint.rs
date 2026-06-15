@@ -11,7 +11,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use crate::structural::SeverityCounts;
+use crate::config::{BarePathOverride, Override, StaleReferenceOverride};
+use crate::fm::{ExceptionLint, Exceptions};
+use crate::structural::{self, SeverityCounts};
 use crate::validation::{self, Diagnostic, Severity};
 use crate::workspace::Workspace;
 
@@ -97,6 +99,17 @@ pub fn run(start: &Path, strict: bool, quiet: bool, out: &mut impl Write) -> Res
         )?;
     }
 
+    // Subtree-override pass (issue 037, decision 012 part 2). The level-override
+    // (per-file) path already ran inside the workspace structural collect via
+    // `Config::effective_policy`; this is the *workspace-aggregate* half — the
+    // `{ expect = N }` tripwires and the freeze ledger rows. It consumes the
+    // assembled diagnostics plus the override globs and returns: the override
+    // ledger rows (freeze / matched-expect), and the workspace-level messages
+    // (expect drift, unused-override). Aggregates are computed over the whole
+    // workspace (the glob's full match set), independent of the lint scope; the
+    // scope filter below still governs what prints.
+    let override_outcome = apply_subtree_overrides(&workspace, &mut diagnostics);
+
     diagnostics.sort_by(|a, b| a.file.cmp(&b.file).then(a.line.cmp(&b.line)));
 
     for diag in &diagnostics {
@@ -115,12 +128,27 @@ pub fn run(start: &Path, strict: bool, quiet: bool, out: &mut impl Write) -> Res
         writeln!(out, "{}", format_diagnostic(diag))?;
     }
 
+    // Workspace-level override messages (issue 037): expect-drift and
+    // unused-override flags. They have no document line, so they print as
+    // `.lattice.toml:` warnings naming the override entry (CLI-first; the LSP
+    // publish path is a deferred follow-up — these do not map to one markdown
+    // file). They gate like warnings under `--strict`.
+    for message in &override_outcome.messages {
+        if strict {
+            failed = true;
+        }
+        writeln!(out, ".lattice.toml: warning: {message}")?;
+    }
+
     // The suppression ledger (issue 036, decision 012): summarize what was
     // suppressed in the in-scope files, by source and severity. `--quiet` drops
-    // it. Scoped identically to the diagnostics above — a suppression is
-    // attributed to the file it occurred in.
+    // it. Per-file rows are scoped identically to the diagnostics above; the
+    // workspace-level subtree-override rows (issue 037) are appended after them
+    // — an override is a central, workspace-wide policy statement, not a
+    // per-file suppression, so it is shown whenever it suppressed anything.
     if !quiet {
-        let rows = collect_ledger_rows(&workspace, scope.as_deref());
+        let mut rows = collect_ledger_rows(&workspace, scope.as_deref());
+        rows.extend(override_outcome.rows);
         write_ledger(&rows, out)?;
     }
 
@@ -184,14 +212,16 @@ fn format_diagnostic(diag: &Diagnostic) -> String {
 
 /// The suppression source a ledger row reports.
 ///
-/// Issue 037 adds a third variant (subtree overrides); the renderer iterates
-/// rows by kind, so a new source slots in without restructuring the output.
+/// Issue 037 adds the third variant (subtree overrides); the renderer iterates
+/// rows by kind, so each source slots in without restructuring the output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LedgerSource {
     /// A file's frontmatter literal exceptions.
     Exceptions,
     /// A per-document count-key.
     CountKey,
+    /// A `[[override]]` subtree entry (freeze or matched `expect = N`).
+    Override,
 }
 
 impl LedgerSource {
@@ -200,6 +230,7 @@ impl LedgerSource {
         match self {
             Self::Exceptions => "exceptions",
             Self::CountKey => "count-key",
+            Self::Override => "overrides",
         }
     }
 }
@@ -255,6 +286,275 @@ fn collect_ledger_rows(workspace: &Workspace, scope: Option<&Path>) -> Vec<Ledge
     rows
 }
 
+// ---------------------------------------------------------------------------
+// Subtree-override workspace pass (issue 037, decision 012 part 2)
+// ---------------------------------------------------------------------------
+
+/// What the subtree-override workspace pass produced: ledger rows to merge and
+/// workspace-level messages to print.
+///
+/// The level-override (per-file) half ran earlier inside the structural collect
+/// (`Config::effective_policy`); this carries the workspace-aggregate half — the
+/// `freeze` and matched-`expect` ledger rows, and the expect-drift /
+/// unused-override flags.
+struct OverrideOutcome {
+    /// Override ledger rows (freeze + matched-expect), appended after the
+    /// per-file rows.
+    rows: Vec<LedgerRow>,
+    /// Workspace-level messages (expect drift, unused-override), printed as
+    /// `.lattice.toml:` warnings.
+    messages: Vec<String>,
+}
+
+/// Run the workspace-aggregate half of the subtree-override feature (issue 037).
+///
+/// Mutates `diagnostics` in place: a matched `{ expect = N }` aggregate has its
+/// live diagnostics **removed** (they become a ledger row); a drifted one leaves
+/// them in place and adds a drift message. Returns the freeze / matched-expect
+/// ledger rows and the workspace-level messages (drift, unused-override).
+///
+/// The two override mechanisms stay strictly separated: the per-file level path
+/// already happened (it shaped what is in `diagnostics`); this function reads
+/// those diagnostics but never re-levels them — it only counts, suppresses, or
+/// flags as a workspace aggregate.
+fn apply_subtree_overrides(
+    workspace: &Workspace,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> OverrideOutcome {
+    let overrides = &workspace.config().overrides;
+    let mut outcome = OverrideOutcome {
+        rows: Vec::new(),
+        messages: Vec::new(),
+    };
+    if overrides.is_empty() {
+        return outcome;
+    }
+
+    // Unused-override: a glob set matching zero workspace files is stale (a tree
+    // was renamed or removed). Flagged regardless of mode, the config analogue
+    // of the unused-exception (decision 012).
+    for ov in overrides {
+        let matches_any = workspace.files().keys().any(|p| ov.matches(p));
+        if !matches_any {
+            outcome.messages.push(format!(
+                "unused override: `{}` matches no files — remove it, or restore the path if the tree moved (see `lattice help config`){}",
+                ov.label(),
+                ov.hint_suffix()
+            ));
+        }
+    }
+
+    // The two 028-family lints are handled independently.
+    for lint in [ExceptionLint::StaleReferences, ExceptionLint::BarePaths] {
+        apply_override_lint(workspace, overrides, lint, diagnostics, &mut outcome);
+    }
+
+    outcome
+}
+
+/// Apply the subtree overrides for one 028-family `lint` across the workspace.
+///
+/// Resolves, per file, the last matching override entry that names this lint
+/// (last-match-wins). A `Level` resolution was already applied per-file in the
+/// structural collect — here it only contributes the **freeze** ledger row when
+/// it is `disabled`. An `Expect(N)` resolution makes the file a member of that
+/// entry's aggregate; once every member is gathered, the aggregate is decided:
+/// total `== N` suppresses the lint's live diagnostics in those files (and adds
+/// one ledger row), total `!= N` leaves them and adds one drift message.
+fn apply_override_lint(
+    workspace: &Workspace,
+    overrides: &[Override],
+    lint: ExceptionLint,
+    diagnostics: &mut Vec<Diagnostic>,
+    outcome: &mut OverrideOutcome,
+) {
+    // Per expect-entry: the member files attributed to it (those whose last
+    // matching entry for this lint is that entry's `Expect`).
+    let mut expect_members: Vec<Vec<PathBuf>> = overrides.iter().map(|_| Vec::new()).collect();
+    // Per freeze-entry: the member files whose last match is that entry's
+    // `disabled` level — for the freeze ledger row's base-level counts.
+    let mut freeze_members: Vec<Vec<PathBuf>> = overrides.iter().map(|_| Vec::new()).collect();
+
+    for path in workspace.files().keys() {
+        match resolve_last_match(overrides, lint, path) {
+            Some((idx, OverrideResolution::Expect)) => expect_members[idx].push(path.clone()),
+            Some((idx, OverrideResolution::Freeze)) => freeze_members[idx].push(path.clone()),
+            Some((_, OverrideResolution::OtherLevel)) | None => {}
+        }
+    }
+
+    // Freeze rows: the lint is off for these files, so the suppressed count is
+    // what it WOULD have emitted at the repo-wide level (after frontmatter
+    // carve-outs). Compute that by a base-level re-collect for frozen files.
+    for (idx, members) in freeze_members.iter().enumerate() {
+        if members.is_empty() {
+            continue;
+        }
+        let mut counts = SeverityCounts::default();
+        for path in members {
+            for diag in base_level_lint_diagnostics(workspace, path, lint) {
+                counts.record(diag.severity);
+            }
+        }
+        if !counts.is_empty() {
+            outcome.rows.push(LedgerRow {
+                source: LedgerSource::Override,
+                label: overrides[idx].label(),
+                counts,
+                detail: format!("override (freeze){}", overrides[idx].hint_suffix()),
+            });
+        }
+    }
+
+    // Expect aggregates: count the lint's live diagnostics across the member
+    // files (already in `diagnostics`, after frontmatter carve-outs), then
+    // suppress or flag.
+    for (idx, members) in expect_members.iter().enumerate() {
+        if members.is_empty() {
+            continue;
+        }
+        let Some(expect) = expect_count(&overrides[idx], lint) else {
+            continue;
+        };
+
+        let member_set: std::collections::HashSet<&Path> =
+            members.iter().map(PathBuf::as_path).collect();
+        let is_member_lint = |d: &Diagnostic| {
+            member_set.contains(d.file.as_path())
+                && structural::classify_028_lint(&d.message) == Some(lint)
+        };
+        let found = diagnostics.iter().filter(|d| is_member_lint(d)).count();
+
+        if found == expect {
+            // Aggregate matches: suppress the lint's diagnostics in these files,
+            // tallying them as one override ledger row.
+            let mut counts = SeverityCounts::default();
+            diagnostics.retain(|d| {
+                if is_member_lint(d) {
+                    counts.record(d.severity);
+                    false
+                } else {
+                    true
+                }
+            });
+            outcome.rows.push(LedgerRow {
+                source: LedgerSource::Override,
+                label: overrides[idx].label(),
+                counts,
+                detail: format!("override (expect={expect}){}", overrides[idx].hint_suffix()),
+            });
+        } else {
+            // Drift: the override is inert (diagnostics stay), plus one flag.
+            outcome.messages.push(format!(
+                "override `{}` expects {expect} {} but found {found} — update the count or fix the drift (see `lattice help config`){}",
+                overrides[idx].label(),
+                lint.noun(),
+                overrides[idx].hint_suffix()
+            ));
+        }
+    }
+}
+
+/// The resolution of a single 028-family `lint` for one file under the overrides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OverrideResolution {
+    /// The winning entry sets this lint to `{ expect = N }`.
+    Expect,
+    /// The winning entry sets this lint to the `disabled` freeze level.
+    Freeze,
+    /// The winning entry sets this lint to a non-freeze level (warn/deny/hint).
+    /// Already applied per-file; no workspace-aggregate action.
+    OtherLevel,
+}
+
+/// Find the last override entry that names `lint` and matches `path`, with its
+/// resolution kind (last-match-wins, decision 012). `None` when no entry both
+/// matches and names this lint.
+fn resolve_last_match(
+    overrides: &[Override],
+    lint: ExceptionLint,
+    path: &Path,
+) -> Option<(usize, OverrideResolution)> {
+    let mut winner = None;
+    for (idx, ov) in overrides.iter().enumerate() {
+        if !ov.matches(path) {
+            continue;
+        }
+        let resolution = match lint {
+            ExceptionLint::StaleReferences => ov.stale_references.map(|m| match m {
+                StaleReferenceOverride::Expect(_) => OverrideResolution::Expect,
+                StaleReferenceOverride::Level(crate::config::StaleReferencePolicy::Disabled) => {
+                    OverrideResolution::Freeze
+                }
+                StaleReferenceOverride::Level(_) => OverrideResolution::OtherLevel,
+            }),
+            ExceptionLint::BarePaths => ov.bare_paths.map(|m| match m {
+                BarePathOverride::Expect(_) => OverrideResolution::Expect,
+                BarePathOverride::Level(crate::config::BarePathPolicy::Disabled) => {
+                    OverrideResolution::Freeze
+                }
+                BarePathOverride::Level(_) => OverrideResolution::OtherLevel,
+            }),
+        };
+        if let Some(resolution) = resolution {
+            winner = Some((idx, resolution));
+        }
+    }
+    winner
+}
+
+/// The `expect = N` count an override sets for `lint`, if any.
+fn expect_count(ov: &Override, lint: ExceptionLint) -> Option<usize> {
+    match lint {
+        ExceptionLint::StaleReferences => match ov.stale_references {
+            Some(StaleReferenceOverride::Expect(n)) => Some(n),
+            _ => None,
+        },
+        ExceptionLint::BarePaths => match ov.bare_paths {
+            Some(BarePathOverride::Expect(n)) => Some(n),
+            _ => None,
+        },
+    }
+}
+
+/// Re-collect a file's structural diagnostics at the **repo-wide** policy and
+/// return only those of `lint`.
+///
+/// A `disabled` freeze emits nothing for the frozen lint, so its ledger row's
+/// suppressed count cannot be read from the diagnostics — it is "what the lint
+/// would have said at the base level". This recomputes that, with the file's
+/// frontmatter applied (frontmatter wins, decision 012), using the same oracles
+/// the workspace loader uses. Called only for frozen files (rare, opt-in, CLI
+/// path), so the extra collect is not a hot-path cost.
+fn base_level_lint_diagnostics(
+    workspace: &Workspace,
+    rel_path: &Path,
+    lint: ExceptionLint,
+) -> Vec<Diagnostic> {
+    let Some(file_data) = workspace.file(rel_path) else {
+        return Vec::new();
+    };
+    let file_exists = |target: &Path| workspace.file(target).is_some();
+    let external_exists = |path: &Path| path.exists();
+    let empty_exceptions = Exceptions::default();
+    let exceptions = file_data
+        .frontmatter
+        .as_ref()
+        .map_or(&empty_exceptions, |fm| &fm.exceptions);
+    let (diagnostics, _) = structural::collect_with_suppressions(
+        &file_data.tree,
+        rel_path,
+        workspace.config(),
+        &file_exists,
+        &external_exists,
+        exceptions,
+    );
+    diagnostics
+        .into_iter()
+        .filter(|d| structural::classify_028_lint(&d.message) == Some(lint))
+        .collect()
+}
+
 /// Render a `SeverityCounts` as the comma-joined `N warnings, M hints` phrase the
 /// ledger uses. Zero-severity buckets are omitted; the plural `s` is dropped for
 /// a count of one.
@@ -292,7 +592,11 @@ fn write_ledger(rows: &[LedgerRow], out: &mut impl Write) -> Result<()> {
         totals.add(row.counts);
     }
     let mut source_counts = Vec::new();
-    for source in [LedgerSource::CountKey, LedgerSource::Exceptions] {
+    for source in [
+        LedgerSource::Override,
+        LedgerSource::CountKey,
+        LedgerSource::Exceptions,
+    ] {
         let n = rows.iter().filter(|r| r.source == source).count();
         if n > 0 {
             source_counts.push(format!("{n} {}", source.header_name()));
@@ -989,6 +1293,250 @@ mod tests {
         assert!(
             !output.contains("suppressed:"),
             "a clean run prints no ledger: {output}"
+        );
+    }
+
+    // -- Subtree overrides (issue 037, decision 012 part 2) --
+
+    #[test]
+    fn override_disables_lint_for_matching_files_only() {
+        // archive/old.md and live/cur.md both quote a dead `.md` path (a stale
+        // reference, warning by default). A freeze override on archive/** must
+        // silence archive/old.md's stale reference while live/cur.md's stays.
+        let dir = setup(&[
+            (
+                ".lattice.toml",
+                "[[override]]\npaths = [\"archive/**\"]\nstale_references = \"disabled\"\nhint = \"frozen docs\"\n",
+            ),
+            ("archive/old.md", "See `gone.md` here.\n"),
+            ("live/cur.md", "See `missing.md` here.\n"),
+        ]);
+        let (_failed, output) = run_lint(&dir);
+        assert!(
+            !output.contains("archive/old.md"),
+            "the freeze override silences the matching file's stale reference: {output}"
+        );
+        assert!(
+            output.contains("live/cur.md") && output.contains("stale reference"),
+            "a non-matching file's stale reference is unaffected: {output}"
+        );
+    }
+
+    #[test]
+    fn override_raise_escalates_for_matching_files() {
+        // stale_references default is warn; a deny override on strict/** must
+        // escalate the matching file's stale reference to an error (and exit 1),
+        // while a non-matching file stays a warning.
+        let dir = setup(&[
+            (
+                ".lattice.toml",
+                "[[override]]\npaths = [\"strict/**\"]\nstale_references = \"deny\"\n",
+            ),
+            ("strict/a.md", "See `gone.md` here.\n"),
+            ("lax/b.md", "See `gone.md` here.\n"),
+        ]);
+        let (failed, output) = run_lint(&dir);
+        assert!(
+            failed,
+            "a raise to deny must fail the exit code on the matching file: {output}"
+        );
+        assert!(
+            output.contains("strict/a.md:1: error: stale reference"),
+            "the matching file's stale reference is escalated to an error: {output}"
+        );
+        assert!(
+            output.contains("lax/b.md:1: warning: stale reference"),
+            "a non-matching file keeps the repo-wide warning level: {output}"
+        );
+    }
+
+    #[test]
+    fn override_expect_match_suppresses_all() {
+        // Two matching files with one stale reference each: expect = 2 matches
+        // the aggregate, so both are suppressed and no stale-reference
+        // diagnostic prints.
+        let dir = setup(&[
+            (
+                ".lattice.toml",
+                "[[override]]\npaths = [\"sweep/**\"]\nstale_references = { expect = 2 }\n",
+            ),
+            ("sweep/a.md", "See `gone.md` here.\n"),
+            ("sweep/b.md", "See `missing.md` here.\n"),
+        ]);
+        let (_failed, output) = run_lint(&dir);
+        assert!(
+            !output.contains("stale reference"),
+            "a matched expect aggregate suppresses every member's stale reference: {output}"
+        );
+    }
+
+    #[test]
+    fn override_expect_drift_resurfaces_and_flags() {
+        // expect = 5 but only two stale references exist: the override is inert,
+        // so both diagnostics resurface AND one drift flag names the override.
+        let dir = setup(&[
+            (
+                ".lattice.toml",
+                "[[override]]\npaths = [\"sweep/**\"]\nstale_references = { expect = 5 }\n",
+            ),
+            ("sweep/a.md", "See `gone.md` here.\n"),
+            ("sweep/b.md", "See `missing.md` here.\n"),
+        ]);
+        let (_failed, output) = run_lint(&dir);
+        assert!(
+            output.contains("sweep/a.md") && output.contains("sweep/b.md"),
+            "on drift, every member diagnostic resurfaces: {output}"
+        );
+        assert!(
+            output.contains("expects 5 stale references but found 2")
+                && output.contains("sweep/**"),
+            "the drift flag names the override and the expected/found counts: {output}"
+        );
+    }
+
+    #[test]
+    fn unused_override_flags() {
+        // A glob matching zero files is flagged as an unused override.
+        let dir = setup(&[
+            (
+                ".lattice.toml",
+                "[[override]]\npaths = [\"archive/**\"]\nstale_references = \"disabled\"\n",
+            ),
+            ("live/doc.md", "# Live\n"),
+        ]);
+        let (_failed, output) = run_lint(&dir);
+        assert!(
+            output.contains("unused override") && output.contains("archive/**"),
+            "a zero-match override is flagged, naming the glob: {output}"
+        );
+    }
+
+    #[test]
+    fn frontmatter_wins_over_override() {
+        // Two files match an expect = 1 override. sweep/a.md's own frontmatter
+        // excepts its dead reference — frontmatter wins, so that reference is
+        // carved out FIRST and is never counted in the override aggregate. Only
+        // sweep/b.md's live stale reference reaches the aggregate, so expect = 1
+        // matches and suppresses it. If the override (not frontmatter) had
+        // claimed a.md's reference, the aggregate would have seen 2 and drifted.
+        let dir = setup(&[
+            (
+                ".lattice.toml",
+                "[[override]]\npaths = [\"sweep/**\"]\nstale_references = { expect = 1 }\n",
+            ),
+            (
+                "sweep/a.md",
+                "---\nexceptions:\n  stale_references:\n    \"gone.md\": \"frontmatter wins\"\n---\nSee `gone.md` here.\n",
+            ),
+            ("sweep/b.md", "See `missing.md` here.\n"),
+        ]);
+        let (_failed, output) = run_lint(&dir);
+        assert!(
+            !output.contains("stale reference"),
+            "frontmatter carves a.md's reference out first, then the expect = 1 aggregate suppresses b.md's: {output}"
+        );
+        assert!(
+            !output.contains("expects 1"),
+            "the aggregate counts only the frontmatter survivor (1), so it matches and does not drift: {output}"
+        );
+    }
+
+    #[test]
+    fn override_expect_drifts_when_frontmatter_carves_all() {
+        // The mirror of `frontmatter_wins_over_override`: when frontmatter carves
+        // out the only reference, the aggregate honestly sees 0. An expect = 5
+        // there is genuinely stale (the subtree no longer has 5 dead refs), so it
+        // drifts — frontmatter winning does not silence the tripwire, it just
+        // changes what the tripwire counts.
+        let dir = setup(&[
+            (
+                ".lattice.toml",
+                "[[override]]\npaths = [\"sweep/**\"]\nstale_references = { expect = 5 }\n",
+            ),
+            (
+                "sweep/a.md",
+                "---\nexceptions:\n  stale_references:\n    \"gone.md\": \"frontmatter wins\"\n---\nSee `gone.md` here.\n",
+            ),
+        ]);
+        let (_failed, output) = run_lint(&dir);
+        assert!(
+            output.contains("expects 5 stale references but found 0"),
+            "with every reference carved out by frontmatter, the expect = 5 aggregate honestly drifts to 0: {output}"
+        );
+    }
+
+    #[test]
+    fn ledger_includes_override_rows() {
+        // A freeze override and a matched expect override each contribute one
+        // ledger row, labelled by glob with the freeze / expect=N detail.
+        let dir = setup(&[
+            (
+                ".lattice.toml",
+                "[[override]]\npaths = [\"archive/**\"]\nstale_references = \"disabled\"\n\n[[override]]\npaths = [\"sweep/**\"]\nstale_references = { expect = 1 }\n",
+            ),
+            ("archive/old.md", "See `gone.md` here.\n"),
+            ("sweep/a.md", "See `missing.md` here.\n"),
+        ]);
+        let (_failed, output) = run_lint_with_ledger(&dir);
+        assert!(
+            output.contains("suppressed:") && output.contains("2 overrides"),
+            "the ledger header tallies both override rows: {output}"
+        );
+        assert!(
+            output.contains("archive/**") && output.contains("override (freeze)"),
+            "the freeze override contributes a labelled ledger row: {output}"
+        );
+        assert!(
+            output.contains("sweep/**") && output.contains("override (expect=1)"),
+            "the matched expect override contributes a labelled ledger row: {output}"
+        );
+    }
+
+    #[test]
+    fn override_last_match_wins_freeze_then_raise() {
+        // x/** freezes bare_paths; x/strict/** raises it to deny. A file under
+        // x/strict resolving a make-it-a-link bare path must error (the later
+        // entry wins); a file only under x/** is silenced.
+        let dir = setup(&[
+            (
+                ".lattice.toml",
+                "[[override]]\npaths = [\"x/**\"]\nbare_paths = \"disabled\"\n\n[[override]]\npaths = [\"x/strict/**\"]\nbare_paths = \"deny\"\n",
+            ),
+            ("x/strict/a.md", "See \"target.md\" for details.\n"),
+            ("x/other.md", "See \"target.md\" for details.\n"),
+            ("target.md", "# Target\n"),
+        ]);
+        let (failed, output) = run_lint(&dir);
+        assert!(
+            failed,
+            "the later deny entry wins for the overlapping file and fails the exit code: {output}"
+        );
+        assert!(
+            output.contains("x/strict/a.md:1: error:"),
+            "the file under the last-matching deny entry escalates to an error: {output}"
+        );
+        assert!(
+            !output.contains("x/other.md"),
+            "a file matched only by the first freeze entry is silenced: {output}"
+        );
+    }
+
+    #[test]
+    fn override_drift_gates_under_strict() {
+        // An expect-drift flag is a warning; under --strict it must fail the exit
+        // code like any other warning.
+        let dir = setup(&[
+            (
+                ".lattice.toml",
+                "[[override]]\npaths = [\"sweep/**\"]\nstale_references = { expect = 5 }\n",
+            ),
+            ("sweep/a.md", "See `gone.md` here.\n"),
+        ]);
+        let (failed, output) = run_lint_with(&dir, true);
+        assert!(failed, "the drift flag gates under --strict: {output}");
+        assert!(
+            output.contains("expects 5 stale references but found 1"),
+            "the drift flag is present: {output}"
         );
     }
 }

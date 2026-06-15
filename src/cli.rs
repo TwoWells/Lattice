@@ -177,12 +177,50 @@ reference:
     lint makes the sentinel inert (no suppression, no flag).
 
 
+[[override]] — per-subtree policy
+---------------------------------
+
+A `[[override]]` array-of-tables sets the 028-family policy
+(`stale_references` / `bare_paths`) per path-glob, generalizing the repo-wide
+[policy] knob to a subtree. Globs are matched against workspace-relative paths.
+
+    [[override]]
+    paths = [\"archive/**\", \"*_bak.md\"]
+    stale_references = \"disabled\"          # freeze
+    hint = \"frozen/superseded docs; refs rotted after the live docs moved on\"
+
+    [[override]]
+    paths = [\"tickets/sweep/**\"]
+    stale_references = { expect = 40 }     # tripwire
+    hint = \"sweep-audit tickets that quote dead paths as their subject\"
+
+  - A per-lint key is EITHER a level string (`hint` / `warn` / `deny` /
+    `disabled`) OR an inline `{ expect = N }` table — two distinct mechanisms.
+  - Level string = a PER-FILE policy override. A matching file resolves that
+    lint to this level instead of the repo-wide one; the level may LOWER or RAISE
+    (e.g. `warn` -> `deny` on a strict subtree). `disabled` is the deliberate
+    FREEZE (lint off for those files, no reconciliation).
+  - `{ expect = N }` = a WORKSPACE-AGGREGATE tripwire. The lint stays at its base
+    level per file, but across all files the glob matches, the live diagnostics
+    of that lint are summed: total `== N` suppresses them all (one ledger row);
+    total `!= N` resurfaces them all plus one drift flag naming the override.
+  - `hint` is optional (no required reason — at config grain the honesty comes
+    from the ledger, not a forced justification).
+  - Last match wins when two entries match the same file. A frontmatter
+    declaration (a per-reference exception or count-key) wins over any override
+    on the same file.
+  - Unused-override. A glob matching zero files is flagged — the config analogue
+    of the unused-exception, catching a stale override after a tree was renamed.
+
+
 suppression ledger (lattice lint)
 ---------------------------------
 
 After the diagnostics, `lattice lint` prints a ledger of what was suppressed —
-by source (frontmatter exceptions, count-keys) and severity — so a turned-off
-blanket is never silent. `--quiet` drops the ledger for CI.
+by source (frontmatter exceptions, count-keys, subtree overrides) and severity —
+so a turned-off blanket is never silent. Each override row is labelled by glob
+and `override (freeze)` or `override (expect=N)`. `--quiet` drops the ledger for
+CI.
 
 
 [policy] — lint knobs
@@ -344,6 +382,35 @@ mod tests {
         assert!(
             CONFIG_REFERENCE.contains("suppression ledger") && CONFIG_REFERENCE.contains("--quiet"),
             "the reference documents the suppression ledger and --quiet"
+        );
+    }
+
+    #[test]
+    fn reference_documents_subtree_override() {
+        // Issue 037: the [[override]] grammar — both mechanisms (level / expect),
+        // last-match-wins, frontmatter precedence, and the unused-override flag.
+        assert!(
+            CONFIG_REFERENCE.contains("[[override]]") && CONFIG_REFERENCE.contains("expect = N"),
+            "the reference shows the [[override]] table and the expect form"
+        );
+        assert!(
+            CONFIG_REFERENCE.contains("PER-FILE policy override")
+                && CONFIG_REFERENCE.contains("WORKSPACE-AGGREGATE tripwire"),
+            "the reference distinguishes the level and expect mechanisms"
+        );
+        assert!(
+            CONFIG_REFERENCE.contains("Last match wins")
+                && CONFIG_REFERENCE.contains("wins over any override"),
+            "the reference documents last-match-wins and frontmatter precedence"
+        );
+        assert!(
+            CONFIG_REFERENCE.contains("Unused-override"),
+            "the reference documents the unused-override flag"
+        );
+        assert!(
+            CONFIG_REFERENCE.contains("override (freeze)")
+                && CONFIG_REFERENCE.contains("override (expect=N)"),
+            "the ledger section documents the override row labels"
         );
     }
 
