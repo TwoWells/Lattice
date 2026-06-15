@@ -41,6 +41,15 @@ pub enum Command {
         /// diagnostics never affect the exit code.
         #[arg(long, alias = "deny-warnings")]
         strict: bool,
+        /// Suppress the trailing suppression ledger summary.
+        ///
+        /// By default `lattice lint` prints, after the diagnostics, a ledger of
+        /// what was suppressed — by source (frontmatter exceptions, count-keys)
+        /// and severity — so a turned-off blanket is never silent (decision
+        /// 012). `--quiet` drops the ledger, leaving only the diagnostics, for
+        /// machine-readable CI output.
+        #[arg(long)]
+        quiet: bool,
     },
     /// Start the LSP server on stdio.
     ///
@@ -137,6 +146,43 @@ document's own frontmatter — a block sibling to `backlinks`:
   - A `Disabled` lint makes its exceptions inert: not consulted, not flagged.
   - Never auto-removed. Lattice flags; you decide whether to drop the
     exception or restore the reference.
+
+
+frontmatter count-key — per-document residual, reconciled
+---------------------------------------------------------
+
+For a document that is path-quoting by nature (a migration table, a sweep
+audit, a frozen archive) where enumerating one literal key per non-reference
+is noise, an all-digits key under a lint namespace is a count SENTINEL, not a
+reference:
+
+    ---
+    exceptions:
+      stale_references:
+        \"{Catenary}/old/layout.md\": \"a kept literal, carved out first\"
+        31: \"consolidation migration table — every path is a record, not a live reference\"
+    ---
+
+  - Shape, not value. A key matching `^[0-9]+$` (`31`, or quoted `\"31\"`) is the
+    sentinel; any path-shaped key (a name, slash, or `#`) is a literal. No real
+    reference is named `31`, so `31.md` and `a/31` stay literal references.
+  - Residual semantics. The sentinel `N` claims the lint's RESIDUAL — its live
+    diagnostics minus those already carved out by literal keys (literals win,
+    subtracted first). Let the residual be `M`.
+  - Tripwire, not silence. `M == N` suppresses the whole residual under the one
+    shared reason. `M != N` makes the sentinel inert: every residual diagnostic
+    resurfaces, plus one warning on the key — `expected N here, found M`. Adding
+    a genuinely-broken reference bumps the count and shows you the new one.
+  - A REQUIRED reason, `N >= 1`, at most one sentinel per namespace; a `Disabled`
+    lint makes the sentinel inert (no suppression, no flag).
+
+
+suppression ledger (lattice lint)
+---------------------------------
+
+After the diagnostics, `lattice lint` prints a ledger of what was suppressed —
+by source (frontmatter exceptions, count-keys) and severity — so a turned-off
+blanket is never silent. `--quiet` drops the ledger for CI.
 
 
 [policy] — lint knobs
@@ -278,6 +324,26 @@ mod tests {
             CONFIG_REFERENCE.contains("Disabled")
                 && CONFIG_REFERENCE.contains("Never auto-removed"),
             "the reference notes the disabled-lint and never-auto-removed rules"
+        );
+    }
+
+    #[test]
+    fn reference_documents_count_key_and_ledger() {
+        // Issue 036: the count-key sentinel and the suppression ledger, which
+        // the new diagnostics point at via `lattice help config`.
+        assert!(
+            CONFIG_REFERENCE.contains("count SENTINEL")
+                && CONFIG_REFERENCE.contains("^[0-9]+$")
+                && CONFIG_REFERENCE.contains("RESIDUAL"),
+            "the reference documents the all-digits count-key sentinel and residual"
+        );
+        assert!(
+            CONFIG_REFERENCE.contains("expected N here, found M"),
+            "the reference describes the count-key drift tripwire"
+        );
+        assert!(
+            CONFIG_REFERENCE.contains("suppression ledger") && CONFIG_REFERENCE.contains("--quiet"),
+            "the reference documents the suppression ledger and --quiet"
         );
     }
 

@@ -7,7 +7,7 @@
 //! artifact, independent of Lattice's predicate graph. They run on every
 //! file regardless of whether `.lattice.toml` is present.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -15,7 +15,7 @@ use crate::block::{self, ElementKind, Syntax, Tree};
 use crate::config::{
     BarePathPolicy, CodeBlockLanguagePolicy, Config, FragmentAlgorithm, StaleReferencePolicy,
 };
-use crate::fm::{ExceptionEntry, ExceptionLint, Exceptions};
+use crate::fm::{CountKey, ExceptionEntry, ExceptionLint, Exceptions};
 use crate::html;
 use crate::span::Span;
 use crate::validation::{Diagnostic, Severity};
@@ -41,6 +41,13 @@ use crate::validation::{Diagnostic, Severity};
 /// the corresponding `exceptions.<lint>` namespace is **suppressed**, and an
 /// entry that matches no live diagnostic is reconciled afterward — flagged as an
 /// *unused exception* echoing its reason, or as a missing-reason defect.
+///
+/// This is the diagnostics-only convenience wrapper over
+/// [`collect_with_suppressions`]; it discards the suppression ledger. The
+/// production path (the workspace loader) calls the suppressions form so the CLI
+/// can render the ledger, while the property suite, the fuzz harness, and the
+/// invariants module — which only assert on the diagnostics — use this form.
+#[cfg(any(test, feature = "fuzzing"))]
 pub fn collect(
     tree: &Tree,
     rel_path: &Path,
@@ -49,6 +56,35 @@ pub fn collect(
     external_exists: &dyn Fn(&Path) -> bool,
     exceptions: &Exceptions,
 ) -> Vec<Diagnostic> {
+    collect_with_suppressions(
+        tree,
+        rel_path,
+        config,
+        file_exists,
+        external_exists,
+        exceptions,
+    )
+    .0
+}
+
+/// Like [`collect`], but also returns the [`FileSuppressions`] ledger entry for
+/// this file — what each suppression source (literal frontmatter exceptions and
+/// count-keys) actually suppressed, broken out by severity (issue 036,
+/// decision 012 part B).
+///
+/// [`collect`] is the thin wrapper that discards the ledger for the LSP, the
+/// property suite, and the fuzz harness, which only consume the diagnostics; the
+/// CLI lint loop calls this form and aggregates the ledger across files. The
+/// emitted diagnostics are identical between the two — count-key resolution and
+/// unused-exception reconciliation run regardless of whether the ledger is kept.
+pub fn collect_with_suppressions(
+    tree: &Tree,
+    rel_path: &Path,
+    config: &Config,
+    file_exists: &dyn Fn(&Path) -> bool,
+    external_exists: &dyn Fn(&Path) -> bool,
+    exceptions: &Exceptions,
+) -> (Vec<Diagnostic>, FileSuppressions) {
     let mut diagnostics = Vec::new();
     let source = tree.source();
 
@@ -56,7 +92,8 @@ pub fn collect(
     // emit sites. A lint whose policy is `Disabled` is excluded so its
     // exceptions are neither consulted nor flagged as unused — there are no live
     // diagnostics to reconcile against, and flagging them all would be a false
-    // unused-exception flood (issue 031).
+    // unused-exception flood (issue 031). The same `Disabled` gate makes a
+    // count-key inert (issue 036).
     let lookup = ExceptionLookup::new(
         exceptions,
         config.policy.stale_references != StaleReferencePolicy::Disabled,
@@ -89,50 +126,185 @@ pub fn collect(
     emit_image_diagnostics(tree, rel_path, config, &mut diagnostics);
     emit_trailing_whitespace_diagnostics(source, rel_path, tree, &mut diagnostics);
 
+    // Resolve the count-keys: each lint's residual (the diagnostics buffered
+    // because a count-key was active and they survived literal suppression) is
+    // either suppressed wholesale (residual `M == N`) or resurfaced with a drift
+    // warning anchored at the count key (`M != N`) — issue 036, decision 012.
+    lookup.resolve_count_keys(rel_path, &mut diagnostics);
+
     // Reconcile: after every live diagnostic has had a chance to match, flag the
     // exceptions that matched nothing (issue 031, decision 011 — flag, never
     // auto-remove).
     lookup.emit_unmatched(rel_path, &mut diagnostics);
 
     diagnostics.sort_by(|a, b| a.file.cmp(&b.file).then(a.line.cmp(&b.line)));
-    diagnostics
+    let suppressions = lookup.into_suppressions(rel_path);
+    (diagnostics, suppressions)
 }
 
 // ---------------------------------------------------------------------------
-// Exception reconciliation (issue 031, decision 011)
+// Suppression ledger (issue 036, decision 012 part B)
 // ---------------------------------------------------------------------------
 
-/// Per-lint exception entries paired with a matched flag.
+/// A tally of suppressed diagnostics broken out by severity.
 ///
-/// Interior mutability (`Cell<bool>`) lets the emit pass record matches behind a
-/// shared reference, so the lookup can be threaded as `&self` alongside the
-/// `&mut Vec<Diagnostic>` the emitters already carry.
+/// The ledger reports what each suppression source hid, by severity; this is the
+/// per-source, per-file accumulator. Only the severities a path-shaped lint
+/// actually produces are tracked (errors under a `Deny` policy, warnings, and
+/// hints); `Info` is included for completeness so the type is total.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SeverityCounts {
+    /// Suppressed error-level diagnostics.
+    pub errors: usize,
+    /// Suppressed warning-level diagnostics.
+    pub warnings: usize,
+    /// Suppressed info-level diagnostics.
+    pub info: usize,
+    /// Suppressed hint-level diagnostics.
+    pub hints: usize,
+}
+
+impl SeverityCounts {
+    /// Record one suppressed diagnostic of `severity`.
+    fn record(&mut self, severity: Severity) {
+        match severity {
+            Severity::Error => self.errors += 1,
+            Severity::Warning => self.warnings += 1,
+            Severity::Info => self.info += 1,
+            Severity::Hint => self.hints += 1,
+        }
+    }
+
+    /// Fold another tally into this one (cross-file aggregation).
+    pub fn add(&mut self, other: Self) {
+        self.errors += other.errors;
+        self.warnings += other.warnings;
+        self.info += other.info;
+        self.hints += other.hints;
+    }
+
+    /// Whether nothing was suppressed (every severity is zero).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.errors == 0 && self.warnings == 0 && self.info == 0 && self.hints == 0
+    }
+}
+
+/// One count-key ledger row: a count-key that suppressed its residual.
+///
+/// Recorded only when the residual matched the expected count (`M == N`), so the
+/// suppression actually fired. A drifted count-key suppresses nothing and so
+/// produces no row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CountKeySuppression {
+    /// The shared reason — the ledger row's label (decision 012's "the
+    /// consolidation table").
+    pub reason: String,
+    /// The count-key text as written (e.g. `31`), shown as `count-key (31)`.
+    pub raw: String,
+    /// What the count-key suppressed, by severity.
+    pub counts: SeverityCounts,
+}
+
+/// One literal-exceptions ledger row: the diagnostics a file's frontmatter
+/// literal exceptions suppressed.
+///
+/// Aggregated per file (the row label is the file path), with the number of
+/// distinct entries that actually matched at least one diagnostic — the ledger's
+/// `exceptions (k)` detail.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExceptionSuppression {
+    /// What the file's literal exceptions suppressed, by severity.
+    pub counts: SeverityCounts,
+    /// The number of distinct literal entries that matched ≥1 live diagnostic.
+    pub matched_entries: usize,
+}
+
+/// The per-file suppression ledger entry: what each source suppressed in one
+/// file (issue 036, decision 012 part B).
+///
+/// The CLI lint loop collects one of these per file and renders the workspace
+/// ledger from them. Issue 037 will add a third source (subtree overrides) as a
+/// sibling field, so the renderer iterates source kinds rather than hard-coding
+/// two.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FileSuppressions {
+    /// The file these suppressions belong to (workspace-relative).
+    pub file: std::path::PathBuf,
+    /// The literal-exceptions row for this file, if any literal exception
+    /// matched.
+    pub exceptions: Option<ExceptionSuppression>,
+    /// The count-key rows for this file (at most one per lint namespace).
+    pub count_keys: Vec<CountKeySuppression>,
+}
+
+impl FileSuppressions {
+    /// Whether this file suppressed nothing (no ledger rows).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.exceptions.is_none() && self.count_keys.is_empty()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Exception reconciliation (issue 031, decision 011) + count-key (issue 036)
+// ---------------------------------------------------------------------------
+
+/// Per-lint exception entries paired with a matched flag, plus the optional
+/// count-key residual buffer and the per-source suppression tallies.
+///
+/// Interior mutability (`Cell` / `RefCell`) lets the emit pass record matches,
+/// buffer count-key residuals, and tally suppressions behind a shared reference,
+/// so the lookup can be threaded as `&self` alongside the `&mut Vec<Diagnostic>`
+/// the emitters already carry.
 struct LintBucket<'a> {
     /// Whether this lint is active (policy not `Disabled`). When `false` the
-    /// bucket is inert: it suppresses nothing and is never flagged as unused.
+    /// bucket is inert: it suppresses nothing, is never flagged as unused, and
+    /// its count-key neither suppresses nor flags (issue 036).
     active: bool,
-    /// The declared entries, in source order.
+    /// The declared literal entries, in source order.
     entries: &'a [ExceptionEntry],
     /// Parallel matched flags — set the first time an entry's reference matches
     /// a live diagnostic this pass.
     matched: Vec<Cell<bool>>,
+    /// The count-key sentinel for this lint, if one was declared (issue 036).
+    count_key: Option<&'a CountKey>,
+    /// The residual buffer: live diagnostics that survived literal suppression
+    /// and are deferred for the count-key decision. Only populated when a
+    /// count-key is active for this lint.
+    residual: RefCell<Vec<Diagnostic>>,
+    /// What this lint's literal exceptions suppressed, by severity.
+    literal_suppressed: RefCell<SeverityCounts>,
+    /// What this lint's count-key suppressed, by severity (set only when the
+    /// residual matched `N`).
+    count_suppressed: RefCell<SeverityCounts>,
 }
 
 impl<'a> LintBucket<'a> {
-    fn new(entries: &'a [ExceptionEntry], active: bool) -> Self {
+    fn new(entries: &'a [ExceptionEntry], count_key: Option<&'a CountKey>, active: bool) -> Self {
         Self {
             active,
             entries,
             matched: entries.iter().map(|_| Cell::new(false)).collect(),
+            count_key,
+            residual: RefCell::new(Vec::new()),
+            literal_suppressed: RefCell::new(SeverityCounts::default()),
+            count_suppressed: RefCell::new(SeverityCounts::default()),
         }
     }
 
-    /// Suppress a live diagnostic whose reference matches an active entry,
-    /// recording the match. Returns `true` when the diagnostic should be
-    /// suppressed. The key is matched **verbatim** (issue 031): the full
-    /// reference string, including any leading `{Name}/…` and any `#fragment`,
-    /// with no normalization.
-    fn suppress(&self, reference: &str) -> bool {
+    /// Whether a count-key residual buffer is collecting for this lint: the lint
+    /// is active and a count-key is declared.
+    fn count_key_active(&self) -> bool {
+        self.active && self.count_key.is_some()
+    }
+
+    /// Try to suppress a live diagnostic against an active literal entry,
+    /// recording the match and tallying the suppression. Returns `true` when a
+    /// literal key matched (the diagnostic is suppressed). The key is matched
+    /// **verbatim** (issue 031): the full reference string, including any leading
+    /// `{Name}/…` and any `#fragment`, with no normalization.
+    fn suppress_literal(&self, reference: &str, severity: Severity) -> bool {
         if !self.active {
             return false;
         }
@@ -143,16 +315,23 @@ impl<'a> LintBucket<'a> {
                 suppressed = true;
             }
         }
+        if suppressed {
+            self.literal_suppressed.borrow_mut().record(severity);
+        }
         suppressed
     }
 }
 
-/// The per-file exception reconciliation lever (issue 031, decision 011).
+/// The per-file exception reconciliation lever (issue 031, decision 011; issue
+/// 036, decision 012).
 ///
-/// Holds both lint buckets and the matched-flag state. The path-shaped emitters
-/// call [`suppress`](Self::suppress) before pushing a diagnostic; after the
-/// pass, [`emit_unmatched`](Self::emit_unmatched) flags every entry that matched
-/// no live diagnostic.
+/// Holds both lint buckets, the matched-flag state, the count-key residual
+/// buffers, and the suppression tallies. The path-shaped emitters call
+/// [`route`](Self::route) with each would-be diagnostic; the lookup either
+/// suppresses it (a literal key matched), buffers it for the count-key decision,
+/// or passes it straight through to `out`. After the emit pass,
+/// [`resolve_count_keys`](Self::resolve_count_keys) decides each residual and
+/// [`emit_unmatched`](Self::emit_unmatched) flags unmatched literal entries.
 struct ExceptionLookup<'a> {
     stale_references: LintBucket<'a>,
     bare_paths: LintBucket<'a>,
@@ -163,9 +342,14 @@ impl<'a> ExceptionLookup<'a> {
         Self {
             stale_references: LintBucket::new(
                 exceptions.entries(ExceptionLint::StaleReferences),
+                exceptions.count_key(ExceptionLint::StaleReferences),
                 stale_active,
             ),
-            bare_paths: LintBucket::new(exceptions.entries(ExceptionLint::BarePaths), bare_active),
+            bare_paths: LintBucket::new(
+                exceptions.entries(ExceptionLint::BarePaths),
+                exceptions.count_key(ExceptionLint::BarePaths),
+                bare_active,
+            ),
         }
     }
 
@@ -176,10 +360,114 @@ impl<'a> ExceptionLookup<'a> {
         }
     }
 
-    /// Whether a live `lint` diagnostic on `reference` is excepted (and record
-    /// the match). See [`LintBucket::suppress`].
-    fn suppress(&self, lint: ExceptionLint, reference: &str) -> bool {
-        self.bucket(lint).suppress(reference)
+    /// Route a would-be `lint` diagnostic on `reference` through the lookup.
+    ///
+    /// Three outcomes, in order: a matching literal key **suppresses** it
+    /// (tallied, dropped — literal keys win and are carved out of the residual
+    /// first, decision 012); otherwise an active count-key **buffers** it for the
+    /// later residual decision; otherwise it passes straight through to `out`.
+    /// `reference` is matched verbatim against literal keys, exactly as the old
+    /// inline `suppress` call did.
+    fn route(
+        &self,
+        lint: ExceptionLint,
+        reference: &str,
+        diag: Diagnostic,
+        out: &mut Vec<Diagnostic>,
+    ) {
+        let bucket = self.bucket(lint);
+        if bucket.suppress_literal(reference, diag.severity) {
+            return;
+        }
+        if bucket.count_key_active() {
+            bucket.residual.borrow_mut().push(diag);
+        } else {
+            out.push(diag);
+        }
+    }
+
+    /// Resolve each lint's count-key against its buffered residual (issue 036).
+    ///
+    /// For a lint with an active count-key, let `M` be the residual size and `N`
+    /// the count-key's expected value. `N` must be `>= 1` and the reason
+    /// non-empty (both diagnosed at the key otherwise, with the residual
+    /// resurfaced). If `M == N` the whole residual is suppressed under the shared
+    /// reason (and tallied); if `M != N` the count-key is inert — every residual
+    /// diagnostic resurfaces and one drift `Warning` is anchored at the key.
+    fn resolve_count_keys(&self, rel_path: &Path, out: &mut Vec<Diagnostic>) {
+        for (lint, bucket) in [
+            (ExceptionLint::StaleReferences, &self.stale_references),
+            (ExceptionLint::BarePaths, &self.bare_paths),
+        ] {
+            let Some(count_key) = bucket.count_key else {
+                continue;
+            };
+            // An inactive bucket (a `Disabled` lint) is inert: no diagnostics
+            // were buffered, and the count-key neither suppresses nor flags.
+            if !bucket.active {
+                continue;
+            }
+            let residual = bucket.residual.take();
+            let found = residual.len();
+            let expected = count_key.expected;
+
+            // A required reason and `N >= 1` (decision 012): when either is
+            // violated the count-key cannot suppress — diagnose at the key and
+            // resurface the whole residual (inert).
+            if count_key.reason.trim().is_empty() {
+                out.push(Diagnostic {
+                    file: rel_path.to_path_buf(),
+                    line: count_key.line,
+                    severity: Severity::Warning,
+                    message: format!(
+                        "count-key `{}` under `exceptions.{}` has no reason — add one explaining why these are not live references (see `lattice help config`)",
+                        count_key.raw,
+                        lint.key()
+                    ),
+                    span: Some(count_key.key_span),
+                });
+                out.extend(residual);
+                continue;
+            }
+            if expected == 0 {
+                out.push(Diagnostic {
+                    file: rel_path.to_path_buf(),
+                    line: count_key.line,
+                    severity: Severity::Warning,
+                    message: format!(
+                        "count-key `{}` under `exceptions.{}` must be at least 1 (see `lattice help config`)",
+                        count_key.raw,
+                        lint.key()
+                    ),
+                    span: Some(count_key.key_span),
+                });
+                out.extend(residual);
+                continue;
+            }
+
+            if found == expected {
+                // Residual matches the expected count: suppress it all under the
+                // shared reason, tallying each by severity for the ledger.
+                let mut tally = bucket.count_suppressed.borrow_mut();
+                for diag in &residual {
+                    tally.record(diag.severity);
+                }
+            } else {
+                // Drift in either direction: the sentinel is inert. Every
+                // residual diagnostic resurfaces, plus one warning at the key.
+                out.extend(residual);
+                out.push(Diagnostic {
+                    file: rel_path.to_path_buf(),
+                    line: count_key.line,
+                    severity: Severity::Warning,
+                    message: format!(
+                        "expected {expected} {} here, found {found} — update the count (and revisit the reason) or fix the drift (see `lattice help config`)",
+                        lint.noun()
+                    ),
+                    span: Some(count_key.key_span),
+                });
+            }
+        }
     }
 
     /// Flag every exception entry that matched no live diagnostic this pass.
@@ -224,6 +512,45 @@ impl<'a> ExceptionLookup<'a> {
                     });
                 }
             }
+        }
+    }
+
+    /// Consume the lookup's tallies into the file's ledger entry (issue 036).
+    ///
+    /// One literal-exceptions row per file (folding both lint namespaces, since
+    /// the ledger keys exceptions by file) carrying the count of distinct entries
+    /// that matched, and one count-key row per namespace whose residual actually
+    /// suppressed (`M == N`).
+    fn into_suppressions(self, rel_path: &Path) -> FileSuppressions {
+        let mut exception_counts = SeverityCounts::default();
+        let mut matched_entries = 0;
+        let mut count_keys = Vec::new();
+
+        for bucket in [&self.stale_references, &self.bare_paths] {
+            exception_counts.add(*bucket.literal_suppressed.borrow());
+            matched_entries += bucket.matched.iter().filter(|c| c.get()).count();
+
+            let count_counts = *bucket.count_suppressed.borrow();
+            if let Some(count_key) = bucket.count_key
+                && !count_counts.is_empty()
+            {
+                count_keys.push(CountKeySuppression {
+                    reason: count_key.reason.clone(),
+                    raw: count_key.raw.clone(),
+                    counts: count_counts,
+                });
+            }
+        }
+
+        let exceptions = (!exception_counts.is_empty()).then_some(ExceptionSuppression {
+            counts: exception_counts,
+            matched_entries,
+        });
+
+        FileSuppressions {
+            file: rel_path.to_path_buf(),
+            exceptions,
+            count_keys,
         }
     }
 }
@@ -279,25 +606,24 @@ fn emit_tree_bare_paths(
         // An external-namespace reference (`{Name}/…`) is resolved existence-
         // only against its alias directory, never dir/root-joined (issue 030).
         if let Some(stale) = external_is_stale(config, external_exists, &bare.path) {
-            if stale && !lookup.suppress(ExceptionLint::StaleReferences, &bare.path) {
-                emit_stale_reference(
+            if stale {
+                route_stale_reference(
                     config.policy.stale_references,
                     rel_path,
                     bare.line,
                     None,
                     &bare.path,
+                    lookup,
                     out,
                 );
             }
             continue;
         }
         if resolves_under_any_base(rel_path, &bare.path, file_exists) {
-            if config.policy.bare_paths == BarePathPolicy::Disabled
-                || lookup.suppress(ExceptionLint::BarePaths, &bare.path)
-            {
+            if config.policy.bare_paths == BarePathPolicy::Disabled {
                 continue;
             }
-            out.push(Diagnostic {
+            let diag = Diagnostic {
                 file: rel_path.to_path_buf(),
                 line: bare.line,
                 severity: bare_path_severity(config.policy.bare_paths, Severity::Warning),
@@ -307,14 +633,16 @@ fn emit_tree_bare_paths(
                 ),
                 // `BarePath` carries only a line; fall back to a whole-line range.
                 span: None,
-            });
-        } else if !lookup.suppress(ExceptionLint::StaleReferences, &bare.path) {
-            emit_stale_reference(
+            };
+            lookup.route(ExceptionLint::BarePaths, &bare.path, diag, out);
+        } else {
+            route_stale_reference(
                 config.policy.stale_references,
                 rel_path,
                 bare.line,
                 None,
                 &bare.path,
+                lookup,
                 out,
             );
         }
@@ -478,22 +806,21 @@ const fn bare_path_severity(policy: BarePathPolicy, base: Severity) -> Severity 
 /// following suggestion 001's self-documenting-message principle), so an agent
 /// learns from the diagnostic that a cross-repo reference should be written and
 /// aliased rather than left to dangle.
-fn emit_stale_reference(
+fn build_stale_reference(
     policy: StaleReferencePolicy,
     rel_path: &Path,
     line: usize,
     span: Option<Span>,
     reference: &str,
-    out: &mut Vec<Diagnostic>,
-) {
+) -> Option<Diagnostic> {
     let severity = match policy {
-        StaleReferencePolicy::Disabled => return,
+        StaleReferencePolicy::Disabled => return None,
         StaleReferencePolicy::Hint => Severity::Hint,
         StaleReferencePolicy::Warn => Severity::Warning,
         StaleReferencePolicy::Deny => Severity::Error,
     };
 
-    out.push(Diagnostic {
+    Some(Diagnostic {
         file: rel_path.to_path_buf(),
         line,
         severity,
@@ -501,7 +828,28 @@ fn emit_stale_reference(
             "stale reference: `{reference}` — no such markdown file under this root; fix the path if it moved, or write it as `{{repo}}/…` (and alias `repo` in .lattice.toml — see `lattice help config`) if it's in another repo"
         ),
         span,
-    });
+    })
+}
+
+/// Route a dangling-reference stale diagnostic through the exception lookup.
+///
+/// Builds the stale-reference diagnostic for `reference` (a no-op under a
+/// `Disabled` policy) and hands it to [`ExceptionLookup::route`], so a literal
+/// `stale_references` exception suppresses it, an active count-key buffers it, or
+/// it passes through to `out` — the single seam every stale-reference emit site
+/// now shares (issue 031, issue 036).
+fn route_stale_reference(
+    policy: StaleReferencePolicy,
+    rel_path: &Path,
+    line: usize,
+    span: Option<Span>,
+    reference: &str,
+    lookup: &ExceptionLookup,
+    out: &mut Vec<Diagnostic>,
+) {
+    if let Some(diag) = build_stale_reference(policy, rel_path, line, span, reference) {
+        lookup.route(ExceptionLint::StaleReferences, reference, diag, out);
+    }
 }
 
 /// Emit diagnostics for bare URLs, quoted paths, and backticked paths found in
@@ -577,16 +925,22 @@ fn emit_bare_path_diagnostics(
                 // An external-namespace reference (`{Name}/…`) is resolved
                 // existence-only against its alias directory (issue 030).
                 if let Some(is_stale) = external_is_stale(config, external_exists, path) {
-                    if is_stale && !lookup.suppress(ExceptionLint::StaleReferences, inner) {
-                        emit_stale_reference(stale, rel_path, line, Some(child.span), inner, out);
+                    if is_stale {
+                        route_stale_reference(
+                            stale,
+                            rel_path,
+                            line,
+                            Some(child.span),
+                            inner,
+                            lookup,
+                            out,
+                        );
                     }
                     continue;
                 }
                 if resolves_under_any_base(rel_path, path, file_exists) {
-                    if policy != BarePathPolicy::Disabled
-                        && !lookup.suppress(ExceptionLint::BarePaths, inner)
-                    {
-                        out.push(Diagnostic {
+                    if policy != BarePathPolicy::Disabled {
+                        let diag = Diagnostic {
                             file: rel_path.to_path_buf(),
                             line,
                             severity: bare_path_severity(policy, Severity::Hint),
@@ -594,10 +948,19 @@ fn emit_bare_path_diagnostics(
                                 "backticked path `{inner}` refers to an existing file: make it a link, or drop the extension if you only mean the file's name, or add a frontmatter `exceptions.bare_paths` entry with a reason (see `lattice help config`)"
                             ),
                             span: Some(child.span),
-                        });
+                        };
+                        lookup.route(ExceptionLint::BarePaths, inner, diag, out);
                     }
-                } else if !lookup.suppress(ExceptionLint::StaleReferences, inner) {
-                    emit_stale_reference(stale, rel_path, line, Some(child.span), inner, out);
+                } else {
+                    route_stale_reference(
+                        stale,
+                        rel_path,
+                        line,
+                        Some(child.span),
+                        inner,
+                        lookup,
+                        out,
+                    );
                 }
             }
         }
@@ -820,18 +1183,24 @@ fn scan_line_for_quoted_paths(
                     // An external-namespace reference (`{Name}/…`) resolves
                     // existence-only against its alias directory (issue 030).
                     if let Some(is_stale) = external_is_stale(config, external_exists, path) {
-                        if is_stale && !lookup.suppress(ExceptionLint::StaleReferences, inner) {
-                            emit_stale_reference(stale, rel_path, line_num, Some(span), inner, out);
+                        if is_stale {
+                            route_stale_reference(
+                                stale,
+                                rel_path,
+                                line_num,
+                                Some(span),
+                                inner,
+                                lookup,
+                                out,
+                            );
                         }
                         i = end_abs + 1;
                         continue;
                     }
                     if resolves_under_any_base(rel_path, path, file_exists) {
-                        if policy != BarePathPolicy::Disabled
-                            && !lookup.suppress(ExceptionLint::BarePaths, inner)
-                        {
+                        if policy != BarePathPolicy::Disabled {
                             let q = char::from(quote);
-                            out.push(Diagnostic {
+                            let diag = Diagnostic {
                                 file: rel_path.to_path_buf(),
                                 line: line_num,
                                 severity: bare_path_severity(policy, Severity::Hint),
@@ -839,10 +1208,19 @@ fn scan_line_for_quoted_paths(
                                     "quoted path `{q}{inner}{q}`: use backticks or make a markdown link (see `lattice help config`)"
                                 ),
                                 span: Some(span),
-                            });
+                            };
+                            lookup.route(ExceptionLint::BarePaths, inner, diag, out);
                         }
-                    } else if !lookup.suppress(ExceptionLint::StaleReferences, inner) {
-                        emit_stale_reference(stale, rel_path, line_num, Some(span), inner, out);
+                    } else {
+                        route_stale_reference(
+                            stale,
+                            rel_path,
+                            line_num,
+                            Some(span),
+                            inner,
+                            lookup,
+                            out,
+                        );
                     }
                 }
                 i = end_abs + 1;
@@ -3637,6 +4015,273 @@ mod tests {
         assert!(
             has_matching(&diags, Severity::Warning, "lattice help config"),
             "the empty-reason message points at `lattice help config`: {diags:?}"
+        );
+    }
+
+    // -- Count-key + suppression ledger (issue 036, decision 012) --
+
+    /// Like [`diagnose_with_files`], but returns both the diagnostics and the
+    /// [`FileSuppressions`] ledger entry, with an explicit config so the
+    /// count-key tests can flip a lint to `Disabled`.
+    fn diagnose_full(
+        content: &str,
+        config: &Config,
+        existing: &[&str],
+    ) -> (Vec<Diagnostic>, FileSuppressions) {
+        let fm = yaml::parse_frontmatter_block(content);
+        let fm_span = fm.as_ref().map(|b| b.span);
+        let tree = block::parse_tree(content, fm_span);
+        let rel_path = std::path::Path::new("test.md");
+        let existing_set: HashSet<&str> = existing.iter().copied().collect();
+        let exceptions = exceptions_of(content);
+        collect_with_suppressions(
+            &tree,
+            rel_path,
+            config,
+            &|p| existing_set.contains(p.to_str().unwrap_or("")),
+            &|_| false,
+            &exceptions,
+        )
+    }
+
+    /// A document with three dangling stale references in the body, under a
+    /// `stale_references` count-key of `count`, with a non-empty shared reason.
+    fn three_stale_with_count(count: &str) -> String {
+        format!(
+            "---\n\
+             exceptions:\n  \
+               stale_references:\n    \
+                 \"{count}\": \"migration table — every path is a record, not a live reference\"\n\
+             ---\n\
+             See `a.md`, `b.md`, and `c.md`.\n"
+        )
+    }
+
+    #[test]
+    fn count_key_suppresses_iff_residual_equals_n() {
+        // Three dangling references, N = 3: the whole residual is suppressed
+        // under the single shared reason, nothing resurfaces.
+        let config = Config::default();
+        let (diags, sup) = diagnose_full(&three_stale_with_count("3"), &config, &[]);
+        assert!(
+            !has_any(&diags, "stale reference"),
+            "a count-key of N == M suppresses the whole residual: {diags:?}"
+        );
+        assert!(
+            !has_any(&diags, "expected"),
+            "no drift warning when the count matches: {diags:?}"
+        );
+        // The ledger records the count-key suppression by severity (the default
+        // stale_references policy is `warn`).
+        let count_key = &sup.count_keys;
+        assert_eq!(
+            count_key.len(),
+            1,
+            "the matched count-key produces one ledger row: {sup:?}"
+        );
+        assert_eq!(
+            count_key[0].counts.warnings, 3,
+            "the ledger tallies the three suppressed warnings: {sup:?}"
+        );
+        assert_eq!(
+            count_key[0].raw, "3",
+            "the row carries the raw key: {sup:?}"
+        );
+    }
+
+    #[test]
+    fn count_key_one_too_many_resurfaces_and_flags() {
+        // Three dangling references, N = 2 (one too few expected → drift): the
+        // sentinel is inert, every residual resurfaces, and a drift warning is
+        // anchored on the key with the `expected N, found M` message.
+        let config = Config::default();
+        let (diags, sup) = diagnose_full(&three_stale_with_count("2"), &config, &[]);
+        assert_eq!(
+            count_matching(&diags, Severity::Warning, "stale reference: `"),
+            3,
+            "every residual diagnostic resurfaces on drift: {diags:?}"
+        );
+        assert!(
+            has_matching(
+                &diags,
+                Severity::Warning,
+                "expected 2 stale references here, found 3"
+            ),
+            "the drift warning names N and M: {diags:?}"
+        );
+        assert!(
+            sup.count_keys.is_empty(),
+            "a drifted count-key suppresses nothing, so no ledger row: {sup:?}"
+        );
+    }
+
+    #[test]
+    fn count_key_one_too_few_resurfaces_and_flags() {
+        // Three dangling references, N = 4 (one too many expected → drift).
+        let config = Config::default();
+        let (diags, sup) = diagnose_full(&three_stale_with_count("4"), &config, &[]);
+        assert_eq!(
+            count_matching(&diags, Severity::Warning, "stale reference: `"),
+            3,
+            "every residual diagnostic resurfaces on drift: {diags:?}"
+        );
+        assert!(
+            has_matching(
+                &diags,
+                Severity::Warning,
+                "expected 4 stale references here, found 3"
+            ),
+            "the drift warning names N and M: {diags:?}"
+        );
+        assert!(
+            sup.count_keys.is_empty(),
+            "a drifted count-key suppresses nothing: {sup:?}"
+        );
+    }
+
+    #[test]
+    fn count_key_and_literal_compose() {
+        // A literal key carves its own diagnostic out of the residual first; the
+        // count-key then claims the remaining two. N = 2 over the residual.
+        let content = "---\n\
+            exceptions:\n  \
+              stale_references:\n    \
+                \"a.md\": \"the worked example path\"\n    \
+                \"2\": \"the rest of the migration table\"\n\
+            ---\n\
+            See `a.md`, `b.md`, and `c.md`.\n";
+        let config = Config::default();
+        let (diags, sup) = diagnose_full(content, &config, &[]);
+        assert!(
+            !has_any(&diags, "stale reference"),
+            "the literal carves one out and the count covers the rest: {diags:?}"
+        );
+        assert!(
+            !has_any(&diags, "expected"),
+            "no drift: the residual after the literal is exactly N: {diags:?}"
+        );
+        let ex = sup
+            .exceptions
+            .as_ref()
+            .expect("the literal exception suppressed one");
+        assert_eq!(
+            ex.counts.warnings, 1,
+            "the literal row tallies its one suppression: {sup:?}"
+        );
+        assert_eq!(ex.matched_entries, 1, "one literal entry matched: {sup:?}");
+        assert_eq!(
+            sup.count_keys.first().map(|c| c.counts.warnings),
+            Some(2),
+            "the count-key row tallies the residual of two: {sup:?}"
+        );
+    }
+
+    #[test]
+    fn count_key_with_empty_reason_is_diagnosed() {
+        // An empty reason is a defect (the shared epitaph is required), anchored
+        // at the key; the residual resurfaces (the sentinel cannot suppress).
+        let content = "---\n\
+            exceptions:\n  \
+              stale_references:\n    \
+                \"3\": \"\"\n\
+            ---\n\
+            See `a.md`, `b.md`, and `c.md`.\n";
+        let config = Config::default();
+        let (diags, sup) = diagnose_full(content, &config, &[]);
+        assert!(
+            has_matching(&diags, Severity::Warning, "count-key `3`")
+                && has_matching(&diags, Severity::Warning, "has no reason"),
+            "an empty-reason count-key is diagnosed at the key: {diags:?}"
+        );
+        assert_eq!(
+            count_matching(&diags, Severity::Warning, "stale reference: `"),
+            3,
+            "the residual resurfaces under an empty-reason count-key: {diags:?}"
+        );
+        assert!(
+            sup.count_keys.is_empty(),
+            "an empty-reason count-key suppresses nothing: {sup:?}"
+        );
+    }
+
+    #[test]
+    fn count_key_of_zero_is_diagnosed() {
+        // `N >= 1`: a `0` count-key is invalid — diagnosed at the key, residual
+        // resurfaces.
+        let content = "---\n\
+            exceptions:\n  \
+              stale_references:\n    \
+                \"0\": \"a reason\"\n\
+            ---\n\
+            See `a.md`.\n";
+        let config = Config::default();
+        let (diags, _sup) = diagnose_full(content, &config, &[]);
+        assert!(
+            has_matching(&diags, Severity::Warning, "must be at least 1"),
+            "a zero count-key is diagnosed: {diags:?}"
+        );
+        assert_eq!(
+            count_matching(&diags, Severity::Warning, "stale reference: `"),
+            1,
+            "the residual resurfaces under a zero count-key: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn count_key_under_disabled_lint_is_inert() {
+        // A `Disabled` stale_references lint makes the count-key inert: no
+        // suppression, no drift flag, no empty-reason flag — and no residual to
+        // resurface (the lint emits nothing).
+        let mut config = Config::default();
+        config.policy.stale_references = StaleReferencePolicy::Disabled;
+        // N deliberately mismatches the body, which would drift if active.
+        let (diags, sup) = diagnose_full(&three_stale_with_count("99"), &config, &[]);
+        assert!(
+            !has_any(&diags, "stale reference"),
+            "a disabled lint emits no stale references: {diags:?}"
+        );
+        assert!(
+            !has_any(&diags, "expected"),
+            "a disabled lint's count-key raises no drift flag: {diags:?}"
+        );
+        assert!(
+            sup.is_empty(),
+            "a disabled-lint count-key suppresses nothing: {sup:?}"
+        );
+    }
+
+    #[test]
+    fn count_key_shape_discrimination() {
+        // `31` is a sentinel (claims the residual); `31.md` and `a/31.md` are
+        // literal references (each suppresses only its own diagnostic). Here the
+        // two literal keys carve their own out and the `31` sentinel claims the
+        // single remaining dangling reference, so N = 1 suppresses cleanly.
+        let content = "---\n\
+            exceptions:\n  \
+              stale_references:\n    \
+                \"31.md\": \"a literal path-shaped key\"\n    \
+                \"a/31.md\": \"another literal path-shaped key\"\n    \
+                \"1\": \"the residual count sentinel\"\n\
+            ---\n\
+            See `31.md`, `a/31.md`, and `loose.md`.\n";
+        let config = Config::default();
+        let (diags, sup) = diagnose_full(content, &config, &[]);
+        assert!(
+            !has_any(&diags, "stale reference"),
+            "the two literals carve out, the sentinel claims the rest: {diags:?}"
+        );
+        let ex = sup
+            .exceptions
+            .as_ref()
+            .expect("the two path-shaped literals suppressed");
+        assert_eq!(
+            ex.matched_entries, 2,
+            "`31.md` and `a/31.md` are literal entries, both matched: {sup:?}"
+        );
+        assert_eq!(
+            sup.count_keys.first().map(|c| c.counts.warnings),
+            Some(1),
+            "the `1` sentinel claims the single residual: {sup:?}"
         );
     }
 }

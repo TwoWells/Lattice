@@ -64,6 +64,12 @@ pub struct FileData {
     /// diagnostic collectors read it directly instead of re-walking every
     /// cached tree on each sync (issue 013 — stage 2).
     pub structural: Vec<Diagnostic>,
+    /// Cached suppression ledger entry for this file (issue 036, decision 012):
+    /// what each suppression source (literal frontmatter exceptions, count-keys)
+    /// actually suppressed, by severity. Refreshed alongside `structural` from
+    /// the same `structural::collect_with_suppressions` pass; the CLI lint loop
+    /// aggregates it into the workspace ledger. The LSP never reads it.
+    pub suppressions: structural::FileSuppressions,
     /// Cached extracted headings (`Tree::headings()` output, with precomputed
     /// github/gitlab/vscode slugs) for this file.
     ///
@@ -319,7 +325,7 @@ impl Workspace {
             .frontmatter
             .as_ref()
             .map_or(&empty_exceptions, |fm| &fm.exceptions);
-        let diagnostics = structural::collect(
+        let (diagnostics, suppressions) = structural::collect_with_suppressions(
             &file_data.tree,
             rel_path,
             &self.config,
@@ -329,6 +335,7 @@ impl Workspace {
         );
         if let Some(file_data) = self.files.get_mut(rel_path) {
             file_data.structural = diagnostics;
+            file_data.suppressions = suppressions;
         }
     }
 
@@ -503,8 +510,10 @@ pub fn parse_content(content: &str, rel_path: &Path, config: &Config) -> FileDat
         parse_diagnostics,
         // Left empty here — `structural::collect` needs workspace membership
         // (for bare-path existence) that a standalone parse cannot know. The
-        // workspace fills it via `recompute_structural` after insertion.
+        // workspace fills it (and the suppression ledger) via
+        // `recompute_structural` after insertion.
         structural: Vec::new(),
+        suppressions: structural::FileSuppressions::default(),
         headings,
         links,
         anchors,

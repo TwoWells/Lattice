@@ -265,6 +265,16 @@ impl ExceptionLint {
             Self::BarePaths => "bare_paths",
         }
     }
+
+    /// The plural human-readable noun for this lint, used in the count-key drift
+    /// message (`expected N <noun> here, found M` — issue 036).
+    #[must_use]
+    pub const fn noun(self) -> &'static str {
+        match self {
+            Self::StaleReferences => "stale references",
+            Self::BarePaths => "bare paths",
+        }
+    }
 }
 
 /// A single `exceptions.<lint>` entry: a reference, its declared reason, and the
@@ -289,26 +299,86 @@ pub struct ExceptionEntry {
     pub line: usize,
 }
 
-/// Parsed `exceptions` frontmatter block (issue 031, decision 011).
+/// A per-document **count-key** under an `exceptions.<lint>` namespace (issue
+/// 036, decision 012).
 ///
-/// Sibling to `backlinks`, lint-namespaced, keyed by the literal reference with
-/// the reason as the value. Entries preserve source order and retain per-key
-/// positions so reconciliation can anchor diagnostics at the offending key.
+/// An all-digits key (shape `^[0-9]+$`, e.g. `31` or a quoted `"31"`) is a
+/// *count sentinel*, not a literal reference. It claims the lint's **residual**
+/// — the live diagnostics of that lint in the document minus those already
+/// suppressed by literal-path keys. When the residual count equals
+/// [`expected`](Self::expected) the whole residual is suppressed under the
+/// single shared [`reason`](Self::reason); when it drifts the sentinel goes
+/// inert and a drift warning is anchored at [`key_span`](Self::key_span).
+///
+/// No real reference is named `31`, so the shape alone disambiguates: a
+/// path-shaped key (with a name, slash, or `#`) is always a literal reference.
+#[derive(Debug, Clone)]
+pub struct CountKey {
+    /// The expected residual count `N` (`N >= 1`; parsed from the all-digits
+    /// key). A key whose digits overflow `usize` is clamped to [`usize::MAX`],
+    /// which no real residual will reach, so it reads as a permanent drift.
+    pub expected: usize,
+    /// The declared shared reason — the document-level epitaph. Empty when the
+    /// value was missing, blank, or not a scalar, which is itself diagnosed
+    /// (required-reason), exactly like a literal exception.
+    pub reason: String,
+    /// Byte span of the all-digits key token in the source (anchors the
+    /// empty-reason and drift diagnostics).
+    pub key_span: Span,
+    /// 1-based line of the key token in the source.
+    pub line: usize,
+    /// The key text exactly as written (e.g. `31`), for the drift / ledger
+    /// messages.
+    pub raw: String,
+}
+
+/// Whether `key` is a count-key by shape — one or more ASCII digits and nothing
+/// else (`^[0-9]+$`, issue 036).
+///
+/// A literal reference is always path-shaped (it has a name, a slash, or a
+/// fragment), so an all-digits key is unambiguously the count sentinel; `31` and
+/// a quoted `"31"` both match, while `31.md` and `a/31` do not.
+#[must_use]
+pub fn is_count_key(key: &str) -> bool {
+    !key.is_empty() && key.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Parsed `exceptions` frontmatter block (issue 031, decision 011; issue 036,
+/// decision 012).
+///
+/// Sibling to `backlinks`, lint-namespaced. A path-shaped key is a literal
+/// reference paired with its reason ([`ExceptionEntry`]); an all-digits key is
+/// the per-document count sentinel ([`CountKey`]). Entries preserve source order
+/// and retain per-key positions so reconciliation can anchor diagnostics at the
+/// offending key.
 #[derive(Debug, Default)]
 pub struct Exceptions {
-    /// Entries under `exceptions.stale_references`.
+    /// Literal-reference entries under `exceptions.stale_references`.
     pub stale_references: Vec<ExceptionEntry>,
-    /// Entries under `exceptions.bare_paths`.
+    /// Literal-reference entries under `exceptions.bare_paths`.
     pub bare_paths: Vec<ExceptionEntry>,
+    /// The count-key under `exceptions.stale_references`, if one was declared.
+    pub stale_references_count: Option<CountKey>,
+    /// The count-key under `exceptions.bare_paths`, if one was declared.
+    pub bare_paths_count: Option<CountKey>,
 }
 
 impl Exceptions {
-    /// The entries declared for `lint`.
+    /// The literal-reference entries declared for `lint`.
     #[must_use]
     pub fn entries(&self, lint: ExceptionLint) -> &[ExceptionEntry] {
         match lint {
             ExceptionLint::StaleReferences => &self.stale_references,
             ExceptionLint::BarePaths => &self.bare_paths,
+        }
+    }
+
+    /// The count-key declared for `lint`, if any.
+    #[must_use]
+    pub fn count_key(&self, lint: ExceptionLint) -> Option<&CountKey> {
+        match lint {
+            ExceptionLint::StaleReferences => self.stale_references_count.as_ref(),
+            ExceptionLint::BarePaths => self.bare_paths_count.as_ref(),
         }
     }
 }
@@ -325,6 +395,11 @@ impl Exceptions {
 /// not a scalar yields an empty reason (the required-reason diagnostic fires on
 /// it downstream). Lint namespaces other than the two recognized ones are
 /// ignored — they cannot name a path-shaped lint, so they carry no obligation.
+///
+/// An all-digits key (`^[0-9]+$`, issue 036) is the per-document count sentinel
+/// rather than a literal reference: it is parsed into the namespace's
+/// [`CountKey`] slot (the first one wins; at most one sentinel per namespace),
+/// not the literal-entry bucket. Every other key remains a literal reference.
 #[must_use]
 pub fn extract_exceptions(block: &FrontmatterBlock, source: &str) -> Exceptions {
     let mut exceptions = Exceptions::default();
@@ -358,10 +433,6 @@ pub fn extract_exceptions(block: &FrontmatterBlock, source: &str) -> Exceptions 
                 continue;
             };
 
-            let bucket = match lint {
-                ExceptionLint::StaleReferences => &mut exceptions.stale_references,
-                ExceptionLint::BarePaths => &mut exceptions.bare_paths,
-            };
             for ref_entry in refs {
                 let FmNode::Mapping {
                     key: ref_key,
@@ -375,11 +446,37 @@ pub fn extract_exceptions(block: &FrontmatterBlock, source: &str) -> Exceptions 
                     FmValue::Scalar(s) => s.text.clone(),
                     _ => String::new(),
                 };
+                let key_line = byte_offset_to_line(source, ref_key.span.start);
+
+                // Discriminate by shape (issue 036): an all-digits key is the
+                // count sentinel; everything else is a literal reference.
+                if is_count_key(&ref_key.text) {
+                    let count_slot = match lint {
+                        ExceptionLint::StaleReferences => &mut exceptions.stale_references_count,
+                        ExceptionLint::BarePaths => &mut exceptions.bare_paths_count,
+                    };
+                    // At most one sentinel per namespace — the first one wins.
+                    if count_slot.is_none() {
+                        *count_slot = Some(CountKey {
+                            expected: ref_key.text.parse().unwrap_or(usize::MAX),
+                            reason,
+                            key_span: ref_key.span,
+                            line: key_line,
+                            raw: ref_key.text.clone(),
+                        });
+                    }
+                    continue;
+                }
+
+                let bucket = match lint {
+                    ExceptionLint::StaleReferences => &mut exceptions.stale_references,
+                    ExceptionLint::BarePaths => &mut exceptions.bare_paths,
+                };
                 bucket.push(ExceptionEntry {
                     reference: ref_key.text.clone(),
                     reason,
                     key_span: ref_key.span,
-                    line: byte_offset_to_line(source, ref_key.span.start),
+                    line: key_line,
                 });
             }
         }
@@ -480,7 +577,7 @@ pub fn byte_offset_to_line(source: &str, offset: usize) -> usize {
 #[cfg(test)]
 #[allow(clippy::expect_used, reason = "tests use expect for clarity")]
 mod tests {
-    use super::{ExceptionLint, extract_exceptions};
+    use super::{ExceptionLint, extract_exceptions, is_count_key};
     use crate::yaml::parse_frontmatter_block;
 
     #[test]
@@ -548,6 +645,80 @@ mod tests {
             ex.stale_references[0].line, 4,
             "the key's line is recorded: {ex:?}"
         );
+    }
+
+    #[test]
+    fn is_count_key_discriminates_by_shape() {
+        // An all-digits key is the sentinel; any path-shaped key (name, slash,
+        // or fragment) is a literal reference (issue 036).
+        assert!(is_count_key("31"), "all-digits is a count key");
+        assert!(is_count_key("0"), "a single digit is all-digits");
+        assert!(!is_count_key("31.md"), "a `.md` name is a literal ref");
+        assert!(!is_count_key("a/31"), "a slashed path is a literal ref");
+        assert!(!is_count_key("3a"), "a trailing letter is a literal ref");
+        assert!(!is_count_key(""), "the empty string is not a count key");
+        assert!(
+            !is_count_key("#31"),
+            "a fragment-shaped key is a literal ref"
+        );
+    }
+
+    #[test]
+    fn extract_exceptions_count_key_parsed_into_sentinel_slot() {
+        // An all-digits key lands in the count-key slot, not the literal
+        // bucket, carrying its parsed N, reason, and span (issue 036).
+        let source =
+            "---\nexceptions:\n  stale_references:\n    \"31\": \"migration table\"\n---\n";
+        let block = parse_frontmatter_block(source).expect("should parse");
+        let ex = extract_exceptions(&block, source);
+        assert!(
+            ex.stale_references.is_empty(),
+            "the count key is not a literal entry: {ex:?}"
+        );
+        let count = ex
+            .count_key(ExceptionLint::StaleReferences)
+            .expect("count key present");
+        assert_eq!(count.expected, 31, "N is parsed from the key: {ex:?}");
+        assert_eq!(
+            count.reason, "migration table",
+            "reason is the value: {ex:?}"
+        );
+        assert_eq!(count.raw, "31", "raw key text is retained: {ex:?}");
+    }
+
+    #[test]
+    fn extract_exceptions_count_key_and_literal_compose() {
+        // A literal key and a count key coexist in one namespace: the literal
+        // lands in the bucket, the all-digits key in the sentinel slot.
+        let source = "---\nexceptions:\n  stale_references:\n    \"a.md\": \"literal\"\n    \"31\": \"count\"\n---\n";
+        let block = parse_frontmatter_block(source).expect("should parse");
+        let ex = extract_exceptions(&block, source);
+        assert_eq!(
+            ex.stale_references.len(),
+            1,
+            "only the literal key is an entry: {ex:?}"
+        );
+        assert_eq!(
+            ex.stale_references[0].reference, "a.md",
+            "the literal key is the path: {ex:?}"
+        );
+        assert!(
+            ex.count_key(ExceptionLint::StaleReferences).is_some(),
+            "the all-digits key is the sentinel: {ex:?}"
+        );
+    }
+
+    #[test]
+    fn extract_exceptions_count_key_first_wins() {
+        // At most one sentinel per namespace — the first all-digits key wins.
+        let source =
+            "---\nexceptions:\n  bare_paths:\n    \"3\": \"first\"\n    \"7\": \"second\"\n---\n";
+        let block = parse_frontmatter_block(source).expect("should parse");
+        let ex = extract_exceptions(&block, source);
+        let count = ex
+            .count_key(ExceptionLint::BarePaths)
+            .expect("count key present");
+        assert_eq!(count.expected, 3, "the first sentinel wins: {ex:?}");
     }
 
     #[test]

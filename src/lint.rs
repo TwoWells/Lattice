@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
+use crate::structural::SeverityCounts;
 use crate::validation::{self, Diagnostic, Severity};
 use crate::workspace::Workspace;
 
@@ -37,11 +38,17 @@ use crate::workspace::Workspace;
 /// `strict` is set — any in-scope warning-level diagnostic. Info/hint
 /// diagnostics never fail the exit code.
 ///
+/// After the diagnostics, unless `quiet` is set, prints the **suppression
+/// ledger** (issue 036, decision 012): a summary of what each suppression source
+/// (frontmatter literal exceptions, count-keys) hid in the in-scope files,
+/// broken out by severity. A turned-off blanket is never silent; `--quiet` drops
+/// it for machine-readable CI output.
+///
 /// # Errors
 ///
 /// Returns an error if the workspace cannot be scanned or output cannot
 /// be written.
-pub fn run(start: &Path, strict: bool, out: &mut impl Write) -> Result<bool> {
+pub fn run(start: &Path, strict: bool, quiet: bool, out: &mut impl Write) -> Result<bool> {
     let workspace = Workspace::scan(start).context("failed to scan workspace")?;
 
     // The lint scope is `start` expressed relative to the discovered root.
@@ -108,6 +115,15 @@ pub fn run(start: &Path, strict: bool, out: &mut impl Write) -> Result<bool> {
         writeln!(out, "{}", format_diagnostic(diag))?;
     }
 
+    // The suppression ledger (issue 036, decision 012): summarize what was
+    // suppressed in the in-scope files, by source and severity. `--quiet` drops
+    // it. Scoped identically to the diagnostics above — a suppression is
+    // attributed to the file it occurred in.
+    if !quiet {
+        let rows = collect_ledger_rows(&workspace, scope.as_deref());
+        write_ledger(&rows, out)?;
+    }
+
     Ok(failed)
 }
 
@@ -162,6 +178,153 @@ fn format_diagnostic(diag: &Diagnostic) -> String {
     )
 }
 
+// ---------------------------------------------------------------------------
+// Suppression ledger (issue 036, decision 012 part B)
+// ---------------------------------------------------------------------------
+
+/// The suppression source a ledger row reports.
+///
+/// Issue 037 adds a third variant (subtree overrides); the renderer iterates
+/// rows by kind, so a new source slots in without restructuring the output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LedgerSource {
+    /// A file's frontmatter literal exceptions.
+    Exceptions,
+    /// A per-document count-key.
+    CountKey,
+}
+
+impl LedgerSource {
+    /// The header label naming this source's row count (`N <name>`).
+    const fn header_name(self) -> &'static str {
+        match self {
+            Self::Exceptions => "exceptions",
+            Self::CountKey => "count-key",
+        }
+    }
+}
+
+/// One row of the suppression ledger: a label, what it suppressed by severity,
+/// and a source-specific detail suffix.
+#[derive(Debug, Clone)]
+struct LedgerRow {
+    /// The source kind, for the header tally and ordering.
+    source: LedgerSource,
+    /// The row label — a file path (exceptions) or the shared reason (count-key).
+    label: String,
+    /// What this row suppressed, by severity.
+    counts: SeverityCounts,
+    /// The trailing detail — `count-key (31)` or `exceptions (2)`.
+    detail: String,
+}
+
+/// Gather the suppression ledger rows from the workspace, scoped like the
+/// diagnostics.
+///
+/// One row per in-scope file with matched literal exceptions (labeled by path)
+/// and one row per in-scope count-key that suppressed its residual (labeled by
+/// its shared reason). Files in source order (the workspace is a `BTreeMap`), so
+/// the ledger is deterministic.
+fn collect_ledger_rows(workspace: &Workspace, scope: Option<&Path>) -> Vec<LedgerRow> {
+    let mut rows = Vec::new();
+    for (path, file_data) in workspace.files() {
+        if !in_scope(path, scope) {
+            continue;
+        }
+        let sup = &file_data.suppressions;
+        if sup.is_empty() {
+            continue;
+        }
+        if let Some(ex) = &sup.exceptions {
+            rows.push(LedgerRow {
+                source: LedgerSource::Exceptions,
+                label: path.display().to_string(),
+                counts: ex.counts,
+                detail: format!("exceptions ({})", ex.matched_entries),
+            });
+        }
+        for ck in &sup.count_keys {
+            rows.push(LedgerRow {
+                source: LedgerSource::CountKey,
+                label: ck.reason.clone(),
+                counts: ck.counts,
+                detail: format!("count-key ({})", ck.raw),
+            });
+        }
+    }
+    rows
+}
+
+/// Render a `SeverityCounts` as the comma-joined `N warnings, M hints` phrase the
+/// ledger uses. Zero-severity buckets are omitted; the plural `s` is dropped for
+/// a count of one.
+fn format_counts(counts: &SeverityCounts) -> String {
+    let mut parts = Vec::new();
+    for (n, singular) in [
+        (counts.errors, "error"),
+        (counts.warnings, "warning"),
+        (counts.info, "info"),
+        (counts.hints, "hint"),
+    ] {
+        if n == 0 {
+            continue;
+        }
+        // `info` has no distinct plural; the others take a trailing `s`.
+        if n == 1 || singular == "info" {
+            parts.push(format!("{n} {singular}"));
+        } else {
+            parts.push(format!("{n} {singular}s"));
+        }
+    }
+    parts.join(", ")
+}
+
+/// Write the suppression ledger (issue 036). No-op when nothing was suppressed,
+/// so a clean run prints no ledger at all.
+fn write_ledger(rows: &[LedgerRow], out: &mut impl Write) -> Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+
+    // Header: total suppressed by severity, then the row count per source kind.
+    let mut totals = SeverityCounts::default();
+    for row in rows {
+        totals.add(row.counts);
+    }
+    let mut source_counts = Vec::new();
+    for source in [LedgerSource::CountKey, LedgerSource::Exceptions] {
+        let n = rows.iter().filter(|r| r.source == source).count();
+        if n > 0 {
+            source_counts.push(format!("{n} {}", source.header_name()));
+        }
+    }
+    writeln!(
+        out,
+        "suppressed: {}  ({})",
+        format_counts(&totals),
+        source_counts.join(", ")
+    )?;
+
+    // Rows: label, padded, then the per-row counts and the source detail. The
+    // label column is padded to the widest label so the counts align.
+    let label_width = rows.iter().map(|r| r.label.len()).max().unwrap_or(0);
+    let counts_width = rows
+        .iter()
+        .map(|r| format_counts(&r.counts).len())
+        .max()
+        .unwrap_or(0);
+    for row in rows {
+        let counts = format_counts(&row.counts);
+        writeln!(
+            out,
+            "  {label:<label_width$}  {counts:<counts_width$}  {detail}",
+            label = row.label,
+            detail = row.detail,
+        )?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 #[allow(
     clippy::expect_used,
@@ -198,15 +361,26 @@ mod tests {
         dir
     }
 
-    /// Run lint on a temp dir and return (`failed`, output).
+    /// Run lint on a temp dir and return (`failed`, output). The ledger is
+    /// suppressed (`quiet`) so diagnostic-output assertions stay focused on the
+    /// diagnostics; the ledger has its own tests.
     fn run_lint(dir: &TempDir) -> (bool, String) {
         run_lint_with(dir, false)
     }
 
-    /// Run lint on a temp dir with an explicit `strict` flag.
+    /// Run lint on a temp dir with an explicit `strict` flag, ledger suppressed.
     fn run_lint_with(dir: &TempDir, strict: bool) -> (bool, String) {
         let mut buf = Vec::new();
-        let failed = run(dir.path(), strict, &mut buf).expect("run should succeed");
+        let failed = run(dir.path(), strict, true, &mut buf).expect("run should succeed");
+        let output = String::from_utf8(buf).expect("output should be utf-8");
+        (failed, output)
+    }
+
+    /// Run lint on a temp dir with the suppression ledger enabled (the default
+    /// user experience) and return (`failed`, output).
+    fn run_lint_with_ledger(dir: &TempDir) -> (bool, String) {
+        let mut buf = Vec::new();
+        let failed = run(dir.path(), false, false, &mut buf).expect("run should succeed");
         let output = String::from_utf8(buf).expect("output should be utf-8");
         (failed, output)
     }
@@ -431,7 +605,7 @@ mod tests {
     /// scoped invocation can be exercised. Returns (`failed`, output).
     fn run_lint_start(start: &Path) -> (bool, String) {
         let mut buf = Vec::new();
-        let failed = run(start, false, &mut buf).expect("run should succeed");
+        let failed = run(start, false, true, &mut buf).expect("run should succeed");
         let output = String::from_utf8(buf).expect("output should be utf-8");
         (failed, output)
     }
@@ -707,6 +881,114 @@ mod tests {
         assert!(
             in_scope(Path::new("anything/at/all.md"), None),
             "a None scope means the whole workspace is in scope"
+        );
+    }
+
+    // -- Suppression ledger (issue 036, decision 012 part B) --
+
+    #[test]
+    fn format_counts_omits_zero_buckets_and_pluralizes() {
+        let one = SeverityCounts {
+            warnings: 1,
+            ..SeverityCounts::default()
+        };
+        assert_eq!(
+            format_counts(&one),
+            "1 warning",
+            "a count of one is singular and only the warning bucket shows"
+        );
+        let many = SeverityCounts {
+            warnings: 84,
+            hints: 12,
+            ..SeverityCounts::default()
+        };
+        assert_eq!(
+            format_counts(&many),
+            "84 warnings, 12 hints",
+            "multiple non-zero buckets are comma-joined and pluralized"
+        );
+    }
+
+    #[test]
+    fn ledger_reports_exception_counts_by_severity() {
+        // A file whose frontmatter excepts a dangling stale reference: the ledger
+        // reports one exception row, one suppressed warning, labeled by path.
+        let dir = setup(&[(
+            "intro.md",
+            "---\n\
+             exceptions:\n  \
+               stale_references:\n    \
+                 \"gone.md\": \"a worked example path, not a live reference\"\n\
+             ---\n\
+             See `gone.md` for details.\n",
+        )]);
+        let (_failed, output) = run_lint_with_ledger(&dir);
+        assert!(
+            output.contains("suppressed: 1 warning  (1 exceptions)"),
+            "the ledger header tallies one suppressed warning from one exception source: {output}"
+        );
+        assert!(
+            output.contains("intro.md") && output.contains("exceptions (1)"),
+            "the exception row is labeled by path with the matched-entry detail: {output}"
+        );
+    }
+
+    #[test]
+    fn ledger_reports_count_key_row_by_reason() {
+        // A count-key whose residual matches: the ledger row is labeled by the
+        // shared reason and detailed as `count-key (N)`.
+        let dir = setup(&[(
+            "table.md",
+            "---\n\
+             exceptions:\n  \
+               stale_references:\n    \
+                 \"2\": \"the consolidation migration table\"\n\
+             ---\n\
+             See `a.md` and `b.md`.\n",
+        )]);
+        let (_failed, output) = run_lint_with_ledger(&dir);
+        assert!(
+            output.contains("suppressed: 2 warnings  (1 count-key)"),
+            "the header tallies the count-key's two suppressed warnings: {output}"
+        );
+        assert!(
+            output.contains("the consolidation migration table")
+                && output.contains("count-key (2)"),
+            "the count-key row is labeled by reason, detailed by raw key: {output}"
+        );
+    }
+
+    #[test]
+    fn quiet_drops_the_ledger() {
+        let dir = setup(&[(
+            "intro.md",
+            "---\n\
+             exceptions:\n  \
+               stale_references:\n    \
+                 \"gone.md\": \"a worked example path, not a live reference\"\n\
+             ---\n\
+             See `gone.md` for details.\n",
+        )]);
+        // Default (ledger on) shows it; `--quiet` (the `run_lint` helper) drops it.
+        let (_f1, with_ledger) = run_lint_with_ledger(&dir);
+        assert!(
+            with_ledger.contains("suppressed:"),
+            "the ledger prints by default: {with_ledger}"
+        );
+        let (_f2, quiet) = run_lint(&dir);
+        assert!(
+            !quiet.contains("suppressed:"),
+            "--quiet drops the ledger: {quiet}"
+        );
+    }
+
+    #[test]
+    fn ledger_absent_when_nothing_suppressed() {
+        let dir = setup(&[("clean.md", "# Title\n\nNo suppressions here.\n")]);
+        let (_failed, output) = run_lint_with_ledger(&dir);
+        assert!(
+            !output.contains("suppressed:"),
+            "a clean run prints no ledger: {output}"
         );
     }
 }

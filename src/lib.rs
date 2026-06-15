@@ -60,9 +60,13 @@ pub fn run() -> ExitCode {
     let args = cli::Cli::parse();
 
     match args.command {
-        cli::Command::Lint { path, strict } => {
+        cli::Command::Lint {
+            path,
+            strict,
+            quiet,
+        } => {
             let mut stderr = io::stderr().lock();
-            match lint::run(&path, strict, &mut stderr) {
+            match lint::run(&path, strict, quiet, &mut stderr) {
                 Ok(has_errors) => {
                     if has_errors {
                         ExitCode::from(1)
