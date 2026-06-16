@@ -1,19 +1,40 @@
 # Lattice
 
+[![crates.io](https://img.shields.io/crates/v/lattice.svg)](https://crates.io/crates/lattice)
+[![docs.rs](https://img.shields.io/docsrs/lattice)](https://docs.rs/lattice)
+[![CI](https://github.com/TwoWells/Lattice/actions/workflows/ci.yml/badge.svg)](https://github.com/TwoWells/Lattice/actions/workflows/ci.yml)
+[![license](https://img.shields.io/crates/l/lattice.svg)](#license)
+
 A markdown predicate linter and backlink reconciler, shipped as an LSP server.
 
 Lattice encodes link predicates in CommonMark title text and maintains
 backlinks in YAML frontmatter. The graph lives in the files themselves —
 no database, everything in git.
 
+## Installation
+
+```sh
+cargo install lattice
+```
+
+Or download a prebuilt binary (Linux, macOS, Windows) from the
+[latest release](https://github.com/TwoWells/Lattice/releases/latest).
+Building from source needs Rust 1.95 or newer.
+
 ## Usage
 
 ```sh
-# Lint all markdown files in the current project
+# Lint all markdown files in the current project (exit 1 on errors)
 lattice lint
 
 # Run as an LSP server (used by editors)
 lattice serve
+
+# Print the full configuration reference (every option, with defaults)
+lattice config
+
+# Print the version (with git commit and dirty state)
+lattice --version
 ```
 
 ## Neovim
@@ -31,9 +52,11 @@ vim.lsp.enable("lattice")
 ```
 
 Diagnostics appear inline on open, change, and save. Lattice is
-diagnostic-first, but the server also answers document/workspace
-symbols, references, rename, hover, folding, and document links over
-the predicate graph.
+diagnostic-first, but the server is a full markdown LSP: completion
+(paths, headings, predicates, reference labels, footnotes), hover,
+document and workspace symbols, references, rename, folding, document
+links, formatting, and go-to-definition/declaration/type/implementation
+plus call and type hierarchy over the predicate graph.
 
 On Neovim older than 0.11, start it per buffer instead:
 
@@ -127,7 +150,7 @@ no backlink obligation.
 
 ## Agent instructions
 
-Add this to your project's `AGENTS.md` or `CLAUDE.md`:
+Add this to your project's `AGENTS` or `CLAUDE` file:
 
 > Markdown links follow [Lattice](https://github.com/TwoWells/Lattice)
 > conventions: predicates are encoded in title text, e.g.
