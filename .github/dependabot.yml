@@ -1,0 +1,12 @@
+# Keep GitHub Actions versions current automatically. Dependabot opens a PR
+# whenever an action used in .github/workflows/ publishes a new release —
+# including major bumps like the Node 20 -> 24 runtime moves — so deprecations
+# don't have to be chased by hand.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "ci"

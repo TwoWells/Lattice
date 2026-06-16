@@ -38,7 +38,7 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       # rustup reads rust-toolchain.toml (channel 1.95 + rustfmt/clippy) and
       # installs the pinned toolchain if the runner doesn't have it yet.
