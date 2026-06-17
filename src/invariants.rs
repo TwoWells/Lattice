@@ -336,6 +336,83 @@ pub fn assert_inline_resource_fidelity(tree: &Tree) {
 }
 
 // ---------------------------------------------------------------------------
+// Emphasis-run span fidelity (ticket 26)
+// ---------------------------------------------------------------------------
+
+/// Assert span fidelity for every emphasis / strong / strikethrough run.
+///
+/// Flanking is a classic source of off-by-one span bugs, and these runs carry
+/// no resolved text field for [`assert_inline_resource_fidelity`] to check — the
+/// span *is* the data. For each [`Strong`], [`Emphasis`], or [`Strikethrough`]
+/// node this asserts the source slice is delimited by the expected marker at
+/// both ends, with the correct opening/closing run lengths (`**`/`__` and `~~`
+/// take two, `*`/`_` and single `~` take one), and that the inner content is
+/// non-empty. A drifted span — one short of the closing delimiter, or one byte
+/// into the content — fails the boundary check rather than slicing silently
+/// wrong styling data.
+///
+/// [`Strong`]: ElementKind::Strong
+/// [`Emphasis`]: ElementKind::Emphasis
+/// [`Strikethrough`]: ElementKind::Strikethrough
+pub fn assert_emphasis_span_fidelity(tree: &Tree) {
+    let source = tree.source();
+    for node in tree.nodes() {
+        // The minimum number of delimiter characters the kind carries at each
+        // edge. Strong takes two; emphasis takes one; a strikethrough run is one
+        // or two tildes (its exact length is read from the slice and checked for
+        // symmetry below, so its lower bound is one).
+        let open_len = match node.kind {
+            ElementKind::Strong => 2,
+            ElementKind::Emphasis | ElementKind::Strikethrough => 1,
+            _ => continue,
+        };
+        let slice = &source[node.span.start..node.span.end];
+        // The first character is the delimiter that opens the run. `*` and `_`
+        // are interchangeable across the emphasis family; `~` is strikethrough.
+        let delim = slice.chars().next().unwrap_or(' ');
+        let expected_family = matches!(node.kind, ElementKind::Strikethrough);
+        let is_strike_delim = delim == '~';
+        let is_emphasis_delim = delim == '*' || delim == '_';
+        assert!(
+            (expected_family && is_strike_delim) || (!expected_family && is_emphasis_delim),
+            "emphasis run {slice:?} starts with {delim:?}, not a delimiter for {:?}",
+            node.kind
+        );
+        // The leading and trailing delimiter runs. They must each carry *at
+        // least* the kind's delimiter count: a nested run anchored at the same
+        // source delimiter run (e.g. the outer `*` of `***foo***`) can place a
+        // consumed inner delimiter immediately after the opener, so the edge
+        // count is `>= open_len`, not exactly it. The matched delimiters
+        // themselves are the outermost ones, so the closing edge mirrors it.
+        let lead = slice.chars().take_while(|&c| c == delim).count();
+        let trail = slice.chars().rev().take_while(|&c| c == delim).count();
+        assert!(
+            lead >= open_len && trail >= open_len,
+            "emphasis run {slice:?} is not delimited by at least {open_len} {delim:?} at each \
+             edge for {:?}",
+            node.kind
+        );
+        // A strikethrough run pairs equal-length openers and closers (one or two
+        // tildes), so the edges are symmetric and bounded.
+        if is_strike_delim {
+            assert!(
+                lead == trail && (1..=2).contains(&lead),
+                "strikethrough run {slice:?} edges {lead}/{trail} are not a symmetric 1- or \
+                 2-tilde pair"
+            );
+        }
+        // The matched delimiters bound non-empty content: stripping `open_len`
+        // delimiters from each edge must leave at least one character (delimiters
+        // are ASCII, so each is one byte).
+        assert!(
+            slice.len() > 2 * open_len,
+            "emphasis run {slice:?} has no content between its delimiters for {:?}",
+            node.kind
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // HTML tag bounds
 // ---------------------------------------------------------------------------
 
@@ -515,6 +592,7 @@ pub fn assert_document_invariants(source: &str) {
     let file = parse_content(source, Path::new("oracle.md"), &Config::default());
     assert_tree_wellformed(&file.tree);
     assert_inline_resource_fidelity(&file.tree);
+    assert_emphasis_span_fidelity(&file.tree);
     assert_position_round_trip(source);
     assert_line_index_agrees(source, &file.line_index);
     if let (Some(block), _) = detect_frontmatter(source) {

@@ -174,6 +174,12 @@ fn scan_inlines(
     // to bound per-line inline work.
     let mut line_start = 0;
 
+    // Emphasis / strong / strikethrough delimiter runs found in top-level text
+    // (i.e. not inside a code span, link destination, autolink, or raw HTML).
+    // Matched into runs after the scan completes; offsets here are relative to
+    // `text`, not `base`.
+    let mut delimiters: Vec<DelimRun> = Vec::new();
+
     while i < bytes.len() {
         // Per-line inline-scan cap: bytes past the limit on a single line are
         // treated as plain text. A degenerate line (e.g. unmatched `$` runs)
@@ -382,11 +388,19 @@ fn scan_inlines(
                     i += 1;
                 }
             }
+            b'*' | b'_' | b'~' => {
+                let marker = bytes[i];
+                let run_len = count_char(bytes, i, marker);
+                delimiters.push(classify_delim_run(text, i, run_len, marker));
+                i += run_len;
+            }
             _ => {
                 i += 1;
             }
         }
     }
+
+    match_emphasis(base, &delimiters, tree, parent);
 }
 
 // ---------------------------------------------------------------------------
@@ -397,6 +411,198 @@ fn scan_inlines(
 /// by whitespace).
 fn is_word_boundary(bytes: &[u8], i: usize) -> bool {
     i == 0 || bytes[i - 1].is_ascii_whitespace()
+}
+
+// ---------------------------------------------------------------------------
+// Emphasis / strong / strikethrough (CommonMark + GFM flanking)
+// ---------------------------------------------------------------------------
+
+/// A run of identical emphasis delimiter characters found in top-level text.
+///
+/// Offsets are relative to the host text slice. `can_open` / `can_close`
+/// encode the `CommonMark` delimiter-run flanking rules (with the GFM tilde
+/// rules for `~`), precomputed from the characters surrounding the run so the
+/// matching pass is a pure stack walk.
+struct DelimRun {
+    /// Delimiter character: `*`, `_`, or `~`.
+    marker: u8,
+    /// Start offset of the run within the host text.
+    start: usize,
+    /// Number of delimiter characters remaining in the run. Consumed from the
+    /// inner edges as the run is matched, so a long run can pair more than once.
+    count: usize,
+    /// End offset of the run within the host text (`start + original length`).
+    end: usize,
+    /// Whether this run can open emphasis (left-flanking, with the `_`/`~`
+    /// refinements).
+    can_open: bool,
+    /// Whether this run can close emphasis (right-flanking, with the `_`/`~`
+    /// refinements).
+    can_close: bool,
+}
+
+/// Classify a delimiter run for `CommonMark` / GFM flanking.
+///
+/// Reads the Unicode characters immediately before and after the run (the
+/// start and end of the host text count as whitespace, per `CommonMark`) and
+/// derives left/right-flanking and the `can_open` / `can_close` predicates,
+/// including the intraword-`_` restriction and the GFM tilde rules.
+fn classify_delim_run(text: &str, start: usize, len: usize, marker: u8) -> DelimRun {
+    let end = start + len;
+    let before = text[..start].chars().next_back();
+    let after = text[end..].chars().next();
+
+    let before_ws = before.is_none_or(is_unicode_whitespace);
+    let after_ws = after.is_none_or(is_unicode_whitespace);
+    let before_punct = before.is_some_and(is_punct);
+    let after_punct = after.is_some_and(is_punct);
+
+    // CommonMark left-flanking: not followed by whitespace, and either not
+    // followed by punctuation or (followed by punctuation and preceded by
+    // whitespace or punctuation).
+    let left_flanking = !after_ws && (!after_punct || before_ws || before_punct);
+    // CommonMark right-flanking: not preceded by whitespace, and either not
+    // preceded by punctuation or (preceded by punctuation and followed by
+    // whitespace or punctuation).
+    let right_flanking = !before_ws && (!before_punct || after_ws || after_punct);
+
+    let (can_open, can_close) = match marker {
+        // `_` carries the intraword restriction: it may only open when it is
+        // left-flanking and either not right-flanking or preceded by
+        // punctuation, and symmetrically for closing.
+        b'_' => (
+            left_flanking && (!right_flanking || before_punct),
+            right_flanking && (!left_flanking || after_punct),
+        ),
+        // `*` and `~` (GFM strikethrough) use the plain flanking predicates.
+        _ => (left_flanking, right_flanking),
+    };
+
+    DelimRun {
+        marker,
+        start,
+        count: len,
+        end,
+        can_open,
+        can_close,
+    }
+}
+
+/// `CommonMark` "Unicode whitespace": a space, tab, newline, carriage return,
+/// form feed, or any Unicode whitespace character.
+fn is_unicode_whitespace(c: char) -> bool {
+    c.is_whitespace()
+}
+
+/// `CommonMark` "punctuation": an ASCII punctuation character or any Unicode
+/// punctuation/symbol character.
+fn is_punct(c: char) -> bool {
+    c.is_ascii_punctuation() || (!c.is_alphanumeric() && !c.is_whitespace() && !c.is_control())
+}
+
+/// Find the nearest opener (scanning back from `close_idx`) that can pair with
+/// the closer at `close_idx`, honouring the marker, flanking, multiple-of-3,
+/// and GFM tilde length rules. Returns the opener index, or `None` if no run
+/// before the closer is a compatible partner.
+fn find_opener(runs: &[DelimRun], remaining: &[usize], close_idx: usize) -> Option<usize> {
+    let closer = &runs[close_idx];
+    let mut open_idx = close_idx;
+    while open_idx > 0 {
+        open_idx -= 1;
+        let candidate = &runs[open_idx];
+        if candidate.marker != closer.marker || !candidate.can_open || remaining[open_idx] == 0 {
+            continue;
+        }
+        if closer.marker == b'~' {
+            // GFM strikethrough: opener and closer must be the same original
+            // length, and only runs of one or two tildes are delimiters.
+            if candidate.count != closer.count || closer.count > 2 {
+                continue;
+            }
+            return Some(open_idx);
+        }
+        // CommonMark rule 9/10: when one of the two runs can both open and
+        // close, the sum of their *original* lengths must not be a multiple of
+        // 3 unless both lengths are themselves multiples of 3.
+        if (candidate.can_close || closer.can_open)
+            && (candidate.count + closer.count).is_multiple_of(3)
+            && (!candidate.count.is_multiple_of(3) || !closer.count.is_multiple_of(3))
+        {
+            continue;
+        }
+        return Some(open_idx);
+    }
+    None
+}
+
+/// Match collected delimiter runs into strong / emphasis / strikethrough nodes
+/// and attach them to `parent`.
+///
+/// Implements the `CommonMark` emphasis delimiter-stack algorithm for `*` / `_`
+/// (pairing `**`/`__` into [`ElementKind::Strong`] and a single delimiter into
+/// [`ElementKind::Emphasis`]), plus the GFM strikethrough rule for `~` (a run
+/// of exactly one or two tildes, matched against an equal-length closer). The
+/// span of each emitted run covers both delimiters and their content; offsets
+/// in `runs` are relative to the host text, so each span is shifted by `base`.
+fn match_emphasis(base: usize, runs: &[DelimRun], tree: &mut Tree, parent: NodeId) {
+    // Working copy of the remaining delimiter counts, consumed as runs pair.
+    let mut remaining: Vec<usize> = runs.iter().map(|r| r.count).collect();
+    // Emitted spans, collected then sorted so attachment order is deterministic
+    // (outermost-first by start) regardless of the inside-out matching order.
+    let mut emitted: Vec<(Span, ElementKind)> = Vec::new();
+
+    // Walk closers left-to-right; for each, repeatedly scan back for the
+    // nearest compatible opener and pair until the closer is exhausted (the
+    // classic delimiter-stack walk — a long run pairs more than once).
+    for close_idx in 0..runs.len() {
+        let closer = &runs[close_idx];
+        if !closer.can_close {
+            continue;
+        }
+
+        while remaining[close_idx] > 0 {
+            let opener = find_opener(runs, &remaining, close_idx);
+            let Some(open_idx) = opener else {
+                break;
+            };
+
+            if closer.marker == b'~' {
+                // GFM strikethrough: only runs of length 1 or 2 are delimiters,
+                // and an opener pairs with a closer of the *same* original
+                // length. `find_opener` already filtered to an equal-length,
+                // <=2 partner, so emit and consume both whole runs.
+                let span = Span::new(base + runs[open_idx].start, base + closer.end);
+                remaining[open_idx] = 0;
+                remaining[close_idx] = 0;
+                emitted.push((span, ElementKind::Strikethrough));
+                continue;
+            }
+
+            // `*` / `_`: consume two delimiters for strong, otherwise one for
+            // emphasis, from the inner edges of each run.
+            let use_two = remaining[open_idx] >= 2 && remaining[close_idx] >= 2;
+            let take = if use_two { 2 } else { 1 };
+            let open_inner = runs[open_idx].start + (remaining[open_idx] - take);
+            let close_inner = closer.start + (closer.count - remaining[close_idx]) + take;
+            let span = Span::new(base + open_inner, base + close_inner);
+            remaining[open_idx] -= take;
+            remaining[close_idx] -= take;
+            let kind = if use_two {
+                ElementKind::Strong
+            } else {
+                ElementKind::Emphasis
+            };
+            emitted.push((span, kind));
+        }
+    }
+
+    // Attach outermost-first so the wellformedness invariant sees a stable,
+    // deterministic order (a node's siblings need not be disjoint, only
+    // contained in the shared parent).
+    emitted.sort_by(|a, b| a.0.start.cmp(&b.0.start).then(b.0.end.cmp(&a.0.end)));
+    for (span, kind) in emitted {
+        tree.add_child(parent, kind, Syntax::Markdown, span);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1762,5 +1968,142 @@ mod tests {
             urls.iter().all(|u| u != "b.md"),
             "link past the cap is treated as text: {urls:?}"
         );
+    }
+
+    // ===================================================================
+    // Emphasis / strong / strikethrough (ticket 26)
+    // ===================================================================
+
+    /// Collect the source slices of every node of a given emphasis kind.
+    fn emphasis_slices(tree: &Tree, want: &ElementKind) -> Vec<String> {
+        tree.nodes()
+            .iter()
+            .filter(|n| &n.kind == want)
+            .map(|n| tree.source()[n.span.start..n.span.end].to_string())
+            .collect()
+    }
+
+    #[test]
+    fn strong_double_asterisk() {
+        let tree = parse("a **bold** b\n");
+        assert_eq!(
+            emphasis_slices(&tree, &ElementKind::Strong),
+            vec!["**bold**".to_string()],
+            "double-asterisk strong run covers both delimiters"
+        );
+        assert!(
+            emphasis_slices(&tree, &ElementKind::Emphasis).is_empty(),
+            "no emphasis run for a pure strong run"
+        );
+    }
+
+    #[test]
+    fn strong_double_underscore() {
+        let tree = parse("a __bold__ b\n");
+        assert_eq!(
+            emphasis_slices(&tree, &ElementKind::Strong),
+            vec!["__bold__".to_string()],
+            "double-underscore strong run"
+        );
+    }
+
+    #[test]
+    fn emphasis_intraword_asterisk() {
+        // `*` has no intraword restriction: `a*b*c` emphasizes `b`.
+        let tree = parse("a*b*c\n");
+        assert_eq!(
+            emphasis_slices(&tree, &ElementKind::Emphasis),
+            vec!["*b*".to_string()],
+            "intraword asterisk emphasis is recognized"
+        );
+    }
+
+    #[test]
+    fn emphasis_intraword_underscore_suppressed() {
+        // `_` carries the intraword restriction: `foo_bar_baz` is not emphasis.
+        let tree = parse("foo_bar_baz\n");
+        assert!(
+            emphasis_slices(&tree, &ElementKind::Emphasis).is_empty(),
+            "intraword underscore must not emphasize"
+        );
+        assert!(
+            emphasis_slices(&tree, &ElementKind::Strong).is_empty(),
+            "intraword underscore must not strong-emphasize"
+        );
+    }
+
+    #[test]
+    fn strikethrough_double_tilde() {
+        let tree = parse("a ~~struck~~ b\n");
+        assert_eq!(
+            emphasis_slices(&tree, &ElementKind::Strikethrough),
+            vec!["~~struck~~".to_string()],
+            "double-tilde strikethrough run"
+        );
+    }
+
+    #[test]
+    fn strikethrough_single_tilde() {
+        let tree = parse("a ~one~ b\n");
+        assert_eq!(
+            emphasis_slices(&tree, &ElementKind::Strikethrough),
+            vec!["~one~".to_string()],
+            "single-tilde GFM strikethrough run"
+        );
+    }
+
+    #[test]
+    fn tilde_left_flanking_only_is_not_strikethrough() {
+        // The headline correctness case (ticket 26): in `~89 of ~162` the second
+        // `~` is preceded by whitespace, so it is left-flanking only and cannot
+        // close. cmark-gfm produces no strikethrough; Lattice must match.
+        let tree = parse("~89 of ~162\n");
+        assert!(
+            emphasis_slices(&tree, &ElementKind::Strikethrough).is_empty(),
+            "left-flanking-only single tildes must not form a strikethrough run: {:?}",
+            emphasis_slices(&tree, &ElementKind::Strikethrough)
+        );
+        // No diagnostic is emitted for emphasis (styling-only).
+        assert!(
+            tree.diagnostics().is_empty(),
+            "emphasis recognition emits no diagnostics: {:?}",
+            tree.diagnostics()
+        );
+    }
+
+    #[test]
+    fn emphasis_emits_no_diagnostics() {
+        let tree = parse("**bold** and *em* and ~~strike~~ and a*b*c here\n");
+        assert!(
+            tree.diagnostics().is_empty(),
+            "emphasis runs are styling-only and emit no diagnostics: {:?}",
+            tree.diagnostics()
+        );
+    }
+
+    #[test]
+    fn emphasis_nested_strong_in_emphasis() {
+        // `***foo***` pairs into a strong run inside an emphasis run, both
+        // children of the paragraph. The inner `<strong>` spans `**foo**`; the
+        // outer `<em>` wraps it, so its span runs from the outermost `*` to the
+        // outermost `*` — the whole `***foo***`, matching cmark-gfm.
+        let tree = parse("***foo***\n");
+        let strong = emphasis_slices(&tree, &ElementKind::Strong);
+        let em = emphasis_slices(&tree, &ElementKind::Emphasis);
+        assert_eq!(strong, vec!["**foo**".to_string()], "inner strong run");
+        assert_eq!(
+            em,
+            vec!["***foo***".to_string()],
+            "outer emphasis run wraps the strong run"
+        );
+    }
+
+    #[test]
+    fn emphasis_spans_pass_fidelity_invariant() {
+        // Every recognized run must clear the shared span-fidelity invariant,
+        // including runs adjacent to multi-byte characters.
+        let tree = parse("**café** and *résumé* and ~~naïve~~ and ~89 of ~162\n");
+        crate::invariants::assert_tree_wellformed(&tree);
+        crate::invariants::assert_emphasis_span_fidelity(&tree);
     }
 }

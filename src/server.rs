@@ -406,6 +406,9 @@ fn element_symbol_kind(kind: &ElementKind) -> Option<u32> {
         | ElementKind::InlineCode
         | ElementKind::InlineMath
         | ElementKind::InlineHtml
+        | ElementKind::Strong
+        | ElementKind::Emphasis
+        | ElementKind::Strikethrough
         | ElementKind::FootnoteRef { .. }
         | ElementKind::ReferenceDef { .. }
         | ElementKind::DetailsSummary

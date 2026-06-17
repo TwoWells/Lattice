@@ -58,9 +58,9 @@ use crate::fm;
 use crate::html::{self, HtmlTag};
 use crate::invariants::{
     Edit, assert_block_wellformed, assert_carrier_fidelity, assert_edit_sequence_stable,
-    assert_frontmatter_scalar_fidelity, assert_html_tag_in_bounds, assert_inline_resource_fidelity,
-    assert_line_index_agrees, assert_structural_invariants, assert_tree_wellformed,
-    carrier_backlinks, collect_scalars, detect_frontmatter,
+    assert_emphasis_span_fidelity, assert_frontmatter_scalar_fidelity, assert_html_tag_in_bounds,
+    assert_inline_resource_fidelity, assert_line_index_agrees, assert_structural_invariants,
+    assert_tree_wellformed, carrier_backlinks, collect_scalars, detect_frontmatter,
 };
 use crate::line_index::LineIndex;
 use crate::{inline, json, toml, yaml};
@@ -214,12 +214,51 @@ fn markdown_fragment() -> impl Strategy<Value = String> {
         blank_fragment(),
         html_tag_fragment(),
         link_fragment(),
+        emphasis_fragment(),
     ]
 }
 
 /// A markdown document assembled from random fragments.
 fn markdown_document() -> impl Strategy<Value = String> {
     proptest::collection::vec(markdown_fragment(), 0..25).prop_map(|frags| frags.concat())
+}
+
+/// An inline fragment exercising the emphasis / strong / strikethrough
+/// delimiters, including flanking edge cases and the GFM single-`~` form. The
+/// raw-delimiter arm wraps arbitrary delimiters around text so the flanking
+/// rules are stressed with both well-formed and ill-formed runs.
+fn emphasis_fragment() -> impl Strategy<Value = String> {
+    let delim = prop_oneof![
+        Just("*"),
+        Just("**"),
+        Just("_"),
+        Just("__"),
+        Just("~"),
+        Just("~~")
+    ];
+    prop_oneof![
+        (delim.clone(), inline_text(10)).prop_map(|(d, t)| format!("{d}{t}{d}\n")),
+        inline_text(12).prop_map(|t| format!("a*{t}*c\n")),
+        inline_text(12).prop_map(|t| format!("foo_{t}_baz\n")),
+        // The headline correctness case: left-flanking-only single tildes.
+        Just("~89 of ~162\n".to_string()),
+        // Raw delimiters around text — flanking decides whether they pair.
+        (delim, inline_text(8), delim_tail())
+            .prop_map(|(open, t, close)| format!("{open}{t}{close}\n")),
+    ]
+}
+
+/// A trailing delimiter run for the raw-delimiter emphasis arm.
+fn delim_tail() -> impl Strategy<Value = &'static str> {
+    prop_oneof![
+        Just("*"),
+        Just("**"),
+        Just("_"),
+        Just("~"),
+        Just("~~"),
+        Just(" *"),
+        Just("")
+    ]
 }
 
 // ---------------------------------------------------------------------------
@@ -678,6 +717,23 @@ proptest! {
         links in proptest::collection::vec(link_fragment(), 0..12)
     ) {
         assert_tree_wellformed(&parse_full(&links.concat()));
+    }
+
+    /// Every recognized emphasis / strong / strikethrough run carries a span
+    /// that is delimited correctly at both ends with non-empty content — the
+    /// off-by-one span guard for the flanking algorithm (ticket 26). Driven over
+    /// both emphasis-focused fragments and arbitrary UTF-8 so adjacent
+    /// multi-byte characters exercise char-boundary span arithmetic.
+    #[test]
+    fn emphasis_spans_are_delimited(
+        doc in prop_oneof![
+            proptest::collection::vec(emphasis_fragment(), 0..12).prop_map(|v| v.concat()),
+            arbitrary_string(200),
+        ]
+    ) {
+        let tree = parse_full(&doc);
+        assert_tree_wellformed(&tree);
+        assert_emphasis_span_fidelity(&tree);
     }
 }
 

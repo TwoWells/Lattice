@@ -118,6 +118,17 @@ pub enum ElementKind {
     InlineCode,
     /// Inline math span (`$...$`, content skipped).
     InlineMath,
+    /// Strong emphasis run (`**...**` or `__...__`). The span covers the
+    /// delimiters and their content. Styling/parse data only — never a
+    /// diagnostic.
+    Strong,
+    /// Emphasis run (`*...*` or `_..._`). The span covers the delimiters and
+    /// their content. Styling/parse data only — never a diagnostic.
+    Emphasis,
+    /// GFM strikethrough run (`~~...~~` or single `~...~`). The span covers the
+    /// delimiters and their content. Styling/parse data only — never a
+    /// diagnostic.
+    Strikethrough,
     /// Generic inline raw-HTML open tag bearing an anchor `id` (e.g. a
     /// mid-paragraph `<span id="x">`). Materialized so the tag's `id` is
     /// visible to the same `Syntax::Html` surface that anchor resolution and
