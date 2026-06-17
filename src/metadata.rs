@@ -26,7 +26,7 @@
 //!   and the more-than-one-carrier warning. It is called from
 //!   [`crate::structural::collect`].
 
-use crate::block::{ElementKind, Syntax, Tree};
+use crate::block::{ElementKind, NodeId, Syntax, Tree};
 use crate::fm::{FmSeverity, FrontmatterBlock};
 use crate::span::Span;
 use crate::validation::{Diagnostic, Severity};
@@ -65,6 +65,54 @@ fn is_carrier_info(info: &str) -> bool {
     tokens.next() == Some(CARRIER_LANG)
         && tokens.next() == Some(CARRIER_DISCRIMINATOR)
         && tokens.next().is_none()
+}
+
+/// Whether a fence info string is a *near-miss* carrier: the language token
+/// `yaml` followed by the discriminator `lattice`, but carrying one or more
+/// extra tokens (`yaml lattice title="x"`, `yaml lattice lines`).
+///
+/// Such a block reads to an author as a metadata carrier, but the info string
+/// is not exactly `yaml lattice`, so [`is_carrier_info`] rejects it and its
+/// metadata is silently dropped. At a carrier site this earns a near-miss
+/// warning (decision 015: hint when intent is high but the form is invalid);
+/// nested/embedded near-misses stay inert and silent. Mutually exclusive with
+/// [`is_carrier_info`] — an exact match has no extra token.
+fn is_carrier_near_miss(info: &str) -> bool {
+    let mut tokens = info.split_whitespace();
+    tokens.next() == Some(CARRIER_LANG)
+        && tokens.next() == Some(CARRIER_DISCRIMINATOR)
+        && tokens.next().is_some()
+}
+
+/// Whether a node sits at a *carrier site* — the one position where a
+/// `yaml lattice` fence is the document's own live metadata (decision 015).
+///
+/// A carrier site is a node whose parent is the document root
+/// ([`ElementKind::Document`], always index 0), or whose parent is an
+/// [`ElementKind::Details`] node that is itself a direct child of the document
+/// root. Any other ancestor — `QuoteBlock`, `List` / `ListItem`,
+/// `Table` / `TableRow` / `TableCell`, generic `Container`, `Admonition`, a
+/// nested `<details>`, etc. — marks the fence as *quoted or embedded* content,
+/// inert and silent, exactly like a documented example inside an outer fence.
+///
+/// The test is purely structural (parent / child links), never a text scan.
+fn is_carrier_site(tree: &Tree, node_id: NodeId) -> bool {
+    let Some(parent_id) = tree.node(node_id).parent else {
+        // Only the `Document` root has no parent; it is never itself a fence.
+        return false;
+    };
+    let parent = tree.node(parent_id);
+    match parent.kind {
+        // Directly at the document top level.
+        ElementKind::Document => true,
+        // Inside a `<details>` that is itself at the document top level. A
+        // `<details>` nested deeper (e.g. in a blockquote) is not a carrier
+        // site, so its parent must be the document root in turn.
+        ElementKind::Details => parent.parent.is_some_and(|grandparent_id| {
+            matches!(tree.node(grandparent_id).kind, ElementKind::Document)
+        }),
+        _ => false,
+    }
 }
 
 /// Extract the info string of a fenced code block from its raw text, or `None`
@@ -157,15 +205,21 @@ fn has_leading_frontmatter(tree: &Tree) -> bool {
 /// Scan the parse tree for every metadata-carrier fence (`yaml lattice`).
 ///
 /// Returns the carriers in document order. A fence is a carrier only when it is
-/// a real markdown [`CodeBlock`](ElementKind::CodeBlock) node — an HTML-syntax
-/// code block, or a `yaml lattice` example nested inside an outer fence (one
-/// opaque code-block node whose own info string is the outer language), is not
-/// recognized.
+/// a real markdown [`CodeBlock`](ElementKind::CodeBlock) node at a *carrier
+/// site* (top level, or directly inside a top-level `<details>`; see
+/// [`is_carrier_site`]). An HTML-syntax code block, a `yaml lattice` example
+/// nested inside an outer fence (one opaque code-block node whose own info
+/// string is the outer language), or a `yaml lattice` fence embedded in a
+/// blockquote / list / table / generic container is **not** recognized — it is
+/// quoted or embedded content, not the document's own metadata.
 fn scan_carriers(tree: &Tree) -> Vec<Carrier> {
     let source = tree.source();
     let mut carriers = Vec::new();
-    for node in tree.nodes() {
+    for (node_id, node) in tree.nodes().iter().enumerate() {
         if !matches!(node.kind, ElementKind::CodeBlock) || node.syntax == Syntax::Html {
+            continue;
+        }
+        if !is_carrier_site(tree, node_id) {
             continue;
         }
         let raw = &source[node.span.start..node.span.end];
@@ -287,6 +341,41 @@ pub fn carrier_diagnostics(tree: &Tree, rel_path: &Path, out: &mut Vec<Diagnosti
                 span: Some(diag.span),
             });
         }
+    }
+
+    // Near-miss carrier (decision 015): a fence at a carrier site whose info
+    // string is `yaml lattice` plus extra tokens (`yaml lattice title="x"`,
+    // `yaml lattice lines`) reads as a metadata carrier but is not exactly
+    // `yaml lattice`, so its metadata is silently dropped. Hint when intent is
+    // high but the form is invalid — warn, anchored at the fence-open/info line.
+    // This fires only at a carrier site: a near-miss nested in a blockquote or
+    // list stays inert and silent (the structural-scoping rule wins over the
+    // near-miss hint).
+    for (node_id, node) in tree.nodes().iter().enumerate() {
+        if !matches!(node.kind, ElementKind::CodeBlock) || node.syntax == Syntax::Html {
+            continue;
+        }
+        if !is_carrier_site(tree, node_id) {
+            continue;
+        }
+        let raw = &source[node.span.start..node.span.end];
+        let Some(info) = fence_info(raw) else {
+            continue;
+        };
+        if !is_carrier_near_miss(info) {
+            continue;
+        }
+        let span = fence_open_line_span(source, node.span.start, node.span.end);
+        out.push(Diagnostic {
+            file: rel_path.to_path_buf(),
+            line: crate::block::byte_offset_to_line(source, node.span.start),
+            severity: Severity::Warning,
+            message:
+                "this looks like a `yaml lattice` metadata carrier but the info string is not \
+                 exactly `yaml lattice`, so its metadata is not loaded — drop the extra tokens"
+                    .to_string(),
+            span: Some(span),
+        });
     }
 
     // Render gotchas: a `<details>`-wrapped carrier whose fence is not separated
@@ -556,6 +645,213 @@ mod tests {
         assert!(
             carrier_diags(content).is_empty(),
             "an incidental `yaml` block emits no carrier diagnostic"
+        );
+    }
+
+    // -- Top-level scoping (the blockquote gotcha) -----------------------
+
+    #[test]
+    fn carrier_inside_blockquote_is_inert() {
+        // A `yaml lattice` fence inside a blockquote is a real `CodeBlock`, but
+        // quoted content — not the document's own metadata. Inert and silent.
+        let content =
+            "# T\n\n> ```yaml lattice\n> backlinks:\n>   referenced_by:\n>     - a.md\n> ```\n";
+        assert!(
+            backlinks_of(content).is_empty(),
+            "a carrier inside a blockquote extracts no metadata: {:?}",
+            backlinks_of(content)
+        );
+        assert!(
+            carrier_diags(content).is_empty(),
+            "a carrier inside a blockquote emits no diagnostic: {:?}",
+            carrier_diags(content)
+        );
+    }
+
+    #[test]
+    fn carrier_inside_list_item_is_inert() {
+        // A `yaml lattice` fence inside a list item is embedded content. Inert.
+        let content =
+            "# T\n\n- ```yaml lattice\n  backlinks:\n    referenced_by:\n      - a.md\n  ```\n";
+        assert!(
+            backlinks_of(content).is_empty(),
+            "a carrier inside a list item extracts no metadata: {:?}",
+            backlinks_of(content)
+        );
+        assert!(
+            carrier_diags(content).is_empty(),
+            "a carrier inside a list item emits no diagnostic: {:?}",
+            carrier_diags(content)
+        );
+    }
+
+    #[test]
+    fn carrier_inside_generic_container_is_inert() {
+        // A `yaml lattice` fence inside a generic HTML `<div>` container is a
+        // real `CodeBlock` child of the `Container`, not the document's own
+        // metadata — inert and silent. (Verified the fence parses to a
+        // `CodeBlock` whose parent is `Container`, so the scoping path is
+        // exercised, not bypassed.)
+        let content = "# T\n\n<div>\n\n```yaml lattice\nbacklinks:\n  referenced_by:\n    - a.md\n```\n\n</div>\n";
+        assert!(
+            backlinks_of(content).is_empty(),
+            "a carrier inside a generic container extracts no metadata: {:?}",
+            backlinks_of(content)
+        );
+        assert!(
+            carrier_diags(content).is_empty(),
+            "a carrier inside a generic container emits no diagnostic: {:?}",
+            carrier_diags(content)
+        );
+    }
+
+    #[test]
+    fn carrier_text_in_table_cell_is_inert() {
+        // A GFM table cell parses inline content only — a fenced code block
+        // cannot live inside one (the triple-backtick is an inline code span,
+        // not a `CodeBlock` node). So a `yaml lattice` mention in a table cell
+        // is never recognized: no metadata, no diagnostic.
+        let content = "# T\n\n| a | b |\n| --- | --- |\n| ```yaml lattice``` | x |\n";
+        assert!(
+            backlinks_of(content).is_empty(),
+            "a `yaml lattice` mention in a table cell extracts no metadata: {:?}",
+            backlinks_of(content)
+        );
+        assert!(
+            carrier_diags(content).is_empty(),
+            "a `yaml lattice` mention in a table cell emits no diagnostic: {:?}",
+            carrier_diags(content)
+        );
+    }
+
+    #[test]
+    fn carrier_inside_nested_details_is_inert() {
+        // A `<details>` nested inside a blockquote is not a top-level carrier
+        // site, so the fence inside it is inert — the `<details>` parent must be
+        // the document root for the fence to be live metadata.
+        let content = "# T\n\n> <details><summary>lattice</summary>\n>\n> ```yaml lattice\n> backlinks:\n>   referenced_by:\n>     - a.md\n> ```\n>\n> </details>\n";
+        assert!(
+            backlinks_of(content).is_empty(),
+            "a carrier inside a nested `<details>` extracts no metadata: {:?}",
+            backlinks_of(content)
+        );
+        assert!(
+            carrier_diags(content).is_empty(),
+            "a carrier inside a nested `<details>` emits no diagnostic: {:?}",
+            carrier_diags(content)
+        );
+    }
+
+    // -- Near-miss info strings (warning) --------------------------------
+
+    #[test]
+    fn near_miss_extra_attribute_warns_and_loads_nothing() {
+        // `yaml lattice title="x"`: looks like a carrier, but the info string
+        // is not exactly `yaml lattice`, so nothing is loaded — warn.
+        let content =
+            "# T\n\n```yaml lattice title=\"x\"\nbacklinks:\n  referenced_by:\n    - a.md\n```\n";
+        let diags = carrier_diags(content);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.severity == Severity::Warning && d.message.contains("not loaded")),
+            "a near-miss carrier earns a warning: {diags:?}"
+        );
+        assert!(
+            backlinks_of(content).is_empty(),
+            "a near-miss carrier loads no metadata: {:?}",
+            backlinks_of(content)
+        );
+    }
+
+    #[test]
+    fn near_miss_extra_bare_token_warns() {
+        // `yaml lattice lines`: a bare third token is still a near-miss.
+        let content =
+            "# T\n\n```yaml lattice lines\nbacklinks:\n  referenced_by:\n    - a.md\n```\n";
+        let diags = carrier_diags(content);
+        let warnings = diags
+            .iter()
+            .filter(|d| d.severity == Severity::Warning && d.message.contains("not loaded"))
+            .count();
+        assert_eq!(
+            warnings, 1,
+            "a near-miss carrier earns exactly one warning: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn near_miss_warning_anchors_at_info_line() {
+        // The warning span anchors at the fence-open / info line.
+        let content =
+            "# T\n\n```yaml lattice lines\nbacklinks:\n  referenced_by:\n    - a.md\n```\n";
+        let diags = carrier_diags(content);
+        let warning = diags
+            .iter()
+            .find(|d| d.message.contains("not loaded"))
+            .expect("a near-miss carrier emits a warning");
+        let span = warning.span.expect("near-miss warning carries a span");
+        let info_line_start = content
+            .find("```yaml lattice lines")
+            .expect("fixture contains the near-miss fence");
+        assert_eq!(
+            span.start, info_line_start,
+            "the near-miss span anchors at the fence-open/info line: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn near_miss_inside_blockquote_is_silent() {
+        // Nested wins: a near-miss inside a blockquote stays inert and silent —
+        // the structural-scoping rule suppresses the near-miss hint.
+        let content = "# T\n\n> ```yaml lattice title=\"x\"\n> backlinks:\n>   referenced_by:\n>     - a.md\n> ```\n";
+        assert!(
+            carrier_diags(content).is_empty(),
+            "a near-miss inside a blockquote is silent (nested wins): {:?}",
+            carrier_diags(content)
+        );
+        assert!(
+            backlinks_of(content).is_empty(),
+            "a near-miss inside a blockquote loads nothing: {:?}",
+            backlinks_of(content)
+        );
+    }
+
+    #[test]
+    fn near_miss_under_top_level_details_warns() {
+        // A near-miss directly under a top-level `<details>` is a carrier site,
+        // so it earns the warning just like a naked top-level near-miss.
+        let content = "# T\n\n<details><summary>lattice</summary>\n\n```yaml lattice title=\"x\"\nbacklinks:\n  referenced_by:\n    - a.md\n```\n\n</details>\n";
+        let diags = carrier_diags(content);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.severity == Severity::Warning && d.message.contains("not loaded")),
+            "a near-miss under a top-level `<details>` warns: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn exact_carrier_is_not_a_near_miss() {
+        // An exact `yaml lattice` carrier never trips the near-miss warning.
+        let content = "# T\n\n```yaml lattice\nbacklinks:\n  referenced_by:\n    - a.md\n```\n";
+        assert!(
+            !carrier_diags(content)
+                .iter()
+                .any(|d| d.message.contains("not loaded")),
+            "an exact carrier is not a near-miss: {:?}",
+            carrier_diags(content)
+        );
+    }
+
+    #[test]
+    fn near_miss_span_round_trips_crlf() {
+        // CRLF: the near-miss span must still round-trip (helper asserts it).
+        let content = "# T\r\n\r\n```yaml lattice title=\"x\"\r\nbacklinks:\r\n  referenced_by:\r\n    - a.md\r\n```\r\n";
+        let diags = carrier_diags(content);
+        assert!(
+            diags.iter().any(|d| d.message.contains("not loaded")),
+            "the near-miss warning fires under CRLF: {diags:?}"
         );
     }
 
