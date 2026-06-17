@@ -128,10 +128,6 @@ impl LineIndex {
     /// down to the enclosing char's start; a line past the end of input maps to
     /// `source.len()`.
     #[must_use]
-    #[allow(
-        dead_code,
-        reason = "the inverse lookup is added for the future incremental text-sync path (ticket perf 05 / issue 014); it has no production caller yet, but the round-trip invariant and unit tests exercise it under test/fuzzing"
-    )]
     pub fn offset(&self, source: &str, pos: lsp::Position) -> usize {
         let Some(&start) = self.line_starts.get(pos.line as usize) else {
             return source.len();

@@ -126,6 +126,33 @@ impl Workspaces {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Semantic tokens legend (ticket integration 15)
+// ---------------------------------------------------------------------------
+
+/// The single semantic token type Lattice emits. All emphasis runs carry this
+/// base type and distinguish themselves through modifiers, so overlapping runs
+/// (strong inside emphasis) compose into one token with combined modifiers
+/// rather than two illegal overlapping tokens.
+const SEMANTIC_TOKEN_TYPE_MARKUP: &str = "markup";
+/// Modifier name for strong (`**bold**`) runs.
+const SEMANTIC_MODIFIER_BOLD: &str = "bold";
+/// Modifier name for emphasis (`*italic*`) runs.
+const SEMANTIC_MODIFIER_ITALIC: &str = "italic";
+/// Modifier name for strikethrough (`~~struck~~`) runs.
+const SEMANTIC_MODIFIER_STRIKETHROUGH: &str = "strikethrough";
+
+/// Token-type index into the legend's `tokenTypes` array. Only `markup`
+/// (index 0) exists.
+const SEMANTIC_TOKEN_TYPE_MARKUP_INDEX: u32 = 0;
+/// Modifier bit for `bold` — index 0 in the legend's `tokenModifiers` array.
+const SEMANTIC_MODIFIER_BOLD_BIT: u32 = 1 << 0;
+/// Modifier bit for `italic` — index 1 in the legend's `tokenModifiers` array.
+const SEMANTIC_MODIFIER_ITALIC_BIT: u32 = 1 << 1;
+/// Modifier bit for `strikethrough` — index 2 in the legend's `tokenModifiers`
+/// array.
+const SEMANTIC_MODIFIER_STRIKETHROUGH_BIT: u32 = 1 << 2;
+
 /// Run the LSP server on stdio.
 ///
 /// # Errors
@@ -162,6 +189,28 @@ pub fn run() -> Result<()> {
             // Destination open, path separator, fragment, title quote, and
             // reference/footnote open (ticket integration 14).
             "triggerCharacters": ["(", "/", "#", "\"", "[", "^"]
+        },
+        // Inline emphasis highlighting (ticket integration 15). One custom
+        // token type, `markup`, carrying `bold` / `italic` / `strikethrough`
+        // modifiers, so a character covered by overlapping runs (e.g. the
+        // `foo` in `***foo***`) gets a single token with both modifiers.
+        // Custom legend entries are spec-legal; clients that don't recognize
+        // them skip them. The legend index is positional: `tokenType` and the
+        // `tokenModifiers` bitmask in each emitted quintuple index into these
+        // arrays. `full/delta` is not advertised — re-encoding only the
+        // emphasis runs is already cheap, and a delta seam waits on the perf
+        // workstream's "what changed" diff (see `semantic_tokens_full`).
+        "semanticTokensProvider": {
+            "legend": {
+                "tokenTypes": [SEMANTIC_TOKEN_TYPE_MARKUP],
+                "tokenModifiers": [
+                    SEMANTIC_MODIFIER_BOLD,
+                    SEMANTIC_MODIFIER_ITALIC,
+                    SEMANTIC_MODIFIER_STRIKETHROUGH,
+                ]
+            },
+            "full": true,
+            "range": true
         },
         "workspace": {
             "workspaceFolders": {
@@ -346,6 +395,17 @@ fn handle_request(
             let params: lsp::TextDocumentPositionParams = serde_json::from_value(req.params)?;
             let list = completion(workspaces, &params);
             Response::new_ok(req.id, list)
+        }
+        lsp::method::SEMANTIC_TOKENS_FULL => {
+            let params: lsp::SemanticTokensParams = serde_json::from_value(req.params)?;
+            let tokens = semantic_tokens_full(workspaces, &params.text_document.uri);
+            Response::new_ok(req.id, tokens)
+        }
+        lsp::method::SEMANTIC_TOKENS_RANGE => {
+            let params: lsp::SemanticTokensRangeParams = serde_json::from_value(req.params)?;
+            let tokens =
+                semantic_tokens_range(workspaces, &params.text_document.uri, &params.range);
+            Response::new_ok(req.id, tokens)
         }
         _ => Response::new_err(
             req.id,
@@ -2294,6 +2354,213 @@ fn folding_ranges(workspaces: &Workspaces, uri: &str) -> Vec<lsp::FoldingRange> 
     }
 
     ranges
+}
+
+// ---------------------------------------------------------------------------
+// Semantic tokens (ticket integration 15)
+// ---------------------------------------------------------------------------
+
+/// A maximal disjoint byte region carrying the union of emphasis modifiers
+/// active over it. Reconstructed from the parser's flat, *overlapping* sibling
+/// emphasis spans so the emitted token stream can be non-overlapping (an LSP
+/// hard requirement), while still styling the `foo` in `***foo***` as both
+/// bold and italic.
+#[derive(Debug, Clone, Copy)]
+struct EmphasisRegion {
+    /// Byte start (inclusive) in the source.
+    start: usize,
+    /// Byte end (exclusive) in the source.
+    end: usize,
+    /// OR of the `SEMANTIC_MODIFIER_*_BIT` flags active over `[start, end)`.
+    modifiers: u32,
+}
+
+/// Map an emphasis [`ElementKind`] to its modifier bit, or `None` if the node
+/// is not an emphasis run.
+fn emphasis_modifier_bit(kind: &ElementKind) -> Option<u32> {
+    match kind {
+        ElementKind::Strong => Some(SEMANTIC_MODIFIER_BOLD_BIT),
+        ElementKind::Emphasis => Some(SEMANTIC_MODIFIER_ITALIC_BIT),
+        ElementKind::Strikethrough => Some(SEMANTIC_MODIFIER_STRIKETHROUGH_BIT),
+        _ => None,
+    }
+}
+
+/// Reconstruct the maximal disjoint regions from the parser's overlapping
+/// emphasis spans, each tagged with the union of modifiers active over it.
+///
+/// Parser 26 emits emphasis as flat, *overlapping* sibling spans (e.g.
+/// `***foo***` yields a `Strong` over `**foo**` and an `Emphasis` over the
+/// whole `***foo***`), but the LSP semantic-tokens protocol requires a flat,
+/// non-overlapping token list. We flatten by collecting every emphasis span's
+/// endpoints as cut points, then, for each adjacent pair of cut points, OR the
+/// modifiers of every span that fully covers that sub-segment. Segments with
+/// no active modifier (the gaps between runs) are dropped. The result is sorted
+/// by start and pairwise non-overlapping.
+///
+/// Emphasis runs never appear inside code spans or code blocks — the inline
+/// parser excludes those before delimiter matching — so this naturally emits no
+/// tokens in code.
+fn collect_emphasis_regions(tree: &Tree) -> Vec<EmphasisRegion> {
+    // (start, end, modifier_bit) for every emphasis run.
+    let mut spans: Vec<(usize, usize, u32)> = Vec::new();
+    for node in tree.nodes() {
+        if let Some(bit) = emphasis_modifier_bit(&node.kind) {
+            spans.push((node.span.start, node.span.end, bit));
+        }
+    }
+    if spans.is_empty() {
+        return Vec::new();
+    }
+
+    // Sorted, deduped boundary set: every distinct start/end is a cut point.
+    let mut cuts: Vec<usize> = Vec::with_capacity(spans.len() * 2);
+    for &(start, end, _) in &spans {
+        cuts.push(start);
+        cuts.push(end);
+    }
+    cuts.sort_unstable();
+    cuts.dedup();
+
+    // For each adjacent cut-point pair, the modifier mask is the OR of every
+    // span that fully covers the segment.
+    let mut regions: Vec<EmphasisRegion> = Vec::new();
+    for window in cuts.windows(2) {
+        let (seg_start, seg_end) = (window[0], window[1]);
+        let mut modifiers = 0;
+        for &(start, end, bit) in &spans {
+            if start <= seg_start && seg_end <= end {
+                modifiers |= bit;
+            }
+        }
+        if modifiers != 0 {
+            regions.push(EmphasisRegion {
+                start: seg_start,
+                end: seg_end,
+                modifiers,
+            });
+        }
+    }
+    regions
+}
+
+/// Encode emphasis regions as the LSP delta-quintuple stream, restricted to
+/// `byte_filter` (the whole document for `/full`, or a range's byte span for
+/// `/range`).
+///
+/// A single LSP token may not span a line break, so each region is split at
+/// line boundaries before encoding. Byte→UTF-16 conversion is delegated to the
+/// file's cached [`LineIndex`] (`span_to_lsp_range`), the same UTF-16-aware
+/// mapping diagnostics use, so multibyte and astral characters map correctly.
+/// Tokens are delta-encoded against the previous token's position, as the
+/// protocol requires.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "line/column values in markdown files won't exceed u32::MAX"
+)]
+fn encode_semantic_tokens(
+    source: &str,
+    index: &LineIndex,
+    regions: &[EmphasisRegion],
+    byte_filter: std::ops::Range<usize>,
+) -> lsp::SemanticTokens {
+    let mut data: Vec<u32> = Vec::new();
+    // Previous token's absolute (line, char) for delta encoding.
+    let mut prev_line = 0u32;
+    let mut prev_char = 0u32;
+
+    for region in regions {
+        let start = region.start.max(byte_filter.start);
+        let end = region.end.min(byte_filter.end);
+        if start >= end {
+            continue;
+        }
+        let range = span_to_lsp_range(source, index, &Span::new(start, end));
+        // Split into one token per line the region touches: an LSP token is
+        // single-line, so a region crossing a `\n` becomes several tokens.
+        for line in range.start.line..=range.end.line {
+            let line_start_char = if line == range.start.line {
+                range.start.character
+            } else {
+                0
+            };
+            // The line's content end in UTF-16 units, or the region end on the
+            // final line.
+            let line_end_char = if line == range.end.line {
+                range.end.character
+            } else {
+                let (ls, le) = line_byte_range(source, line);
+                source[ls..le].chars().map(char::len_utf16).sum::<usize>() as u32
+            };
+            let length = line_end_char.saturating_sub(line_start_char);
+            if length == 0 {
+                continue;
+            }
+            let delta_line = line - prev_line;
+            let delta_start = if delta_line == 0 {
+                line_start_char - prev_char
+            } else {
+                line_start_char
+            };
+            data.extend_from_slice(&[
+                delta_line,
+                delta_start,
+                length,
+                SEMANTIC_TOKEN_TYPE_MARKUP_INDEX,
+                region.modifiers,
+            ]);
+            prev_line = line;
+            prev_char = line_start_char;
+        }
+    }
+
+    lsp::SemanticTokens { data }
+}
+
+/// Answer `textDocument/semanticTokens/full`: emphasis tokens over the whole
+/// document.
+///
+/// Returns an empty token set for unknown documents. Styling only — never
+/// emits a diagnostic.
+///
+/// # Perf seam
+///
+/// `full/delta` is intentionally not served: re-encoding only the emphasis runs
+/// is cheap, and a delta handler should consume the perf workstream's reusable
+/// "what changed since last parse" diff rather than recompute one — wire it
+/// here once that lands (ticket integration 15, perf seam).
+fn semantic_tokens_full(workspaces: &Workspaces, uri: &str) -> lsp::SemanticTokens {
+    let Some((workspace, rel_path)) = workspaces.resolve(uri) else {
+        return lsp::SemanticTokens::default();
+    };
+    let Some(file_data) = workspace.file(&rel_path) else {
+        return lsp::SemanticTokens::default();
+    };
+    let source = file_data.tree.source();
+    let regions = collect_emphasis_regions(&file_data.tree);
+    encode_semantic_tokens(source, &file_data.line_index, &regions, 0..source.len())
+}
+
+/// Answer `textDocument/semanticTokens/range`: emphasis tokens restricted to
+/// `range` (the byte span between its endpoints), for large documents.
+///
+/// Returns an empty token set for unknown documents.
+fn semantic_tokens_range(
+    workspaces: &Workspaces,
+    uri: &str,
+    range: &lsp::Range,
+) -> lsp::SemanticTokens {
+    let Some((workspace, rel_path)) = workspaces.resolve(uri) else {
+        return lsp::SemanticTokens::default();
+    };
+    let Some(file_data) = workspace.file(&rel_path) else {
+        return lsp::SemanticTokens::default();
+    };
+    let source = file_data.tree.source();
+    let start = file_data.line_index.offset(source, range.start);
+    let end = file_data.line_index.offset(source, range.end);
+    let regions = collect_emphasis_regions(&file_data.tree);
+    encode_semantic_tokens(source, &file_data.line_index, &regions, start..end)
 }
 
 // ---------------------------------------------------------------------------
@@ -7060,6 +7327,334 @@ mod tests {
         assert!(
             complete_at(&workspaces, &dir, "doc.md", 1, 4).is_none(),
             "no completion inside a code block"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Semantic tokens (ticket integration 15)
+    // -----------------------------------------------------------------------
+
+    /// One decoded semantic token in absolute coordinates (the delta encoding
+    /// undone), for assertion convenience.
+    #[derive(Debug, PartialEq, Eq)]
+    struct DecodedToken {
+        line: u32,
+        start: u32,
+        length: u32,
+        token_type: u32,
+        modifiers: u32,
+    }
+
+    /// Decode the LSP delta-quintuple stream into absolute tokens, asserting the
+    /// stream is well-formed (a multiple of five) along the way.
+    fn decode_tokens(tokens: &lsp::SemanticTokens) -> Vec<DecodedToken> {
+        assert_eq!(
+            tokens.data.len() % 5,
+            0,
+            "semantic token data must be a flat sequence of 5-tuples"
+        );
+        let mut out = Vec::new();
+        let mut line = 0u32;
+        let mut character = 0u32;
+        for chunk in tokens.data.chunks_exact(5) {
+            let (delta_line, delta_start, length, token_type, modifiers) =
+                (chunk[0], chunk[1], chunk[2], chunk[3], chunk[4]);
+            if delta_line == 0 {
+                character += delta_start;
+            } else {
+                line += delta_line;
+                character = delta_start;
+            }
+            out.push(DecodedToken {
+                line,
+                start: character,
+                length,
+                token_type,
+                modifiers,
+            });
+        }
+        out
+    }
+
+    /// Request full semantic tokens for `rel`.
+    fn tokens_for(
+        workspaces: &Workspaces,
+        dir: &tempfile::TempDir,
+        rel: &str,
+    ) -> Vec<DecodedToken> {
+        decode_tokens(&semantic_tokens_full(workspaces, &file_uri(dir, rel)))
+    }
+
+    /// Assert tokens are sorted by (line, start) and pairwise non-overlapping —
+    /// the LSP protocol's hard requirement.
+    fn assert_sorted_non_overlapping(tokens: &[DecodedToken]) {
+        for pair in tokens.windows(2) {
+            let (a, b) = (&pair[0], &pair[1]);
+            let ordered = a.line < b.line || (a.line == b.line && a.start <= b.start);
+            assert!(
+                ordered,
+                "tokens must be sorted by (line, start): {a:?} then {b:?}"
+            );
+            if a.line == b.line {
+                assert!(
+                    a.start + a.length <= b.start,
+                    "tokens on a line must not overlap: {a:?} then {b:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn semantic_tokens_legend_indices_match_capability_order() {
+        // The emitted `tokenType`/`tokenModifiers` indices are positional into
+        // the legend arrays declared in the capabilities blob. Guard that the
+        // bit/index constants match the declared modifier order
+        // (bold, italic, strikethrough) so the two can't silently drift.
+        assert_eq!(
+            SEMANTIC_TOKEN_TYPE_MARKUP_INDEX, 0,
+            "markup is the only (index-0) token type"
+        );
+        assert_eq!(SEMANTIC_MODIFIER_BOLD_BIT, 1, "bold is legend modifier 0");
+        assert_eq!(
+            SEMANTIC_MODIFIER_ITALIC_BIT, 2,
+            "italic is legend modifier 1"
+        );
+        assert_eq!(
+            SEMANTIC_MODIFIER_STRIKETHROUGH_BIT, 4,
+            "strikethrough is legend modifier 2"
+        );
+    }
+
+    #[test]
+    fn semantic_tokens_basic_strong_emphasis_strikethrough() {
+        let dir = workspace_with_files(&[("doc.md", "**a** *b* ~~c~~\n")]);
+        let workspaces = scan_workspaces(&dir);
+        let tokens = tokens_for(&workspaces, &dir, "doc.md");
+        assert_sorted_non_overlapping(&tokens);
+        // `**a**` cols 0..5 bold; `*b*` cols 6..9 italic; `~~c~~` cols 10..15
+        // strikethrough.
+        assert_eq!(
+            tokens,
+            vec![
+                DecodedToken {
+                    line: 0,
+                    start: 0,
+                    length: 5,
+                    token_type: 0,
+                    modifiers: SEMANTIC_MODIFIER_BOLD_BIT,
+                },
+                DecodedToken {
+                    line: 0,
+                    start: 6,
+                    length: 3,
+                    token_type: 0,
+                    modifiers: SEMANTIC_MODIFIER_ITALIC_BIT,
+                },
+                DecodedToken {
+                    line: 0,
+                    start: 10,
+                    length: 5,
+                    token_type: 0,
+                    modifiers: SEMANTIC_MODIFIER_STRIKETHROUGH_BIT,
+                },
+            ],
+            "one token per run, each with its own modifier"
+        );
+    }
+
+    #[test]
+    fn semantic_tokens_triple_emphasis_combines_bold_italic() {
+        // `***foo***` is the central overlap case: parser 26 emits Strong over
+        // `**foo**` and Emphasis over the whole `***foo***`. The flattening must
+        // yield non-overlapping tokens whose union covers `***foo***`, with
+        // `foo` carrying BOTH bold and italic.
+        let dir = workspace_with_files(&[("doc.md", "***foo***\n")]);
+        let workspaces = scan_workspaces(&dir);
+        let tokens = tokens_for(&workspaces, &dir, "doc.md");
+        assert_sorted_non_overlapping(&tokens);
+
+        // Tokens must tile `***foo***` (cols 0..9) with no gap or overlap.
+        assert_eq!(tokens.first().map(|t| t.start), Some(0), "starts at col 0");
+        let last = tokens.last().expect("at least one token");
+        assert_eq!(
+            last.start + last.length,
+            9,
+            "tokens tile through the closing delimiters (col 9)"
+        );
+        let bold = SEMANTIC_MODIFIER_BOLD_BIT;
+        let italic = SEMANTIC_MODIFIER_ITALIC_BIT;
+        // Find the region covering `foo` (cols 3..6) — it must carry both.
+        let foo = tokens
+            .iter()
+            .find(|t| t.start <= 3 && 6 <= t.start + t.length)
+            .expect("a token covers the inner `foo`");
+        assert_eq!(
+            foo.modifiers,
+            bold | italic,
+            "the inner `foo` carries both bold and italic"
+        );
+        // Every token has the markup type and a non-empty modifier set; no
+        // token is plain.
+        for t in &tokens {
+            assert_eq!(t.token_type, 0, "all tokens are the markup type");
+            assert_ne!(t.modifiers, 0, "no token without an emphasis modifier");
+        }
+    }
+
+    #[test]
+    fn semantic_tokens_no_strikethrough_for_flanking_tildes() {
+        // The ticket-26 flanking fix end to end: `~89 of ~162` has no
+        // strikethrough run, so no token is emitted. (Acceptance criterion.)
+        let dir = workspace_with_files(&[("doc.md", "~89 of ~162\n")]);
+        let workspaces = scan_workspaces(&dir);
+        let tokens = tokens_for(&workspaces, &dir, "doc.md");
+        assert!(
+            tokens.is_empty(),
+            "left-flanking-only single tildes produce no strikethrough token: {tokens:?}"
+        );
+    }
+
+    #[test]
+    fn semantic_tokens_none_in_prose_or_code() {
+        // Plain prose, an inline code span containing emphasis-looking text, and
+        // a fenced code block: parser 26 keeps emphasis runs out of code, so the
+        // tree has none there and no token is emitted.
+        let dir = workspace_with_files(&[(
+            "doc.md",
+            "just prose here\n\n`**not bold**`\n\n```\n*not em*\n```\n",
+        )]);
+        let workspaces = scan_workspaces(&dir);
+        let tokens = tokens_for(&workspaces, &dir, "doc.md");
+        assert!(
+            tokens.is_empty(),
+            "no tokens in prose, inline code, or code blocks: {tokens:?}"
+        );
+    }
+
+    #[test]
+    fn semantic_tokens_emit_no_diagnostics() {
+        // Requesting semantic tokens is styling-only and must never publish a
+        // diagnostic. The parse tree for an emphasis document carries none.
+        let dir = workspace_with_files(&[("doc.md", "**bold** and *em* and ~~strike~~\n")]);
+        let workspaces = scan_workspaces(&dir);
+        let (ws, rel) = workspaces
+            .resolve(&file_uri(&dir, "doc.md"))
+            .expect("doc.md resolves");
+        let file_data = ws.file(&rel).expect("doc.md parsed");
+        assert!(
+            file_data.tree.diagnostics().is_empty(),
+            "emphasis recognition emits no diagnostics: {:?}",
+            file_data.tree.diagnostics()
+        );
+        // And the surface itself still produces tokens (sanity).
+        let tokens = tokens_for(&workspaces, &dir, "doc.md");
+        assert_eq!(tokens.len(), 3, "three emphasis runs, three tokens");
+    }
+
+    #[test]
+    fn semantic_tokens_round_trip_multibyte_and_crlf() {
+        // UTF-16 offsets must round-trip on multibyte + CRLF input, mirroring
+        // the `position_round_trip_*` tests. `café` is 4 chars / 5 bytes; 😀 is
+        // 2 UTF-16 units; λ is 1 unit but 2 bytes. Each line is one run.
+        let content = "**café 😀** done\r\n*λ done*\n";
+        let dir = workspace_with_files(&[("doc.md", content)]);
+        let workspaces = scan_workspaces(&dir);
+        let tokens = tokens_for(&workspaces, &dir, "doc.md");
+        assert_sorted_non_overlapping(&tokens);
+        assert_eq!(tokens.len(), 2, "one strong run, one emphasis run");
+
+        // Line 0: `**café 😀**` — cols 0..11 (** + café=4 + space + 😀=2 UTF-16
+        // units + **).
+        assert_eq!(
+            tokens[0],
+            DecodedToken {
+                line: 0,
+                start: 0,
+                length: 11,
+                token_type: 0,
+                modifiers: SEMANTIC_MODIFIER_BOLD_BIT,
+            },
+            "bold run measured in UTF-16 units (astral 😀 = 2)"
+        );
+        // Line 1 (CRLF-terminated line 0): `*λ done*` — cols 0..8.
+        assert_eq!(
+            tokens[1],
+            DecodedToken {
+                line: 1,
+                start: 0,
+                length: 8,
+                token_type: 0,
+                modifiers: SEMANTIC_MODIFIER_ITALIC_BIT,
+            },
+            "emphasis run on the line after a CRLF break"
+        );
+
+        // The decoded UTF-16 columns must map back to the run's byte span via
+        // the same inverse conversion diagnostics use.
+        let (ws, rel) = workspaces
+            .resolve(&file_uri(&dir, "doc.md"))
+            .expect("doc.md resolves");
+        let file_data = ws.file(&rel).expect("doc.md parsed");
+        let source = file_data.tree.source();
+        let bold_start = file_data.line_index.offset(
+            source,
+            lsp::Position {
+                line: 0,
+                character: 0,
+            },
+        );
+        assert_eq!(
+            bold_start,
+            source.find("**").expect("** present"),
+            "UTF-16 column 0 maps back to the run's byte start"
+        );
+    }
+
+    #[test]
+    fn semantic_tokens_range_restricts_to_byte_span() {
+        // `/range` emits only the runs intersecting the requested range. Two
+        // runs on two lines; ask for line 0 only.
+        let dir = workspace_with_files(&[("doc.md", "**a**\n*b*\n")]);
+        let workspaces = scan_workspaces(&dir);
+        let range = lsp::Range {
+            start: lsp::Position {
+                line: 0,
+                character: 0,
+            },
+            end: lsp::Position {
+                line: 1,
+                character: 0,
+            },
+        };
+        let tokens = decode_tokens(&semantic_tokens_range(
+            &workspaces,
+            &file_uri(&dir, "doc.md"),
+            &range,
+        ));
+        assert_eq!(
+            tokens,
+            vec![DecodedToken {
+                line: 0,
+                start: 0,
+                length: 5,
+                token_type: 0,
+                modifiers: SEMANTIC_MODIFIER_BOLD_BIT,
+            }],
+            "only the line-0 bold run falls in the requested range"
+        );
+    }
+
+    #[test]
+    fn semantic_tokens_unknown_document_is_empty() {
+        let dir = workspace_with_files(&[("doc.md", "**a**\n")]);
+        let workspaces = scan_workspaces(&dir);
+        let tokens = decode_tokens(&semantic_tokens_full(
+            &workspaces,
+            &file_uri(&dir, "missing.md"),
+        ));
+        assert!(
+            tokens.is_empty(),
+            "an unknown document yields an empty token set"
         );
     }
 }

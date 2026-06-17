@@ -396,6 +396,37 @@ pub struct DocumentDiagnosticParams {
     pub text_document: TextDocumentIdentifier,
 }
 
+/// `textDocument/semanticTokens/full` params.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SemanticTokensParams {
+    /// The document to tokenize.
+    pub text_document: TextDocumentIdentifier,
+}
+
+/// `textDocument/semanticTokens/range` params.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SemanticTokensRangeParams {
+    /// The document to tokenize.
+    pub text_document: TextDocumentIdentifier,
+    /// The range to restrict the tokens to.
+    pub range: Range,
+}
+
+/// A semantic-tokens result: the flat delta-encoded `data` array.
+///
+/// `data` is a flat sequence of 5-tuples
+/// `[deltaLine, deltaStartChar, length, tokenType, tokenModifiers]` — see the
+/// LSP `SemanticTokens` type. The offsets are in the negotiated position
+/// encoding (UTF-16 by default).
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SemanticTokens {
+    /// The flat delta-encoded token data (groups of five `u32`).
+    pub data: Vec<u32>,
+}
+
 /// A completion item.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -564,4 +595,8 @@ pub mod method {
     pub const FORMATTING: &str = "textDocument/formatting";
     /// `textDocument/completion`.
     pub const COMPLETION: &str = "textDocument/completion";
+    /// `textDocument/semanticTokens/full`.
+    pub const SEMANTIC_TOKENS_FULL: &str = "textDocument/semanticTokens/full";
+    /// `textDocument/semanticTokens/range`.
+    pub const SEMANTIC_TOKENS_RANGE: &str = "textDocument/semanticTokens/range";
 }
