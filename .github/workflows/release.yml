@@ -91,7 +91,9 @@ jobs:
 
       - name: Package (zip)
         if: matrix.archive == 'zip'
-        shell: pwsh
+        # The self-hosted Windows VM has Windows PowerShell 5.1 (powershell), not
+        # PowerShell 7 (pwsh). Compress-Archive exists in 5.1, so this is unchanged.
+        shell: powershell
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
           Compress-Archive -Force `
