@@ -139,6 +139,21 @@ fn fence_body_span(node_span: Span, source: &str) -> Span {
     Span::new(body_start, node_span.end)
 }
 
+/// Whether the document carries a leading `---` / `+++` / `{` frontmatter block.
+///
+/// The tree builder emits a single [`Frontmatter`](ElementKind::Frontmatter)
+/// node as the first child of the document exactly when a leading block was
+/// detected (`parse_tree_with_entries` adds it only for a `Some` frontmatter
+/// span). A `yaml lattice` carrier is never represented by this node — it is a
+/// [`CodeBlock`](ElementKind::CodeBlock) — so the presence of a `Frontmatter`
+/// node is an exact, tree-based signal that a leading block exists, the other
+/// half of the one-carrier-per-document check (decision 015).
+fn has_leading_frontmatter(tree: &Tree) -> bool {
+    tree.nodes()
+        .iter()
+        .any(|node| matches!(node.kind, ElementKind::Frontmatter))
+}
+
 /// Scan the parse tree for every metadata-carrier fence (`yaml lattice`).
 ///
 /// Returns the carriers in document order. A fence is a carrier only when it is
@@ -203,12 +218,14 @@ enum DetailsLine {
 
 /// Emit the metadata carrier's structural diagnostics for a single file.
 ///
-/// Covers the render gotchas, the malformed-YAML errors, and the
-/// more-than-one-carrier warning of decision 015. Carrier *position* is never
-/// diagnosed — a carrier renders correctly anywhere, so position fixes no defect
-/// (decisions 009/008). The unterminated-`<details>` error is already emitted by
-/// the block parser (an "unclosed `<details>` tag" diagnostic) and flows through
-/// the structural layer's parser-diagnostic pass, so it is not duplicated here.
+/// Covers the render gotchas, the malformed-YAML errors, the
+/// more-than-one-carrier warning, and the one-carrier-per-document warning
+/// (a leading frontmatter block coexisting with a `yaml lattice` carrier) of
+/// decision 015. Carrier *position* is never diagnosed — a carrier renders
+/// correctly anywhere, so position fixes no defect (decisions 009/008). The
+/// unterminated-`<details>` error is already emitted by the block parser (an
+/// "unclosed `<details>` tag" diagnostic) and flows through the structural
+/// layer's parser-diagnostic pass, so it is not duplicated here.
 ///
 /// Every emitted span is a char-boundary byte range that round-trips through LSP
 /// position mapping — the shared invariants (`invariants.rs`) the rest of the
@@ -216,6 +233,27 @@ enum DetailsLine {
 pub fn carrier_diagnostics(tree: &Tree, rel_path: &Path, out: &mut Vec<Diagnostic>) {
     let source = tree.source();
     let carriers = scan_carriers(tree);
+
+    // One carrier per document — frontmatter XOR fenced block (decision 015). A
+    // leading `---` / `+++` / `{` block coexisting with a `yaml lattice` carrier
+    // is ambiguous authority: the two are not merged (the leading block wins for
+    // metadata; the carrier is ignored for data, see `workspace::parse_content`),
+    // so flag every carrier that shares the document with a leading block. The
+    // warning anchors at the fenced carrier — the "second" carrier relative to
+    // the leading block — pointing the author at the one to remove.
+    if has_leading_frontmatter(tree) {
+        for carrier in &carriers {
+            out.push(Diagnostic {
+                file: rel_path.to_path_buf(),
+                line: crate::block::byte_offset_to_line(source, carrier.node_span.start),
+                severity: Severity::Warning,
+                message: "a `yaml lattice` metadata carrier coexists with leading frontmatter — \
+                     document metadata has one home; keep the frontmatter or the carrier, not both"
+                    .to_string(),
+                span: Some(carrier.node_span),
+            });
+        }
+    }
 
     // More than one carrier: document metadata is singular (decision 015). Flag
     // every carrier past the first, anchored at the offending fence node.
@@ -615,6 +653,99 @@ mod tests {
                 .iter()
                 .any(|d| d.message.contains("more than one")),
             "a single carrier yields no duplicate warning"
+        );
+    }
+
+    // -- One carrier per document (warning) ------------------------------
+
+    #[test]
+    fn frontmatter_and_carrier_coexist_warns() {
+        // Decision 015: frontmatter XOR fenced block. A leading `---` block plus
+        // a `yaml lattice` carrier is ambiguous authority — exactly one warning,
+        // anchored at the fenced carrier (the "second" carrier).
+        let content = "---\nbacklinks:\n  referenced_by:\n    - a.md\n---\n# T\n\n```yaml lattice\nbacklinks:\n  referenced_by:\n    - b.md\n```\n";
+        let diags = carrier_diags(content);
+        let coexist: Vec<_> = diags
+            .iter()
+            .filter(|d| d.severity == Severity::Warning && d.message.contains("coexists"))
+            .collect();
+        assert_eq!(
+            coexist.len(),
+            1,
+            "frontmatter + carrier yields exactly one coexistence warning: {diags:?}"
+        );
+        // The warning anchors at the fenced carrier, after the frontmatter block.
+        let carrier_start = content
+            .find("```yaml lattice")
+            .expect("fixture contains a fenced carrier");
+        assert_eq!(
+            coexist[0]
+                .span
+                .expect("coexistence warning carries a span")
+                .start,
+            carrier_start,
+            "the coexistence warning anchors at the fenced carrier, not the frontmatter: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn carrier_only_no_coexistence_warning() {
+        // A fenced carrier with no leading frontmatter is the supported single-
+        // carrier case — no coexistence warning.
+        let content = "# T\n\n```yaml lattice\nbacklinks:\n  referenced_by:\n    - a.md\n```\n";
+        assert!(
+            !carrier_diags(content)
+                .iter()
+                .any(|d| d.message.contains("coexists")),
+            "a lone carrier yields no coexistence warning"
+        );
+    }
+
+    #[test]
+    fn frontmatter_only_no_coexistence_warning() {
+        // A leading `---` block with no carrier is the zero-config default — no
+        // coexistence warning (and no carrier diagnostics at all).
+        let content = "---\nbacklinks:\n  referenced_by:\n    - a.md\n---\n# T\n";
+        assert!(
+            carrier_diags(content).is_empty(),
+            "leading frontmatter with no carrier emits no carrier diagnostic"
+        );
+    }
+
+    #[test]
+    fn frontmatter_and_duplicate_carriers_warn_per_carrier() {
+        // Two carriers alongside leading frontmatter: each carrier draws a
+        // coexistence warning, and the second additionally draws the duplicate
+        // warning — the two checks compose.
+        let content = "---\nbacklinks:\n  referenced_by:\n    - a.md\n---\n# T\n\n```yaml lattice\nbacklinks:\n  referenced_by:\n    - b.md\n```\n\n```yaml lattice\nbacklinks:\n  referenced_by:\n    - c.md\n```\n";
+        let diags = carrier_diags(content);
+        let coexist = diags
+            .iter()
+            .filter(|d| d.message.contains("coexists"))
+            .count();
+        let duplicate = diags
+            .iter()
+            .filter(|d| d.message.contains("more than one"))
+            .count();
+        assert_eq!(
+            coexist, 2,
+            "each carrier coexisting with frontmatter is flagged: {diags:?}"
+        );
+        assert_eq!(
+            duplicate, 1,
+            "the second carrier still draws the duplicate warning: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn coexistence_warning_spans_round_trip_crlf() {
+        // CRLF line endings: the coexistence-warning span must still round-trip
+        // (the `carrier_diags` helper asserts it via the shared invariant).
+        let content = "---\r\nbacklinks:\r\n  referenced_by:\r\n    - a.md\r\n---\r\n# T\r\n\r\n```yaml lattice\r\nbacklinks:\r\n  referenced_by:\r\n    - b.md\r\n```\r\n";
+        let diags = carrier_diags(content);
+        assert!(
+            diags.iter().any(|d| d.message.contains("coexists")),
+            "the coexistence warning fires under CRLF: {diags:?}"
         );
     }
 

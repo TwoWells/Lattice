@@ -2166,4 +2166,197 @@ fragments = \"gitlab\"
             validate_connectivity(&ws)
         );
     }
+
+    // --- Carrier-agnostic reconciliation (decision 015, ticket 06) ---
+    //
+    // Reconciliation reads `FileData.frontmatter`, which the workspace loader
+    // populates from either a leading `---` block or a `yaml lattice` carrier.
+    // These tests pin that a backlink/exception declared in a carrier reconciles
+    // identically to one in `---` frontmatter — the carrier-agnostic guarantee.
+
+    #[test]
+    fn carrier_backlink_present_no_warning() {
+        // The `referenced_by` backlink the source's link expects lives in the
+        // target's `yaml lattice` carrier (here `<details>`-wrapped, at the foot)
+        // — it must satisfy the obligation exactly as a `---` backlink does.
+        let target = "# Target\n\nbody\n\n<details><summary>lattice</summary>\n\n```yaml lattice\nbacklinks:\n  referenced_by:\n    - index.md\n```\n\n</details>\n";
+        let (_dir, ws) = setup_workspace(&[
+            ("index.md", r#"[target](target.md "references")"#),
+            ("target.md", target),
+        ]);
+
+        let diags = validate_backlinks(&ws);
+        assert!(
+            diags.is_empty(),
+            "a carrier-declared backlink satisfies the obligation: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn carrier_backlink_missing_warns_identically_to_frontmatter() {
+        // No backlink anywhere: a carrier-only target warns exactly as a
+        // frontmatter-only target would — the missing-backlink path is unchanged.
+        // The target's carrier holds only an (unmatched-but-not-stale) exceptions
+        // block, so it exercises the carrier path without itself adding a backlink.
+        let carrier_target = "# Target\n\n```yaml lattice\nexceptions:\n  bare_paths:\n    \"x.md\": \"placeholder\"\n```\n";
+        let (_dir, ws) = setup_workspace(&[
+            ("index.md", r#"[target](target.md "supersedes")"#),
+            ("target.md", carrier_target),
+        ]);
+
+        let warnings: Vec<_> = validate_backlinks(&ws)
+            .into_iter()
+            .filter(|d| d.severity == Severity::Warning)
+            .collect();
+
+        assert_eq!(
+            warnings.len(),
+            1,
+            "a missing backlink warns even with an unrelated carrier present: {warnings:?}"
+        );
+        assert!(
+            warnings[0].message.contains("superseded_by"),
+            "the warning names the inverse predicate: {}",
+            warnings[0].message
+        );
+        assert_eq!(
+            warnings[0].file,
+            Path::new("index.md"),
+            "the warning anchors on the source link, as for frontmatter"
+        );
+    }
+
+    #[test]
+    fn carrier_backlink_stale_warns() {
+        // A carrier backlink with no corresponding forward link is stale, exactly
+        // as a stale `---` backlink is (mirrors `stale_backlink_warning`).
+        let target =
+            "# Target\n\n```yaml lattice\nbacklinks:\n  superseded_by:\n    - ghost.md\n```\n";
+        let (_dir, ws) = setup_workspace(&[("target.md", target)]);
+
+        let warnings: Vec<_> = validate_backlinks(&ws)
+            .into_iter()
+            .filter(|d| d.severity == Severity::Warning)
+            .collect();
+
+        assert_eq!(
+            warnings.len(),
+            1,
+            "a carrier backlink with no forward link is stale: {warnings:?}"
+        );
+        assert!(
+            warnings[0]
+                .message
+                .contains("no corresponding forward link"),
+            "the message describes staleness: {}",
+            warnings[0].message
+        );
+        assert!(
+            warnings[0].message.contains("ghost.md"),
+            "the message names the stale source: {}",
+            warnings[0].message
+        );
+    }
+
+    #[test]
+    fn carrier_backlink_satisfied_by_reciprocal_forward_link() {
+        // Decision 008: a reciprocal forward link satisfies the obligation with no
+        // materialized backlink. The target carries its (here irrelevant) metadata
+        // in a `yaml lattice` carrier; the reciprocal-link satisfaction is
+        // unaffected by the carrier choice.
+        let (_dir, ws) = setup_workspace(&[
+            ("a.md", r#"[b](b.md "superseded_by")"#),
+            (
+                "b.md",
+                "[a](a.md \"supersedes\")\n\n```yaml lattice\nbacklinks:\n  referenced_by:\n    - unrelated.md\n```\n",
+            ),
+        ]);
+
+        let warnings: Vec<_> = validate_backlinks(&ws)
+            .into_iter()
+            .filter(|d| d.severity == Severity::Warning)
+            .collect();
+
+        assert!(
+            !warnings
+                .iter()
+                .any(|d| d.message.contains("supersedes") && d.file == Path::new("a.md")),
+            "a reciprocal forward link satisfies the obligation even with a carrier target: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn carrier_and_frontmatter_backlinks_reconcile_identically() {
+        // Same edge, two carriers: one workspace materializes the backlink in
+        // `---`, the other in a `yaml lattice` carrier. Both must be warning-free.
+        let fm_target = "---\nbacklinks:\n  referenced_by:\n    - index.md\n---\n# Target\n";
+        let carrier_target =
+            "# Target\n\n```yaml lattice\nbacklinks:\n  referenced_by:\n    - index.md\n```\n";
+        let (_dir_fm, ws_fm) = setup_workspace(&[
+            ("index.md", r#"[target](target.md "references")"#),
+            ("target.md", fm_target),
+        ]);
+        let (_dir_carrier, ws_carrier) = setup_workspace(&[
+            ("index.md", r#"[target](target.md "references")"#),
+            ("target.md", carrier_target),
+        ]);
+
+        assert_eq!(
+            validate_backlinks(&ws_fm).is_empty(),
+            validate_backlinks(&ws_carrier).is_empty(),
+            "carrier and frontmatter reconcile to the same (empty) result"
+        );
+        assert!(
+            validate_backlinks(&ws_carrier).is_empty(),
+            "the carrier backlink is reconciled with no warning: {:?}",
+            validate_backlinks(&ws_carrier)
+        );
+    }
+
+    #[test]
+    fn carrier_exception_suppresses_stale_reference() {
+        // Decision 011/012: a `stale_references` exception declared in a carrier
+        // suppresses the matching dangling-reference diagnostic exactly as a
+        // frontmatter exception does (mirrors the workspace frontmatter test).
+        let doc = "# Doc\n\nSee `gone.md` here.\n\n```yaml lattice\nexceptions:\n  stale_references:\n    \"gone.md\": \"deliberately dead\"\n```\n";
+        let (_dir, ws) = setup_workspace(&[("doc.md", doc)]);
+
+        let data = ws.file(Path::new("doc.md")).expect("doc.md indexed");
+        assert!(
+            !data
+                .structural
+                .iter()
+                .any(|d| d.message.contains("stale reference")),
+            "the carrier exception suppresses the stale-reference diagnostic: {:?}",
+            data.structural
+        );
+    }
+
+    #[test]
+    fn carrier_unused_exception_emits_epitaph() {
+        // An exception that matches no live diagnostic is flagged as unused, with
+        // its reason echoed (decision 011) — identical to the frontmatter path,
+        // because reconciliation reads the same `exceptions` block the carrier
+        // populated. Here `gone.md` is never mentioned, so the exception is unused.
+        let doc = "# Doc\n\nNo references here.\n\n```yaml lattice\nexceptions:\n  stale_references:\n    \"gone.md\": \"deliberately dead\"\n```\n";
+        let (_dir, ws) = setup_workspace(&[("doc.md", doc)]);
+
+        let data = ws.file(Path::new("doc.md")).expect("doc.md indexed");
+        let epitaph: Vec<_> = data
+            .structural
+            .iter()
+            .filter(|d| d.message.contains("unused exception"))
+            .collect();
+        assert_eq!(
+            epitaph.len(),
+            1,
+            "the carrier's unmatched exception is flagged as unused: {:?}",
+            data.structural
+        );
+        assert!(
+            epitaph[0].message.contains("deliberately dead"),
+            "the unused-exception epitaph echoes the stored reason: {}",
+            epitaph[0].message
+        );
+    }
 }
