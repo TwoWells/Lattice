@@ -32,16 +32,17 @@
     reason = "these are assertion helpers: panicking with a descriptive message on violation is their entire contract, the tree-wellformedness check is necessarily long, and each helper intentionally leads with a full explanatory paragraph describing the invariant it enforces"
 )]
 
+use std::collections::HashMap;
 use std::path::Path;
 
-use crate::block::{ElementKind, Syntax, Tree};
+use crate::block::{self, ElementKind, Syntax, Tree};
 use crate::config::Config;
-use crate::fm::{Exceptions, FmNode, FmValue, FrontmatterBlock, ScalarSpan};
+use crate::fm::{self, Exceptions, FmNode, FmValue, FrontmatterBlock, ScalarSpan};
 use crate::html::HtmlTag;
 use crate::line_index::LineIndex;
 use crate::validation::Diagnostic;
 use crate::workspace::parse_content;
-use crate::{json, lsp, structural, toml, yaml};
+use crate::{json, lsp, metadata, structural, toml, yaml};
 
 // ---------------------------------------------------------------------------
 // Full-pipeline helper
@@ -548,6 +549,211 @@ pub fn assert_edit_sequence_stable(base: &str, edits: &[Edit]) {
         text = apply_lsp_edit(&text, &index, edit);
         assert_document_invariants(&text);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Metadata-carrier content fidelity (ticket 25, decision 015)
+// ---------------------------------------------------------------------------
+
+/// Whether a document carries a leading `---` / `+++` / `{` frontmatter block.
+///
+/// Mirrors the precedence in [`crate::workspace::parse_content`]: a leading
+/// block is the primary carrier, and the `yaml lattice` carrier is consulted for
+/// data *only* when no leading block matched. The carrier-fidelity invariant must
+/// therefore look at the carrier exactly when production does — when this returns
+/// `false`.
+fn has_leading_frontmatter_block(source: &str) -> bool {
+    yaml::parse_frontmatter_block(source).is_some()
+        || toml::parse_frontmatter_block(source).is_some()
+        || json::parse_frontmatter_block(source).is_some()
+}
+
+/// Build the parse tree the way [`crate::workspace::parse_content`] does for a
+/// document with no leading frontmatter block: no frontmatter span, default
+/// (`Yaml`) syntax, no pre-parsed entries. This is the exact tree the carrier
+/// scanner runs against in production, so the carrier is reached top-level-only
+/// per ticket 24.
+fn carrier_tree(source: &str) -> Tree {
+    block::parse_tree_with_entries(source, None, Syntax::Yaml, None)
+}
+
+/// Assert content fidelity for a document whose metadata comes from a
+/// `yaml lattice` carrier (decision 015).
+///
+/// `fuzz_full`'s [`assert_frontmatter_scalar_fidelity`] only ever inspects the
+/// *leading* `---` / `+++` / `{` block ([`detect_frontmatter`]) and skips the
+/// carrier entirely — the content-fidelity blind spot ticket 25 closes. This
+/// reaches the carrier the way [`crate::workspace::parse_content`] does
+/// (top-level only, and only when no leading block is present), then asserts two
+/// things about the metadata it sources:
+///
+/// 1. **Scalar fidelity.** The carrier's parsed [`FrontmatterBlock`] is
+///    well-formed and every resolved scalar occurs verbatim in its document
+///    source slice — the same bar a leading block must clear, now applied to the
+///    carrier body. A byte-as-`char` regression in the carrier parse path would
+///    mangle a multi-byte key/path here and is caught.
+/// 2. **Differential `carrier ≡ leading block`.** Where feasible (see below), the
+///    backlinks and exceptions extracted from the carrier equal those extracted
+///    when the *same YAML body* is presented as a leading `---` block. This is the
+///    strongest statement of the carrier-agnostic reconciliation validation 06
+///    verified: it catches any carrier-specific parse drift — a divergence between
+///    the `parse_yaml_body` path and the `parse_frontmatter_block` path that a
+///    no-panic check is blind to.
+///
+/// The differential arm is **skipped** (the scalar-fidelity arm still runs) when
+/// the carrier body cannot be losslessly re-expressed as a leading block: when a
+/// body line is itself a `---` closing delimiter (it would close the synthetic
+/// block early) or when the body opens with a UTF-8 BOM (which the leading-block
+/// parser strips but `parse_yaml_body` does not). Skipping a genuinely
+/// non-equivalent transform keeps the invariant from firing on a *correct* parse
+/// — it is never broadened to no-panic.
+pub fn assert_carrier_fidelity(source: &str) {
+    // Production consults the carrier for data only when there is no leading
+    // block; mirror that, so the invariant inspects the carrier exactly when the
+    // workspace loader would source metadata from it.
+    if has_leading_frontmatter_block(source) {
+        return;
+    }
+    let tree = carrier_tree(source);
+    let Some(carrier_block) = metadata::parse_carrier_block(&tree) else {
+        return;
+    };
+
+    // Arm 1: the carrier block is well-formed and every scalar is faithful — the
+    // carrier body's spans point into `source`, so the leading-block helpers
+    // apply unchanged.
+    assert_block_wellformed(&carrier_block, source);
+    assert_frontmatter_scalar_fidelity(&carrier_block, source);
+
+    let carrier_backlinks = fm::extract_backlinks(&carrier_block, source);
+    let carrier_exceptions = fm::extract_exceptions(&carrier_block, source);
+
+    // Arm 2: differential `carrier ≡ equivalent leading block`. The carrier body
+    // is exactly `content_span` (see `yaml::parse_yaml_body`).
+    let body = &source[carrier_block.content_span.start..carrier_block.content_span.end];
+    let Some(leading) = equivalent_leading_block(body) else {
+        // The body cannot be losslessly wrapped as a leading `---` block; the
+        // scalar-fidelity arm above still guarantees content fidelity.
+        return;
+    };
+    let Some(leading_block) = yaml::parse_frontmatter_block(&leading) else {
+        // The synthetic wrap failed to parse as a leading block at all — a
+        // non-equivalent transform, not a carrier bug. Skip the differential arm.
+        return;
+    };
+    let leading_backlinks = fm::extract_backlinks(&leading_block, &leading);
+    let leading_exceptions = fm::extract_exceptions(&leading_block, &leading);
+
+    assert_eq!(
+        carrier_backlinks, leading_backlinks,
+        "backlinks from a `yaml lattice` carrier must equal those from the same YAML as a \
+         leading `---` block — carrier-specific parse drift\n  carrier body: {body:?}"
+    );
+    assert_exceptions_equivalent(&carrier_exceptions, &leading_exceptions, body);
+}
+
+/// Wrap a carrier body as an equivalent leading `---` YAML block, or `None` when
+/// the wrap would not be lossless.
+///
+/// The synthetic document feeds the *same* body bytes between `---` delimiters,
+/// so [`yaml::parse_frontmatter_block`] sees the identical YAML the carrier's
+/// [`yaml::parse_yaml_body`] did. Returns `None` when the transform is unsound:
+///
+/// - a body line is exactly `---` — it would close the synthetic block early, so
+///   the leading block would see a *prefix* of the body, not all of it;
+/// - the body opens with a UTF-8 BOM — [`yaml::parse_frontmatter_block`] strips a
+///   leading BOM transparently, which `parse_yaml_body` does not, so the two
+///   would parse a different first key; conservatively declined.
+///
+/// Declining a non-equivalent transform is deliberate: the differential arm must
+/// compare like with like, so a body that cannot round-trip is left to the
+/// scalar-fidelity arm rather than producing a false counterexample.
+fn equivalent_leading_block(body: &str) -> Option<String> {
+    // A `---` (or `---`-with-trailing-CR) line inside the body closes the
+    // synthetic leading block prematurely. `find_closing` in the YAML parser
+    // treats a line whose content is exactly `---` as the terminator, so any such
+    // line makes the wrap lossy.
+    if body
+        .lines()
+        .any(|line| line.trim_end_matches('\r') == "---")
+    {
+        return None;
+    }
+    // A leading BOM is stripped by `parse_frontmatter_block` but not by
+    // `parse_yaml_body`, so the wrapped block and the carrier would disagree on
+    // the first key. Decline conservatively.
+    if body.starts_with('\u{feff}') {
+        return None;
+    }
+    // Separate the body from the closing `---` with a newline so the delimiter is
+    // always at the start of its own line, regardless of whether the body ends in
+    // a newline. The extra trailing blank line cannot change the extracted
+    // backlinks/exceptions structure (a plain-scalar map/sequence shape).
+    Some(format!("---\n{body}\n---\n"))
+}
+
+/// Assert two [`Exceptions`] blocks carry the same reconciled metadata.
+///
+/// [`Exceptions`] is not `PartialEq`, and only the *extracted* content is
+/// load-bearing for the carrier-agnostic guarantee (the per-key source spans
+/// differ by construction — the carrier body and the synthetic leading block sit
+/// at different offsets). This compares the reference/reason pairs and the
+/// count-key shape per namespace, which is exactly what reconciliation consumes.
+fn assert_exceptions_equivalent(carrier: &Exceptions, leading: &Exceptions, body: &str) {
+    /// The `(reference, reason)` pairs of an entry list, in source order.
+    fn pairs(entries: &[fm::ExceptionEntry]) -> Vec<(&str, &str)> {
+        entries
+            .iter()
+            .map(|e| (e.reference.as_str(), e.reason.as_str()))
+            .collect()
+    }
+    // The `(expected, reason, raw)` of a count-key, if any. A closure (not a
+    // `fn`) so this thin `Option::map` does not trip the single-option-map lint a
+    // mapping `fn` would.
+    let count = |key: Option<&fm::CountKey>| -> Option<(usize, String, String)> {
+        key.map(|c| (c.expected, c.reason.clone(), c.raw.clone()))
+    };
+
+    assert_eq!(
+        pairs(&carrier.stale_references),
+        pairs(&leading.stale_references),
+        "carrier and leading-block `stale_references` exceptions must match — carrier parse \
+         drift\n  carrier body: {body:?}"
+    );
+    assert_eq!(
+        pairs(&carrier.bare_paths),
+        pairs(&leading.bare_paths),
+        "carrier and leading-block `bare_paths` exceptions must match — carrier parse drift\n  \
+         carrier body: {body:?}"
+    );
+    assert_eq!(
+        count(carrier.stale_references_count.as_ref()),
+        count(leading.stale_references_count.as_ref()),
+        "carrier and leading-block `stale_references` count-keys must match — carrier parse \
+         drift\n  carrier body: {body:?}"
+    );
+    assert_eq!(
+        count(carrier.bare_paths_count.as_ref()),
+        count(leading.bare_paths_count.as_ref()),
+        "carrier and leading-block `bare_paths` count-keys must match — carrier parse drift\n  \
+         carrier body: {body:?}"
+    );
+}
+
+/// Extract the backlinks a `yaml lattice` carrier sources for `source`, mirroring
+/// [`crate::workspace::parse_content`]'s carrier path (no leading block, tree-based
+/// recognition). Returns an empty map when there is no live carrier. Exposed for
+/// the deterministic teeth test that corrupts the extracted metadata and asserts
+/// the differential arm catches the divergence.
+#[must_use]
+pub fn carrier_backlinks(source: &str) -> HashMap<String, Vec<String>> {
+    if has_leading_frontmatter_block(source) {
+        return HashMap::new();
+    }
+    let tree = carrier_tree(source);
+    metadata::parse_carrier_block(&tree)
+        .map(|block| fm::extract_backlinks(&block, source))
+        .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------

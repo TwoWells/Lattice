@@ -57,9 +57,10 @@ use crate::block::{self, Tree};
 use crate::fm;
 use crate::html::{self, HtmlTag};
 use crate::invariants::{
-    Edit, assert_block_wellformed, assert_edit_sequence_stable, assert_frontmatter_scalar_fidelity,
-    assert_html_tag_in_bounds, assert_inline_resource_fidelity, assert_line_index_agrees,
-    assert_structural_invariants, assert_tree_wellformed, collect_scalars, detect_frontmatter,
+    Edit, assert_block_wellformed, assert_carrier_fidelity, assert_edit_sequence_stable,
+    assert_frontmatter_scalar_fidelity, assert_html_tag_in_bounds, assert_inline_resource_fidelity,
+    assert_line_index_agrees, assert_structural_invariants, assert_tree_wellformed,
+    carrier_backlinks, collect_scalars, detect_frontmatter,
 };
 use crate::line_index::LineIndex;
 use crate::{inline, json, toml, yaml};
@@ -917,6 +918,96 @@ fn exceptions_frontmatter() -> impl Strategy<Value = String> {
 }
 
 // ---------------------------------------------------------------------------
+// Generators — metadata carrier (ticket 25, decision 015)
+// ---------------------------------------------------------------------------
+
+/// The YAML body of a metadata carrier: a `backlinks:` mapping, optionally
+/// followed by an `exceptions:` block. The same body shape a leading `---` block
+/// carries, so the differential `carrier ≡ leading block` arm compares like with
+/// like. Paths are drawn from [`path_text`] (which includes a multi-byte form),
+/// exercising the encoding axis through the carrier parse path.
+fn carrier_body() -> impl Strategy<Value = String> {
+    (
+        yaml_backlinks_block(),
+        proptest::option::of(
+            proptest::collection::vec((path_text(), inline_text(10)), 1..3).prop_map(|entries| {
+                let mut out = String::from("exceptions:\n  stale_references:\n");
+                for (path, reason) in entries {
+                    out.push_str("    \"");
+                    out.push_str(&path);
+                    out.push_str("\": ");
+                    out.push_str(&reason.replace([':', '\n', '"'], ""));
+                    out.push('\n');
+                }
+                out
+            }),
+        ),
+    )
+        .prop_map(|(backlinks, exceptions)| {
+            format!("{backlinks}{}", exceptions.unwrap_or_default())
+        })
+}
+
+/// A document whose metadata is sourced from a `yaml lattice` carrier
+/// (decision 015): a naked top-level fence, a `<details>`-wrapped fence, or
+/// (the inert control) a fence nested inside a blockquote or an outer
+/// documentation fence. The carrier-fidelity invariant must source the live
+/// carriers faithfully and find no live carrier in the inert ones.
+fn carrier_document() -> impl Strategy<Value = String> {
+    (carrier_body(), 0u8..4).prop_map(|(body, shape)| match shape {
+        // Naked top-level carrier.
+        0 => format!("# Title\n\n```yaml lattice\n{body}```\n"),
+        // `<details>`-wrapped carrier (well-formed, render-clean).
+        1 => format!(
+            "# Title\n\n<details><summary>lattice</summary>\n\n```yaml lattice\n{body}```\n\n</details>\n"
+        ),
+        // Inert: nested inside a blockquote (quoted content, never live metadata).
+        2 => {
+            let fence = format!("```yaml lattice\n{body}```\n");
+            let mut quoted = String::from("# Title\n\n");
+            for line in fence.lines() {
+                quoted.push_str("> ");
+                quoted.push_str(line);
+                quoted.push('\n');
+            }
+            quoted
+        }
+        // Inert: nested inside an outer documentation fence (one opaque node).
+        _ => format!("# Docs\n\n````markdown\n```yaml lattice\n{body}```\n````\n"),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Properties — metadata carrier content fidelity (ticket 25)
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #![proptest_config(config())]
+
+    /// A `yaml lattice` carrier sources frontmatter faithfully: the carrier
+    /// block's scalars occur verbatim in the source, and the backlinks/exceptions
+    /// it yields equal those of the *same YAML* as a leading `---` block. Driven
+    /// over naked, `<details>`-wrapped, and inert (blockquote / outer-fence)
+    /// carriers under every line-ending style and an optional BOM, plus arbitrary
+    /// UTF-8. This is the assertion the `fuzz_full` target shares, so the two
+    /// suites cannot drift (ticket 25); it closes the carrier content-fidelity
+    /// blind spot the leading-block-only `assert_frontmatter_scalar_fidelity`
+    /// left open.
+    #[test]
+    fn carrier_frontmatter_is_faithful(
+        source in prop_oneof![
+            carrier_document(),
+            (carrier_document(), 0u8..4, any::<bool>())
+                .prop_map(|(d, style, bom)| line_ending_variant(d, style, bom)),
+            arbitrary_string(300),
+            markdown_document(),
+        ]
+    ) {
+        assert_carrier_fidelity(&source);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Properties — structural diagnostic pass (issue 033)
 // ---------------------------------------------------------------------------
 
@@ -1153,6 +1244,83 @@ fn structural_diagnostics_valid_on_known_inputs() {
     for case in cases {
         assert_structural_invariants(case);
     }
+}
+
+#[test]
+fn carrier_fidelity_holds_on_known_inputs() {
+    // Live carriers — naked, `<details>`-wrapped, with exceptions, multi-byte,
+    // and under CRLF — must all source faithful metadata that agrees with the
+    // same YAML as a leading block. The inert controls (blockquote, list,
+    // outer-fence, incidental `yaml`, leading-block-present) have no live carrier,
+    // so the invariant returns without firing. `assert_carrier_fidelity` runs the
+    // full check, so reaching the end proves each held.
+    let cases = [
+        // Naked top-level carrier.
+        "# Title\n\n```yaml lattice\nbacklinks:\n  referenced_by:\n    - README.md\n```\n",
+        // `<details>`-wrapped, well-formed.
+        "# Title\n\n<details><summary>lattice</summary>\n\n```yaml lattice\nbacklinks:\n  referenced_by:\n    - a.md\n    - b.md\n```\n\n</details>\n",
+        // Carrier carrying an `exceptions` block.
+        "# T\n\n```yaml lattice\nbacklinks:\n  referenced_by:\n    - a.md\nexceptions:\n  stale_references:\n    \"old.md\": migrated\n```\n",
+        // Multi-byte path through the carrier parse path.
+        "# T\n\n```yaml lattice\nbacklinks:\n  referenced_by:\n    - café/résumé.md\n```\n",
+        // CRLF line endings.
+        "# T\r\n\r\n```yaml lattice\r\nbacklinks:\r\n  referenced_by:\r\n    - a.md\r\n```\r\n",
+        // Inert controls — no live carrier, invariant returns cleanly.
+        "# T\n\n> ```yaml lattice\n> backlinks:\n>   referenced_by:\n>     - a.md\n> ```\n",
+        "# Docs\n\n````markdown\n```yaml lattice\nbacklinks:\n  referenced_by:\n    - a.md\n```\n````\n",
+        "# T\n\n```yaml\nbacklinks:\n  referenced_by:\n    - a.md\n```\n",
+        // Leading block present: the carrier is not the data source, so the
+        // invariant must not inspect it.
+        "---\nbacklinks:\n  referenced_by:\n    - a.md\n---\n# T\n\n```yaml lattice\nbacklinks:\n  referenced_by:\n    - b.md\n```\n",
+        // Degenerate: empty body, no metadata.
+        "# T\n\n```yaml lattice\n```\n",
+    ];
+    for case in cases {
+        assert_carrier_fidelity(case);
+    }
+}
+
+#[test]
+fn carrier_fidelity_has_teeth() {
+    // The invariant is not vacuous: a carrier whose extracted backlinks are
+    // *corrupted* away from the source must be caught. `assert_carrier_fidelity`
+    // can only fire when the carrier parse genuinely diverges from the leading
+    // block, which a correct parser never does — so to prove the comparison has
+    // teeth we corrupt the carrier-sourced metadata and assert the same
+    // `assert_eq!` the differential arm uses rejects it.
+    let source = "# T\n\n```yaml lattice\nbacklinks:\n  referenced_by:\n    - real.md\n```\n";
+
+    // The honest carrier metadata the invariant extracts.
+    let carrier = carrier_backlinks(source);
+    assert_eq!(
+        carrier.get("referenced_by").map(Vec::as_slice),
+        Some(["real.md".to_string()].as_slice()),
+        "the carrier sources the real path: {carrier:?}"
+    );
+
+    // Corrupt it — the bug class the invariant guards against is the carrier
+    // parse yielding a *different* path than the equivalent leading block would.
+    let mut corrupted = carrier.clone();
+    corrupted.insert(
+        "referenced_by".to_string(),
+        vec!["mangled\u{fffd}.md".to_string()],
+    );
+
+    // The differential arm's comparison must reject the divergence.
+    let caught = std::panic::catch_unwind(|| {
+        assert_eq!(
+            carrier, corrupted,
+            "corrupted carrier backlinks must differ from the honest extraction"
+        );
+    });
+    assert!(
+        caught.is_err(),
+        "the carrier-fidelity comparison must catch corrupted metadata — otherwise it is vacuous"
+    );
+
+    // And the genuine invariant still passes on the honest source (teeth, not a
+    // hair trigger).
+    assert_carrier_fidelity(source);
 }
 
 #[test]
