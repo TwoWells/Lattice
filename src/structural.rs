@@ -123,6 +123,7 @@ pub fn collect_with_suppressions(
     );
     emit_html_diagnostics(tree, rel_path, &mut diagnostics);
     check_markdown_in_opaque_html(tree, rel_path, &mut diagnostics);
+    crate::metadata::carrier_diagnostics(tree, rel_path, &mut diagnostics);
     emit_code_block_diagnostics(tree, rel_path, config, &mut diagnostics);
     emit_image_diagnostics(tree, rel_path, config, &mut diagnostics);
     emit_trailing_whitespace_diagnostics(source, rel_path, tree, &mut diagnostics);

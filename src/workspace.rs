@@ -108,13 +108,22 @@ pub struct FileData {
 }
 
 /// Parsed frontmatter from a markdown document.
+///
+/// Populated from a leading `---` / `+++` / `{` block or, when none is present,
+/// from a fenced `yaml lattice` metadata carrier (decision 015). The two carry
+/// identical backlink/exception data; the spans differ only in what they cover
+/// (delimiter-bounded block vs. in-fence body).
 #[derive(Debug)]
 pub struct Frontmatter {
-    /// Byte range of the entire frontmatter block (including `---` delimiters).
+    /// Byte range of the metadata carrier — the entire frontmatter block
+    /// (including `---` delimiters) or the in-fence body of a `yaml lattice`
+    /// carrier.
     pub byte_range: Range<usize>,
-    /// 1-based line of the opening `---`.
+    /// 1-based line of the carrier's start (the opening `---`, or the carrier's
+    /// first body line).
     pub start_line: usize,
-    /// 1-based line of the closing `---`.
+    /// 1-based line of the carrier's last line (the closing `---`, or the
+    /// carrier body's last line).
     pub end_line: usize,
     /// Parsed backlinks: backlink label → list of relative file paths. The
     /// label is any known predicate — an inverse value or a forward label
@@ -455,7 +464,21 @@ pub fn parse_content(content: &str, rel_path: &Path, config: &Config) -> FileDat
     let mut backlink_diagnostics = Vec::new();
     let mut parse_diagnostics = Vec::new();
 
-    if let Some(block) = &fm_block {
+    // A leading `---` / `+++` / `{` block is the primary carrier; when absent,
+    // a fenced `yaml lattice` metadata carrier (decision 015) populates the same
+    // `frontmatter` fields. The block parsers detect frontmatter by leading
+    // delimiter, so the two never both match `fm_block`; the carrier is consulted
+    // only when no leading block was found. Its body is parsed via the tree-based
+    // recognition in `metadata`, so a `yaml lattice` fence nested in an outer
+    // documentation fence stays inert.
+    let carrier_block = if fm_block.is_some() {
+        None
+    } else {
+        crate::metadata::parse_carrier_block(&tree)
+    };
+    let effective_block = fm_block.as_ref().or(carrier_block.as_ref());
+
+    if let Some(block) = effective_block {
         // Collect parse diagnostics (partial recovery).
         for diag in &block.diagnostics {
             let line = byte_offset_to_line(content, diag.span.start);
@@ -467,7 +490,7 @@ pub fn parse_content(content: &str, rel_path: &Path, config: &Config) -> FileDat
         }
 
         let byte_range: Range<usize> = block.span.into();
-        let start_line = 1;
+        let start_line = byte_offset_to_line(content, byte_range.start);
         let end_byte = byte_range.end.min(content.len());
         // Step back one byte off the span end (which includes the closing
         // delimiter's line ending) so we land on the delimiter line itself
@@ -776,6 +799,37 @@ mod tests {
         assert!(
             data.backlink_diagnostics.is_empty(),
             "known predicate should produce no diagnostics"
+        );
+    }
+
+    #[test]
+    fn fenced_carrier_populates_backlinks() {
+        // Decision 015: a `yaml lattice` carrier (here `<details>`-wrapped, at the
+        // foot) populates `FileData.frontmatter` backlinks exactly as a leading
+        // `---` block would, with no leading frontmatter present.
+        let dir = workspace_with_files(&[(
+            "target.md",
+            "# Target\n\nbody\n\n<details><summary>lattice</summary>\n\n```yaml lattice\nbacklinks:\n  superseded_by:\n    - source.md\n```\n\n</details>\n",
+        )]);
+
+        let ws = Workspace::scan(dir.path()).expect("scan should succeed");
+        let data = ws
+            .file(Path::new("target.md"))
+            .expect("should find target.md");
+        let fm = data
+            .frontmatter
+            .as_ref()
+            .expect("carrier should populate frontmatter");
+        assert_eq!(
+            fm.backlinks.get("superseded_by"),
+            Some(&vec!["source.md".to_string()]),
+            "the fenced carrier populates backlinks: {:?}",
+            fm.backlinks
+        );
+        assert!(
+            data.backlink_diagnostics.is_empty(),
+            "known predicate produces no diagnostics: {:?}",
+            data.backlink_diagnostics
         );
     }
 

@@ -1075,6 +1075,53 @@ pub fn parse_frontmatter_block(source: &str) -> Option<FrontmatterBlock> {
     })
 }
 
+/// Parse a free-standing YAML body into a [`FrontmatterBlock`], with every span
+/// offset by `base` so it points back into the original document.
+///
+/// Unlike [`parse_frontmatter_block`], this expects no `---` delimiters: `body`
+/// is the raw YAML text (e.g. the inside of a fenced `yaml lattice` metadata
+/// carrier, decision 015), and `base` is the byte offset of `body` within the
+/// document. The returned block's `span` and `content_span` both cover exactly
+/// `body`; its entries and diagnostics carry absolute, document-relative spans,
+/// so `backlinks` / `exceptions` extraction and the structural diagnostic layer
+/// treat a carrier body identically to a leading `---` block.
+///
+/// An over-large body is treated as opaque and skipped with a warning, matching
+/// the [`parse_frontmatter_block`] size guard.
+#[must_use]
+pub fn parse_yaml_body(body: &str, base: usize) -> FrontmatterBlock {
+    let block_span = Span::new(base, base + body.len());
+
+    // Size limit: an enormous body is treated as opaque and skipped, so the
+    // parser never walks a multi-megabyte region (mirrors the frontmatter guard).
+    if body.len() > crate::limits::MAX_FRONTMATTER_BYTES {
+        return FrontmatterBlock {
+            span: block_span,
+            content_span: block_span,
+            entries: Vec::new(),
+            diagnostics: vec![FmDiagnostic {
+                span: Span::new(base, base),
+                severity: FmSeverity::Warning,
+                message: format!(
+                    "metadata block exceeds the {}-byte limit; skipped",
+                    crate::limits::MAX_FRONTMATTER_BYTES
+                ),
+            }],
+        };
+    }
+
+    let mut parser = Parser::new(body, base);
+    let entries = parser.parse_entries(0);
+    let diagnostics = parser.diagnostics;
+
+    FrontmatterBlock {
+        span: block_span,
+        content_span: block_span,
+        entries,
+        diagnostics,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1794,6 +1841,70 @@ mod tests {
                 .any(|d| d.message.contains("exceeds the")),
             "expected an oversize diagnostic: {:?}",
             block.diagnostics
+        );
+    }
+
+    // -- parse_yaml_body (metadata carrier, decision 015) ----------------
+
+    #[test]
+    fn parse_yaml_body_offsets_spans_by_base() {
+        // The body is a slice of a larger document; every scalar span must point
+        // back into the document via `base`.
+        let doc = "prefix\nbacklinks:\n  referenced_by:\n    - a.md\n";
+        let base = 7; // after "prefix\n"
+        let body = &doc[base..];
+        let block = parse_yaml_body(body, base);
+        assert_eq!(
+            block.span.start, base,
+            "block span starts at the base offset: {:?}",
+            block.span
+        );
+        let backlinks = extract_backlinks(&block, doc);
+        assert_eq!(
+            backlinks.get("referenced_by").map(Vec::as_slice),
+            Some(["a.md".to_string()].as_slice()),
+            "the body parses backlinks: {backlinks:?}"
+        );
+        // The first scalar (`backlinks` key) sits at `base` in the document.
+        let crate::fm::FmNode::Mapping { key, .. } = &block.entries[0] else {
+            panic!("expected a mapping entry");
+        };
+        assert_eq!(
+            &doc[key.span.start..key.span.end],
+            "backlinks",
+            "the key span resolves against the document"
+        );
+    }
+
+    #[test]
+    fn parse_yaml_body_malformed_yaml_diagnoses() {
+        // A deeper-indented bare line with no parent mapping is a YAML error,
+        // anchored inside the body (offset by base).
+        let body = "backlinks:\n      bad_indent\n";
+        let block = parse_yaml_body(body, 0);
+        assert!(
+            block
+                .diagnostics
+                .iter()
+                .any(|d| d.severity == FmSeverity::Error),
+            "malformed body yields an error diagnostic: {:?}",
+            block.diagnostics
+        );
+    }
+
+    #[test]
+    fn parse_yaml_body_empty_is_inert() {
+        let block = parse_yaml_body("", 42);
+        assert!(block.entries.is_empty(), "empty body has no entries");
+        assert!(
+            block.diagnostics.is_empty(),
+            "empty body has no diagnostics: {:?}",
+            block.diagnostics
+        );
+        assert_eq!(
+            (block.span.start, block.span.end),
+            (42, 42),
+            "empty body span is zero-length at base"
         );
     }
 }

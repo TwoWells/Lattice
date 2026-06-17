@@ -1138,6 +1138,17 @@ fn structural_diagnostics_valid_on_known_inputs() {
         "\u{feff}# BOM\r\nWith CRLF and a 'path.md' ref.\r\n",
         "---\nexceptions:\n  bare_paths:\n    \"./missing.md\": gone\n---\nSee ./missing.md\n",
         "---\nexceptions:\n  stale_references:\n    \"old.md\": legacy\n---\nbody\n",
+        // Metadata-channel carrier (decision 015): naked, `<details>`-wrapped,
+        // both render gotchas, a duplicate, malformed inner YAML, and an
+        // inert example nested in an outer fence — every carrier diagnostic
+        // span must round-trip, including under CRLF and a multi-byte path.
+        "```yaml lattice\nbacklinks:\n  referenced_by:\n    - café.md\n```\n",
+        "<details><summary>lattice</summary>\n\n```yaml lattice\nbacklinks:\n  referenced_by:\n    - a.md\n```\n\n</details>\n",
+        "<details><summary>lattice</summary>\n```yaml lattice\nbacklinks:\n  referenced_by:\n    - a.md\n```\n\n</details>\n",
+        "<details><summary>lattice</summary>\r\n\r\n```yaml lattice\r\nbacklinks:\r\n  referenced_by:\r\n    - a.md\r\n```\r\n</details>\r\n",
+        "```yaml lattice\nbacklinks:\n  referenced_by:\n    - a.md\n```\n\n```yaml lattice\nbacklinks:\n  referenced_by:\n    - b.md\n```\n",
+        "```yaml lattice\nbacklinks:\n      bad_indent\n```\n",
+        "````markdown\n```yaml lattice\nbacklinks:\n  referenced_by:\n    - a.md\n```\n````\n",
     ];
     for case in cases {
         assert_structural_invariants(case);
