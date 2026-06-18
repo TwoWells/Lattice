@@ -6,9 +6,11 @@
 // Validates Lattice's block structure parser against the official
 // CommonMark spec test suite (vendored at `tests/fixtures/commonmark_spec.json`).
 //
-// Only block-structure sections are tested. Inline sections (emphasis,
-// code spans, links, images, etc.) are skipped — Lattice does not parse
-// inline formatting.
+// Block-structure sections are tested with the `Shape` comparator below. The
+// "Emphasis and strong emphasis" section is additionally tested with the
+// inline-aware emphasis-mask comparator (ticket 27). The remaining inline
+// sections (code spans, links, images, etc.) are still skipped — Lattice does
+// not model their content against the spec.
 //
 // Assertion model
 // ---------------
@@ -21,6 +23,11 @@
 // - Heading levels.
 // - List properties (ordered, start number, tight/loose).
 // - Block quote child structure.
+//
+// For emphasis, the `Shape` layer returns `None` (it has no inline variant), so
+// a second comparator (see "Inline emphasis comparator" below) reduces both the
+// expected HTML and Lattice's tree to a per-character bold/italic mask and
+// compares those.
 //
 // Intentional deviations
 // ----------------------
@@ -463,6 +470,239 @@ fn skip_unknown_html(html: &str, pos: usize) -> Option<usize> {
 }
 
 // ---------------------------------------------------------------------------
+// Inline emphasis comparator (ticket 27)
+// ---------------------------------------------------------------------------
+//
+// The block-shape comparison above returns `None` for every inline element, so
+// the "Emphasis and strong emphasis" section is invisible to it. This second,
+// inline-aware comparator closes that gap.
+//
+// Both the expected HTML and Lattice's tree are reduced to the *same*
+// representation: a per-content-character emphasis mask — a `Vec<(char, Mask)>`
+// over the example's rendered text content, where `Mask` records which of
+// bold / italic is active over that character. Comparing the two vectors checks
+// both *which* characters survive as text content and *what* emphasis applies
+// to each, in one shot.
+//
+// This reduction neutralizes parser 26's two structural mismatches against the
+// spec uniformly:
+//
+//   - Delimiter-vs-content: Lattice spans cover the delimiters (`*bar*`), the
+//     HTML `<em>` wraps only the content (`bar`). Both sides strip their markup,
+//     so only the content text is compared.
+//   - Flat-overlap-vs-nesting: parser 26 emits flat, *overlapping* sibling spans
+//     (`***foo***` -> a `Strong` over `**foo**` and an `Emphasis` over the whole
+//     run), while the HTML nests `<em><strong>`. ORing each span's modifier bit
+//     over the characters it covers collapses both to the same per-character
+//     mask — exactly the cut-point flatten the semantic-tokens layer (feat 15,
+//     `collect_emphasis_regions`) already performs.
+//
+// CommonMark 0.31.2 has no strikethrough examples (strikethrough is GFM), so the
+// comparator models only bold (`<strong>`) and italic (`<em>`).
+
+/// Per-character emphasis state: bit 0 = bold, bit 1 = italic.
+type Mask = u8;
+
+const BOLD: Mask = 0b01;
+const ITALIC: Mask = 0b10;
+
+/// One rendered text character paired with the emphasis active over it.
+type MaskedText = Vec<(char, Mask)>;
+
+// --- HTML -> masked text ---
+
+/// Reduce an example's expected HTML to its rendered text content, tagging each
+/// character with the bold/italic emphasis active over it.
+///
+/// `<strong>`/`<em>` open and close tags drive the bold/italic depth; every
+/// other tag (`<a>`, `<code>`, `<img>`, ...) is skipped while its inner text is
+/// kept under the current mask. The handful of HTML entities the spec emits in
+/// this section are decoded so the text aligns with Lattice's source bytes.
+///
+/// Only text *inside* a `<p>` block is collected: the inter-block `\n` the spec
+/// renders between `</p>` and the next `<p>` is not content, and the tree side
+/// (which walks paragraphs directly) emits nothing there either. A soft-break
+/// `\n` inside a single paragraph stays, since it is inside the `<p>`.
+fn html_emphasis_mask(html: &str) -> MaskedText {
+    let bytes = html.as_bytes();
+    let mut out: MaskedText = Vec::new();
+    let mut bold = 0u32;
+    let mut italic = 0u32;
+    let mut in_para = false;
+    let mut i = 0;
+
+    while i < html.len() {
+        if bytes[i] == b'<' {
+            let rest = &html[i..];
+            if rest.starts_with("<p>") || rest.starts_with("<p ") {
+                in_para = true;
+            } else if rest.starts_with("</p>") {
+                in_para = false;
+            }
+            i = consume_emphasis_tag(html, i, &mut bold, &mut italic);
+            continue;
+        }
+        if !in_para {
+            i += 1;
+            continue;
+        }
+        if bytes[i] == b'&'
+            && let Some((ch, end)) = decode_entity(html, i)
+        {
+            out.push((ch, current_mask(bold, italic)));
+            i = end;
+            continue;
+        }
+        let ch = html[i..]
+            .chars()
+            .next()
+            .expect("byte index is on a char boundary");
+        out.push((ch, current_mask(bold, italic)));
+        i += ch.len_utf8();
+    }
+
+    out
+}
+
+/// Mask from the current bold/italic depths.
+const fn current_mask(bold: u32, italic: u32) -> Mask {
+    let mut m = 0;
+    if bold > 0 {
+        m |= BOLD;
+    }
+    if italic > 0 {
+        m |= ITALIC;
+    }
+    m
+}
+
+/// Consume one HTML tag at `pos`, adjusting the bold/italic depth for
+/// `<strong>`/`<em>` (open and close), and skipping every other tag. Returns the
+/// byte position just past the tag's `>` (or past `<` if the tag is unterminated).
+fn consume_emphasis_tag(html: &str, pos: usize, bold: &mut u32, italic: &mut u32) -> usize {
+    let rest = &html[pos..];
+    let Some(gt) = rest.find('>') else {
+        return pos + 1;
+    };
+    let inner = &rest[1..gt]; // between '<' and '>'
+    match inner {
+        "strong" => *bold += 1,
+        "/strong" => *bold = bold.saturating_sub(1),
+        "em" => *italic += 1,
+        "/em" => *italic = italic.saturating_sub(1),
+        _ => {}
+    }
+    pos + gt + 1
+}
+
+/// Decode the small set of HTML entities the emphasis examples emit. Returns the
+/// decoded character and the byte position past the `;`, or `None` if `pos` does
+/// not start a recognized entity.
+fn decode_entity(html: &str, pos: usize) -> Option<(char, usize)> {
+    for (name, ch) in &[
+        ("&amp;", '&'),
+        ("&lt;", '<'),
+        ("&gt;", '>'),
+        ("&quot;", '"'),
+        ("&#39;", '\''),
+    ] {
+        if html[pos..].starts_with(name) {
+            return Some((*ch, pos + name.len()));
+        }
+    }
+    None
+}
+
+// --- Tree -> masked text ---
+
+/// Reduce Lattice's tree for an example to the same per-character masked text:
+/// the rendered content of every inline host (`Paragraph` / `Heading`), in
+/// document order, with emphasis delimiters stripped and each surviving
+/// character tagged with the union of `Strong`/`Emphasis` modifiers covering it.
+///
+/// A `*`/`_` byte is markup (and dropped) exactly when it is one of the
+/// `open_len` outermost delimiters at the leading or trailing edge of some
+/// emphasis span — `Strong` consumes two at each edge, `Emphasis` one. OR-ing
+/// the modifier bit of every span that covers a surviving byte yields its mask,
+/// matching the cut-point flatten used for semantic tokens.
+fn tree_emphasis_mask(tree: &Tree) -> MaskedText {
+    let source = tree.source();
+
+    // Per-byte: OR of modifier bits of the emphasis spans covering it, and
+    // whether the byte is a consumed edge delimiter (markup to drop).
+    let mut mask = vec![0u8; source.len()];
+    let mut is_markup = vec![false; source.len()];
+
+    for node in tree.nodes() {
+        let bit = match node.kind {
+            ElementKind::Strong => BOLD,
+            ElementKind::Emphasis => ITALIC,
+            _ => continue,
+        };
+        let (start, end) = (node.span.start, node.span.end);
+        for slot in &mut mask[start..end] {
+            *slot |= bit;
+        }
+        // `Strong` consumes two delimiters at each edge, `Emphasis` one — the
+        // outermost ones. Mark exactly those bytes as dropped markup.
+        let open_len = if bit == BOLD { 2 } else { 1 };
+        for off in 0..open_len {
+            is_markup[start + off] = true;
+            is_markup[end - 1 - off] = true;
+        }
+    }
+
+    let mut out: MaskedText = Vec::new();
+    for node in tree.nodes() {
+        if !matches!(
+            node.kind,
+            ElementKind::Paragraph | ElementKind::Heading { .. }
+        ) {
+            continue;
+        }
+        // Collect this host's content, then trim its own leading/trailing
+        // whitespace before appending. A paragraph node's span can carry a
+        // trailing newline, and consecutive paragraphs (`a\n\nb`) must join with
+        // nothing — matching the HTML, where the inter-`<p>` `\n` is not content.
+        // A soft break *inside* one paragraph (`*foo\nbar*`) is interior to a
+        // single node, so it survives the per-host trim.
+        let (start, end) = (node.span.start, node.span.end);
+        let mut host: MaskedText = Vec::new();
+        let mut i = start;
+        while i < end {
+            if is_markup[i] {
+                i += 1;
+                continue;
+            }
+            let ch = source[i..]
+                .chars()
+                .next()
+                .expect("byte index is on a char boundary");
+            host.push((ch, mask[i]));
+            i += ch.len_utf8();
+        }
+        out.extend(normalize_masked(&host));
+    }
+
+    out
+}
+
+/// Normalize masked text for comparison: trim leading/trailing whitespace-only
+/// entries (paragraph edges) and collapse no characters in between. The HTML and
+/// the tree can disagree on a single trailing `\n` inside a multi-paragraph
+/// example's join, so this drops *only* outer whitespace, leaving interior text
+/// and every emphasis mask intact.
+fn normalize_masked(text: &MaskedText) -> MaskedText {
+    let is_ws = |&(c, _): &(char, Mask)| c.is_whitespace();
+    let start = text.iter().position(|e| !is_ws(e)).unwrap_or(text.len());
+    let end = text
+        .iter()
+        .rposition(|e| !is_ws(e))
+        .map_or(start, |p| p + 1);
+    text[start..end].to_vec()
+}
+
+// ---------------------------------------------------------------------------
 // Known deviations
 // ---------------------------------------------------------------------------
 
@@ -550,6 +790,96 @@ fn run_section(section: &str) {
 }
 
 // ---------------------------------------------------------------------------
+// Emphasis deviations (ticket 27)
+// ---------------------------------------------------------------------------
+
+/// Emphasis examples whose *text content* differs from Lattice's because they
+/// exercise an inline feature Lattice deliberately does not model inside the
+/// emphasis comparator (not a flanking disagreement — see ticket 27). Each entry
+/// names the unmodeled feature, never a "which text is emphasized" mismatch.
+const EMPHASIS_DEVIATIONS: &[(u32, &str)] = &[
+    // Links / autolinks inside emphasis: the HTML renders the link text or the
+    // autolink target, while Lattice keeps the literal `[..](..)` / `<..>`
+    // bracket syntax in the paragraph text. The link parser is a separate inline
+    // pass; this comparator reduces only emphasis, so the bracket text diverges.
+    (404, "link inside emphasis (`[bar](/url)` -> `bar`)"),
+    (419, "link with nested emphasis inside emphasis"),
+    (422, "link inside strong"),
+    (433, "link with nested emphasis inside strong"),
+    (473, "emphasis delimiter inside a link label"),
+    (474, "emphasis delimiter inside a link label"),
+    (480, "autolink absorbs the trailing `**`"),
+    (481, "autolink absorbs the trailing `__`"),
+    // Code spans inside emphasis: the HTML renders the code content (`<code>*`),
+    // while Lattice keeps the backticks. Code spans are a separate inline pass.
+    (478, "code span inside emphasis (`` `*` `` -> `*`)"),
+    (479, "code span inside emphasis (`` `_` `` -> `_`)"),
+    // Raw inline HTML: the HTML round-trips the tag (with its quoted `*`/`_`),
+    // while Lattice keeps the literal source. Raw HTML is not emphasis content.
+    (475, "raw inline HTML (`<img .. title=\"*\"/>`)"),
+    (476, "raw inline HTML (`<a href=\"**\">`)"),
+    (477, "raw inline HTML (`<a href=\"__\">`)"),
+    // Backslash escapes: the HTML drops the backslash (`\*` -> `*`), Lattice
+    // keeps the source byte. Escapes are a separate inline concern.
+    (437, "backslash-escaped delimiter (`\\*`)"),
+    (440, "backslash-escaped delimiter (`\\*`)"),
+    (449, "backslash-escaped delimiter (`\\_`)"),
+    (452, "backslash-escaped delimiter (`\\_`)"),
+];
+
+fn is_emphasis_deviation(example: u32) -> bool {
+    EMPHASIS_DEVIATIONS.iter().any(|(n, _)| *n == example)
+}
+
+/// Run the inline emphasis comparator over the "Emphasis and strong emphasis"
+/// section: reduce both the expected HTML and Lattice's tree to a per-character
+/// bold/italic mask and assert they match, skipping the documented
+/// unmodeled-feature deviations.
+fn run_emphasis_section() {
+    let spec = load_spec();
+    let examples = section_examples(&spec, "Emphasis and strong emphasis");
+    assert!(
+        !examples.is_empty(),
+        "no spec examples found for the emphasis section"
+    );
+
+    let mut failures: Vec<String> = Vec::new();
+    let mut skipped = 0u32;
+
+    for ex in &examples {
+        if is_emphasis_deviation(ex.example) {
+            skipped += 1;
+            continue;
+        }
+
+        let tree = parse(&ex.markdown);
+        let actual = normalize_masked(&tree_emphasis_mask(&tree));
+        let expected = normalize_masked(&html_emphasis_mask(&ex.html));
+
+        if actual != expected {
+            failures.push(format!(
+                "Example {} (spec line {}):\n\
+                 \x20 expected: {expected:?}\n\
+                 \x20 actual:   {actual:?}\n\
+                 \x20 markdown: {:?}\n\
+                 \x20 html:     {:?}",
+                ex.example, ex.start_line, ex.markdown, ex.html,
+            ));
+        }
+    }
+
+    let total = examples.len();
+    let passed = total - failures.len() - skipped as usize;
+
+    assert!(
+        failures.is_empty(),
+        "Emphasis and strong emphasis: {passed}/{total} passed, {skipped} skipped, {} failed:\n\n{}",
+        failures.len(),
+        failures.join("\n\n")
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Per-section tests
 // ---------------------------------------------------------------------------
 
@@ -623,6 +953,11 @@ fn spec_lists() {
     run_section("Lists");
 }
 
+#[test]
+fn spec_emphasis() {
+    run_emphasis_section();
+}
+
 // ---------------------------------------------------------------------------
 // Section coverage
 // ---------------------------------------------------------------------------
@@ -635,10 +970,14 @@ fn all_sections_covered() {
     sections.sort_unstable();
     sections.dedup();
 
-    let structural: &[&str] = &[
+    // Sections covered by a conformance test: block-structure sections via the
+    // `Shape` comparator, plus "Emphasis and strong emphasis" via the inline
+    // emphasis-mask comparator (ticket 27).
+    let tested: &[&str] = &[
         "ATX headings",
         "Blank lines",
         "Block quotes",
+        "Emphasis and strong emphasis",
         "Fenced code blocks",
         "HTML blocks",
         "Indented code blocks",
@@ -651,11 +990,11 @@ fn all_sections_covered() {
         "Tabs",
         "Thematic breaks",
     ];
+    // Inline sections Lattice does not model against the spec.
     let inline: &[&str] = &[
         "Autolinks",
         "Backslash escapes",
         "Code spans",
-        "Emphasis and strong emphasis",
         "Entity and numeric character references",
         "Hard line breaks",
         "Images",
@@ -668,8 +1007,8 @@ fn all_sections_covered() {
 
     for section in &sections {
         assert!(
-            structural.contains(section) || inline.contains(section),
-            "unaccounted spec section: {section:?} — add it to structural or inline list"
+            tested.contains(section) || inline.contains(section),
+            "unaccounted spec section: {section:?} — add it to tested or inline list"
         );
     }
 }
