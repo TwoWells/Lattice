@@ -8017,10 +8017,15 @@ mod tests {
     // --- Pathological input limits (ticket 20) ---
 
     use crate::limits;
-    use std::time::Instant;
+    use cpu_time::ThreadTime;
 
-    /// Parsing must always terminate quickly; this generous bound catches
-    /// quadratic or runaway behavior without being flaky under CI load.
+    /// Parsing must always terminate quickly; this generous per-thread
+    /// **CPU-time** bound catches quadratic or runaway behavior while remaining
+    /// immune to scheduling delay. Because CPU time accrues only while the
+    /// thread is actually executing, it excludes time spent descheduled, so
+    /// cross-process contention (e.g. a concurrent full-suite run saturating
+    /// every core) cannot inflate it — unlike a wall-clock bound. The parse is
+    /// single-threaded, so the calling thread's CPU time captures all the work.
     const SLOW_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
 
     #[test]
@@ -8028,7 +8033,7 @@ mod tests {
         // 10,000 `>` markers on one line. Block quotes are parsed iteratively,
         // but the nesting cap must still fire so node growth is bounded.
         let source = format!("{} text\n", ">".repeat(10_000));
-        let start = Instant::now();
+        let start = ThreadTime::now();
         let tree = parse(&source);
         assert!(
             start.elapsed() < SLOW_BOUND,
@@ -8059,7 +8064,7 @@ mod tests {
         // `- - - - ... x` recurses through `classify_item_content`; without a
         // cap this overflows the stack.
         let source = format!("{}x\n", "- ".repeat(10_000));
-        let start = Instant::now();
+        let start = ThreadTime::now();
         let tree = parse(&source);
         assert!(
             start.elapsed() < SLOW_BOUND,
@@ -8093,7 +8098,7 @@ mod tests {
             source.push_str(&" ".repeat(depth * 2));
             source.push_str("- item\n");
         }
-        let start = Instant::now();
+        let start = ThreadTime::now();
         let tree = parse(&source);
         assert!(start.elapsed() < SLOW_BOUND, "nested lists must not hang");
 
@@ -8122,7 +8127,7 @@ mod tests {
         // (`consume_html_raw` -> `handle_html_open`); the cap bounds recursion
         // depth and prevents stack overflow.
         let source = "<div>\n".repeat(10_000);
-        let start = Instant::now();
+        let start = ThreadTime::now();
         let tree = parse(&source);
         assert!(start.elapsed() < SLOW_BOUND, "nested HTML must not hang");
 
@@ -8142,7 +8147,7 @@ mod tests {
         // stack reaches its hard cap before the list cap — exercising the
         // cross-container backstop.
         let source = format!("{}{}x\n", "> ".repeat(90), "- ".repeat(100));
-        let start = Instant::now();
+        let start = ThreadTime::now();
         let tree = parse(&source);
         assert!(
             start.elapsed() < SLOW_BOUND,
@@ -8185,7 +8190,7 @@ mod tests {
         let delim = format!("{}|\n", "|-".repeat(10_000));
         let row = format!("{}|\n", "|b".repeat(10_000));
         let source = format!("{header}{delim}{row}");
-        let start = Instant::now();
+        let start = ThreadTime::now();
         let tree = parse(&source);
         assert!(
             start.elapsed() < SLOW_BOUND,
@@ -8208,7 +8213,7 @@ mod tests {
         for i in 0..10_000 {
             let _ = writeln!(source, "[ref{i}]: https://example.com/{i}");
         }
-        let start = Instant::now();
+        let start = ThreadTime::now();
         let _tree = parse(&source);
         assert!(
             start.elapsed() < SLOW_BOUND,
@@ -8226,7 +8231,7 @@ mod tests {
         while source.len() < 1_000_000 {
             source.push_str(unit);
         }
-        let start = Instant::now();
+        let start = ThreadTime::now();
         let tree = parse(&source);
         let elapsed = start.elapsed();
         assert!(

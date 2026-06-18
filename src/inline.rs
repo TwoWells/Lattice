@@ -1878,8 +1878,14 @@ mod tests {
 
     // --- Pathological inline input (ticket 20) ---
 
-    /// Generous wall-clock bound: catches quadratic backtracking without
-    /// being flaky under CI load.
+    /// Generous per-thread **CPU-time** bound: catches quadratic backtracking
+    /// while remaining immune to scheduling delay. Because CPU time accrues
+    /// only while the thread is actually executing, it excludes time spent
+    /// descheduled, so cross-process contention (e.g. a concurrent full-suite
+    /// run saturating every core) cannot inflate it — unlike a wall-clock
+    /// bound. A linear parse burns ~constant CPU regardless of load; a
+    /// quadratic regression burns orders of magnitude more, so this bound
+    /// stays meaningful without flaking.
     const INLINE_SLOW_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
 
     #[test]
@@ -1888,7 +1894,7 @@ mod tests {
         // O(n) forward scan; the precomputed match table makes the whole scan
         // linear.
         let source = format!("{}\n", "[".repeat(200_000));
-        let start = std::time::Instant::now();
+        let start = cpu_time::ThreadTime::now();
         let tree = parse(&source);
         let elapsed = start.elapsed();
         assert!(
@@ -1905,7 +1911,7 @@ mod tests {
         // matching from each `[` would be O(n^2); the precompute keeps it
         // linear.
         let source = format!("{}]\n", "[".repeat(200_000));
-        let start = std::time::Instant::now();
+        let start = cpu_time::ThreadTime::now();
         let _tree = parse(&source);
         let elapsed = start.elapsed();
         assert!(
@@ -1918,7 +1924,7 @@ mod tests {
     fn long_backtick_run_is_not_quadratic() {
         // A long run of backticks with no matching closer.
         let source = format!("{}\n", "`".repeat(200_000));
-        let start = std::time::Instant::now();
+        let start = cpu_time::ThreadTime::now();
         let _tree = parse(&source);
         let elapsed = start.elapsed();
         assert!(
@@ -1932,7 +1938,7 @@ mod tests {
         // `$a $a $a ...` — each unmatched `$` would scan to end of line; the
         // per-line inline cap bounds the work.
         let source = format!("{}\n", "$a ".repeat(100_000));
-        let start = std::time::Instant::now();
+        let start = cpu_time::ThreadTime::now();
         let _tree = parse(&source);
         let elapsed = start.elapsed();
         assert!(
