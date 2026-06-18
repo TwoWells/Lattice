@@ -498,13 +498,16 @@ fn skip_unknown_html(html: &str, pos: usize) -> Option<usize> {
 //     `collect_emphasis_regions`) already performs.
 //
 // CommonMark 0.31.2 has no strikethrough examples (strikethrough is GFM), so the
-// comparator models only bold (`<strong>`) and italic (`<em>`).
+// CommonMark emphasis section uses only bold (`<strong>`) and italic (`<em>`).
+// The strikethrough bit (`<del>`) is additionally modeled for the GFM
+// strikethrough examples (see `spec_gfm_strikethrough`).
 
-/// Per-character emphasis state: bit 0 = bold, bit 1 = italic.
+/// Per-character emphasis state: bit 0 = bold, bit 1 = italic, bit 2 = strikethrough.
 type Mask = u8;
 
-const BOLD: Mask = 0b01;
-const ITALIC: Mask = 0b10;
+const BOLD: Mask = 0b001;
+const ITALIC: Mask = 0b010;
+const STRIKE: Mask = 0b100;
 
 /// One rendered text character paired with the emphasis active over it.
 type MaskedText = Vec<(char, Mask)>;
@@ -528,6 +531,7 @@ fn html_emphasis_mask(html: &str) -> MaskedText {
     let mut out: MaskedText = Vec::new();
     let mut bold = 0u32;
     let mut italic = 0u32;
+    let mut strike = 0u32;
     let mut in_para = false;
     let mut i = 0;
 
@@ -539,7 +543,7 @@ fn html_emphasis_mask(html: &str) -> MaskedText {
             } else if rest.starts_with("</p>") {
                 in_para = false;
             }
-            i = consume_emphasis_tag(html, i, &mut bold, &mut italic);
+            i = consume_emphasis_tag(html, i, &mut bold, &mut italic, &mut strike);
             continue;
         }
         if !in_para {
@@ -549,7 +553,7 @@ fn html_emphasis_mask(html: &str) -> MaskedText {
         if bytes[i] == b'&'
             && let Some((ch, end)) = decode_entity(html, i)
         {
-            out.push((ch, current_mask(bold, italic)));
+            out.push((ch, current_mask(bold, italic, strike)));
             i = end;
             continue;
         }
@@ -557,15 +561,15 @@ fn html_emphasis_mask(html: &str) -> MaskedText {
             .chars()
             .next()
             .expect("byte index is on a char boundary");
-        out.push((ch, current_mask(bold, italic)));
+        out.push((ch, current_mask(bold, italic, strike)));
         i += ch.len_utf8();
     }
 
     out
 }
 
-/// Mask from the current bold/italic depths.
-const fn current_mask(bold: u32, italic: u32) -> Mask {
+/// Mask from the current bold/italic/strikethrough depths.
+const fn current_mask(bold: u32, italic: u32, strike: u32) -> Mask {
     let mut m = 0;
     if bold > 0 {
         m |= BOLD;
@@ -573,13 +577,23 @@ const fn current_mask(bold: u32, italic: u32) -> Mask {
     if italic > 0 {
         m |= ITALIC;
     }
+    if strike > 0 {
+        m |= STRIKE;
+    }
     m
 }
 
-/// Consume one HTML tag at `pos`, adjusting the bold/italic depth for
-/// `<strong>`/`<em>` (open and close), and skipping every other tag. Returns the
-/// byte position just past the tag's `>` (or past `<` if the tag is unterminated).
-fn consume_emphasis_tag(html: &str, pos: usize, bold: &mut u32, italic: &mut u32) -> usize {
+/// Consume one HTML tag at `pos`, adjusting the bold/italic/strikethrough depth
+/// for `<strong>`/`<em>`/`<del>` (open and close), and skipping every other tag.
+/// Returns the byte position just past the tag's `>` (or past `<` if the tag is
+/// unterminated).
+fn consume_emphasis_tag(
+    html: &str,
+    pos: usize,
+    bold: &mut u32,
+    italic: &mut u32,
+    strike: &mut u32,
+) -> usize {
     let rest = &html[pos..];
     let Some(gt) = rest.find('>') else {
         return pos + 1;
@@ -590,6 +604,8 @@ fn consume_emphasis_tag(html: &str, pos: usize, bold: &mut u32, italic: &mut u32
         "/strong" => *bold = bold.saturating_sub(1),
         "em" => *italic += 1,
         "/em" => *italic = italic.saturating_sub(1),
+        "del" => *strike += 1,
+        "/del" => *strike = strike.saturating_sub(1),
         _ => {}
     }
     pos + gt + 1
@@ -617,14 +633,16 @@ fn decode_entity(html: &str, pos: usize) -> Option<(char, usize)> {
 
 /// Reduce Lattice's tree for an example to the same per-character masked text:
 /// the rendered content of every inline host (`Paragraph` / `Heading`), in
-/// document order, with emphasis delimiters stripped and each surviving
-/// character tagged with the union of `Strong`/`Emphasis` modifiers covering it.
+/// document order, with emphasis delimiters stripped and each surviving character
+/// tagged with the union of `Strong`/`Emphasis`/`Strikethrough` modifiers
+/// covering it.
 ///
-/// A `*`/`_` byte is markup (and dropped) exactly when it is one of the
-/// `open_len` outermost delimiters at the leading or trailing edge of some
-/// emphasis span — `Strong` consumes two at each edge, `Emphasis` one. OR-ing
-/// the modifier bit of every span that covers a surviving byte yields its mask,
-/// matching the cut-point flatten used for semantic tokens.
+/// A `*`/`_`/`~` byte is markup (and dropped) exactly when it is one of the
+/// `open_len` outermost delimiters at the leading or trailing edge of some span —
+/// `Strong` consumes two at each edge, `Emphasis` one, and `Strikethrough` one or
+/// two tildes (read from the slice). OR-ing the modifier bit of every span that
+/// covers a surviving byte yields its mask, matching the cut-point flatten used
+/// for semantic tokens.
 fn tree_emphasis_mask(tree: &Tree) -> MaskedText {
     let source = tree.source();
 
@@ -634,18 +652,25 @@ fn tree_emphasis_mask(tree: &Tree) -> MaskedText {
     let mut is_markup = vec![false; source.len()];
 
     for node in tree.nodes() {
-        let bit = match node.kind {
-            ElementKind::Strong => BOLD,
-            ElementKind::Emphasis => ITALIC,
+        let (start, end) = (node.span.start, node.span.end);
+        // The modifier bit, and how many delimiter chars sit at each edge of the
+        // span. `Strong` is always two (`**`/`__`), `Emphasis` one (`*`/`_`);
+        // `Strikethrough` is one or two tildes — its edges are symmetric per the
+        // parser invariant, so count the leading tilde run.
+        let (bit, open_len) = match node.kind {
+            ElementKind::Strong => (BOLD, 2),
+            ElementKind::Emphasis => (ITALIC, 1),
+            ElementKind::Strikethrough => (
+                STRIKE,
+                source[start..end].chars().take_while(|&c| c == '~').count(),
+            ),
             _ => continue,
         };
-        let (start, end) = (node.span.start, node.span.end);
         for slot in &mut mask[start..end] {
             *slot |= bit;
         }
-        // `Strong` consumes two delimiters at each edge, `Emphasis` one — the
-        // outermost ones. Mark exactly those bytes as dropped markup.
-        let open_len = if bit == BOLD { 2 } else { 1 };
+        // Mark exactly the `open_len` outermost delimiter bytes at each edge as
+        // dropped markup.
         for off in 0..open_len {
             is_markup[start + off] = true;
             is_markup[end - 1 - off] = true;
@@ -956,6 +981,45 @@ fn spec_lists() {
 #[test]
 fn spec_emphasis() {
     run_emphasis_section();
+}
+
+/// The three GFM "Strikethrough (extension)" spec examples (GFM v0.29-gfm, §6.5).
+/// `CommonMark` 0.31.2 has no strikethrough, so these are not in
+/// `commonmark_spec.json`; the section has exactly three examples, transcribed
+/// inline here. Each is reduced to the same bold/italic/strikethrough mask as the
+/// emphasis section and compared. All three are expected to pass: parser 26 pairs
+/// runs of one or two tildes, rejects three-or-more, and collects runs per inline
+/// host, so a strikethrough cannot span the blank line in example 2.
+#[test]
+fn spec_gfm_strikethrough() {
+    // (markdown, expected HTML) — verbatim from the GFM strikethrough spec.
+    const EXAMPLES: &[(&str, &str)] = &[
+        // Single and double tildes both strike.
+        (
+            "~~Hi~~ Hello, ~there~ world!\n",
+            "<p><del>Hi</del> Hello, <del>there</del> world!</p>\n",
+        ),
+        // Strikethrough does not span a paragraph break — both `~~` stay literal.
+        (
+            "This ~~has a\n\nnew paragraph~~.\n",
+            "<p>This ~~has a</p>\n<p>new paragraph~~.</p>\n",
+        ),
+        // Three or more tildes do not strike.
+        (
+            "This will ~~~not~~~ strike.\n",
+            "<p>This will ~~~not~~~ strike.</p>\n",
+        ),
+    ];
+
+    for &(markdown, html) in EXAMPLES {
+        let tree = parse(markdown);
+        let actual = normalize_masked(&tree_emphasis_mask(&tree));
+        let expected = normalize_masked(&html_emphasis_mask(html));
+        assert_eq!(
+            actual, expected,
+            "GFM strikethrough mismatch for {markdown:?}: expected {expected:?}, got {actual:?}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
