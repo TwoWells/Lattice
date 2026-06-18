@@ -566,6 +566,17 @@ fn match_emphasis(base: usize, runs: &[DelimRun], tree: &mut Tree, parent: NodeI
                 break;
             };
 
+            // CommonMark "process emphasis": once an opener and closer are
+            // paired, every delimiter run strictly between them is removed from
+            // the stack — it is now enclosed by the pair and can never match a
+            // delimiter outside it. Omitting this lets an intervening run of a
+            // *different* marker mis-pair across the boundary, emphasizing text
+            // that the spec leaves literal (e.g. the inner `_` in `*foo _bar*`
+            // or the inner `*` in `*foo __bar *baz bim__ bam*`).
+            for slot in &mut remaining[open_idx + 1..close_idx] {
+                *slot = 0;
+            }
+
             if closer.marker == b'~' {
                 // GFM strikethrough: only runs of length 1 or 2 are delimiters,
                 // and an opener pairs with a closer of the *same* original
@@ -2095,6 +2106,47 @@ mod tests {
             em,
             vec!["***foo***".to_string()],
             "outer emphasis run wraps the strong run"
+        );
+    }
+
+    #[test]
+    fn emphasis_intervening_delim_removed_underscore() {
+        // CommonMark example 469: `*foo _bar* baz_`. The `*` pair closes first,
+        // enclosing the inner `_`; that `_` is then removed from the stack and
+        // the trailing `_` finds no opener. Expected `<em>foo _bar</em> baz_`:
+        // exactly one emphasis run, covering `*foo _bar*`, with no strong run and
+        // the second `_` left literal. Before the intervening-delimiter removal,
+        // the two `_` mis-paired and the whole line was emphasized.
+        let tree = parse("*foo _bar* baz_\n");
+        assert_eq!(
+            emphasis_slices(&tree, &ElementKind::Emphasis),
+            vec!["*foo _bar*".to_string()],
+            "the `*` pair encloses the inner `_`, which cannot then pair with the trailing `_`"
+        );
+        assert!(
+            emphasis_slices(&tree, &ElementKind::Strong).is_empty(),
+            "no strong run forms in `*foo _bar* baz_`"
+        );
+    }
+
+    #[test]
+    fn emphasis_intervening_delim_removed_asterisk() {
+        // CommonMark example 470: `*foo __bar *baz bim__ bam*`. The `__` pair
+        // closes first, enclosing the inner `*baz`; that `*` is removed from the
+        // stack, so the final `*` pairs with the leading `*`. Expected
+        // `<em>foo <strong>bar *baz bim</strong> bam</em>`: one emphasis run over
+        // the whole line and one strong run over `__bar *baz bim__`, with the
+        // inner `*` left literal.
+        let tree = parse("*foo __bar *baz bim__ bam*\n");
+        assert_eq!(
+            emphasis_slices(&tree, &ElementKind::Emphasis),
+            vec!["*foo __bar *baz bim__ bam*".to_string()],
+            "the outer `*` pair wraps the whole run once the inner `*` is enclosed by the `__` pair"
+        );
+        assert_eq!(
+            emphasis_slices(&tree, &ElementKind::Strong),
+            vec!["__bar *baz bim__".to_string()],
+            "the `__` pair strongs `bar *baz bim`, leaving the inner `*` literal"
         );
     }
 

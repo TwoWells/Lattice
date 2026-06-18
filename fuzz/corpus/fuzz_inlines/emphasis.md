@@ -6,3 +6,4 @@ Strikethrough ~~struck~~ and single ~one~.
 Nested ***strong in em*** and **bold _and em_**.
 Across a code span *foo `code` bar* and a [link](x.md) too.
 Multibyte **café**, *résumé*, ~~naïve~~ next to ~89 of ~162.
+Enclosed delimiters stay literal: *foo _bar* baz_ and *foo __bar *baz bim__ bam*.
