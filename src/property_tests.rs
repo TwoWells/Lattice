@@ -1337,6 +1337,19 @@ fn carrier_fidelity_holds_on_known_inputs() {
 }
 
 #[test]
+fn carrier_fidelity_unterminated_single_quote_at_eof() {
+    // Issue 041 regression. A `yaml lattice` carrier whose final value is an
+    // unterminated single-quoted scalar (a lone `'`) followed by the body's
+    // trailing newline. The carrier body ends in `'\n`; the synthetic leading
+    // block must present *those exact bytes* as the YAML content, or the
+    // unterminated scalar absorbs a spurious newline and the differential arm
+    // trips on a divergence the parser never produced. The body already ends in
+    // a line ending, so `equivalent_leading_block` must not inject an extra one.
+    let source = "# Title\n\n```yaml lattice\nbacklinks:\n  referenced_by:\n    - ../README.md\nexceptions:\n  stale_references:\n    \"../README.md\": '\n```\n";
+    assert_carrier_fidelity(source);
+}
+
+#[test]
 fn carrier_fidelity_has_teeth() {
     // The invariant is not vacuous: a carrier whose extracted backlinks are
     // *corrupted* away from the source must be caught. `assert_carrier_fidelity`

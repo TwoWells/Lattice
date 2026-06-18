@@ -741,7 +741,12 @@ pub fn assert_carrier_fidelity(source: &str) {
 ///   the leading block would see a *prefix* of the body, not all of it;
 /// - the body opens with a UTF-8 BOM — [`yaml::parse_frontmatter_block`] strips a
 ///   leading BOM transparently, which `parse_yaml_body` does not, so the two
-///   would parse a different first key; conservatively declined.
+///   would parse a different first key; conservatively declined;
+/// - the body does not end in a line ending — the closing `---` must start its
+///   own line, so any wrap would have to *insert* a separator after the body, and
+///   that inserted byte is absorbed by an unterminated trailing scalar (e.g. a
+///   lone `'` at EOF) differently than the carrier's EOF does, so the wrap would
+///   not be byte-equivalent; conservatively declined (issue 041).
 ///
 /// Declining a non-equivalent transform is deliberate: the differential arm must
 /// compare like with like, so a body that cannot round-trip is left to the
@@ -763,11 +768,18 @@ fn equivalent_leading_block(body: &str) -> Option<String> {
     if body.starts_with('\u{feff}') {
         return None;
     }
-    // Separate the body from the closing `---` with a newline so the delimiter is
-    // always at the start of its own line, regardless of whether the body ends in
-    // a newline. The extra trailing blank line cannot change the extracted
-    // backlinks/exceptions structure (a plain-scalar map/sequence shape).
-    Some(format!("---\n{body}\n---\n"))
+    // The carrier body is the bytes between the open and close fence, so it always
+    // ends in the line ending that precedes the closing fence — that terminator is
+    // what puts the synthetic `---` at the start of its own line. Append the
+    // closing delimiter directly after the body (no extra separator) so the
+    // wrapped block's YAML content is byte-identical to the carrier body and both
+    // parsers see the same input. A body that does *not* end in a line ending
+    // cannot be wrapped without inserting a separator the carrier never had — an
+    // unterminated trailing scalar would absorb it (issue 041) — so decline.
+    if !body.ends_with(['\n', '\r']) {
+        return None;
+    }
+    Some(format!("---\n{body}---\n"))
 }
 
 /// Assert two [`Exceptions`] blocks carry the same reconciled metadata.
