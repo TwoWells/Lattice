@@ -681,19 +681,22 @@ fn emit_tree_bare_paths(
     let bare_paths = tree.bare_paths();
     for bare in &bare_paths {
         // An external-namespace reference (`{Name}/…`) is resolved existence-
-        // only against its alias directory, never dir/root-joined (issue 030).
-        if let Some(stale) = external_is_stale(config, external_exists, &bare.path) {
-            if stale {
-                route_stale_reference(
-                    config.policy.stale_references,
-                    rel_path,
-                    bare.line,
-                    None,
-                    &bare.path,
-                    lookup,
-                    out,
-                );
-            }
+        // only against its alias directory, never dir/root-joined (issue 030),
+        // and regardless of extension — a cross-repo directory or non-`.md`
+        // file is a real reference too.
+        if route_external_reference(
+            config,
+            external_exists,
+            config.policy.stale_references,
+            rel_path,
+            bare.line,
+            None,
+            &bare.path,
+            lookup,
+            out,
+        )
+        .is_some()
+        {
             continue;
         }
         if resolves_under_any_base(rel_path, &bare.path, file_exists) {
@@ -931,6 +934,52 @@ fn route_stale_reference(
     }
 }
 
+/// Build the stale-reference diagnostic for a dangling **external** `{Name}/…`
+/// reference (issue 030, tier 4: a defined, present alias whose target is
+/// missing under it).
+///
+/// Distinct from [`build_stale_reference`]: that message frames an intra-repo
+/// dangle ("no such markdown file under this root") and teaches the `{repo}/…`
+/// escape — both wrong here, where the reference *is* already `{repo}/…`, was
+/// resolved against the alias directory rather than this root, and may name a
+/// directory or non-`.md` file. This message instead names the alias and the
+/// directory it resolved to, so the fix (correct the path in the aliased repo,
+/// or repoint the alias) is unambiguous. Severity tracks [`StaleReferencePolicy`]
+/// identically, and `Disabled` returns `None`.
+fn build_external_stale_reference(
+    policy: StaleReferencePolicy,
+    rel_path: &Path,
+    line: usize,
+    span: Option<Span>,
+    reference: &str,
+    alias: &str,
+    config: &Config,
+) -> Option<Diagnostic> {
+    let severity = match policy {
+        StaleReferencePolicy::Disabled => return None,
+        StaleReferencePolicy::Hint => Severity::Hint,
+        StaleReferencePolicy::Warn => Severity::Warning,
+        StaleReferencePolicy::Deny => Severity::Error,
+    };
+    // `Stale` is reached only for a defined alias, so the lookup is present; the
+    // fallback keeps the message coherent rather than panicking if that ever
+    // changes.
+    let dir = config
+        .external
+        .get(alias)
+        .map_or_else(String::new, |p| p.display().to_string());
+
+    Some(Diagnostic {
+        file: rel_path.to_path_buf(),
+        line,
+        severity,
+        message: format!(
+            "stale reference: `{reference}` — external alias `{alias}` resolves to `{dir}`, but no such file or directory exists there; fix the path in that repo (or repoint the `{alias}` alias in .lattice.toml), or except it (see `lattice help config`)"
+        ),
+        span,
+    })
+}
+
 /// Emit diagnostics for bare URLs, quoted paths, and backticked paths found in
 /// inline-host text — paragraphs and table cells alike, matching the cells the
 /// link/edge extractor already walks.
@@ -1002,19 +1051,21 @@ fn emit_bare_path_diagnostics(
                 let path = split_path_fragment(inner).0;
                 let line = block::byte_offset_to_line(source, child.span.start);
                 // An external-namespace reference (`{Name}/…`) is resolved
-                // existence-only against its alias directory (issue 030).
-                if let Some(is_stale) = external_is_stale(config, external_exists, path) {
-                    if is_stale {
-                        route_stale_reference(
-                            stale,
-                            rel_path,
-                            line,
-                            Some(child.span),
-                            inner,
-                            lookup,
-                            out,
-                        );
-                    }
+                // existence-only against its alias directory (issue 030),
+                // regardless of extension.
+                if route_external_reference(
+                    config,
+                    external_exists,
+                    stale,
+                    rel_path,
+                    line,
+                    Some(child.span),
+                    inner,
+                    lookup,
+                    out,
+                )
+                .is_some()
+                {
                     continue;
                 }
                 if resolves_under_any_base(rel_path, path, file_exists) {
@@ -1260,19 +1311,21 @@ fn scan_line_for_quoted_paths(
                     // heading anchor and does not affect file existence.
                     let path = split_path_fragment(inner).0;
                     // An external-namespace reference (`{Name}/…`) resolves
-                    // existence-only against its alias directory (issue 030).
-                    if let Some(is_stale) = external_is_stale(config, external_exists, path) {
-                        if is_stale {
-                            route_stale_reference(
-                                stale,
-                                rel_path,
-                                line_num,
-                                Some(span),
-                                inner,
-                                lookup,
-                                out,
-                            );
-                        }
+                    // existence-only against its alias directory (issue 030),
+                    // regardless of extension.
+                    if route_external_reference(
+                        config,
+                        external_exists,
+                        stale,
+                        rel_path,
+                        line_num,
+                        Some(span),
+                        inner,
+                        lookup,
+                        out,
+                    )
+                    .is_some()
+                    {
                         i = end_abs + 1;
                         continue;
                     }
@@ -1338,11 +1391,21 @@ fn strip_backtick_delimiters(s: &str) -> &str {
 /// root-relative and stays path-shaped (resolved at the workspace root by
 /// [`resolves_under_any_base`]).
 ///
-/// Three shapes are not workspace paths at all, so they are rejected outright
-/// (no make-it-a-link hint, no stale-reference warning): a `~`-leading token
+/// Shapes that are not workspace paths at all are rejected outright (no
+/// make-it-a-link hint, no stale-reference warning): a `~`-leading token
 /// (home-relative, out of the repo, e.g. `~/Projects/Catenary/AGENTS.md`); a
-/// token containing `<` or `>` (a placeholder, e.g. `<name>/SKILL.md`); and a
-/// token containing `*` (a glob, e.g. `NN_*.md`).
+/// token containing `<` or `>` (a placeholder, e.g. `<name>/SKILL.md`); a token
+/// containing `*` (a glob, e.g. `NN_*.md`); and a token containing an ellipsis —
+/// `…` (U+2026) or `...` — which is documentation shorthand for a path shape
+/// (e.g. the `{repo}/…` syntax this tool teaches), not a real file.
+///
+/// An external-namespace token (`{Name}/…`, issue 030) is admitted regardless
+/// of extension — the `.md` scope guards against linkifying non-graph intra-repo
+/// paths, but an external reference is never a local link or a graph edge
+/// (decision 010), so a cross-repo directory or non-`.md` file
+/// (`{Archive}/docs`) is still existence-checked against its alias directory.
+/// The ellipsis exclusion still applies, so the `{Name}/…` placeholder itself
+/// stays exempt while a concrete `{Name}/path` resolves.
 fn looks_like_path(s: &str) -> bool {
     let path = split_path_fragment(s).0;
     !path.is_empty()
@@ -1352,8 +1415,11 @@ fn looks_like_path(s: &str) -> bool {
         && !path.contains('<')
         && !path.contains('>')
         && !path.contains('*')
+        && !path.contains('…')
+        && !path.contains("...")
         && (path.contains('/') || path.contains('.'))
-        && Path::new(path).extension().is_some_and(|ext| ext == "md")
+        && (Path::new(path).extension().is_some_and(|ext| ext == "md")
+            || block::external_namespace(path).is_some())
 }
 
 /// Split a path-shaped token into its path and optional `#fragment`.
@@ -1371,35 +1437,6 @@ fn split_path_fragment(s: &str) -> (&str, Option<&str>) {
     }
 }
 
-/// Recognize an external-namespace reference of the form `{<identifier>}/rest`.
-///
-/// Returns `(alias, rest)` — the bare alias name (inside the braces) and the
-/// path following the `}/` — when the token is shaped as an external reference
-/// (issue 030, decision 010). This is matched **before** the normal dir/root
-/// resolution so the literal `{Name}` component is never dir-joined and
-/// mis-flagged as a dangling intra-repo path.
-///
-/// An identifier is one or more of `[A-Za-z0-9_-]`; the braces must wrap a
-/// non-empty identifier and be immediately followed by `/` and a non-empty
-/// remainder. `{}/x`, `{ }/x`, `{a b}/x`, a bare `{Name}` with no trailing `/`,
-/// and `{Name}/` with no remainder are all rejected — they are not external
-/// references and fall through to ordinary handling.
-fn external_namespace(s: &str) -> Option<(&str, &str)> {
-    let after_brace = s.strip_prefix('{')?;
-    let close = after_brace.find('}')?;
-    let alias = &after_brace[..close];
-    let rest = after_brace[close + 1..].strip_prefix('/')?;
-    if alias.is_empty()
-        || rest.is_empty()
-        || !alias
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-    {
-        return None;
-    }
-    Some((alias, rest))
-}
-
 /// The disposition of an external-namespace reference under its alias.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExternalResolution {
@@ -1415,8 +1452,8 @@ enum ExternalResolution {
 
 /// Resolve an external-namespace reference to its three-tier disposition.
 ///
-/// `alias`/`rest` come from [`external_namespace`]; `external_exists` `stat`s an
-/// absolute filesystem path (decision 010 — existence-only, edge-free: the
+/// `alias`/`rest` come from [`block::external_namespace`]; `external_exists`
+/// `stat`s an absolute filesystem path (decision 010 — existence-only, edge-free: the
 /// aliased directory is touched by `stat` alone, never read, parsed, or
 /// indexed). The tiers (issue 030):
 ///
@@ -1443,21 +1480,45 @@ fn resolve_external(
     }
 }
 
-/// Classify a path-shaped reference as external and report whether it should
-/// draw the stale-reference diagnostic, or `None` if it is not external.
+/// Resolve and route an external-namespace reference, if `reference` is one.
 ///
-/// Returns `Some(true)` for a defined-alias-but-missing-file external reference
-/// (tier 4 — emit stale), `Some(false)` for an exempt or valid external
-/// reference (tiers 1–3 — emit nothing), and `None` when the token is not an
-/// external reference at all (the caller falls through to ordinary resolution).
-/// `reference` is the path part with any `#fragment` already stripped.
-fn external_is_stale(
+/// Returns `Some(())` when `reference` is an external `{Name}/…` token — the
+/// caller has nothing further to do, because an external reference is
+/// existence-only and never a local link, so it skips both the make-it-a-link
+/// nudge and intra-repo resolution (issue 030, decision 010). On the stale tier
+/// (a defined, present alias whose target is missing) it emits the
+/// external-specific stale diagnostic, routed through the exception lookup so a
+/// `{Name}/…`-keyed `stale_references` exception still suppresses it (issue
+/// 031). Returns `None` when the token is not external, so the caller falls
+/// through to ordinary `.md` resolution.
+///
+/// `reference` is the displayed token; any `#fragment` is stripped before
+/// recognition and existence resolution (the fragment is a heading anchor and
+/// does not affect whether the file exists), mirroring the intra-repo arms.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "routing context parameters are distinct concerns"
+)]
+fn route_external_reference(
     config: &Config,
     external_exists: &dyn Fn(&Path) -> bool,
+    policy: StaleReferencePolicy,
+    rel_path: &Path,
+    line: usize,
+    span: Option<Span>,
     reference: &str,
-) -> Option<bool> {
-    let (alias, rest) = external_namespace(reference)?;
-    Some(resolve_external(config, external_exists, alias, rest) == ExternalResolution::Stale)
+    lookup: &ExceptionLookup,
+    out: &mut Vec<Diagnostic>,
+) -> Option<()> {
+    let path = split_path_fragment(reference).0;
+    let (alias, rest) = block::external_namespace(path)?;
+    if resolve_external(config, external_exists, alias, rest) == ExternalResolution::Stale
+        && let Some(diag) =
+            build_external_stale_reference(policy, rel_path, line, span, reference, alias, config)
+    {
+        lookup.route(ExceptionLint::StaleReferences, reference, diag, out);
+    }
+    Some(())
 }
 
 /// Resolve a path-shaped reference against both candidate bases, normalized,
@@ -3276,14 +3337,27 @@ mod tests {
     #[test]
     fn external_namespace_recognizer() {
         assert_eq!(
-            external_namespace("{Catenary}/docs/x.md"),
+            block::external_namespace("{Catenary}/docs/x.md"),
             Some(("Catenary", "docs/x.md")),
             "a leading `{{ident}}/` is recognized, splitting alias from the remainder"
         );
         assert_eq!(
-            external_namespace("{my_repo-2}/x.md"),
+            block::external_namespace("{my_repo-2}/x.md"),
             Some(("my_repo-2", "x.md")),
             "alphanumerics, `_` and `-` are valid identifier characters"
+        );
+        // No extension required: a directory or non-`.md` remainder is still an
+        // external reference (issue 030 — existence-only, edge-free, so the
+        // `.md` graph-edge scope does not apply).
+        assert_eq!(
+            block::external_namespace("{Archive}/docs"),
+            Some(("Archive", "docs")),
+            "an extension-less directory remainder is recognized"
+        );
+        assert_eq!(
+            block::external_namespace("{Archive}/schema.txt"),
+            Some(("Archive", "schema.txt")),
+            "a non-`.md` file remainder is recognized"
         );
         // Not external references — these fall through to ordinary handling.
         for token in [
@@ -3295,7 +3369,7 @@ mod tests {
             "Catenary/x.md",      // no braces
         ] {
             assert_eq!(
-                external_namespace(token),
+                block::external_namespace(token),
                 None,
                 "`{token}` is not an external-namespace reference"
             );
@@ -3408,6 +3482,116 @@ mod tests {
             has_matching(&diags, Severity::Warning, "{repo}/") && has_any(&diags, ".lattice.toml"),
             "the stale message teaches the `{{repo}}/…` external escape: {diags:?}"
         );
+    }
+
+    #[test]
+    fn external_directory_and_non_md_references_are_checked() {
+        // An external `{Name}/…` reference is existence-checked regardless of
+        // extension: a cross-repo *directory* (`{Catenary}/docs`) or non-`.md`
+        // file (`{Catenary}/schema.txt`) is a real reference. It is edge-free and
+        // never a local link (decision 010), so the `.md` graph-edge scope that
+        // gates intra-repo dark matter does not apply. Covered on every citation
+        // surface: bare, backtick, quoted.
+        let config = config_with_catenary_alias();
+        for reference in ["{Catenary}/docs", "{Catenary}/schema.txt"] {
+            for content in [
+                format!("See {reference} for details.\n"),     // bare
+                format!("See `{reference}` for details.\n"),   // backtick
+                format!("See \"{reference}\" for details.\n"), // quoted
+            ] {
+                // Tier 4: alias dir present, target missing under it → stale.
+                let stale = diagnose_with_external(&content, &config, &["/ext/Catenary"]);
+                assert_eq!(
+                    count_matching(&stale, Severity::Warning, "stale reference"),
+                    1,
+                    "a missing external `{reference}` is stale exactly once: {stale:?}"
+                );
+                // Tier 2: alias dir absent → exempt, no diagnostic.
+                let exempt_absent = diagnose_with_external(&content, &config, &[]);
+                assert!(
+                    !has_any(&exempt_absent, "stale reference"),
+                    "an absent alias directory is exempt for `{reference}`: {exempt_absent:?}"
+                );
+                // Tier 1: undefined alias → exempt.
+                let exempt_undef = diagnose(&content);
+                assert!(
+                    !has_any(&exempt_undef, "stale reference"),
+                    "an undefined alias is exempt for `{reference}`: {exempt_undef:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn external_directory_reference_present_is_valid() {
+        // Tier 3 for a directory: the alias dir is present and the referenced
+        // directory exists under it → valid, and (unlike a resolving intra-repo
+        // path) no make-it-a-link nudge, because an external reference is never
+        // a local link.
+        let config = config_with_catenary_alias();
+        let diags = diagnose_with_external(
+            "See `{Catenary}/docs` for details.\n",
+            &config,
+            &["/ext/Catenary", "/ext/Catenary/docs"],
+        );
+        assert!(
+            !has_any(&diags, "stale reference") && !has_any(&diags, "backticked path"),
+            "a present external directory is valid and draws no diagnostic: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn external_stale_message_names_alias_not_intra_repo_escape() {
+        // The external stale message must not reuse the intra-repo framing: the
+        // reference resolves against the alias directory (not "this root"), is
+        // already `{repo}/…` (so teaching that escape is noise), and may name a
+        // directory rather than a "markdown file". It names the alias and the
+        // directory it resolved to instead.
+        let config = config_with_catenary_alias();
+        let diags = diagnose_with_external(
+            "See `{Catenary}/docs` for details.\n",
+            &config,
+            &["/ext/Catenary"],
+        );
+        assert!(
+            has_matching(&diags, Severity::Warning, "external alias `Catenary`"),
+            "the external stale message names the alias: {diags:?}"
+        );
+        assert!(
+            !has_any(&diags, "under this root") && !has_any(&diags, "markdown file"),
+            "it drops the intra-repo 'markdown file under this root' framing: {diags:?}"
+        );
+        assert!(
+            !has_any(&diags, "{repo}/"),
+            "it does not teach the `{{repo}}/…` escape for a reference already using it: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn external_namespace_ellipsis_placeholder_is_exempt() {
+        // The `{repo}/…` syntax this tool teaches is documentation shorthand for
+        // a path *shape*, not a real reference — so a `{Name}/…` (or `{Name}/...`)
+        // placeholder is exempt even when the alias is defined and present, on
+        // every surface (decision 014's move test: there is no target a move
+        // could break). Without this, the syntax description would flag itself —
+        // the regression dogfooding caught when external refs stopped being
+        // `.md`-scoped.
+        let config = config_with_catenary_alias();
+        for placeholder in ["{Catenary}/…", "{Catenary}/..."] {
+            for content in [
+                format!("Write it as {placeholder} for a cross-repo ref.\n"),
+                format!("Write it as `{placeholder}` for a cross-repo ref.\n"),
+                format!("Write it as \"{placeholder}\" for a cross-repo ref.\n"),
+            ] {
+                // Alias dir present (tier-4 territory for a concrete path), yet
+                // the ellipsis placeholder draws nothing.
+                let diags = diagnose_with_external(&content, &config, &["/ext/Catenary"]);
+                assert!(
+                    !has_any(&diags, "stale reference") && !has_any(&diags, "external alias"),
+                    "the `{placeholder}` placeholder is exempt, not a stale reference: {diags:?}"
+                );
+            }
+        }
     }
 
     #[test]

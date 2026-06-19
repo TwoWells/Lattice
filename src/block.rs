@@ -4468,14 +4468,27 @@ const IMPORT_EXTENSIONS: &[&str] = &[".json", ".md", ".toml", ".txt", ".xml", ".
 /// Check whether a string looks like a bare markdown path.
 ///
 /// Scoped to `.md` only (issue 028): `.md` is the extension that forms a graph
-/// edge, so it is the only path-shape worth nudging into a link. A trailing
-/// `#fragment` is stripped before the extension check, so `foo.md#section`
-/// (a genuine anchored reference) is recognized just like `foo.md`.
+/// edge, so it is the only intra-repo path-shape worth nudging into a link. A
+/// trailing `#fragment` is stripped before the extension check, so
+/// `foo.md#section` (a genuine anchored reference) is recognized just like
+/// `foo.md`.
 ///
-/// Three shapes are not workspace paths and are rejected outright: a
-/// `~`-leading token (home-relative, out of the repo), a token containing `<`
-/// or `>` (a placeholder), and a token containing `*` (a glob). These mirror
-/// the same exclusions in the prose path scan ([`crate::structural`]).
+/// An external-namespace token (`{Name}/…`, issue 030) is the one exception to
+/// the `.md` scope: it is recognized regardless of extension, so a cross-repo
+/// directory or non-`.md` reference (`{Archive}/docs`, `{Archive}/schema.txt`)
+/// is collected and existence-checked against its alias directory. The `.md`
+/// rationale does not apply — an external reference never forms a graph edge
+/// (decision 010), and the explicit `{Name}/` brace is a deliberate opt-in, not
+/// the ambiguous prose mention the `.md` scope guards against.
+///
+/// Shapes that are not workspace paths are rejected outright: a `~`-leading
+/// token (home-relative, out of the repo), a token containing `<` or `>` (a
+/// placeholder), a token containing `*` (a glob), and a token containing an
+/// ellipsis — `…` (U+2026) or `...` — which is documentation shorthand for "a
+/// path of this shape" (e.g. the `{repo}/…` syntax this very tool teaches), not
+/// a real file. These mirror the same exclusions in the prose path scan
+/// ([`crate::structural`]) and apply to external tokens too — a `{Name}/…`
+/// placeholder is exempt, while a concrete `{Name}/path` is resolved.
 fn is_bare_path(s: &str) -> bool {
     let path = split_path_fragment(s).0;
     !is_import_directive(path)
@@ -4483,8 +4496,43 @@ fn is_bare_path(s: &str) -> bool {
         && !path.contains('<')
         && !path.contains('>')
         && !path.contains('*')
+        && !path.contains('…')
+        && !path.contains("...")
         && path.contains('/')
-        && is_markdown_ext(Path::new(path))
+        && (is_markdown_ext(Path::new(path)) || external_namespace(path).is_some())
+}
+
+/// Recognize an external-namespace reference of the form `{<identifier>}/rest`.
+///
+/// Returns `(alias, rest)` — the bare alias name (inside the braces) and the
+/// path following the `}/` — when the token is shaped as an external reference
+/// (issue 030, decision 010). This is the single recognizer shared by the bare
+/// scanner ([`is_bare_path`]) and the prose/quoted/backtick scanners
+/// ([`crate::structural`]), so the surfaces cannot drift. It is matched
+/// **before** the normal dir/root resolution so the literal `{Name}` component
+/// is never dir-joined and mis-flagged as a dangling intra-repo path, and
+/// independently of the `.md` extension scope so a cross-repo directory or
+/// non-`.md` file is recognized.
+///
+/// An identifier is one or more of `[A-Za-z0-9_-]`; the braces must wrap a
+/// non-empty identifier and be immediately followed by `/` and a non-empty
+/// remainder. `{}/x`, `{ }/x`, `{a b}/x`, a bare `{Name}` with no trailing `/`,
+/// and `{Name}/` with no remainder are all rejected — they are not external
+/// references and fall through to ordinary handling.
+pub fn external_namespace(s: &str) -> Option<(&str, &str)> {
+    let after_brace = s.strip_prefix('{')?;
+    let close = after_brace.find('}')?;
+    let alias = &after_brace[..close];
+    let rest = after_brace[close + 1..].strip_prefix('/')?;
+    if alias.is_empty()
+        || rest.is_empty()
+        || !alias
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return None;
+    }
+    Some((alias, rest))
 }
 
 /// Split a path-shaped token into its path and optional `#fragment`.
