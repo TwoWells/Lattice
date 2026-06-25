@@ -8074,7 +8074,10 @@ mod tests {
     /// cross-process contention (e.g. a concurrent full-suite run saturating
     /// every core) cannot inflate it — unlike a wall-clock bound. The parse is
     /// single-threaded, so the calling thread's CPU time captures all the work.
-    const SLOW_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
+    /// Set generously to tolerate slower CI hardware (GitHub-hosted runners are
+    /// markedly slower per core than the self-hosted box this was tuned on);
+    /// genuine quadratic blowup is orders of magnitude worse and still trips it.
+    const SLOW_BOUND: std::time::Duration = std::time::Duration::from_secs(30);
 
     #[test]
     fn deeply_nested_block_quotes_hit_limit() {

@@ -1884,9 +1884,12 @@ mod tests {
     /// descheduled, so cross-process contention (e.g. a concurrent full-suite
     /// run saturating every core) cannot inflate it — unlike a wall-clock
     /// bound. A linear parse burns ~constant CPU regardless of load; a
-    /// quadratic regression burns orders of magnitude more, so this bound
-    /// stays meaningful without flaking.
-    const INLINE_SLOW_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+    /// quadratic regression burns orders of magnitude more (seconds → minutes).
+    /// The bound is set generously so slower CI hardware still clears it
+    /// (GitHub-hosted runners are markedly slower per core than the self-hosted
+    /// box this was originally tuned on — the dollar-run case measured ~5.8s
+    /// there), while genuine quadratic blowup never could.
+    const INLINE_SLOW_BOUND: std::time::Duration = std::time::Duration::from_secs(20);
 
     #[test]
     fn unclosed_bracket_run_is_not_quadratic() {

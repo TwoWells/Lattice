@@ -1,12 +1,19 @@
 # Release — on a vX.Y.Z tag push:
 #   1. verify        the tag matches Cargo.toml's version
-#   2. build         cross-platform binaries on the self-hosted fleet
+#   2. build         cross-platform binaries on GitHub-hosted runners
 #   3. publish-crate to crates.io via Trusted Publishing (OIDC — no stored token)
-#   4. release       cut a GitHub Release with the binaries attached
+#   4. release       cut a GitHub Release with the binaries attached + attested
 #
 # Triggered ONLY by tag pushes, which require write access — a fork PR can never
-# trigger this, so it is safe to run on the persistent Windows/macOS runners
-# (the publish credential is never exposed to untrusted code).
+# trigger this, so the publish credential is never exposed to untrusted code.
+#
+# Runners are GitHub-hosted: Linux builds inside ghcr.io/twowells/rust-ci (which
+# carries rustup + the pinned toolchain + cc), Windows on windows-latest (MSVC),
+# macOS on macos-14 (Apple Silicon, Xcode CLT). rustup self-installs the pinned
+# toolchain from rust-toolchain.toml on each, so nothing is pre-provisioned.
+#
+# Release archives are attested with build provenance (actions/attest-build-
+# provenance), giving each binary a verifiable link back to this workflow run.
 #
 # This is the first workflow to create GitHub Releases; v0.1.0 was tagged before
 # it existed (a pre-history crates.io name-grab), so v0.2.0 is the first Release.
@@ -14,9 +21,6 @@
 # One-time setup before the first successful run:
 #   - crates.io  → crate Settings → Trusted Publishing → add repo TwoWells/Lattice
 #                  and workflow file `release.yml`.
-#   - macOS      → register the M2 Max runner (labels: self-hosted,macos,arm64).
-#   - Runner provisioning: rustup everywhere; MSVC Build Tools on Windows;
-#                  Xcode Command Line Tools on macOS; cc/gcc on Linux.
 name: Release
 
 on:
@@ -25,12 +29,13 @@ on:
 
 permissions:
   contents: write # create the GitHub Release
-  id-token: write # OIDC token for crates.io Trusted Publishing
+  id-token: write # OIDC token for crates.io Trusted Publishing + provenance signing
+  attestations: write # write build-provenance attestations for the release archives
 
 jobs:
   # Guard: a pushed tag whose version disagrees with Cargo.toml is a mistake.
   verify:
-    runs-on: homeserver-pool
+    runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.v.outputs.version }}
     steps:
@@ -56,19 +61,19 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
-            runner: homeserver-pool
+            runner: ubuntu-latest
             container: ghcr.io/twowells/rust-ci:latest
             archive: tar
           - target: x86_64-pc-windows-msvc
-            runner: [self-hosted, windows, x64]
+            runner: windows-latest
             archive: zip
           - target: aarch64-apple-darwin
-            runner: [self-hosted, macos, arm64]
+            runner: macos-14
             archive: tar
     runs-on: ${{ matrix.runner }}
-    # Linux builds inside the rust-ci image (bare ARC pod). Windows/macOS define
-    # no matrix container, so this evaluates empty and they build natively on the
-    # VM / M2 Max, which carry their own MSVC / Xcode toolchains.
+    # Linux builds inside the rust-ci image on the hosted runner. Windows/macOS
+    # define no matrix container, so this evaluates empty and they build natively
+    # on windows-latest / macos-14, which carry their own MSVC / Xcode toolchains.
     container: ${{ matrix.container }}
     steps:
       - uses: actions/checkout@v6
@@ -91,8 +96,9 @@ jobs:
 
       - name: Package (zip)
         if: matrix.archive == 'zip'
-        # The self-hosted Windows VM has Windows PowerShell 5.1 (powershell), not
-        # PowerShell 7 (pwsh). Compress-Archive exists in 5.1, so this is unchanged.
+        # windows-latest ships both Windows PowerShell 5.1 (powershell) and
+        # PowerShell 7 (pwsh); we pin `powershell` (5.1) deliberately for a stable,
+        # always-present shell. Compress-Archive is built in there, so this works.
         shell: powershell
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
@@ -109,8 +115,8 @@ jobs:
   # a re-run (or a re-pushed tag) is a harmless no-op rather than a hard failure.
   publish-crate:
     needs: verify
-    runs-on: homeserver-pool
-    # Bare ARC pod → run in the toolchain image (cargo publish + the curl guard).
+    runs-on: ubuntu-latest
+    # Hosted runner → run in the toolchain image (cargo publish + the curl guard).
     container: ghcr.io/twowells/rust-ci:latest
     # Container default shell is sh (dash); force bash for the guard/publish steps.
     defaults:
@@ -157,12 +163,22 @@ jobs:
 
   release:
     needs: [verify, build, publish-crate]
-    runs-on: homeserver-pool
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
+
+      # Sign a build-provenance attestation for every release archive, linking
+      # each binary back to this workflow run. The globs cover the Linux/macOS
+      # tar.gz and the Windows zip; Lattice ships no .sha256 sidecars, so these
+      # match exactly the archives and nothing else.
+      - uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: |
+            dist/lattice-*.tar.gz
+            dist/lattice-*.zip
 
       - uses: softprops/action-gh-release@v3
         with:

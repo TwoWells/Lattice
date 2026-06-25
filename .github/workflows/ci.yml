@@ -1,20 +1,14 @@
 # CI — lint, build, and test Lattice on every push.
 #
-# Runs on the self-hosted ARC pool `homeserver-pool` (ephemeral Linux pods,
-# minRunners: 0 — a fresh container is spun up per job and torn down after).
+# Runs on GitHub-hosted `ubuntu-latest` inside the ghcr.io/twowells/rust-ci
+# image, which bakes in rustup + the pinned toolchain + cc/make/git/pkg-config,
+# so the job needs nothing provisioned on the runner itself.
 #
 # There is intentionally NO `pull_request` trigger. Fork PRs fire only
-# pull_request events (their push happened in the fork), so with
-# push/workflow_dispatch-only triggers a fork PR can never schedule a job onto
-# the self-hosted runners. If you later want CI for outside contributors' PRs,
-# add a SEPARATE workflow with `on: pull_request` pinned to
-# `runs-on: ubuntu-latest` (GitHub-hosted, free on public repos, fork-safe).
-#
-# Runner provisioning required on `homeserver-pool` (bake into the ARC image or
-# install via ansible):
-#   - rustup        (the pinned 1.95 toolchain + rustfmt/clippy install
-#                    themselves from rust-toolchain.toml on first cargo call)
-#   - cc/gcc, git, make, pkg-config   (make check shells out to all of these)
+# pull_request events (their push happened in the fork), so push/
+# workflow_dispatch-only triggers mean a fork PR never schedules a job here.
+# If you later want CI for outside contributors' PRs, add a SEPARATE workflow
+# with `on: pull_request` (also `ubuntu-latest`, free on public repos).
 name: CI
 
 on:
@@ -28,8 +22,8 @@ concurrency:
 
 jobs:
   check:
-    runs-on: homeserver-pool
-    # The ARC pod is a bare runner with no Rust. This image bakes in rustup + the
+    runs-on: ubuntu-latest
+    # The hosted runner has no pinned Rust. This image bakes in rustup + the
     # pinned toolchain + cc/make/git, so the job doesn't reprovision every run.
     container: ghcr.io/twowells/rust-ci:latest
     # Inside a container job GitHub's default shell is sh (dash); force bash so
