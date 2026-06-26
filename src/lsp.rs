@@ -504,8 +504,6 @@ pub mod symbol_kind {
     pub const STRUCT: u32 = 23;
     /// Event (form elements: `<input>`, `<select>`, `<textarea>`).
     pub const EVENT: u32 = 24;
-    /// Operator (thematic breaks).
-    pub const OPERATOR: u32 = 25;
 }
 
 /// LSP `CompletionItemKind` constants (subset).

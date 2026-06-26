@@ -455,12 +455,14 @@ fn element_symbol_kind(kind: &ElementKind) -> Option<u32> {
         | ElementKind::Admonition { .. }
         | ElementKind::Details
         | ElementKind::Container => Some(lsp::symbol_kind::MODULE),
-        ElementKind::Rules => Some(lsp::symbol_kind::OPERATOR),
         ElementKind::FootnoteDef { .. } => Some(lsp::symbol_kind::CONSTANT),
         ElementKind::FormControl => Some(lsp::symbol_kind::EVENT),
         ElementKind::FrontmatterKey { .. } => Some(lsp::symbol_kind::FIELD),
-        // Not emitted: leaf content nodes, structural internals.
-        ElementKind::Document
+        // Not emitted: leaf content nodes, structural internals, and thematic
+        // breaks (`---`/`***`/`___`) — they are visual separators, not outline
+        // entries, and only clutter the symbol list.
+        ElementKind::Rules
+        | ElementKind::Document
         | ElementKind::Paragraph
         | ElementKind::HtmlBlock
         | ElementKind::InlineCode
@@ -5423,13 +5425,12 @@ mod tests {
     }
 
     #[test]
-    fn thematic_break_emits_operator() {
-        let syms = symbols_for("---\n");
-        let breaks = find_symbols(&syms, &|s| s.kind == lsp::symbol_kind::OPERATOR);
-        assert_eq!(breaks.len(), 1, "should have one thematic break");
-        assert_eq!(
-            breaks[0].name, "Break",
-            "thematic break name should be Break"
+    fn thematic_break_not_emitted() {
+        let syms = symbols_for("# Heading\n\n---\n");
+        let all = find_symbols(&syms, &|_| true);
+        assert!(
+            all.iter().all(|s| s.name != "Break"),
+            "thematic breaks are visual separators and should not appear in the symbol list"
         );
     }
 
@@ -5498,9 +5499,9 @@ mod tests {
             TaggedSymbol {
                 level: 0,
                 symbol: lsp::DocumentSymbol {
-                    name: "---".to_string(),
+                    name: "link".to_string(),
                     detail: None,
-                    kind: lsp::symbol_kind::OPERATOR,
+                    kind: lsp::symbol_kind::FUNCTION,
                     range: lsp::Range::default(),
                     selection_range: lsp::Range::default(),
                     children: None,
@@ -5509,15 +5510,19 @@ mod tests {
         ];
 
         let symbols = nest_by_heading_level(tagged);
-        assert_eq!(symbols.len(), 1, "thematic break should nest under heading");
+        assert_eq!(
+            symbols.len(),
+            1,
+            "non-heading symbol should nest under heading"
+        );
         let children = symbols[0]
             .children
             .as_ref()
             .expect("heading should have children");
         assert_eq!(
             children[0].kind,
-            lsp::symbol_kind::OPERATOR,
-            "child should be the thematic break"
+            lsp::symbol_kind::FUNCTION,
+            "child should be the non-heading symbol"
         );
     }
 
