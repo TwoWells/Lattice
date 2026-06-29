@@ -166,6 +166,14 @@ pub struct DidOpenTextDocumentParams {
     pub text_document: TextDocumentItem,
 }
 
+/// `textDocument/didClose` params.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DidCloseTextDocumentParams {
+    /// The closed document.
+    pub text_document: TextDocumentIdentifier,
+}
+
 /// `textDocument/didSave` params.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -218,13 +226,30 @@ pub struct DidChangeWatchedFilesParams {
 
 /// A single watched-file change event.
 ///
-/// The wire form also carries a numeric `type` (created/changed/deleted) which
-/// Lattice does not read: any event for `.lattice.toml` triggers a config
-/// reload, and a deletion correctly falls back to defaults via `Config::load`.
+/// The marker (`.lattice.toml`) path ignores `change_type` — any event reloads
+/// config, and a deletion correctly falls back to defaults via `Config::load`.
+/// The `.md` document path branches on it (ticket server 09): created/deleted
+/// are membership changes honored regardless of open state, while a `changed`
+/// event re-reads disk only for files not currently open in the editor — the
+/// synced buffer is authoritative (decision 017 §3).
 #[derive(Debug, Deserialize)]
 pub struct FileEvent {
     /// The changed file's URI.
     pub uri: String,
+    /// The change kind: see [`file_change_type`].
+    #[serde(rename = "type")]
+    pub change_type: u8,
+}
+
+/// `FileChangeType` values carried by a [`FileEvent`]'s `type` field
+/// (`workspace/didChangeWatchedFiles`).
+pub mod file_change_type {
+    /// The watched file was created.
+    pub const CREATED: u8 = 1;
+    /// The watched file's content changed.
+    pub const CHANGED: u8 = 2;
+    /// The watched file was deleted.
+    pub const DELETED: u8 = 3;
 }
 
 // ---------------------------------------------------------------------------
@@ -603,6 +628,8 @@ pub mod method {
     // Notifications
     /// `textDocument/didOpen`.
     pub const DID_OPEN: &str = "textDocument/didOpen";
+    /// `textDocument/didClose`.
+    pub const DID_CLOSE: &str = "textDocument/didClose";
     /// `textDocument/didSave`.
     pub const DID_SAVE: &str = "textDocument/didSave";
     /// `textDocument/didChange`.

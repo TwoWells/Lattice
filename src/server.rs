@@ -55,6 +55,18 @@ struct Workspaces {
     /// materialization cache). Only non-empty entries are stored, so an absent
     /// entry means the client currently holds no diagnostics for that URI.
     published: HashMap<String, PublishedDiagnostics>,
+    /// URIs of documents currently open in the editor — live between
+    /// `textDocument/didOpen` and `textDocument/didClose`.
+    ///
+    /// The editor buffer is authoritative for these (decision 017 §3): a
+    /// `workspace/didChangeWatchedFiles` `changed` event carries *disk* content,
+    /// so honoring it for a file open with unsaved edits would clobber the live
+    /// buffer with stale bytes — and an open file edited in the editor already
+    /// reaches the server through `didChange`, so the watcher event would be a
+    /// second source of truth (the issue 009 duplication class). A `changed`
+    /// event is therefore dropped while its URI is in this set; create/delete
+    /// membership events are honored regardless (ticket server 09).
+    open_documents: HashSet<String>,
 }
 
 impl Workspaces {
@@ -82,6 +94,7 @@ impl Workspaces {
         Self {
             inner,
             published: HashMap::new(),
+            open_documents: HashSet::new(),
         }
     }
 
@@ -166,9 +179,15 @@ const WATCHED_FILES_REGISTRATION_ID: &str = "lattice-watched-files";
 const REGISTER_CAPABILITY_REQUEST_ID: &str = "lattice-register-capability";
 
 /// Glob the marker watcher subscribes to: the project-level `.lattice.toml`
-/// at any depth under a workspace folder (decision 017, ticket server 08). The
-/// `**/*.md` document watch is deliberately a separate ticket (09).
+/// at any depth under a workspace folder (decision 017, ticket server 08).
 const LATTICE_TOML_WATCH_GLOB: &str = "**/.lattice.toml";
+
+/// Glob the document watcher subscribes to: every markdown file at any depth
+/// under a workspace folder (decision 017, ticket server 09). Catches on-disk
+/// `.md` changes for files that are not open in the editor, where
+/// `textDocument` sync never fires; the buffer-wins rule reconciles it with the
+/// document-sync channel for open files.
+const MD_WATCH_GLOB: &str = "**/*.md";
 
 /// Run the LSP server on stdio.
 ///
@@ -271,12 +290,13 @@ fn serve(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Register the `.lattice.toml` watcher with the client.
+/// Register the watched-file globs with the client.
 ///
 /// Sends a `client/registerCapability` request for
-/// `workspace/didChangeWatchedFiles` with a single watcher glob,
-/// [`LATTICE_TOML_WATCH_GLOB`]. This is the only way to subscribe to file
-/// changes — there is no static server-capability field for watchers
+/// `workspace/didChangeWatchedFiles` with two watcher globs: the marker
+/// [`LATTICE_TOML_WATCH_GLOB`] (ticket server 08) and the document
+/// [`MD_WATCH_GLOB`] (ticket server 09). This is the only way to subscribe to
+/// file changes — there is no static server-capability field for watchers
 /// (decision 017). The request is fire-and-forget: the client's `Response` is
 /// discarded by [`main_loop`], so a fixed registration id and request id are
 /// sufficient.
@@ -288,7 +308,8 @@ fn register_watched_files(connection: &Connection) -> Result<()> {
                 "method": lsp::method::DID_CHANGE_WATCHED_FILES,
                 "registerOptions": {
                     "watchers": [
-                        { "globPattern": LATTICE_TOML_WATCH_GLOB }
+                        { "globPattern": LATTICE_TOML_WATCH_GLOB },
+                        { "globPattern": MD_WATCH_GLOB }
                     ]
                 }
             }
@@ -311,6 +332,16 @@ fn uri_to_path(uri: &str) -> PathBuf {
 /// Convert a filesystem path to an LSP URI string.
 fn path_to_uri(path: &Path) -> String {
     format!("file://{}", path.display())
+}
+
+/// Whether a URI names a markdown file (a case-insensitive `.md` extension),
+/// matching how [`crate::workspace`] discovers indexed files. Used to route a
+/// `workspace/didChangeWatchedFiles` event onto the document-sync path
+/// (ticket server 09).
+fn is_markdown_uri(uri: &str) -> bool {
+    Path::new(uri)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
 }
 
 /// Main message loop.
@@ -3374,10 +3405,25 @@ fn handle_notification(
     match notif.method.as_str() {
         lsp::method::DID_OPEN => {
             let params: lsp::DidOpenTextDocumentParams = serde_json::from_value(notif.params)?;
+            // The editor now owns this document's truth: while it is open, a
+            // watched-file `changed` event for the same URI is dropped so the
+            // synced buffer is never clobbered by stale disk bytes (decision 017
+            // §3, ticket server 09).
+            workspaces
+                .open_documents
+                .insert(params.text_document.uri.clone());
             if let Some((ws, rel_path)) = workspaces.resolve_mut(&params.text_document.uri) {
                 ws.update_content(&rel_path, &params.text_document.text);
             }
             publish_all_diagnostics(connection, workspaces, Some(&params.text_document.uri))?;
+        }
+        lsp::method::DID_CLOSE => {
+            let params: lsp::DidCloseTextDocumentParams = serde_json::from_value(notif.params)?;
+            // The buffer is gone, so the document is no longer editor-authoritative
+            // and watched-file `changed` events for it are honored again. The
+            // on-disk content stays indexed — closing a file does not drop it from
+            // the workspace (ticket server 09).
+            workspaces.open_documents.remove(&params.text_document.uri);
         }
         lsp::method::DID_SAVE => {
             let params: lsp::DidSaveTextDocumentParams = serde_json::from_value(notif.params)?;
@@ -3436,27 +3482,70 @@ fn handle_notification(
         }
         lsp::method::DID_CHANGE_WATCHED_FILES => {
             let params: lsp::DidChangeWatchedFilesParams = serde_json::from_value(notif.params)?;
-            // Reload config for every workspace whose `.lattice.toml` changed.
-            // The marker watch is the only registered glob (ticket server 08),
-            // but guard on the suffix so an unrelated future glob can never
-            // trigger a config reload.
+            // Two registered globs (decision 017): the `.lattice.toml` marker
+            // (ticket server 08) and `**/*.md` documents (ticket server 09).
+            // Branch on the URI so each takes its own reconciliation path.
             let mut reloaded = false;
+            // `.md` URIs whose on-disk state was applied. Each needs a
+            // graph-aware re-publish — a content or membership change can move
+            // *other* files' backlink/forward edges — so this mirrors how
+            // `didSave` re-publishes through `publish_all_diagnostics`.
+            let mut changed_docs: Vec<String> = Vec::new();
             for change in &params.changes {
-                if !change.uri.ends_with(".lattice.toml") {
+                if change.uri.ends_with(".lattice.toml") {
+                    // The marker watch is config: any event reloads it. Guard on
+                    // the suffix so an unrelated future glob can never trigger a
+                    // config reload.
+                    if let Some((workspace, _rel)) = workspaces.resolve_mut(&change.uri) {
+                        workspace.reload_config();
+                        reloaded = true;
+                    }
                     continue;
                 }
-                if let Some((workspace, _rel)) = workspaces.resolve_mut(&change.uri) {
-                    workspace.reload_config();
-                    reloaded = true;
+                if !is_markdown_uri(&change.uri) {
+                    continue;
+                }
+                match change.change_type {
+                    // `changed` carries disk content; for a file open in the
+                    // editor the synced buffer wins, so the event is dropped
+                    // (decision 017 §3). The open file already reaches the server
+                    // through `didChange`, so honoring the watcher too would also
+                    // double-deliver (the issue 009 class).
+                    lsp::file_change_type::CHANGED
+                        if workspaces.open_documents.contains(&change.uri) => {}
+                    // created / deleted are membership changes honored regardless
+                    // of open state; a non-open `changed` re-reads disk. All three
+                    // route through `Workspace::update`, which re-reads disk —
+                    // reparsing a created/changed file and dropping a deleted one —
+                    // and refreshes the structural caches.
+                    lsp::file_change_type::CREATED
+                    | lsp::file_change_type::CHANGED
+                    | lsp::file_change_type::DELETED => {
+                        if let Some((workspace, rel_path)) = workspaces.resolve_mut(&change.uri) {
+                            let _ = workspace.update(&rel_path);
+                            changed_docs.push(change.uri.clone());
+                        }
+                    }
+                    _ => {}
                 }
             }
             // A marker change invalidates the whole workspace (predicates,
             // artifacts, overrides, and external aliases all feed parse and
             // structural analysis), so take the full re-publish path, not the
-            // `has_config()`-gated single-file delta (decision 017). No single
-            // file's text changed, so pass `None`.
-            if reloaded {
+            // `has_config()`-gated single-file delta (decision 017). When `.md`
+            // files also changed, the per-document publishes below already run
+            // the full graph diff against the freshly reloaded config, so a
+            // marker-only notification is the only case that needs this `None`
+            // publish.
+            if reloaded && changed_docs.is_empty() {
                 publish_all_diagnostics(connection, workspaces, None)?;
+            }
+            // Re-publish each applied `.md` change through the graph-aware path,
+            // naming the document so its own materialization is refreshed
+            // unconditionally (its disk content changed). The whole-graph diff
+            // inside each call also catches any other file whose edges moved.
+            for uri in &changed_docs {
+                publish_all_diagnostics(connection, workspaces, Some(uri))?;
             }
         }
         _ => {}
@@ -3852,6 +3941,7 @@ mod tests {
         Workspaces {
             inner: BTreeMap::from([(root, ws)]),
             published: HashMap::new(),
+            open_documents: HashSet::new(),
         }
     }
 
@@ -7911,6 +8001,10 @@ mod tests {
             reg_json.contains(LATTICE_TOML_WATCH_GLOB),
             "the registration watches the marker glob: {reg_json}"
         );
+        assert!(
+            reg_json.contains(MD_WATCH_GLOB),
+            "the registration also watches the markdown document glob (ticket server 09): {reg_json}"
+        );
 
         // Opening doc.md surfaces the stale-reference diagnostic.
         open_doc(&client, &doc_uri, "See `catenary.md` here.\n");
@@ -8011,6 +8105,241 @@ mod tests {
         assert!(
             !publish.is_empty(),
             "the server survived the malformed payload and still publishes, got {publish:?}"
+        );
+
+        shutdown(&client, server_thread);
+    }
+
+    // -----------------------------------------------------------------------
+    // Watched-file document sync (ticket server 09, decision 017 §3)
+    //
+    // Same in-memory `Connection` harness as the ticket-08 tests: a `**/*.md`
+    // watcher reconciled with the document-sync channel by the buffer-wins
+    // rule and an open-document set.
+    // -----------------------------------------------------------------------
+
+    /// Deliver a `workspace/didChangeWatchedFiles` event for one URI with the
+    /// given `FileChangeType` (1 = created, 2 = changed, 3 = deleted).
+    fn send_watched_change(client: &Connection, uri: &str, change_type: u8) {
+        send_notification(
+            client,
+            lsp::method::DID_CHANGE_WATCHED_FILES,
+            serde_json::json!({ "changes": [ { "uri": uri, "type": change_type } ] }),
+        );
+    }
+
+    /// Deliver a `textDocument/didClose` for `uri`.
+    fn send_close(client: &Connection, uri: &str) {
+        send_notification(
+            client,
+            lsp::method::DID_CLOSE,
+            serde_json::json!({ "textDocument": { "uri": uri } }),
+        );
+    }
+
+    /// Whether any diagnostic in `diags` (wire JSON) has a message containing
+    /// `needle`.
+    fn any_message_contains(diags: &[serde_json::Value], needle: &str) -> bool {
+        diags.iter().any(|d| {
+            d.get("message")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|m| m.contains(needle))
+        })
+    }
+
+    /// Send a request and drain server messages until its matching response,
+    /// returning the response `result` (or `Null` on an error response).
+    fn request_response(
+        client: &Connection,
+        id: i32,
+        method: &str,
+        params: serde_json::Value,
+    ) -> serde_json::Value {
+        client
+            .sender
+            .send(Message::Request(Request::new(
+                RequestId::from(id),
+                method.to_string(),
+                params,
+            )))
+            .expect("send request");
+        for _ in 0..32 {
+            if let Message::Response(resp) = recv_message(client)
+                && resp.id == RequestId::from(id)
+            {
+                return resp.result.unwrap_or(serde_json::Value::Null);
+            }
+        }
+        panic!("no response for request {id} after 32 messages");
+    }
+
+    #[test]
+    fn closed_md_disk_change_updates_own_diagnostics() {
+        // A `.md` file that is never opened in the editor still tracks disk: a
+        // clean file edited on disk to introduce a stale reference reaches the
+        // workspace graph through the watcher, without a restart.
+        let dir = workspace_with_files(&[("doc.md", "# Clean\n")]);
+        let root = fs::canonicalize(dir.path()).expect("canonicalize temp dir");
+        let root_uri = path_to_uri(&root);
+        let doc_uri = path_to_uri(&root.join("doc.md"));
+
+        let (server, client) = Connection::memory();
+        let server_thread = std::thread::spawn(move || serve(&server));
+
+        handshake(&client, &root_uri, true);
+        let reg = recv_message(&client);
+        assert!(
+            matches!(reg, Message::Request(_)),
+            "the registration request precedes the watched change, got {reg:?}"
+        );
+
+        // doc.md is never opened. Mutate it on disk, then deliver the watcher
+        // `changed` event.
+        fs::write(root.join("doc.md"), "See `gone.md` here.\n").expect("rewrite doc.md on disk");
+        send_watched_change(&client, &doc_uri, lsp::file_change_type::CHANGED);
+
+        let after = recv_publish_for(&client, &doc_uri);
+        assert!(
+            any_message_contains(&after, "stale reference"),
+            "a closed file's on-disk change reaches the graph without a restart, got {after:?}"
+        );
+
+        shutdown(&client, server_thread);
+    }
+
+    #[test]
+    fn watched_create_and_delete_update_cross_file_edges() {
+        // a.md makes a bare-path reference to docs/page.md and is never opened.
+        // Creating the target on disk and delivering the watcher `created`
+        // event flips a.md to the make-it-a-link nudge — a cross-file edge moved
+        // by a membership change; deleting it flips a.md back to a stale
+        // reference. Both reach the closed source through the graph-aware
+        // re-publish.
+        let dir = workspace_with_files(&[("a.md", "See docs/page.md for details.\n")]);
+        let root = fs::canonicalize(dir.path()).expect("canonicalize temp dir");
+        let root_uri = path_to_uri(&root);
+        let a_uri = path_to_uri(&root.join("a.md"));
+        let page_uri = path_to_uri(&root.join("docs/page.md"));
+
+        let (server, client) = Connection::memory();
+        let server_thread = std::thread::spawn(move || serve(&server));
+
+        handshake(&client, &root_uri, true);
+        let reg = recv_message(&client);
+        assert!(
+            matches!(reg, Message::Request(_)),
+            "the registration request precedes the membership changes, got {reg:?}"
+        );
+
+        // Create the target on disk; deliver the `created` event.
+        fs::create_dir_all(root.join("docs")).expect("create docs dir");
+        fs::write(root.join("docs/page.md"), "# Page\n").expect("write page.md");
+        send_watched_change(&client, &page_uri, lsp::file_change_type::CREATED);
+        let created = recv_publish_for(&client, &a_uri);
+        assert!(
+            any_message_contains(&created, "convert to a markdown link"),
+            "creating the target flips the closed source's bare path to make-it-a-link, got {created:?}"
+        );
+
+        // Delete the target; deliver the `deleted` event.
+        fs::remove_file(root.join("docs/page.md")).expect("delete page.md");
+        send_watched_change(&client, &page_uri, lsp::file_change_type::DELETED);
+        let deleted = recv_publish_for(&client, &a_uri);
+        assert!(
+            any_message_contains(&deleted, "stale reference"),
+            "deleting the target flips the closed source back to a stale reference, got {deleted:?}"
+        );
+
+        shutdown(&client, server_thread);
+    }
+
+    #[test]
+    fn open_md_buffer_wins_then_close_reenables_watcher() {
+        // Decision 017 §3: while a `.md` file is open the synced buffer is
+        // authoritative. A watched `changed` event carrying divergent disk bytes
+        // is dropped — no diagnostic regresses to the on-disk version, and the
+        // open file's single edit is never delivered twice (issue 009 class).
+        // After didClose the watcher is re-enabled and the next `changed` event
+        // re-reads disk.
+        let dir = workspace_with_files(&[("doc.md", "See `disk-only.md` here.\n")]);
+        let root = fs::canonicalize(dir.path()).expect("canonicalize temp dir");
+        let root_uri = path_to_uri(&root);
+        let doc_uri = path_to_uri(&root.join("doc.md"));
+
+        let (server, client) = Connection::memory();
+        let server_thread = std::thread::spawn(move || serve(&server));
+
+        handshake(&client, &root_uri, true);
+        let reg = recv_message(&client);
+        assert!(
+            matches!(reg, Message::Request(_)),
+            "the registration request precedes the document sync, got {reg:?}"
+        );
+
+        // Open with a buffer that references a different (also absent) file than
+        // disk. The publish reflects the buffer.
+        open_doc(&client, &doc_uri, "See `buffer-only.md` here.\n");
+        let opened = recv_publish_for(&client, &doc_uri);
+        assert!(
+            any_message_contains(&opened, "buffer-only.md"),
+            "the open buffer's diagnostic reflects the buffer, not the disk, got {opened:?}"
+        );
+
+        // A watched `changed` event for the still-open file is dropped: no
+        // publish arrives, so the buffer is not clobbered by stale disk bytes.
+        send_watched_change(&client, &doc_uri, lsp::file_change_type::CHANGED);
+        assert!(
+            client
+                .receiver
+                .recv_timeout(std::time::Duration::from_millis(300))
+                .is_err(),
+            "an open file's watched `changed` event is dropped — buffer wins, no double delivery"
+        );
+
+        // Close the file, then deliver the same event: now honored, disk wins.
+        send_close(&client, &doc_uri);
+        send_watched_change(&client, &doc_uri, lsp::file_change_type::CHANGED);
+        let after = recv_publish_for(&client, &doc_uri);
+        assert!(
+            any_message_contains(&after, "disk-only.md"),
+            "after didClose the watcher re-reads disk: the diagnostic now reflects disk, got {after:?}"
+        );
+
+        shutdown(&client, server_thread);
+    }
+
+    #[test]
+    fn did_close_keeps_indexed_content() {
+        // didClose removes the URI from the open set but must NOT drop the
+        // file's indexed content — the last-synced content stays queryable.
+        // Observe via documentSymbol after the close: the buffer heading is
+        // still resolved.
+        let dir = workspace_with_files(&[("doc.md", "# On Disk\n")]);
+        let root = fs::canonicalize(dir.path()).expect("canonicalize temp dir");
+        let root_uri = path_to_uri(&root);
+        let doc_uri = path_to_uri(&root.join("doc.md"));
+
+        let (server, client) = Connection::memory();
+        let server_thread = std::thread::spawn(move || serve(&server));
+
+        // No watcher needed for this test; skip the registration entirely.
+        handshake(&client, &root_uri, false);
+
+        // Open with a buffer heading that differs from disk, then close. The
+        // clean buffer publishes nothing, so there is no publish to drain.
+        open_doc(&client, &doc_uri, "# In Buffer\n");
+        send_close(&client, &doc_uri);
+
+        let symbols = request_response(
+            &client,
+            2,
+            lsp::method::DOCUMENT_SYMBOL,
+            serde_json::json!({ "textDocument": { "uri": doc_uri } }),
+        );
+        let json = serde_json::to_string(&symbols).expect("serialize document symbols");
+        assert!(
+            json.contains("In Buffer"),
+            "after didClose the file stays indexed with its last-synced content: {json}"
         );
 
         shutdown(&client, server_thread);
