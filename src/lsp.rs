@@ -61,6 +61,26 @@ pub struct InitializeParams {
     pub workspace_folders: Option<Vec<WorkspaceFolder>>,
     /// Deprecated root URI fallback.
     pub root_uri: Option<String>,
+    /// Client capabilities (the subset Lattice reads).
+    #[serde(default)]
+    pub capabilities: ClientCapabilities,
+}
+
+impl InitializeParams {
+    /// Whether the client advertises dynamic registration for
+    /// `workspace/didChangeWatchedFiles`.
+    ///
+    /// File watchers are dynamic-registration only — there is no static server
+    /// capability for them — so Lattice registers the `.lattice.toml` watcher
+    /// at runtime via `client/registerCapability` only when this is `true`
+    /// (decision 017). A client without it degrades to startup-only config.
+    #[must_use]
+    pub const fn supports_watched_files_dynamic_registration(&self) -> bool {
+        self.capabilities
+            .workspace
+            .did_change_watched_files
+            .dynamic_registration
+    }
 }
 
 /// A workspace folder.
@@ -68,6 +88,32 @@ pub struct InitializeParams {
 pub struct WorkspaceFolder {
     /// Folder URI.
     pub uri: String,
+}
+
+/// Subset of the client capabilities Lattice reads.
+#[derive(Debug, Default, Deserialize)]
+pub struct ClientCapabilities {
+    /// Workspace-level capabilities.
+    #[serde(default)]
+    pub workspace: WorkspaceClientCapabilities,
+}
+
+/// Subset of the `workspace`-level client capabilities Lattice reads.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceClientCapabilities {
+    /// The client's `didChangeWatchedFiles` capability.
+    #[serde(default)]
+    pub did_change_watched_files: DidChangeWatchedFilesClientCapabilities,
+}
+
+/// Subset of the client's `workspace/didChangeWatchedFiles` capability.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DidChangeWatchedFilesClientCapabilities {
+    /// Whether the client supports dynamic registration for file watching.
+    #[serde(default)]
+    pub dynamic_registration: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -161,6 +207,24 @@ pub struct WorkspaceFoldersChangeEvent {
     pub added: Vec<WorkspaceFolder>,
     /// Removed folders.
     pub removed: Vec<WorkspaceFolder>,
+}
+
+/// `workspace/didChangeWatchedFiles` params.
+#[derive(Debug, Deserialize)]
+pub struct DidChangeWatchedFilesParams {
+    /// The file change events.
+    pub changes: Vec<FileEvent>,
+}
+
+/// A single watched-file change event.
+///
+/// The wire form also carries a numeric `type` (created/changed/deleted) which
+/// Lattice does not read: any event for `.lattice.toml` triggers a config
+/// reload, and a deletion correctly falls back to defaults via `Config::load`.
+#[derive(Debug, Deserialize)]
+pub struct FileEvent {
+    /// The changed file's URI.
+    pub uri: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -545,10 +609,14 @@ pub mod method {
     pub const DID_CHANGE: &str = "textDocument/didChange";
     /// `workspace/didChangeWorkspaceFolders`.
     pub const DID_CHANGE_WORKSPACE_FOLDERS: &str = "workspace/didChangeWorkspaceFolders";
+    /// `workspace/didChangeWatchedFiles`.
+    pub const DID_CHANGE_WATCHED_FILES: &str = "workspace/didChangeWatchedFiles";
     /// `textDocument/publishDiagnostics`.
     pub const PUBLISH_DIAGNOSTICS: &str = "textDocument/publishDiagnostics";
 
     // Requests
+    /// `client/registerCapability` (server-originated request).
+    pub const REGISTER_CAPABILITY: &str = "client/registerCapability";
     /// `textDocument/documentSymbol`.
     pub const DOCUMENT_SYMBOL: &str = "textDocument/documentSymbol";
     /// `workspace/symbol`.

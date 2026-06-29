@@ -12,7 +12,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use lsp_server::{Connection, Message, Notification, Response};
+use lsp_server::{Connection, Message, Notification, Request, RequestId, Response};
 
 use crate::block::{
     ElementKind, Heading, HeadingId, LinkKind, NodeId, Syntax, Tree, content_lines, first_line,
@@ -153,6 +153,23 @@ const SEMANTIC_MODIFIER_ITALIC_BIT: u32 = 1 << 1;
 /// array.
 const SEMANTIC_MODIFIER_STRIKETHROUGH_BIT: u32 = 1 << 2;
 
+/// Fixed registration id for the `.lattice.toml` watcher.
+///
+/// Registration is fire-and-forget — Lattice registers the watcher once after
+/// initialization and never unregisters it — so a constant id suffices
+/// (decision 017, ticket server 08).
+const WATCHED_FILES_REGISTRATION_ID: &str = "lattice-watched-files";
+
+/// Fixed request id for the server-originated `client/registerCapability`
+/// request. The client's response is discarded by [`main_loop`], so a constant
+/// id is fine.
+const REGISTER_CAPABILITY_REQUEST_ID: &str = "lattice-register-capability";
+
+/// Glob the marker watcher subscribes to: the project-level `.lattice.toml`
+/// at any depth under a workspace folder (decision 017, ticket server 08). The
+/// `**/*.md` document watch is deliberately a separate ticket (09).
+const LATTICE_TOML_WATCH_GLOB: &str = "**/.lattice.toml";
+
 /// Run the LSP server on stdio.
 ///
 /// # Errors
@@ -160,7 +177,22 @@ const SEMANTIC_MODIFIER_STRIKETHROUGH_BIT: u32 = 1 << 2;
 /// Returns an error if the connection or initialization fails.
 pub fn run() -> Result<()> {
     let (connection, io_threads) = Connection::stdio();
+    serve(&connection)?;
+    drop(connection); // Close channels so IO threads can exit.
+    io_threads.join()?;
+    Ok(())
+}
 
+/// Drive the LSP lifecycle on an established connection: the capabilities
+/// handshake, the watched-files registration, then the message loop.
+///
+/// Split out from [`run`] so the wire protocol can be exercised over an
+/// in-memory connection in tests without spawning real stdio IO threads.
+///
+/// # Errors
+///
+/// Returns an error if initialization or the message loop fails.
+fn serve(connection: &Connection) -> Result<()> {
     let capabilities = serde_json::json!({
         "textDocumentSync": {
             "openClose": true,
@@ -226,10 +258,48 @@ pub fn run() -> Result<()> {
 
     let workspaces = Workspaces::from_params(&params);
 
-    main_loop(&connection, workspaces)?;
-    drop(connection); // Close channels so IO threads can exit.
-    io_threads.join()?;
+    // File watchers are dynamic-registration only, so register the
+    // `.lattice.toml` watcher now — after `initialized` — when the client
+    // advertises support. A client without it degrades to startup-only config
+    // (decision 017); Lattice never runs its own watcher.
+    if params.supports_watched_files_dynamic_registration() {
+        register_watched_files(connection)?;
+    }
 
+    main_loop(connection, workspaces)?;
+
+    Ok(())
+}
+
+/// Register the `.lattice.toml` watcher with the client.
+///
+/// Sends a `client/registerCapability` request for
+/// `workspace/didChangeWatchedFiles` with a single watcher glob,
+/// [`LATTICE_TOML_WATCH_GLOB`]. This is the only way to subscribe to file
+/// changes — there is no static server-capability field for watchers
+/// (decision 017). The request is fire-and-forget: the client's `Response` is
+/// discarded by [`main_loop`], so a fixed registration id and request id are
+/// sufficient.
+fn register_watched_files(connection: &Connection) -> Result<()> {
+    let params = serde_json::json!({
+        "registrations": [
+            {
+                "id": WATCHED_FILES_REGISTRATION_ID,
+                "method": lsp::method::DID_CHANGE_WATCHED_FILES,
+                "registerOptions": {
+                    "watchers": [
+                        { "globPattern": LATTICE_TOML_WATCH_GLOB }
+                    ]
+                }
+            }
+        ]
+    });
+    let req = Request::new(
+        RequestId::from(REGISTER_CAPABILITY_REQUEST_ID.to_string()),
+        lsp::method::REGISTER_CAPABILITY.to_string(),
+        params,
+    );
+    connection.sender.send(Message::Request(req))?;
     Ok(())
 }
 
@@ -3364,6 +3434,31 @@ fn handle_notification(
             // files that re-materialize regardless, removed ones are cleared.
             publish_all_diagnostics(connection, workspaces, None)?;
         }
+        lsp::method::DID_CHANGE_WATCHED_FILES => {
+            let params: lsp::DidChangeWatchedFilesParams = serde_json::from_value(notif.params)?;
+            // Reload config for every workspace whose `.lattice.toml` changed.
+            // The marker watch is the only registered glob (ticket server 08),
+            // but guard on the suffix so an unrelated future glob can never
+            // trigger a config reload.
+            let mut reloaded = false;
+            for change in &params.changes {
+                if !change.uri.ends_with(".lattice.toml") {
+                    continue;
+                }
+                if let Some((workspace, _rel)) = workspaces.resolve_mut(&change.uri) {
+                    workspace.reload_config();
+                    reloaded = true;
+                }
+            }
+            // A marker change invalidates the whole workspace (predicates,
+            // artifacts, overrides, and external aliases all feed parse and
+            // structural analysis), so take the full re-publish path, not the
+            // `has_config()`-gated single-file delta (decision 017). No single
+            // file's text changed, so pass `None`.
+            if reloaded {
+                publish_all_diagnostics(connection, workspaces, None)?;
+            }
+        }
         _ => {}
     }
     Ok(())
@@ -3707,7 +3802,11 @@ fn whole_line_range(source: &str, index: &LineIndex, line: usize) -> lsp::Range 
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, reason = "tests use expect for clarity")]
+#[allow(
+    clippy::expect_used,
+    clippy::panic,
+    reason = "tests use expect and panic for clarity"
+)]
 mod tests {
     use std::fs;
     use std::path::PathBuf;
@@ -7661,5 +7760,259 @@ mod tests {
             tokens.is_empty(),
             "an unknown document yields an empty token set"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Watched-files hot-reload (ticket server 08, decision 017)
+    //
+    // Wire-level: an in-memory `Connection` pair drives the real `serve`
+    // lifecycle so the server→client `client/registerCapability` request and
+    // the `workspace/didChangeWatchedFiles` reload path are exercised exactly
+    // as a client would.
+    // -----------------------------------------------------------------------
+
+    /// Block for the next message from the server, failing on timeout.
+    fn recv_message(client: &Connection) -> Message {
+        client
+            .receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("timed out waiting for a server message")
+    }
+
+    /// Drain server messages until a `publishDiagnostics` for `uri`, returning
+    /// its diagnostics array (the wire JSON — the lsp types are send-only).
+    fn recv_publish_for(client: &Connection, uri: &str) -> Vec<serde_json::Value> {
+        for _ in 0..32 {
+            if let Message::Notification(notif) = recv_message(client)
+                && notif.method == lsp::method::PUBLISH_DIAGNOSTICS
+                && notif.params.get("uri").and_then(serde_json::Value::as_str) == Some(uri)
+            {
+                return notif
+                    .params
+                    .get("diagnostics")
+                    .and_then(serde_json::Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+            }
+        }
+        panic!("no publishDiagnostics for {uri} after 32 messages");
+    }
+
+    /// Send a JSON-RPC notification from the client to the server.
+    fn send_notification(client: &Connection, method: &str, params: serde_json::Value) {
+        client
+            .sender
+            .send(Message::Notification(Notification::new(
+                method.to_string(),
+                params,
+            )))
+            .expect("send notification");
+    }
+
+    /// Drive `initialize` + `initialized`, returning once the server is ready.
+    /// `dynamic_registration` advertises the watched-files client capability.
+    fn handshake(client: &Connection, root_uri: &str, dynamic_registration: bool) {
+        let init = Request::new(
+            RequestId::from(1),
+            "initialize".to_string(),
+            serde_json::json!({
+                "capabilities": {
+                    "workspace": {
+                        "didChangeWatchedFiles": {
+                            "dynamicRegistration": dynamic_registration
+                        }
+                    }
+                },
+                "workspaceFolders": [ { "uri": root_uri } ]
+            }),
+        );
+        client
+            .sender
+            .send(Message::Request(init))
+            .expect("send initialize");
+        let resp = recv_message(client);
+        assert!(
+            matches!(resp, Message::Response(_)),
+            "initialize must be answered with a response, got {resp:?}"
+        );
+        send_notification(client, "initialized", serde_json::json!({}));
+    }
+
+    /// Open `doc.md` with `text` so the server publishes its diagnostics.
+    fn open_doc(client: &Connection, uri: &str, text: &str) {
+        send_notification(
+            client,
+            lsp::method::DID_OPEN,
+            serde_json::json!({
+                "textDocument": {
+                    "uri": uri,
+                    "languageId": "markdown",
+                    "version": 1,
+                    "text": text
+                }
+            }),
+        );
+    }
+
+    /// Shut the server down cleanly and join its thread.
+    fn shutdown(client: &Connection, server_thread: std::thread::JoinHandle<Result<()>>) {
+        client
+            .sender
+            .send(Message::Request(Request::new(
+                RequestId::from(9999),
+                "shutdown".to_string(),
+                serde_json::Value::Null,
+            )))
+            .expect("send shutdown");
+        send_notification(client, "exit", serde_json::json!(null));
+        server_thread
+            .join()
+            .expect("server thread panicked")
+            .expect("server returned an error");
+    }
+
+    #[test]
+    fn watched_files_registration_and_reload() {
+        // Full acceptance loop (ticket server 08): a client advertising
+        // dynamic registration receives a `client/registerCapability` request
+        // for `**/.lattice.toml`; editing the marker and delivering the
+        // watched-file change reloads config and re-publishes — the stale
+        // reference is cleared by the new `[graph] artifacts` entry.
+        let dir = workspace_with_files(&[
+            (".lattice.toml", ""),
+            ("doc.md", "See `catenary.md` here.\n"),
+        ]);
+        let root = fs::canonicalize(dir.path()).expect("canonicalize temp dir");
+        let root_uri = path_to_uri(&root);
+        let doc_uri = path_to_uri(&root.join("doc.md"));
+        let marker_uri = path_to_uri(&root.join(".lattice.toml"));
+
+        let (server, client) = Connection::memory();
+        let server_thread = std::thread::spawn(move || serve(&server));
+
+        handshake(&client, &root_uri, true);
+
+        // The server registers the marker watcher.
+        let reg = recv_message(&client);
+        let Message::Request(reg) = reg else {
+            panic!("expected a client/registerCapability request, got {reg:?}");
+        };
+        assert_eq!(
+            reg.method,
+            lsp::method::REGISTER_CAPABILITY,
+            "the server originates a registerCapability request"
+        );
+        let reg_json = serde_json::to_string(&reg.params).expect("serialize registration params");
+        assert!(
+            reg_json.contains(lsp::method::DID_CHANGE_WATCHED_FILES),
+            "the registration is for the watched-files method: {reg_json}"
+        );
+        assert!(
+            reg_json.contains(LATTICE_TOML_WATCH_GLOB),
+            "the registration watches the marker glob: {reg_json}"
+        );
+
+        // Opening doc.md surfaces the stale-reference diagnostic.
+        open_doc(&client, &doc_uri, "See `catenary.md` here.\n");
+        let before = recv_publish_for(&client, &doc_uri);
+        assert!(
+            !before.is_empty(),
+            "doc.md starts with the stale-reference diagnostic, got {before:?}"
+        );
+
+        // Edit the marker on disk, then deliver the watched-file change.
+        fs::write(
+            root.join(".lattice.toml"),
+            "[graph]\nartifacts = [\"catenary.md\"]\n",
+        )
+        .expect("rewrite the marker");
+        send_notification(
+            &client,
+            lsp::method::DID_CHANGE_WATCHED_FILES,
+            serde_json::json!({ "changes": [ { "uri": marker_uri, "type": 2 } ] }),
+        );
+
+        // The reload re-publishes doc.md, now cleared by the artifact glossary.
+        let after = recv_publish_for(&client, &doc_uri);
+        assert!(
+            after.is_empty(),
+            "the reloaded [graph] artifacts entry clears doc.md, got {after:?}"
+        );
+
+        shutdown(&client, server_thread);
+    }
+
+    #[test]
+    fn no_registration_without_dynamic_capability() {
+        // A client that does not advertise dynamic registration must receive no
+        // registration, and the server must keep working (decision 017's
+        // graceful degradation — no own-watcher, no panic).
+        let dir = workspace_with_files(&[("doc.md", "See `catenary.md` here.\n")]);
+        let root = fs::canonicalize(dir.path()).expect("canonicalize temp dir");
+        let root_uri = path_to_uri(&root);
+        let doc_uri = path_to_uri(&root.join("doc.md"));
+
+        let (server, client) = Connection::memory();
+        let server_thread = std::thread::spawn(move || serve(&server));
+
+        handshake(&client, &root_uri, false);
+
+        // No registerCapability request is sent: the server is silent until a
+        // notification drives a publish, so a short wait must time out.
+        assert!(
+            client
+                .receiver
+                .recv_timeout(std::time::Duration::from_millis(300))
+                .is_err(),
+            "a client without dynamic registration receives no registration request"
+        );
+
+        // The server still serves: a didOpen yields diagnostics.
+        open_doc(&client, &doc_uri, "See `catenary.md` here.\n");
+        let publish = recv_publish_for(&client, &doc_uri);
+        assert!(
+            !publish.is_empty(),
+            "the server still publishes diagnostics without a watcher, got {publish:?}"
+        );
+
+        shutdown(&client, server_thread);
+    }
+
+    #[test]
+    fn survives_malformed_watched_files_payload() {
+        // Ticket 06 resilience holds: a malformed `didChangeWatchedFiles`
+        // payload is logged-and-dropped, never fatal — a follow-up didOpen
+        // still publishes.
+        let dir = workspace_with_files(&[("doc.md", "See `catenary.md` here.\n")]);
+        let root = fs::canonicalize(dir.path()).expect("canonicalize temp dir");
+        let root_uri = path_to_uri(&root);
+        let doc_uri = path_to_uri(&root.join("doc.md"));
+
+        let (server, client) = Connection::memory();
+        let server_thread = std::thread::spawn(move || serve(&server));
+
+        handshake(&client, &root_uri, true);
+        let reg = recv_message(&client);
+        assert!(
+            matches!(reg, Message::Request(_)),
+            "the registration request precedes the malformed payload, got {reg:?}"
+        );
+
+        // A payload with no `changes` array fails to deserialize.
+        send_notification(
+            &client,
+            lsp::method::DID_CHANGE_WATCHED_FILES,
+            serde_json::json!({ "unexpected": true }),
+        );
+
+        // The server survived: a follow-up didOpen still publishes.
+        open_doc(&client, &doc_uri, "See `catenary.md` here.\n");
+        let publish = recv_publish_for(&client, &doc_uri);
+        assert!(
+            !publish.is_empty(),
+            "the server survived the malformed payload and still publishes, got {publish:?}"
+        );
+
+        shutdown(&client, server_thread);
     }
 }

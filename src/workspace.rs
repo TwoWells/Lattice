@@ -298,6 +298,52 @@ impl Workspace {
         self.refresh_structural_after_update(rel_path, membership_changed);
     }
 
+    /// Reload `.lattice.toml` and rebuild the index against the new config.
+    ///
+    /// Re-runs [`Config::load`] from the workspace root and re-parses every
+    /// indexed file with the fresh config, then recomputes the structural
+    /// caches. Config feeds both `parse_content` (backlink-predicate
+    /// validation) and the structural collectors (artifacts, overrides,
+    /// external aliases), so a marker change invalidates the *whole* workspace,
+    /// not a single file (decision 017). This is effectively a config-only
+    /// re-scan: membership is preserved and each file is reparsed from its
+    /// in-memory source (the editor buffer, never re-read from disk), so an
+    /// unsaved buffer is not clobbered by a marker edit.
+    ///
+    /// Used by the LSP server to hot-reload `.lattice.toml` on a
+    /// `workspace/didChangeWatchedFiles` event for the marker (issue 044,
+    /// ticket server 08). A parse/read error leaves the workspace on default
+    /// config with the error recorded, matching [`Workspace::scan`].
+    pub fn reload_config(&mut self) {
+        let (config, config_error) = match Config::load(&self.root) {
+            Ok(c) => (c, None),
+            Err(e) => {
+                tracing::warn!(root = %self.root.display(), "config reload error, using defaults: {e}");
+                (Config::default(), Some(e))
+            }
+        };
+        self.has_config = self.root.join(".lattice.toml").is_file();
+        self.config = config;
+        self.config_error = config_error;
+
+        // Re-parse every file from its cached source so config-dependent parse
+        // output (backlink-predicate diagnostics) is refreshed. The source is
+        // the in-memory buffer, so unsaved editor edits survive the reload.
+        let rel_paths: Vec<PathBuf> = self.files.keys().cloned().collect();
+        for rel_path in &rel_paths {
+            let Some(file_data) = self.files.get(rel_path) else {
+                continue;
+            };
+            let content = file_data.tree.source().to_string();
+            let data = parse_content(&content, rel_path, &self.config);
+            self.files.insert(rel_path.clone(), data);
+        }
+
+        // Config changed for every file, so the structural caches must be
+        // recomputed workspace-wide (membership is unchanged).
+        self.recompute_all_structural();
+    }
+
     /// Refresh the structural cache after `rel_path` was (re)parsed.
     ///
     /// An edit that does not change membership only invalidates the edited
@@ -1170,6 +1216,112 @@ mod tests {
             stale_reference_severity(&ws, Path::new("a.md")),
             None,
             "a resolving target draws no stale-reference warning"
+        );
+    }
+
+    #[test]
+    fn reload_config_applies_new_artifacts() {
+        // Issue 044 / decision 017: a bare reference to the absent `catenary.md`
+        // raises a stale-reference diagnostic. Adding `catenary.md` to
+        // `[graph] artifacts` in `.lattice.toml` and reloading must clear that
+        // diagnostic workspace-wide — no re-scan, no server restart.
+        let dir = workspace_with_files(&[
+            (".lattice.toml", ""),
+            ("doc.md", "See `catenary.md` here.\n"),
+        ]);
+        let mut ws = Workspace::scan(dir.path()).expect("scan should succeed");
+        assert!(
+            ws.config().artifacts.is_empty(),
+            "the empty marker resolves to no artifacts"
+        );
+        assert_eq!(
+            stale_reference_severity(&ws, Path::new("doc.md")),
+            Some(crate::validation::Severity::Warning),
+            "the backticked reference to the absent catenary.md is a stale reference before the edit"
+        );
+
+        // Edit the marker on disk to glossary-exempt `catenary.md`.
+        fs::write(
+            dir.path().join(".lattice.toml"),
+            "[graph]\nartifacts = [\"catenary.md\"]\n",
+        )
+        .expect("rewrite .lattice.toml");
+        ws.reload_config();
+
+        assert!(
+            ws.config().artifacts.contains("catenary.md"),
+            "reload picks up the new artifact from the rewritten marker"
+        );
+        assert_eq!(
+            stale_reference_severity(&ws, Path::new("doc.md")),
+            None,
+            "the artifact glossary suppresses the stale-reference diagnostic after reload"
+        );
+        assert_cache_matches_recompute(&ws);
+    }
+
+    #[test]
+    fn reload_config_picks_up_new_predicate() {
+        // A config reload must also refresh config-dependent *parse* output:
+        // an unknown backlink predicate raises a `BacklinkDiagnostic`; defining
+        // it under `[predicates]` and reloading must clear it.
+        let dir = workspace_with_files(&[
+            (".lattice.toml", ""),
+            (
+                "doc.md",
+                "---\nbacklinks:\n  tracks:\n    - other.md\n---\n# Doc\n",
+            ),
+        ]);
+        let mut ws = Workspace::scan(dir.path()).expect("scan should succeed");
+        assert!(
+            ws.file(Path::new("doc.md"))
+                .expect("doc.md indexed")
+                .backlink_diagnostics
+                .iter()
+                .any(|d| d.predicate == "tracks"),
+            "the unknown `tracks` predicate is flagged before the edit"
+        );
+
+        fs::write(
+            dir.path().join(".lattice.toml"),
+            "[predicates]\ntracks = \"tracked_by\"\n",
+        )
+        .expect("rewrite .lattice.toml");
+        ws.reload_config();
+
+        assert!(
+            ws.file(Path::new("doc.md"))
+                .expect("doc.md indexed")
+                .backlink_diagnostics
+                .is_empty(),
+            "defining the predicate clears the unknown-predicate diagnostic after reload"
+        );
+    }
+
+    #[test]
+    fn reload_config_preserves_unsaved_buffer() {
+        // The editor buffer is authoritative (decision 017 §3): a config reload
+        // must reparse from the in-memory source, never re-read disk, so an
+        // unsaved edit survives the marker change.
+        let dir = workspace_with_files(&[(".lattice.toml", ""), ("doc.md", "# On Disk\n")]);
+        let mut ws = Workspace::scan(dir.path()).expect("scan should succeed");
+        // Simulate an unsaved editor buffer diverging from disk.
+        ws.update_content(Path::new("doc.md"), "# In Buffer\n");
+
+        fs::write(
+            dir.path().join(".lattice.toml"),
+            "[graph]\nartifacts = [\"catenary.md\"]\n",
+        )
+        .expect("rewrite .lattice.toml");
+        ws.reload_config();
+
+        assert!(
+            ws.file(Path::new("doc.md"))
+                .expect("doc.md indexed")
+                .tree
+                .source()
+                .contains("In Buffer"),
+            "reload reparsed from the in-memory buffer, not the on-disk content"
         );
     }
 
