@@ -52,10 +52,42 @@ jobs:
           fi
           echo "version=$tag" >> "$GITHUB_OUTPUT"
 
+  # Gate the publish on the full quality bar (issue 049). A crates.io publish is
+  # irreversible, so it must not proceed on a red check. This mirrors ci.yml's
+  # `check` job — same image, same tools, same `make check` — and runs in parallel
+  # with `verify`; `build` and `publish-crate` depend on BOTH, so a failing check
+  # blocks the publish even though the parallel ci.yml tag run is only
+  # informational. Keep this in sync with ci.yml's check job.
+  check:
+    runs-on: ubuntu-latest
+    container: ghcr.io/twowells/rust-ci:latest
+    # Container default shell is sh (dash); force bash so run steps don't break on
+    # a bashism (matches ci.yml).
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Materialize pinned Rust toolchain
+        run: |
+          rustup show
+          rustc --version && cargo --version
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo tools
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest,cargo-deny,cargo-machete
+
+      - name: make check
+        run: make check
+
   # Native build on each platform's own runner. fail-fast: false so one
   # platform's failure doesn't cancel the others.
   build:
-    needs: verify
+    needs: [verify, check]
     strategy:
       fail-fast: false
       matrix:
@@ -114,7 +146,7 @@ jobs:
   # Publish to crates.io. Idempotent: skips if this version is already live, so
   # a re-run (or a re-pushed tag) is a harmless no-op rather than a hard failure.
   publish-crate:
-    needs: verify
+    needs: [verify, check]
     runs-on: ubuntu-latest
     # Hosted runner → run in the toolchain image (cargo publish + the curl guard).
     container: ghcr.io/twowells/rust-ci:latest
