@@ -3419,11 +3419,12 @@ fn handle_notification(
         }
         lsp::method::DID_CLOSE => {
             let params: lsp::DidCloseTextDocumentParams = serde_json::from_value(notif.params)?;
-            // The buffer is gone, so the document is no longer editor-authoritative
-            // and watched-file `changed` events for it are honored again. The
-            // on-disk content stays indexed — closing a file does not drop it from
-            // the workspace (ticket server 09).
+            // The buffer is gone: the document is no longer editor-authoritative,
+            // so watched-file `changed` events for it are honored again (decision
+            // 017 §3), and per the LSP spec content authority reverts to the
+            // filesystem — reconcile the index to disk (issue 046).
             workspaces.open_documents.remove(&params.text_document.uri);
+            reconcile_closed_document(connection, workspaces, &params.text_document.uri)?;
         }
         lsp::method::DID_SAVE => {
             let params: lsp::DidSaveTextDocumentParams = serde_json::from_value(notif.params)?;
@@ -3551,6 +3552,29 @@ fn handle_notification(
         _ => {}
     }
     Ok(())
+}
+
+/// Reconcile a just-closed document's index entry to disk and re-publish.
+///
+/// On `textDocument/didClose` the editor discards the buffer and content
+/// authority reverts to the filesystem (LSP spec, issue 046). Re-read `uri`
+/// from disk via [`Workspace::update`] — which re-parses the file, or drops it
+/// if it is gone — so a buffer closed with unsaved edits leaves no discarded
+/// content indexed; disk never changed, so no watcher event would correct it.
+/// Re-publishes through the graph-aware [`publish_all_diagnostics`] path,
+/// naming the URI: reverting from buffer to disk content can move cross-file
+/// backlink/forward edges, so this mirrors the watched-file `changed` branch
+/// for closed files. A URI in no workspace is a no-op.
+fn reconcile_closed_document(
+    connection: &Connection,
+    workspaces: &mut Workspaces,
+    uri: &str,
+) -> Result<()> {
+    let Some((workspace, rel_path)) = workspaces.resolve_mut(uri) else {
+        return Ok(());
+    };
+    let _ = workspace.update(&rel_path);
+    publish_all_diagnostics(connection, workspaces, Some(uri))
 }
 
 // ---------------------------------------------------------------------------
@@ -8137,6 +8161,19 @@ mod tests {
         );
     }
 
+    /// Deliver a `textDocument/didChange` for `uri` that replaces the whole
+    /// document with `text` (a single full-content change).
+    fn send_change(client: &Connection, uri: &str, text: &str) {
+        send_notification(
+            client,
+            lsp::method::DID_CHANGE,
+            serde_json::json!({
+                "textDocument": { "uri": uri, "version": 2 },
+                "contentChanges": [ { "text": text } ]
+            }),
+        );
+    }
+
     /// Whether any diagnostic in `diags` (wire JSON) has a message containing
     /// `needle`.
     fn any_message_contains(diags: &[serde_json::Value], needle: &str) -> bool {
@@ -8309,11 +8346,12 @@ mod tests {
     }
 
     #[test]
-    fn did_close_keeps_indexed_content() {
-        // didClose removes the URI from the open set but must NOT drop the
-        // file's indexed content — the last-synced content stays queryable.
-        // Observe via documentSymbol after the close: the buffer heading is
-        // still resolved.
+    fn did_close_reverts_to_disk_content() {
+        // didClose reconciles the index to disk: content authority reverts to
+        // the filesystem (issue 046). The file is not dropped (it still exists
+        // on disk), but its indexed content reverts from the discarded buffer
+        // to the on-disk text. Observe via documentSymbol after the close: the
+        // disk heading is resolved, not the buffer heading.
         let dir = workspace_with_files(&[("doc.md", "# On Disk\n")]);
         let root = fs::canonicalize(dir.path()).expect("canonicalize temp dir");
         let root_uri = path_to_uri(&root);
@@ -8325,8 +8363,9 @@ mod tests {
         // No watcher needed for this test; skip the registration entirely.
         handshake(&client, &root_uri, false);
 
-        // Open with a buffer heading that differs from disk, then close. The
-        // clean buffer publishes nothing, so there is no publish to drain.
+        // Open with a buffer heading that differs from disk, then close without
+        // saving. The clean buffer publishes nothing, and closing the equally
+        // clean disk content publishes nothing, so there is no publish to drain.
         open_doc(&client, &doc_uri, "# In Buffer\n");
         send_close(&client, &doc_uri);
 
@@ -8338,8 +8377,147 @@ mod tests {
         );
         let json = serde_json::to_string(&symbols).expect("serialize document symbols");
         assert!(
-            json.contains("In Buffer"),
-            "after didClose the file stays indexed with its last-synced content: {json}"
+            json.contains("On Disk"),
+            "after didClose the index reverts to the on-disk content: {json}"
+        );
+        assert!(
+            !json.contains("In Buffer"),
+            "the discarded buffer content is no longer indexed after didClose: {json}"
+        );
+
+        shutdown(&client, server_thread);
+    }
+
+    #[test]
+    fn did_close_unsaved_edit_clears_buffer_diagnostic() {
+        // Acceptance (issue 046): open a clean file, introduce a broken link in
+        // the buffer without saving, then close without saving. The published
+        // diagnostics must revert to the on-disk (clean) state — the phantom
+        // diagnostic clears on close, since disk never changed.
+        let dir = workspace_with_files(&[("doc.md", "# Clean\n")]);
+        let root = fs::canonicalize(dir.path()).expect("canonicalize temp dir");
+        let root_uri = path_to_uri(&root);
+        let doc_uri = path_to_uri(&root.join("doc.md"));
+
+        let (server, client) = Connection::memory();
+        let server_thread = std::thread::spawn(move || serve(&server));
+
+        handshake(&client, &root_uri, false);
+
+        // Open matching the clean disk content (no publish), then edit the
+        // buffer to add a stale reference. The didChange publishes it.
+        open_doc(&client, &doc_uri, "# Clean\n");
+        send_change(&client, &doc_uri, "See `gone.md` here.\n");
+        let dirty = recv_publish_for(&client, &doc_uri);
+        assert!(
+            any_message_contains(&dirty, "stale reference"),
+            "the unsaved buffer edit surfaces the stale-reference diagnostic, got {dirty:?}"
+        );
+
+        // Close without saving: the index reconciles to the clean disk file, so
+        // the diagnostic clears (an empty publish).
+        send_close(&client, &doc_uri);
+        let after = recv_publish_for(&client, &doc_uri);
+        assert!(
+            after.is_empty(),
+            "didClose reverts the index to clean disk content, clearing the phantom diagnostic, got {after:?}"
+        );
+
+        shutdown(&client, server_thread);
+    }
+
+    #[test]
+    fn did_close_keeps_saved_content_indexed() {
+        // Acceptance (issue 046): open, edit, and save, then close. The saved
+        // content is on disk, so the close re-reads it — the saved content stays
+        // indexed with no regression to a pre-save version. Observe via
+        // documentSymbol after the close: the saved heading is resolved.
+        let dir = workspace_with_files(&[("doc.md", "# Original\n")]);
+        let root = fs::canonicalize(dir.path()).expect("canonicalize temp dir");
+        let root_uri = path_to_uri(&root);
+        let doc_uri = path_to_uri(&root.join("doc.md"));
+
+        let (server, client) = Connection::memory();
+        let server_thread = std::thread::spawn(move || serve(&server));
+
+        handshake(&client, &root_uri, false);
+
+        // Open matching disk, edit the heading in the buffer, then save that
+        // edit to disk and deliver didSave with the saved text. All three steps
+        // keep the file clean, so none publishes a diagnostic.
+        open_doc(&client, &doc_uri, "# Original\n");
+        send_change(&client, &doc_uri, "# Edited\n");
+        fs::write(root.join("doc.md"), "# Edited\n").expect("save doc.md to disk");
+        send_notification(
+            &client,
+            lsp::method::DID_SAVE,
+            serde_json::json!({
+                "textDocument": { "uri": doc_uri },
+                "text": "# Edited\n"
+            }),
+        );
+
+        // Close: the re-read of disk holds the saved content, so the index keeps
+        // the saved heading — closing did not regress to the pre-save version.
+        send_close(&client, &doc_uri);
+        let symbols = request_response(
+            &client,
+            3,
+            lsp::method::DOCUMENT_SYMBOL,
+            serde_json::json!({ "textDocument": { "uri": doc_uri } }),
+        );
+        let json = serde_json::to_string(&symbols).expect("serialize document symbols");
+        assert!(
+            json.contains("Edited"),
+            "after save+close the index holds the saved content: {json}"
+        );
+        assert!(
+            !json.contains("Original"),
+            "the pre-save heading is gone after save+close: {json}"
+        );
+
+        shutdown(&client, server_thread);
+    }
+
+    #[test]
+    fn did_close_drops_file_deleted_while_open() {
+        // Acceptance (issue 046): a file open in the editor whose disk copy is
+        // deleted while open is dropped from the index on close — the re-read of
+        // disk finds nothing, so a closed source that referenced it flips from
+        // the existing-file nudge to a stale reference. The reference resolves
+        // against the index, so it stays valid until target.md is dropped.
+        let dir = workspace_with_files(&[
+            ("a.md", "See `target.md` for details.\n"),
+            ("target.md", "# Target\n"),
+        ]);
+        let root = fs::canonicalize(dir.path()).expect("canonicalize temp dir");
+        let root_uri = path_to_uri(&root);
+        let a_uri = path_to_uri(&root.join("a.md"));
+        let target_uri = path_to_uri(&root.join("target.md"));
+
+        let (server, client) = Connection::memory();
+        let server_thread = std::thread::spawn(move || serve(&server));
+
+        handshake(&client, &root_uri, false);
+
+        // Open target.md (it becomes editor-authoritative). The full re-publish
+        // surfaces a.md's existing-file nudge, since target.md is in the index.
+        open_doc(&client, &target_uri, "# Target\n");
+        let before = recv_publish_for(&client, &a_uri);
+        assert!(
+            any_message_contains(&before, "refers to an existing file"),
+            "while target.md is indexed, a.md's reference is the existing-file nudge, got {before:?}"
+        );
+
+        // Delete target.md on disk while it is open, then close it. The close
+        // must reconcile to disk — the file is gone, so it is dropped from the
+        // index and a.md's reference flips to a stale reference.
+        fs::remove_file(root.join("target.md")).expect("delete target.md while open");
+        send_close(&client, &target_uri);
+        let after = recv_publish_for(&client, &a_uri);
+        assert!(
+            any_message_contains(&after, "stale reference"),
+            "closing a file deleted on disk drops it from the index, so a.md's reference goes stale, got {after:?}"
         );
 
         shutdown(&client, server_thread);
