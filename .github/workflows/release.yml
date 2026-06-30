@@ -1,8 +1,12 @@
 # Release — on a vX.Y.Z tag push:
-#   1. verify        the tag matches Cargo.toml's version
-#   2. build         cross-platform binaries on GitHub-hosted runners
-#   3. publish-crate to crates.io via Trusted Publishing (OIDC — no stored token)
-#   4. release       cut a GitHub Release with the binaries attached + attested
+#   verify        the tag matches Cargo.toml's version
+#   check         `make check` passes (mirrors ci.yml) — gates the publish (issue 049)
+#   build         cross-platform binaries on GitHub-hosted runners
+#   publish-crate to crates.io via Trusted Publishing (OIDC — no stored token)
+#   release       cut a GitHub Release with the binaries attached + attested
+#
+# verify and check run first, in parallel; build and publish-crate need BOTH, so a
+# red check blocks the (irreversible) crates.io publish; release gathers artifacts.
 #
 # Triggered ONLY by tag pushes, which require write access — a fork PR can never
 # trigger this, so the publish credential is never exposed to untrusted code.
