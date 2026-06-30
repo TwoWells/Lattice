@@ -51,7 +51,13 @@ vim.lsp.config.lattice = {
 vim.lsp.enable("lattice")
 ```
 
-Diagnostics appear inline on open, change, and save. Lattice is
+Diagnostics appear inline on open, change, and save. When the editor
+supports LSP dynamic file-watch registration
+(`workspace/didChangeWatchedFiles`), Lattice also registers watches for
+`.lattice.toml` and project `.md` files, so config edits hot-reload (no
+restart) and on-disk changes made outside the editor (e.g. a `git
+checkout`) update the graph live; without that support, both apply only
+on restart. Lattice is
 diagnostic-first, but the server is a full markdown LSP: completion
 (paths, headings, predicates, reference labels, footnotes), hover,
 document and workspace symbols, references, rename, folding, document
