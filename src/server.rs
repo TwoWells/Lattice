@@ -3415,7 +3415,7 @@ fn handle_notification(
             if let Some((ws, rel_path)) = workspaces.resolve_mut(&params.text_document.uri) {
                 ws.update_content(&rel_path, &params.text_document.text);
             }
-            publish_all_diagnostics(connection, workspaces, Some(&params.text_document.uri))?;
+            publish_all_diagnostics(connection, workspaces, &one_uri(&params.text_document.uri))?;
         }
         lsp::method::DID_CLOSE => {
             let params: lsp::DidCloseTextDocumentParams = serde_json::from_value(notif.params)?;
@@ -3435,7 +3435,7 @@ fn handle_notification(
                     let _ = ws.update(&rel_path);
                 }
             }
-            publish_all_diagnostics(connection, workspaces, Some(&params.text_document.uri))?;
+            publish_all_diagnostics(connection, workspaces, &one_uri(&params.text_document.uri))?;
         }
         lsp::method::DID_CHANGE => {
             let params: lsp::DidChangeTextDocumentParams = serde_json::from_value(notif.params)?;
@@ -3463,7 +3463,7 @@ fn handle_notification(
                     publish_all_diagnostics(
                         connection,
                         workspaces,
-                        Some(&params.text_document.uri),
+                        &one_uri(&params.text_document.uri),
                     )?;
                 }
             }
@@ -3479,7 +3479,7 @@ fn handle_notification(
             }
             // No single file's text changed — added folders bring cache-miss
             // files that re-materialize regardless, removed ones are cleared.
-            publish_all_diagnostics(connection, workspaces, None)?;
+            publish_all_diagnostics(connection, workspaces, &HashSet::new())?;
         }
         lsp::method::DID_CHANGE_WATCHED_FILES => {
             let params: lsp::DidChangeWatchedFilesParams = serde_json::from_value(notif.params)?;
@@ -3487,11 +3487,13 @@ fn handle_notification(
             // (ticket server 08) and `**/*.md` documents (ticket server 09).
             // Branch on the URI so each takes its own reconciliation path.
             let mut reloaded = false;
-            // `.md` URIs whose on-disk state was applied. Each needs a
-            // graph-aware re-publish — a content or membership change can move
-            // *other* files' backlink/forward edges — so this mirrors how
-            // `didSave` re-publishes through `publish_all_diagnostics`.
-            let mut changed_docs: Vec<String> = Vec::new();
+            // `.md` URIs whose on-disk state was applied. The whole batch is
+            // re-published in a single graph-aware pass below — a content or
+            // membership change can move *other* files' backlink/forward edges,
+            // so this mirrors how `didSave` re-publishes through
+            // `publish_all_diagnostics`, but folds N changed files into one
+            // O(workspace) recompute instead of N (ticket perf 07).
+            let mut changed_docs: HashSet<String> = HashSet::new();
             for change in &params.changes {
                 if change.uri.ends_with(".lattice.toml") {
                     // The marker watch is config: any event reloads it. Guard on
@@ -3524,7 +3526,7 @@ fn handle_notification(
                     | lsp::file_change_type::DELETED => {
                         if let Some((workspace, rel_path)) = workspaces.resolve_mut(&change.uri) {
                             let _ = workspace.update(&rel_path);
-                            changed_docs.push(change.uri.clone());
+                            changed_docs.insert(change.uri.clone());
                         }
                     }
                     _ => {}
@@ -3534,19 +3536,20 @@ fn handle_notification(
             // artifacts, overrides, and external aliases all feed parse and
             // structural analysis), so take the full re-publish path, not the
             // `has_config()`-gated single-file delta (decision 017). When `.md`
-            // files also changed, the per-document publishes below already run
-            // the full graph diff against the freshly reloaded config, so a
-            // marker-only notification is the only case that needs this `None`
-            // publish.
+            // files also changed, the batched publish below already runs the
+            // full graph diff against the freshly reloaded config, so a
+            // marker-only notification is the only case that needs this
+            // empty-set publish.
             if reloaded && changed_docs.is_empty() {
-                publish_all_diagnostics(connection, workspaces, None)?;
+                publish_all_diagnostics(connection, workspaces, &HashSet::new())?;
             }
-            // Re-publish each applied `.md` change through the graph-aware path,
-            // naming the document so its own materialization is refreshed
-            // unconditionally (its disk content changed). The whole-graph diff
-            // inside each call also catches any other file whose edges moved.
-            for uri in &changed_docs {
-                publish_all_diagnostics(connection, workspaces, Some(uri))?;
+            // Re-publish the whole applied `.md` batch in ONE graph-aware pass,
+            // naming every changed document so each one's materialization is
+            // refreshed unconditionally (its disk content changed). The single
+            // whole-graph diff also catches any other file whose edges moved —
+            // one recompute for the batch, not one per file (ticket perf 07).
+            if !changed_docs.is_empty() {
+                publish_all_diagnostics(connection, workspaces, &changed_docs)?;
             }
         }
         _ => {}
@@ -3574,12 +3577,21 @@ fn reconcile_closed_document(
         return Ok(());
     };
     let _ = workspace.update(&rel_path);
-    publish_all_diagnostics(connection, workspaces, Some(uri))
+    publish_all_diagnostics(connection, workspaces, &one_uri(uri))
 }
 
 // ---------------------------------------------------------------------------
 // Diagnostics
 // ---------------------------------------------------------------------------
+
+/// Build a one-element force-rematerialize set for the single-document callers
+/// of [`publish_all_diagnostics`] / [`diff_diagnostics`] (a `didOpen` /
+/// `didSave` / `didChange` / `didClose` names exactly the document it touched).
+fn one_uri(uri: &str) -> HashSet<String> {
+    let mut set = HashSet::with_capacity(1);
+    set.insert(uri.to_string());
+    set
+}
 
 /// Publish diagnostics for the files whose diagnostics changed.
 ///
@@ -3590,15 +3602,16 @@ fn reconcile_closed_document(
 /// down to the handful that changed (issue 013 — publication diffing, then
 /// ticket perf 02's materialization cache).
 ///
-/// `changed_uri` names the document whose source text just changed, if any, so
-/// its materialization is refreshed unconditionally; see [`diff_diagnostics`]
-/// for why the edited file cannot trust its cached LSP form.
+/// `changed_uris` names the documents whose source text just changed, if any,
+/// so each one's materialization is refreshed unconditionally; see
+/// [`diff_diagnostics`] for why an edited file cannot trust its cached LSP form,
+/// and why a whole batch of changed files is forced together in one pass.
 fn publish_all_diagnostics(
     connection: &Connection,
     workspaces: &mut Workspaces,
-    changed_uri: Option<&str>,
+    changed_uris: &HashSet<String>,
 ) -> Result<()> {
-    for (uri, diagnostics) in diff_diagnostics(workspaces, changed_uri) {
+    for (uri, diagnostics) in diff_diagnostics(workspaces, changed_uris) {
         let params = lsp::PublishDiagnosticsParams { uri, diagnostics };
         let notif = Notification::new(lsp::method::PUBLISH_DIAGNOSTICS.to_string(), params);
         connection.sender.send(Message::Notification(notif))?;
@@ -3728,15 +3741,18 @@ fn desired_diagnostics(workspaces: &Workspaces) -> BTreeMap<String, Vec<lsp::Dia
 /// (a missing backlink reported on the *source*), so a dependent file an edit
 /// touched only indirectly is caught the same way (issue 013 — ticket perf 02).
 ///
-/// `changed_uri` names the document whose source text just changed, if any. Its
-/// materialization is recomputed unconditionally: a length-preserving edit can
+/// `changed_uris` names the documents whose source text just changed, if any.
+/// Each is force-re-materialized unconditionally: a length-preserving edit can
 /// leave the Lattice vector byte-identical yet shift a span's UTF-16 column (an
 /// astral-plane swap upstream of the span on its line), so the cached LSP form
-/// cannot be trusted for the edited file even when its Lattice vector matches.
+/// cannot be trusted for an edited file even when its Lattice vector matches.
 /// Every *other* file's source is unchanged, so Lattice-vector equality there
-/// does guarantee an identical materialization. Pass `None` when no single
-/// file's text changed (e.g. a workspace-folder add/remove — newly scanned
-/// files are cache misses and re-materialize regardless).
+/// does guarantee an identical materialization. Passing a set (rather than a
+/// single URI) lets one pass force-re-materialize a whole batch of changed
+/// files — a bulk on-disk change reconciles all of them in one O(workspace)
+/// recompute instead of one per file (ticket perf 07). Pass an empty set when
+/// no single file's text changed (e.g. a workspace-folder add/remove — newly
+/// scanned files are cache misses and re-materialize regardless).
 ///
 /// A pair is sent when its materialized vector differs from what the client last
 /// received, including the transition to empty — a file that became clean, or
@@ -3746,7 +3762,7 @@ fn desired_diagnostics(workspaces: &Workspaces) -> BTreeMap<String, Vec<lsp::Dia
 /// for deterministic output.
 fn diff_diagnostics(
     workspaces: &mut Workspaces,
-    changed_uri: Option<&str>,
+    changed_uris: &HashSet<String>,
 ) -> Vec<(String, Vec<lsp::Diagnostic>)> {
     // A file the detector decided to (re-)materialize: its fresh Lattice and LSP
     // vectors, plus whether the LSP form differs from what the client holds.
@@ -3757,13 +3773,22 @@ fn diff_diagnostics(
         send: bool,
     }
 
-    // Canonicalize the edited URI to the form the cache is keyed by, so the
+    // Count this whole-workspace recompute pass so tests can assert that a
+    // batched watched-file notification collapses to one pass, not one per
+    // changed file (ticket perf 07). Compiled out of release builds.
+    #[cfg(test)]
+    RECOMPUTE_COUNT.with(|count| count.set(count.get() + 1));
+
+    // Canonicalize each changed URI to the form the cache is keyed by, so the
     // force-re-materialize check below lines up with the per-file URIs.
-    let changed_canonical = changed_uri.and_then(|uri| {
-        workspaces
-            .resolve(uri)
-            .map(|(workspace, rel_path)| path_to_uri(&workspace.root().join(rel_path)))
-    });
+    let changed_canonical: HashSet<String> = changed_uris
+        .iter()
+        .filter_map(|uri| {
+            workspaces
+                .resolve(uri)
+                .map(|(workspace, rel_path)| path_to_uri(&workspace.root().join(rel_path)))
+        })
+        .collect();
 
     // Phase 1 — detection. With an immutable view of the workspaces and the
     // published cache, recompute each file's Lattice vector, decide whether it
@@ -3801,13 +3826,11 @@ fn diff_diagnostics(
 
             let lattice = by_file.remove(rel_path).unwrap_or_default();
             let cached = published.get(&uri);
-            let force = changed_canonical.as_ref().is_some_and(|changed| {
-                if root_is_canonical {
-                    *changed == uri
-                } else {
-                    *changed == path_to_uri(&workspace.root().join(rel_path))
-                }
-            });
+            let force = if root_is_canonical {
+                changed_canonical.contains(&uri)
+            } else {
+                changed_canonical.contains(&path_to_uri(&workspace.root().join(rel_path)))
+            };
 
             // Reuse the cached materialization when this file's source is
             // unchanged (it is not the edited file) and its Lattice vector still
@@ -3882,6 +3905,15 @@ fn diff_diagnostics(
 #[cfg(test)]
 thread_local! {
     static MATERIALIZE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+// Counts `diff_diagnostics` invocations — one per whole-workspace recompute /
+// publish pass — so tests can assert that a batched watched-file notification
+// collapses N changed files into a single pass, not N (ticket perf 07).
+// Compiled out of release builds.
+#[cfg(test)]
+thread_local! {
+    static RECOMPUTE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Convert a Lattice diagnostic to an LSP diagnostic.
@@ -6906,7 +6938,7 @@ mod tests {
         ]);
         let mut workspaces = scan_workspaces(&dir);
 
-        let sent = diff_diagnostics(&mut workspaces, None);
+        let sent = diff_diagnostics(&mut workspaces, &HashSet::new());
         assert_eq!(
             sent.len(),
             1,
@@ -6928,10 +6960,10 @@ mod tests {
         let dir = workspace_with_files(&[("a.md", "# A\n\n# A\n"), ("b.md", "# B\n")]);
         let mut workspaces = scan_workspaces(&dir);
 
-        let first = diff_diagnostics(&mut workspaces, None);
+        let first = diff_diagnostics(&mut workspaces, &HashSet::new());
         assert_eq!(first.len(), 1, "first pass publishes a.md");
 
-        let second = diff_diagnostics(&mut workspaces, None);
+        let second = diff_diagnostics(&mut workspaces, &HashSet::new());
         assert!(
             second.is_empty(),
             "a re-sync with no edits publishes nothing: {second:?}"
@@ -6943,11 +6975,11 @@ mod tests {
         let dir = workspace_with_files(&[("a.md", "# A\n")]);
         let mut workspaces = scan_workspaces(&dir);
 
-        let first = diff_diagnostics(&mut workspaces, None);
+        let first = diff_diagnostics(&mut workspaces, &HashSet::new());
         assert!(first.is_empty(), "clean file publishes nothing: {first:?}");
 
         edit(&mut workspaces, "a.md", "# A\n\n# A\n");
-        let second = diff_diagnostics(&mut workspaces, None);
+        let second = diff_diagnostics(&mut workspaces, &HashSet::new());
         assert_eq!(second.len(), 1, "introducing a diagnostic republishes a.md");
         assert_eq!(
             second[0].0,
@@ -6962,11 +6994,11 @@ mod tests {
         let dir = workspace_with_files(&[("a.md", "# A\n\n# A\n")]);
         let mut workspaces = scan_workspaces(&dir);
 
-        let first = diff_diagnostics(&mut workspaces, None);
+        let first = diff_diagnostics(&mut workspaces, &HashSet::new());
         assert_eq!(first.len(), 1, "first pass publishes a.md's diagnostic");
 
         edit(&mut workspaces, "a.md", "# A\n");
-        let second = diff_diagnostics(&mut workspaces, None);
+        let second = diff_diagnostics(&mut workspaces, &HashSet::new());
         assert_eq!(
             second.len(),
             1,
@@ -6982,7 +7014,7 @@ mod tests {
             "the clearing publish carries an empty vector"
         );
 
-        let third = diff_diagnostics(&mut workspaces, None);
+        let third = diff_diagnostics(&mut workspaces, &HashSet::new());
         assert!(
             third.is_empty(),
             "a clean file is not re-cleared on the next sync: {third:?}"
@@ -6994,7 +7026,7 @@ mod tests {
         let dir = workspace_with_files(&[("a.md", "# A\n\n# A\n"), ("b.md", "# B\n")]);
         let mut workspaces = scan_workspaces(&dir);
 
-        let first = diff_diagnostics(&mut workspaces, None);
+        let first = diff_diagnostics(&mut workspaces, &HashSet::new());
         assert_eq!(first.len(), 1, "first pass publishes a.md");
 
         // Delete a.md from disk and drop it from the index.
@@ -7008,7 +7040,7 @@ mod tests {
             ws.update(Path::new("a.md")).expect("update after delete");
         }
 
-        let second = diff_diagnostics(&mut workspaces, None);
+        let second = diff_diagnostics(&mut workspaces, &HashSet::new());
         assert_eq!(
             second.len(),
             1,
@@ -7068,7 +7100,7 @@ mod tests {
         // Seed the client cache: a.md publishes its trailing-whitespace warning at
         // UTF-16 column 4 (after four ASCII chars), keyed by the symlinked URI.
         let changed_uri = path_to_uri(&link.join("a.md"));
-        let first = diff_diagnostics(&mut workspaces, None);
+        let first = diff_diagnostics(&mut workspaces, &HashSet::new());
         assert_eq!(
             first.len(),
             1,
@@ -7088,7 +7120,7 @@ mod tests {
         // 4..5, so the Lattice vector is byte-identical, but the UTF-16 column of
         // its start shifts 4 -> 2. Only the forced re-materialization can catch it.
         edit(&mut workspaces, "a.md", "😀 \n");
-        let sent = diff_diagnostics(&mut workspaces, Some(&changed_uri));
+        let sent = diff_diagnostics(&mut workspaces, &one_uri(&changed_uri));
         assert_eq!(
             sent.len(),
             1,
@@ -7125,6 +7157,16 @@ mod tests {
         MATERIALIZE_COUNT.with(|count| count.set(0));
         let value = f();
         let count = MATERIALIZE_COUNT.with(std::cell::Cell::get);
+        (count, value)
+    }
+
+    /// Reset the recompute counter, returning the number of whole-workspace
+    /// recompute / publish passes a closure drove — so a test can assert that a
+    /// batched watched-file notification collapses to one pass (ticket perf 07).
+    fn count_recomputes<T>(f: impl FnOnce() -> T) -> (usize, T) {
+        RECOMPUTE_COUNT.with(|count| count.set(0));
+        let value = f();
+        let count = RECOMPUTE_COUNT.with(std::cell::Cell::get);
         (count, value)
     }
 
@@ -7186,7 +7228,7 @@ mod tests {
 
         // Initial sync, then one per edit. After every sync the client must
         // equal the from-scratch desired (non-empty) set.
-        for (uri, diagnostics) in diff_diagnostics(&mut workspaces, None) {
+        for (uri, diagnostics) in diff_diagnostics(&mut workspaces, &HashSet::new()) {
             apply_publish(&mut client, uri, diagnostics);
         }
         assert_client_matches(&workspaces, &client, "after initial sync");
@@ -7196,7 +7238,7 @@ mod tests {
             // Drive the full path with the edited URI, as a graph-tier didChange
             // does, so the force-re-materialize branch is exercised too.
             let changed = file_uri(&dir, rel);
-            for (uri, diagnostics) in diff_diagnostics(&mut workspaces, Some(&changed)) {
+            for (uri, diagnostics) in diff_diagnostics(&mut workspaces, &one_uri(&changed)) {
                 apply_publish(&mut client, uri, diagnostics);
             }
             assert_client_matches(&workspaces, &client, &format!("after edit {i} ({rel})"));
@@ -7215,7 +7257,7 @@ mod tests {
         let mut client: HashMap<String, Vec<lsp::Diagnostic>> = HashMap::new();
 
         // Seed the client with the initial full publish, as didOpen would.
-        for (uri, diagnostics) in diff_diagnostics(&mut workspaces, None) {
+        for (uri, diagnostics) in diff_diagnostics(&mut workspaces, &HashSet::new()) {
             apply_publish(&mut client, uri, diagnostics);
         }
         assert_client_matches(&workspaces, &client, "after initial sync");
@@ -7259,7 +7301,7 @@ mod tests {
         let mut workspaces = scan_workspaces(&dir);
         let mut client: HashMap<String, Vec<lsp::Diagnostic>> = HashMap::new();
 
-        for (uri, diagnostics) in diff_diagnostics(&mut workspaces, None) {
+        for (uri, diagnostics) in diff_diagnostics(&mut workspaces, &HashSet::new()) {
             apply_publish(&mut client, uri, diagnostics);
         }
         assert_client_matches(&workspaces, &client, "after initial sync");
@@ -7284,7 +7326,7 @@ mod tests {
         for (i, (rel, content)) in steps.iter().enumerate() {
             edit(&mut workspaces, rel, content);
             let changed = file_uri(&dir, rel);
-            for (uri, diagnostics) in diff_diagnostics(&mut workspaces, Some(&changed)) {
+            for (uri, diagnostics) in diff_diagnostics(&mut workspaces, &one_uri(&changed)) {
                 apply_publish(&mut client, uri, diagnostics);
             }
             assert_client_matches(&workspaces, &client, &format!("after edit {i} ({rel})"));
@@ -7314,7 +7356,7 @@ mod tests {
         let mut workspaces = scan_workspaces(&dir);
         let mut client: HashMap<String, Vec<lsp::Diagnostic>> = HashMap::new();
 
-        for (uri, diagnostics) in diff_diagnostics(&mut workspaces, None) {
+        for (uri, diagnostics) in diff_diagnostics(&mut workspaces, &HashSet::new()) {
             apply_publish(&mut client, uri, diagnostics);
         }
         assert_client_matches(&workspaces, &client, "after initial sync");
@@ -7328,7 +7370,7 @@ mod tests {
         );
         let changed = file_uri(&dir, "a.md");
         let (materializations, sent) =
-            count_materializations(|| diff_diagnostics(&mut workspaces, Some(&changed)));
+            count_materializations(|| diff_diagnostics(&mut workspaces, &one_uri(&changed)));
 
         // a.md (the edited file) materializes to nothing; index.md re-materializes
         // its one remaining warning. The four clean files are untouched, so the
@@ -8618,5 +8660,140 @@ mod tests {
         );
 
         shutdown(&client, server_thread);
+    }
+
+    /// Drain every pending `publishDiagnostics` non-blockingly, returning a map
+    /// of URI -> its last-published diagnostics wire JSON (the lsp types are
+    /// send-only). Used to inspect a single batched publish pass without a
+    /// `serve` thread, so the recompute counter (a thread-local) stays on the
+    /// test thread.
+    fn drain_publishes(client: &Connection) -> HashMap<String, Vec<serde_json::Value>> {
+        let mut published: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
+        while let Ok(msg) = client.receiver.try_recv() {
+            if let Message::Notification(notif) = msg
+                && notif.method == lsp::method::PUBLISH_DIAGNOSTICS
+                && let Some(uri) = notif
+                    .params
+                    .get("uri")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            {
+                let diagnostics = notif
+                    .params
+                    .get("diagnostics")
+                    .and_then(serde_json::Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                published.insert(uri, diagnostics);
+            }
+        }
+        published
+    }
+
+    #[test]
+    fn watched_batch_publishes_in_one_pass() {
+        // Ticket perf 07: a single `didChangeWatchedFiles` notification carrying
+        // N changed `.md` files must collapse into exactly ONE whole-workspace
+        // recompute / publish pass — not N — while still re-materializing every
+        // changed file. Three closed files each gain a stale-reference
+        // diagnostic on disk; the one batched pass publishes all three.
+        let dir = workspace_with_files(&[
+            (".lattice.toml", ""),
+            ("a.md", "# Clean A\n"),
+            ("b.md", "# Clean B\n"),
+            ("c.md", "# Clean C\n"),
+        ]);
+        let mut workspaces = scan_workspaces(&dir);
+
+        // Seed the published cache with the initial (clean) state: no
+        // diagnostics, so the batch below is a genuine gain for each file.
+        let initial = diff_diagnostics(&mut workspaces, &HashSet::new());
+        assert!(
+            initial.is_empty(),
+            "clean files publish nothing initially: {initial:?}"
+        );
+
+        // Mutate all three files on disk to introduce a stale-reference
+        // diagnostic, then deliver one notification carrying all three changes.
+        for rel in ["a.md", "b.md", "c.md"] {
+            fs::write(dir.path().join(rel), "See `gone.md` here.\n")
+                .unwrap_or_else(|e| panic!("rewrite {rel} on disk: {e}"));
+        }
+        let a_uri = file_uri(&dir, "a.md");
+        let b_uri = file_uri(&dir, "b.md");
+        let c_uri = file_uri(&dir, "c.md");
+        let notif = Notification::new(
+            lsp::method::DID_CHANGE_WATCHED_FILES.to_string(),
+            serde_json::json!({ "changes": [
+                { "uri": a_uri, "type": lsp::file_change_type::CHANGED },
+                { "uri": b_uri, "type": lsp::file_change_type::CHANGED },
+                { "uri": c_uri, "type": lsp::file_change_type::CHANGED },
+            ] }),
+        );
+
+        // Drive the handler on the test thread so the recompute counter (a
+        // thread-local) observes the pass; a memory connection captures the
+        // publishes for inspection.
+        let (server, client) = Connection::memory();
+        let (passes, result) =
+            count_recomputes(|| handle_notification(&server, &mut workspaces, notif));
+        result.expect("handle the batched watched-file notification");
+
+        // The whole batch ran in exactly one recompute pass, not one per file.
+        assert_eq!(
+            passes, 1,
+            "a batch of 3 changed files publishes in one pass, not 3"
+        );
+
+        // Every changed file re-materialized in that single pass.
+        let published = drain_publishes(&client);
+        for uri in [&a_uri, &b_uri, &c_uri] {
+            let diags = published
+                .get(uri)
+                .unwrap_or_else(|| panic!("{uri} was published in the batch pass"));
+            assert!(
+                any_message_contains(diags, "stale reference"),
+                "{uri}'s on-disk change re-materialized in the one pass, got {diags:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn watched_single_change_is_one_pass() {
+        // Ticket perf 07: the N = 1 case is unchanged — a one-file watched
+        // change is the same single pass it always was, with the changed file
+        // re-materialized.
+        let dir = workspace_with_files(&[(".lattice.toml", ""), ("doc.md", "# Clean\n")]);
+        let mut workspaces = scan_workspaces(&dir);
+        let initial = diff_diagnostics(&mut workspaces, &HashSet::new());
+        assert!(
+            initial.is_empty(),
+            "the clean file publishes nothing initially: {initial:?}"
+        );
+
+        fs::write(dir.path().join("doc.md"), "See `gone.md` here.\n")
+            .expect("rewrite doc.md on disk");
+        let doc_uri = file_uri(&dir, "doc.md");
+        let notif = Notification::new(
+            lsp::method::DID_CHANGE_WATCHED_FILES.to_string(),
+            serde_json::json!({ "changes": [
+                { "uri": doc_uri, "type": lsp::file_change_type::CHANGED },
+            ] }),
+        );
+
+        let (server, client) = Connection::memory();
+        let (passes, result) =
+            count_recomputes(|| handle_notification(&server, &mut workspaces, notif));
+        result.expect("handle the single watched-file notification");
+        assert_eq!(passes, 1, "a single changed file is one pass");
+
+        let published = drain_publishes(&client);
+        let diags = published
+            .get(&doc_uri)
+            .expect("doc.md was published in the pass");
+        assert!(
+            any_message_contains(diags, "stale reference"),
+            "the single closed file's on-disk change re-materialized, got {diags:?}"
+        );
     }
 }
