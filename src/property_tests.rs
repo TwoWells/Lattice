@@ -1452,4 +1452,20 @@ fn edit_sequences_cover_cascade_classes() {
             eof_insert("```\n"),
         ],
     );
+
+    // Issue 048: a reversed-range edit splices a single `~` opener against a
+    // closer whose adjacent `\~` is an escaped (literal) tilde — `~===\n~~  \~~`.
+    // The parse is a correct symmetric 1-tilde pair; the emphasis-span invariant
+    // used to over-count the closing edge as two tildes and fire on it. The exact
+    // shrunk counterexample from the perf-03 oracle.
+    assert_edit_sequence_stable(
+        "\n===\n\n> \n\n\n~89 of ~162\n    \n\n# \n\n# \n> \n\n# \n\n    \n    \n# \n\n===\n---\n~~  \\~~\n",
+        &[Edit {
+            start_line: 22,
+            start_char: 0,
+            end_line: 6,
+            end_char: 1,
+            text: "===\n".to_string(),
+        }],
+    );
 }

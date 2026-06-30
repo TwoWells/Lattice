@@ -339,6 +339,35 @@ pub fn assert_inline_resource_fidelity(tree: &Tree) {
 // Emphasis-run span fidelity (ticket 26)
 // ---------------------------------------------------------------------------
 
+/// Whether the leftmost delimiter of a slice's trailing delimiter run (of
+/// length `raw_trail` characters) is backslash-escaped, and so is content
+/// rather than a closing delimiter.
+///
+/// The inline scanner skips `\x` for any ASCII-punctuation `x`, so an escaped
+/// tilde sitting immediately left of a strikethrough closer — the `\~` in a run
+/// like `~a\~~` — is part of the content even though it is the same character as
+/// the delimiter. A run of *k* backslashes escapes the character that follows it
+/// iff *k* is odd (each `\\` pair is one escaped backslash), so the trailing
+/// delimiter run is one shorter than its raw character count exactly when an odd
+/// number of backslashes precedes it. Only the run's *leftmost* delimiter can be
+/// escaped — every other delimiter in the run is preceded by a delimiter, not a
+/// backslash — so the correction is at most one.
+///
+/// The delimiters (`*`, `_`, `~`) and the backslash are all ASCII, so a trailing
+/// run measured in characters is the same length in bytes and starts on a char
+/// boundary; counting backslash *bytes* before it cannot split a multi-byte
+/// scalar.
+fn trailing_delim_is_escaped(slice: &str, raw_trail: usize) -> bool {
+    let bytes = slice.as_bytes();
+    let run_start = bytes.len() - raw_trail;
+    let backslashes = bytes[..run_start]
+        .iter()
+        .rev()
+        .take_while(|&&b| b == b'\\')
+        .count();
+    backslashes % 2 == 1
+}
+
 /// Assert span fidelity for every emphasis / strong / strikethrough run.
 ///
 /// Flanking is a classic source of off-by-one span bugs, and these runs carry
@@ -393,12 +422,19 @@ pub fn assert_emphasis_span_fidelity(tree: &Tree) {
             node.kind
         );
         // A strikethrough run pairs equal-length openers and closers (one or two
-        // tildes), so the edges are symmetric and bounded.
+        // tildes), so the edges are symmetric and bounded. The closing edge is
+        // measured with escapes honored: a backslash-escaped tilde immediately
+        // left of the closing run is content, not a delimiter — the inline
+        // scanner skips `\~` — so it must not inflate the closer count even
+        // though it is the same character (the `~a\~~` class). The opener never
+        // has this problem: a run's span starts at a real delimiter, never an
+        // escaped one.
         if is_strike_delim {
+            let close_run = trail - usize::from(trailing_delim_is_escaped(slice, trail));
             assert!(
-                lead == trail && (1..=2).contains(&lead),
-                "strikethrough run {slice:?} edges {lead}/{trail} are not a symmetric 1- or \
-                 2-tilde pair"
+                lead == close_run && (1..=2).contains(&lead),
+                "strikethrough run {slice:?} edges {lead}/{close_run} (raw trail {trail}) are \
+                 not a symmetric 1- or 2-tilde pair"
             );
         }
         // The matched delimiters bound non-empty content: stripping `open_len`

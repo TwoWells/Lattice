@@ -2073,6 +2073,22 @@ mod tests {
     }
 
     #[test]
+    fn strikethrough_escaped_tilde_adjacent_to_closer() {
+        // A backslash-escaped tilde sitting immediately left of the closing
+        // delimiter is content, not part of the closer: the scanner skips `\~`,
+        // so `~a\~~` is a single-tilde run opened by `~` and closed by the final
+        // `~`, with `\~` literal between them. The span covers the whole thing,
+        // and (regression for issue 048) the closing delimiter run is *one*
+        // tilde, not the two raw tildes the bytes show. cmark-gfm agrees.
+        let tree = parse("~a\\~~\n");
+        assert_eq!(
+            emphasis_slices(&tree, &ElementKind::Strikethrough),
+            vec!["~a\\~~".to_string()],
+            "escaped tilde before the closer is content; the run is a symmetric 1-tilde pair"
+        );
+    }
+
+    #[test]
     fn tilde_left_flanking_only_is_not_strikethrough() {
         // The headline correctness case (ticket 26): in `~89 of ~162` the second
         // `~` is preceded by whitespace, so it is left-flanking only and cannot
