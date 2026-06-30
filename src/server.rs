@@ -3783,13 +3783,31 @@ fn diff_diagnostics(
             by_file.entry(diag.file.clone()).or_default().push(diag);
         }
 
+        // The publish/cache URI is keyed by the client-supplied folder path
+        // (`root`), but the force-re-materialize check below must line up with
+        // `changed_canonical`, which is derived from the workspace's canonical
+        // root (`Workspace::scan` canonicalizes its `start`). The two bases
+        // coincide unless the client opened the folder through a symlink (or
+        // otherwise sent a non-canonical folder URI); when they differ, the
+        // comparison is run on the canonical root so a moved diagnostic on the
+        // edited file is not skipped (issue 047). `workspace.root()` is already
+        // canonical, so this adds no filesystem syscall, and the per-file
+        // canonical URI is rebuilt only in the rare symlinked case.
+        let root_is_canonical = root.as_path() == workspace.root();
+
         for rel_path in workspace.files().keys() {
             let uri = path_to_uri(&root.join(rel_path));
             present.insert(uri.clone());
 
             let lattice = by_file.remove(rel_path).unwrap_or_default();
             let cached = published.get(&uri);
-            let force = changed_canonical.as_deref() == Some(uri.as_str());
+            let force = changed_canonical.as_ref().is_some_and(|changed| {
+                if root_is_canonical {
+                    *changed == uri
+                } else {
+                    *changed == path_to_uri(&workspace.root().join(rel_path))
+                }
+            });
 
             // Reuse the cached materialization when this file's source is
             // unchanged (it is not the edited file) and its Lattice vector still
@@ -7004,6 +7022,85 @@ mod tests {
         assert!(
             second[0].1.is_empty(),
             "the clearing publish carries an empty vector"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn diffing_force_rematerializes_under_symlinked_root() {
+        // Issue 047: the force-re-materialize check must compare on a single,
+        // consistent path basis. When a client opens the workspace folder through
+        // a symlink, the `Workspaces` map is keyed by the symlinked (non-canonical)
+        // folder path the client sent, while `Workspace::scan` canonicalizes the
+        // root. An astral-plane swap upstream of a diagnostic's span leaves the
+        // Lattice vector byte-identical yet shifts its UTF-16 column, so only the
+        // forced re-materialization of the edited file re-publishes the corrected
+        // span. With the pre-fix bug the comparison mixed the canonical (changed)
+        // and client-supplied (per-file) bases, so under the symlink the force
+        // missed and the moved diagnostic was never re-published.
+
+        // Real workspace root: four ASCII chars + one trailing space yields a
+        // trailing-whitespace warning whose span is bytes 4..5 (UTF-16 column 4).
+        let real = workspace_with_files(&[("a.md", "aaaa \n")]);
+
+        // A symlink to the real root: the non-canonical folder path the client
+        // sends. Its string form differs from the canonical root, so the map key
+        // and `workspace.root()` diverge — exactly the issue 047 condition.
+        let link_parent = tempfile::tempdir().expect("create symlink parent dir");
+        let link = link_parent.path().join("ws");
+        std::os::unix::fs::symlink(real.path(), &link).expect("create workspace symlink");
+
+        // Scan through the symlink (scan canonicalizes to the real root) but key
+        // the map by the symlinked path, as `Workspaces::from_params` does for a
+        // client that opened the folder through the symlink.
+        let ws = Workspace::scan(&link).expect("scan should succeed");
+        assert_ne!(
+            ws.root(),
+            link.as_path(),
+            "test setup: the symlinked folder path must differ from the canonical root"
+        );
+        let mut workspaces = Workspaces {
+            inner: BTreeMap::from([(link.clone(), ws)]),
+            published: HashMap::new(),
+            open_documents: HashSet::new(),
+        };
+
+        // Seed the client cache: a.md publishes its trailing-whitespace warning at
+        // UTF-16 column 4 (after four ASCII chars), keyed by the symlinked URI.
+        let changed_uri = path_to_uri(&link.join("a.md"));
+        let first = diff_diagnostics(&mut workspaces, None);
+        assert_eq!(
+            first.len(),
+            1,
+            "first pass publishes a.md's trailing-whitespace warning: {first:?}"
+        );
+        assert_eq!(
+            first[0].0, changed_uri,
+            "the published URI is keyed by the symlinked folder path"
+        );
+        assert_eq!(
+            first[0].1[0].range.start.character, 4,
+            "the span starts after four ASCII chars (UTF-16 column 4)"
+        );
+
+        // Length-preserving astral swap: replace the four ASCII chars with one
+        // astral char (also four bytes). The trailing-whitespace span stays bytes
+        // 4..5, so the Lattice vector is byte-identical, but the UTF-16 column of
+        // its start shifts 4 -> 2. Only the forced re-materialization can catch it.
+        edit(&mut workspaces, "a.md", "😀 \n");
+        let sent = diff_diagnostics(&mut workspaces, Some(&changed_uri));
+        assert_eq!(
+            sent.len(),
+            1,
+            "the edited file re-publishes despite an unchanged Lattice vector: {sent:?}"
+        );
+        assert_eq!(
+            sent[0].0, changed_uri,
+            "the re-published URI is the symlinked a.md"
+        );
+        assert_eq!(
+            sent[0].1[0].range.start.character, 2,
+            "the astral swap moves the span start to UTF-16 column 2"
         );
     }
 
