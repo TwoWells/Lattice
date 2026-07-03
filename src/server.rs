@@ -19,12 +19,12 @@ use crate::block::{
     normalize_label,
 };
 use crate::completion::Context as CompletionContext;
-use crate::config::{Config, FragmentAlgorithm};
+use crate::config::{Config, ConfigError, FragmentAlgorithm};
 use crate::line_index::LineIndex;
 use crate::lsp;
 use crate::span::Span;
 use crate::validation::{self, Diagnostic, Severity};
-use crate::workspace::{FileData, Workspace};
+use crate::workspace::{FileData, Workspace, WorkspaceView, compute_structural, parse_content};
 
 /// What the client currently holds for one document: the Lattice diagnostics
 /// that produced the published set (kept for cheap change-detection) and their
@@ -43,9 +43,55 @@ struct PublishedDiagnostics {
     lsp: Vec<lsp::Diagnostic>,
 }
 
-/// Multiple workspaces keyed by root path.
+/// A single parsed document: the one owner of its [`FileData`] plus the deepest
+/// root that covers it (ticket server 10).
+///
+/// Content has exactly one home regardless of how it arrived — a directory
+/// scan, a `didOpen`, or both — so no two containers can disagree about a
+/// document, which is what the dual `inner`/`singletons` ownership (issue 051)
+/// made possible.
+struct Document {
+    /// Parsed data, always parsed relative to `primary_root` (or the file name
+    /// when rootless), so its link classification matches how the owning root
+    /// resolves it.
+    data: FileData,
+    /// The deepest workspace root whose path covers this document, or `None`
+    /// when the document lies outside every folder — a rootless single-file
+    /// document (issue 051). `None` documents stay diagnostic-quiet: they are
+    /// absent from every root's range scan, so the publish/pull tier never sees
+    /// them, while their document-scoped features still resolve by direct path
+    /// lookup.
+    primary_root: Option<PathBuf>,
+}
+
+/// Root-level state for one workspace folder. Carries no file list — membership
+/// is a range scan over [`Workspaces::documents`], never a secondary index.
+struct RootMeta {
+    /// Canonical scan root ([`Workspace::scan`]'s discovered root). May differ
+    /// from the map key when the client opened the folder through a symlink
+    /// (issue 047): the key is the client-supplied spelling documents resolve
+    /// on, this is the canonical form the force-re-materialize comparison and
+    /// config reload run against.
+    canonical_root: PathBuf,
+    /// Configuration loaded from the root.
+    config: Config,
+    /// Error from loading `.lattice.toml`, if any.
+    config_error: Option<ConfigError>,
+    /// Whether a `.lattice.toml` was found at the root.
+    has_config: bool,
+}
+
+/// The server's flat document store: every parsed document keyed by absolute
+/// path (its single owner), plus root metadata. Root membership is derived by
+/// range scan — `documents.range(root..).take_while(|(p, _)| p.starts_with(root))`
+/// — which is component-wise (via `Path::starts_with`), so a `Lattice` folder
+/// never captures a `LatticeInternal` sibling the way a string-keyed range
+/// would (ticket server 10).
 struct Workspaces {
-    inner: BTreeMap<PathBuf, Workspace>,
+    /// Every parsed document, keyed by absolute path — the single content owner.
+    documents: BTreeMap<PathBuf, Document>,
+    /// Workspace-folder roots, keyed by the client-supplied folder path.
+    roots: BTreeMap<PathBuf, RootMeta>,
     /// Diagnostics last published to the client, keyed by document URI.
     ///
     /// Used to suppress redundant `publishDiagnostics` notifications and to
@@ -65,187 +111,475 @@ struct Workspaces {
     /// reaches the server through `didChange`, so the watcher event would be a
     /// second source of truth (the issue 009 duplication class). A `changed`
     /// event is therefore dropped while its URI is in this set; create/delete
-    /// membership events are honored regardless (ticket server 09).
+    /// membership events are honored regardless (ticket server 09). It also
+    /// pins buffer authority across a workspace-folder change: a folder added
+    /// over an open document keeps the buffer, and a folder removed under one
+    /// keeps it serving rootless.
     open_documents: HashSet<String>,
-    /// Single-file documents opened outside every workspace folder (issue 051),
-    /// keyed by document URI.
-    ///
-    /// Lattice is always a markdown language server: a `didOpen` with no
-    /// ancestor `.lattice.toml`/`.git` (a rootless session, or an open-from-
-    /// outside in a rooted one) still parses and serves its own document-scoped
-    /// features (semantic tokens, folding, symbols, hover, formatting, document
-    /// links, …). Each entry is a self-contained single-file [`Workspace`]
-    /// (`has_config == false`, one indexed document) so those features resolve
-    /// uniformly via [`Workspaces::resolve_document`].
-    ///
-    /// These documents are deliberately absent from `inner`, so the
-    /// graph/structural diagnostic-publish loop (which enumerates `inner`) never
-    /// touches them — the graph tier simply has nothing to say for a single
-    /// file.
-    singletons: BTreeMap<String, Workspace>,
+    /// A borrowable default configuration for rootless single-file views
+    /// (issue 051): a document outside every root parses and serves its
+    /// document-scoped features under defaults, with the graph tier inert.
+    default_config: Config,
 }
 
 impl Workspaces {
+    /// An empty store with no roots and no documents.
+    fn new() -> Self {
+        Self {
+            documents: BTreeMap::new(),
+            roots: BTreeMap::new(),
+            published: HashMap::new(),
+            open_documents: HashSet::new(),
+            default_config: Config::default(),
+        }
+    }
+
     /// Create from the initial set of workspace folders.
     fn from_params(params: &lsp::InitializeParams) -> Self {
-        let mut inner = BTreeMap::new();
+        let mut workspaces = Self::new();
 
         if let Some(folders) = &params.workspace_folders {
             for folder in folders {
-                let root = uri_to_path(&folder.uri);
-                if let Ok(ws) = Workspace::scan(&root) {
-                    inner.insert(root, ws);
-                }
+                workspaces.add_folder(&folder.uri);
             }
         }
 
-        // Fall back to deprecated root_uri if no folders.
-        if let Some(root_uri) = params.root_uri.as_ref().filter(|_| inner.is_empty()) {
-            let root = uri_to_path(root_uri);
-            if let Ok(ws) = Workspace::scan(&root) {
-                inner.insert(root, ws);
+        // Fall back to deprecated root_uri if no folders resolved.
+        if let Some(root_uri) = params
+            .root_uri
+            .as_ref()
+            .filter(|_| workspaces.roots.is_empty())
+        {
+            workspaces.add_folder(root_uri);
+        }
+
+        workspaces
+    }
+
+    // --- Membership derivation (range scan, no index) ---
+
+    /// The deepest root whose path component-covers `abs`, or `None` when `abs`
+    /// lies outside every folder. Deepest = most path components, which for
+    /// nested roots (each a prefix of the other) is the longest, unambiguously.
+    fn deepest_root_for(&self, abs: &Path) -> Option<PathBuf> {
+        self.roots
+            .keys()
+            .filter(|root| abs.starts_with(root))
+            .max_by_key(|root| root.components().count())
+            .cloned()
+    }
+
+    /// The absolute paths of every document under `root`, by range scan.
+    fn document_keys_under(&self, root: &Path) -> Vec<PathBuf> {
+        self.documents
+            .range(root.to_path_buf()..)
+            .take_while(|(abs, _)| abs.starts_with(root))
+            .map(|(abs, _)| abs.clone())
+            .collect()
+    }
+
+    /// The configuration a document with the given primary root parses under:
+    /// the root's config, or the rootless default (issue 051).
+    fn config_for(&self, primary: Option<&Path>) -> &Config {
+        primary
+            .and_then(|root| self.roots.get(root))
+            .map_or(&self.default_config, |meta| &meta.config)
+    }
+
+    /// Build the per-root view the graph/diagnostic pipeline and cross-file
+    /// document features consume: every document under `root` (range scan),
+    /// keyed by path relative to `root`.
+    fn root_view(&self, root: &Path) -> WorkspaceView<'_> {
+        let mut files = BTreeMap::new();
+        for (abs, doc) in self
+            .documents
+            .range(root.to_path_buf()..)
+            .take_while(|(abs, _)| abs.starts_with(root))
+        {
+            if let Ok(rel) = abs.strip_prefix(root) {
+                files.insert(rel.to_path_buf(), &doc.data);
             }
         }
-
-        Self {
-            inner,
-            published: HashMap::new(),
-            open_documents: HashSet::new(),
-            singletons: BTreeMap::new(),
-        }
+        let (config, has_config) = self.roots.get(root).map_or_else(
+            || (&self.default_config, false),
+            |meta| (&meta.config, meta.has_config),
+        );
+        WorkspaceView::new(root.to_path_buf(), config, has_config, files)
     }
 
-    /// Add a workspace folder.
-    fn add(&mut self, uri: &str) {
-        let root = uri_to_path(uri);
-        if let Ok(ws) = Workspace::scan(&root) {
-            self.inner.insert(root, ws);
-        }
+    /// Build a single-file view over one rootless document (issue 051): its
+    /// parent directory is the view root and its file name the sole key, exactly
+    /// as the old single-file `Workspace` was shaped, so document-scoped
+    /// features resolve identically without a workspace.
+    fn single_file_view<'a>(&'a self, abs: &Path, doc: &'a Document) -> WorkspaceView<'a> {
+        let root = match (abs.parent(), abs.file_name()) {
+            (Some(parent), Some(_)) => parent.to_path_buf(),
+            _ => PathBuf::new(),
+        };
+        let mut files = BTreeMap::new();
+        files.insert(document_rel(abs, None), &doc.data);
+        WorkspaceView::new(root, &self.default_config, false, files)
     }
 
-    /// Remove a workspace folder.
-    fn remove(&mut self, uri: &str) {
-        let root = uri_to_path(uri);
-        self.inner.remove(&root);
+    // --- Document resolution ---
+
+    /// Resolve a URI to the view and relative path for its **graph/diagnostic**
+    /// tier: the deepest covering root, or `None` for a rootless or unindexed
+    /// document (which pulls/publishes nothing — issue 051).
+    fn resolve(&self, uri: &str) -> Option<(WorkspaceView<'_>, PathBuf)> {
+        let abs = uri_to_path(uri);
+        let doc = self.documents.get(&abs)?;
+        let root = doc.primary_root.as_ref()?;
+        let rel = abs.strip_prefix(root).ok()?.to_path_buf();
+        Some((self.root_view(root), rel))
     }
 
-    /// Find the workspace that contains a file URI, returning the workspace
-    /// and the file's workspace-relative path.
-    fn resolve(&self, uri: &str) -> Option<(&Workspace, PathBuf)> {
-        let path = uri_to_path(uri);
-        self.inner.iter().rev().find_map(|(root, ws)| {
-            path.strip_prefix(root)
-                .ok()
-                .map(|rel| (ws, rel.to_path_buf()))
-        })
-    }
-
-    /// Find the workspace that contains a file URI (mutable).
-    fn resolve_mut(&mut self, uri: &str) -> Option<(&mut Workspace, PathBuf)> {
-        let path = uri_to_path(uri);
-        self.inner.iter_mut().rev().find_map(|(root, ws)| {
-            path.strip_prefix(root)
-                .ok()
-                .map(|rel| (ws, rel.to_path_buf()))
-        })
-    }
-
-    /// Find the workspace that owns a `.lattice.toml` marker URI.
-    ///
-    /// Tries the ordinary folder-key prefix match first — the same basis
-    /// document URIs resolve on. When that misses, retries against each
-    /// workspace's canonical scan root: the client's file watcher can report
-    /// the marker under a different spelling of the folder path (one side
-    /// through a symlink — the issue 047 class), and a config event dropped on
-    /// a spelling mismatch is the difference between "config live" and
-    /// "config silently dead" (issue 050). `Workspace::root()` is already
-    /// canonical, so only the marker's directory needs canonicalizing — the
-    /// directory rather than the marker itself, so a `deleted` event for a
-    /// just-removed marker still resolves.
-    fn resolve_marker_workspace(&mut self, uri: &str) -> Option<&mut Workspace> {
-        let path = uri_to_path(uri);
-        let key =
-            self.inner
-                .iter()
-                .rev()
-                .find_map(|(root, _)| path.strip_prefix(root).ok().map(|_| root.clone()))
-                .or_else(|| {
-                    let dir = std::fs::canonicalize(path.parent()?).ok()?;
-                    self.inner.iter().rev().find_map(|(root, ws)| {
-                        dir.strip_prefix(ws.root()).ok().map(|_| root.clone())
-                    })
-                })?;
-        self.inner.get_mut(&key)
-    }
-
-    /// Iterate over all workspaces.
-    fn iter(&self) -> impl Iterator<Item = (&PathBuf, &Workspace)> {
-        self.inner.iter()
-    }
-
-    /// Resolve `uri` to the workspace and workspace-relative path that serve its
-    /// document-scoped features (semantic tokens, folding, symbols, hover,
+    /// Resolve a URI to the view and relative path that serve its
+    /// **document-scoped** features (semantic tokens, folding, symbols, hover,
     /// formatting, document links, completion, navigation, …).
     ///
-    /// A URI inside a scanned workspace folder resolves there, exactly as
-    /// [`resolve`](Self::resolve) does. A URI outside every folder — the
-    /// rootless or open-from-outside case (issue 051) — resolves to its
-    /// single-file document, so the feature is served without a workspace.
-    ///
-    /// The graph tier is unaffected: it is driven off `self.inner` alone (see
-    /// `diff_diagnostics` and `document_diagnostic`, which use
-    /// [`resolve`](Self::resolve)), so a single-file document contributes no
-    /// backlink/predicate/connectivity diagnostics.
-    fn resolve_document(&self, uri: &str) -> Option<(&Workspace, PathBuf)> {
-        if let Some(resolved) = self.resolve(uri) {
-            return Some(resolved);
+    /// A single direct path lookup: a rooted document resolves against its
+    /// deepest root's view; a rootless document (issue 051) against a
+    /// single-file view. There is no two-phase workspace-then-singleton
+    /// fallback — the flat store made it unnecessary.
+    fn resolve_document(&self, uri: &str) -> Option<(WorkspaceView<'_>, PathBuf)> {
+        let abs = uri_to_path(uri);
+        let doc = self.documents.get(&abs)?;
+        match doc.primary_root.as_ref() {
+            Some(root) => {
+                let rel = abs.strip_prefix(root).ok()?.to_path_buf();
+                Some((self.root_view(root), rel))
+            }
+            None => Some((self.single_file_view(&abs, doc), document_rel(&abs, None))),
         }
-        let workspace = self.singletons.get(uri)?;
-        let rel_path = workspace.files().keys().next()?.clone();
-        Some((workspace, rel_path))
     }
 
-    /// Sync an opened or edited document's in-memory content into the index.
-    ///
-    /// A URI inside a scanned workspace folder updates that workspace's buffer;
-    /// a URI outside every folder is a single-file document (issue 051) held on
-    /// its own, so its document-scoped features track the edit without a
-    /// workspace.
+    // --- Content upsert / eviction / reconciliation ---
+
+    /// Sync an opened or edited document's in-memory content into the store,
+    /// keyed by path. Content has one home: a URI under a folder joins that
+    /// root's membership; one outside every folder is rootless (issue 051) and
+    /// stays diagnostic-quiet. `primary_root` is computed at insert.
     fn sync_document_content(&mut self, uri: &str, content: &str) {
-        if let Some((workspace, rel_path)) = self.resolve_mut(uri) {
-            workspace.update_content(&rel_path, content);
+        let abs = uri_to_path(uri);
+        let existed = self.documents.contains_key(&abs);
+        let primary = self.deepest_root_for(&abs);
+        let rooted = primary.is_some();
+        let rel = document_rel(&abs, primary.as_deref());
+        let data = {
+            let config = self.config_for(primary.as_deref());
+            parse_content(content, &rel, config)
+        };
+        self.documents.insert(
+            abs.clone(),
+            Document {
+                data,
+                primary_root: primary,
+            },
+        );
+        if existed || !rooted {
+            // An edit to an already-indexed document, or a rootless document
+            // (issue 051): no root's membership changed — a rootless document
+            // appears in no root's range scan, so no other document's
+            // bare-path existence answer can flip. Refresh this document's
+            // own cache only.
+            self.recompute_structural(&abs);
         } else {
-            self.upsert_single_file(uri, content);
+            // A rooted document joined the membership: a bare-path existence
+            // answer can flip in any document that shares a root, so
+            // recompute the structural caches.
+            self.recompute_all_structural();
         }
     }
 
-    /// Create or replace the single-file document for `uri` from in-memory text
-    /// (issue 051).
-    fn upsert_single_file(&mut self, uri: &str, content: &str) {
-        let abs_path = uri_to_path(uri);
-        self.singletons
-            .insert(uri.to_string(), Workspace::single_file(&abs_path, content));
-    }
-
-    /// Refresh a single-file document from disk — used by a `didSave` that
-    /// carries no text. A no-op when `uri` is not a single-file document or the
-    /// file cannot be read (the in-memory buffer is then left as-is).
-    fn refresh_single_file_from_disk(&mut self, uri: &str) {
-        if !self.singletons.contains_key(uri) {
+    /// Reconcile a document to disk: re-read and re-parse it, or drop it if it
+    /// is gone (issue 046 didClose semantics; watched create/change/delete).
+    /// Its `primary_root` is recomputed at insert.
+    fn update_from_disk(&mut self, abs: &Path) {
+        let existed = self.documents.contains_key(abs);
+        if !abs.is_file() {
+            if self.documents.remove(abs).is_some() {
+                self.recompute_all_structural();
+            }
             return;
         }
-        let abs_path = uri_to_path(uri);
-        if let Ok(content) = std::fs::read_to_string(&abs_path) {
-            self.singletons
-                .insert(uri.to_string(), Workspace::single_file(&abs_path, &content));
+        let Ok(content) = std::fs::read_to_string(abs) else {
+            // Exists but unreadable: drop it so no stale content lingers —
+            // stricter than the test-only incremental `Workspace::update`,
+            // which keeps the stale entry and surfaces the read error.
+            if self.documents.remove(abs).is_some() {
+                self.recompute_all_structural();
+            }
+            return;
+        };
+        let primary = self.deepest_root_for(abs);
+        let rel = document_rel(abs, primary.as_deref());
+        let data = {
+            let config = self.config_for(primary.as_deref());
+            parse_content(&content, &rel, config)
+        };
+        self.documents.insert(
+            abs.to_path_buf(),
+            Document {
+                data,
+                primary_root: primary,
+            },
+        );
+        if existed {
+            self.recompute_structural(abs);
+        } else {
+            self.recompute_all_structural();
         }
     }
 
-    /// Drop the single-file document for `uri`, if present (issue 051) — used on
-    /// `didClose`, when the editor discards the buffer.
+    /// Drop a rootless single-file document (issue 051) — used on `didClose`,
+    /// when the editor discards a buffer that has no disk-backed root to revert
+    /// to. A no-op for a rooted or unindexed URI.
     fn remove_single_file(&mut self, uri: &str) {
-        self.singletons.remove(uri);
+        let abs = uri_to_path(uri);
+        if self
+            .documents
+            .get(&abs)
+            .is_some_and(|doc| doc.primary_root.is_none())
+        {
+            self.documents.remove(&abs);
+        }
     }
+
+    // --- Placement (primary_root) recomputation ---
+
+    /// Recompute a document's deepest covering root and, if it changed, reparse
+    /// it from its **in-memory buffer** under the new root's config and relative
+    /// path — never re-reading disk, so an open editor buffer is preserved
+    /// across a workspace-folder change (decision 017 §3).
+    fn refresh_placement(&mut self, abs: &Path) {
+        let new_primary = self.deepest_root_for(abs);
+        let Some(doc) = self.documents.get(abs) else {
+            return;
+        };
+        if doc.primary_root == new_primary {
+            return;
+        }
+        let source = doc.data.tree.source().to_string();
+        let rel = document_rel(abs, new_primary.as_deref());
+        let data = {
+            let config = self.config_for(new_primary.as_deref());
+            parse_content(&source, &rel, config)
+        };
+        self.documents.insert(
+            abs.to_path_buf(),
+            Document {
+                data,
+                primary_root: new_primary,
+            },
+        );
+    }
+
+    /// Reparse a document from its in-memory buffer under its current primary
+    /// root's config (placement unchanged) — used by a config reload
+    /// (ticket server 08), which changes the config every owned document parses
+    /// under while preserving membership and unsaved buffers.
+    fn reparse_from_buffer(&mut self, abs: &Path) {
+        let Some(doc) = self.documents.get(abs) else {
+            return;
+        };
+        let primary = doc.primary_root.clone();
+        let source = doc.data.tree.source().to_string();
+        let rel = document_rel(abs, primary.as_deref());
+        let data = {
+            let config = self.config_for(primary.as_deref());
+            parse_content(&source, &rel, config)
+        };
+        if let Some(doc) = self.documents.get_mut(abs) {
+            doc.data = data;
+        }
+    }
+
+    // --- Structural cache maintenance ---
+
+    /// Recompute one document's cached structural diagnostics against its
+    /// primary root's membership and config. A rootless document is left empty
+    /// (issue 051 — single-file documents carry no workspace-tier verdicts).
+    fn recompute_structural(&mut self, abs: &Path) {
+        let Some(doc) = self.documents.get(abs) else {
+            return;
+        };
+        let Some(root) = doc.primary_root.clone() else {
+            if let Some(doc) = self.documents.get_mut(abs) {
+                doc.data.structural = Vec::new();
+                doc.data.suppressions = crate::structural::FileSuppressions::default();
+            }
+            return;
+        };
+        let rel = abs.strip_prefix(&root).unwrap_or(abs).to_path_buf();
+        let config = self
+            .roots
+            .get(&root)
+            .map_or(&self.default_config, |meta| &meta.config);
+        // Membership under the primary root, by range scan through the flat
+        // store: a bare-path target `t` exists iff `root/t` is a document.
+        let file_exists = |target: &Path| self.documents.contains_key(&root.join(target));
+        let (diagnostics, suppressions) = compute_structural(&doc.data, &rel, config, &file_exists);
+        if let Some(doc) = self.documents.get_mut(abs) {
+            doc.data.structural = diagnostics;
+            doc.data.suppressions = suppressions;
+        }
+    }
+
+    /// Recompute the structural cache for every document. Required on a
+    /// membership change: adding or removing one file can flip a bare-path
+    /// existence answer in any document that shares a root.
+    fn recompute_all_structural(&mut self) {
+        // Count full sweeps so tests can pin which store mutations pay the
+        // O(workspace) cost (a rootless open must not). Compiled out of
+        // release builds.
+        #[cfg(test)]
+        STRUCTURAL_SWEEP_COUNT.with(|count| count.set(count.get() + 1));
+
+        let keys: Vec<PathBuf> = self.documents.keys().cloned().collect();
+        for abs in &keys {
+            self.recompute_structural(abs);
+        }
+    }
+
+    // --- Workspace-folder changes ---
+
+    /// Add a workspace folder: insert its [`RootMeta`], then scan the directory
+    /// *upsert-if-absent*. A document already present (an open buffer, or one a
+    /// shallower root already scanned) keeps its content and only gains a root;
+    /// absent paths parse from disk. Every document under the folder then
+    /// recomputes its deepest primary root — reparsing from its buffer if the
+    /// owner changed — so the editor buffer is never shadowed by disk and no
+    /// orphaned entry remains.
+    fn add_folder(&mut self, uri: &str) {
+        let folder = uri_to_path(uri);
+        let Ok(ws) = Workspace::scan(&folder) else {
+            return;
+        };
+        let parts = ws.into_parts();
+        self.roots.insert(
+            folder.clone(),
+            RootMeta {
+                canonical_root: parts.root,
+                config: parts.config,
+                config_error: parts.config_error,
+                has_config: parts.has_config,
+            },
+        );
+        for (rel, data) in parts.files {
+            let key = folder.join(&rel);
+            // Upsert-if-absent: an occupied entry (an open buffer, or a
+            // pre-existing scan document) keeps its content; the disk parse is
+            // dropped. The provisional primary is corrected below.
+            self.documents.entry(key).or_insert_with(|| Document {
+                data,
+                primary_root: Some(folder.clone()),
+            });
+        }
+        for key in self.document_keys_under(&folder) {
+            self.refresh_placement(&key);
+        }
+        self.recompute_all_structural();
+    }
+
+    /// Remove a workspace folder: drop its [`RootMeta`], evict scan-only
+    /// documents (not open in the editor), and let open documents recompute
+    /// their primary root (possibly to `None`) and keep serving — no dark
+    /// window.
+    fn remove_folder(&mut self, uri: &str) {
+        let folder = uri_to_path(uri);
+        if self.roots.remove(&folder).is_none() {
+            return;
+        }
+        for key in self.document_keys_under(&folder) {
+            let new_primary = self.deepest_root_for(&key);
+            let is_open = self.open_documents.contains(&path_to_uri(&key));
+            if new_primary.is_none() && !is_open {
+                // A scan-only document of the removed folder, covered by no
+                // remaining root: evict it.
+                self.documents.remove(&key);
+            } else {
+                // Still covered by an ancestor root, or an open buffer that
+                // keeps serving rootless — recompute placement (possibly `None`).
+                self.refresh_placement(&key);
+            }
+        }
+        self.recompute_all_structural();
+    }
+
+    // --- Config reload (ticket server 08) ---
+
+    /// The client-key of the root that owns a `.lattice.toml` marker URI, if
+    /// any. Tries the ordinary folder-key prefix match first (the basis
+    /// documents resolve on); on a miss, retries against each root's canonical
+    /// scan path — the watcher may report the marker under a different spelling
+    /// (a symlink — issue 047), and a dropped config event is the difference
+    /// between config live and silently dead (issue 050). Only the marker's
+    /// directory is canonicalized, so a `deleted` event still resolves.
+    fn root_for_marker(&self, uri: &str) -> Option<PathBuf> {
+        let path = uri_to_path(uri);
+        if let Some(root) = self
+            .roots
+            .keys()
+            .rev()
+            .find(|root| path.strip_prefix(root).is_ok())
+        {
+            return Some(root.clone());
+        }
+        let dir = std::fs::canonicalize(path.parent()?).ok()?;
+        self.roots.iter().rev().find_map(|(root, meta)| {
+            dir.strip_prefix(&meta.canonical_root)
+                .ok()
+                .map(|_| root.clone())
+        })
+    }
+
+    /// Reload one root's `.lattice.toml` and re-parse every document it owns
+    /// from its in-memory buffer under the fresh config, then recompute the
+    /// structural caches. A marker change invalidates the whole root — predicate
+    /// vocabulary, artifacts, overrides, and external aliases all feed parse and
+    /// structural analysis (decision 017) — so this is a config-only re-scan
+    /// that preserves membership and unsaved buffers.
+    fn reload_root_config(&mut self, root: &Path) {
+        let Some(meta) = self.roots.get_mut(root) else {
+            return;
+        };
+        let canonical = meta.canonical_root.clone();
+        let (config, config_error) = match Config::load(&canonical) {
+            Ok(c) => (c, None),
+            Err(e) => {
+                tracing::warn!(root = %canonical.display(), "config reload error, using defaults: {e}");
+                (Config::default(), Some(e))
+            }
+        };
+        meta.has_config = canonical.join(".lattice.toml").is_file();
+        meta.config = config;
+        meta.config_error = config_error;
+
+        let owned: Vec<PathBuf> = self
+            .documents
+            .iter()
+            .filter(|(_, doc)| doc.primary_root.as_deref() == Some(root))
+            .map(|(abs, _)| abs.clone())
+            .collect();
+        for abs in &owned {
+            self.reparse_from_buffer(abs);
+        }
+        self.recompute_all_structural();
+    }
+}
+
+/// The path a document parses relative to: its path under `primary` for a
+/// rooted document, or its file name (matching the old single-file `Workspace`)
+/// when rootless.
+fn document_rel(abs: &Path, primary: Option<&Path>) -> PathBuf {
+    primary.map_or_else(
+        || match (abs.parent(), abs.file_name()) {
+            (Some(_), Some(name)) => PathBuf::from(name),
+            _ => abs.to_path_buf(),
+        },
+        |root| abs.strip_prefix(root).unwrap_or(abs).to_path_buf(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1388,11 +1722,16 @@ fn workspace_symbols(workspaces: &Workspaces, query: &str) -> Vec<lsp::SymbolInf
     let query_lower = query.to_lowercase();
     let mut symbols = Vec::new();
 
-    for (root, workspace) in workspaces.iter() {
-        for (rel_path, file_data) in workspace.files() {
-            let tree = &file_data.tree;
-            collect_workspace_symbols(tree, &query_lower, root, rel_path, &mut symbols);
-        }
+    // Enumerate rooted documents only — a rootless single-file document (issue
+    // 051) is deliberately absent from workspace symbols, as it was when the
+    // graph tier enumerated `inner` alone. Each document is visited once under
+    // its deepest root, so overlapping folders do not double-list it.
+    for (abs, doc) in &workspaces.documents {
+        let Some(root) = doc.primary_root.as_deref() else {
+            continue;
+        };
+        let rel_path = abs.strip_prefix(root).unwrap_or(abs);
+        collect_workspace_symbols(&doc.data.tree, &query_lower, root, rel_path, &mut symbols);
     }
 
     symbols
@@ -1563,38 +1902,44 @@ fn find_references(workspaces: &Workspaces, params: &lsp::ReferenceParams) -> Ve
 
     let mut locations = Vec::new();
 
-    for (root, ws) in workspaces.iter() {
-        for (src_path, src_data) in ws.files() {
-            let links = src_data.tree.links(src_path);
-            for link in &links {
-                let LinkKind::IntraProject {
-                    target, fragment, ..
-                } = &link.kind
-                else {
+    // Scan every rooted document's links for edges to the cursor's document. A
+    // source's targets are classified relative to its own deepest root, so a
+    // link resolves to the cursor `rel_path` only within the same root — cross-
+    // root references were never matched, and are not now (each root is its own
+    // graph).
+    for (abs, doc) in &workspaces.documents {
+        let Some(root) = doc.primary_root.as_deref() else {
+            continue;
+        };
+        let src_path = abs.strip_prefix(root).unwrap_or(abs);
+        let links = doc.data.tree.links(src_path);
+        for link in &links {
+            let LinkKind::IntraProject {
+                target, fragment, ..
+            } = &link.kind
+            else {
+                continue;
+            };
+            if target != &rel_path {
+                continue;
+            }
+            // If cursor is on a heading, only match links with a fragment to that heading.
+            if let Some(heading) = target_heading {
+                let Some(frag) = fragment else {
                     continue;
                 };
-                if target != &rel_path {
+                if !heading_matches_fragment(heading, frag) {
                     continue;
                 }
-                // If cursor is on a heading, only match links with a fragment to that heading.
-                if let Some(heading) = target_heading {
-                    let Some(frag) = fragment else {
-                        continue;
-                    };
-                    if !heading_matches_fragment(heading, frag) {
-                        continue;
-                    }
-                }
-                let abs_path = root.join(src_path);
-                let line = link.line.saturating_sub(1) as u32;
-                locations.push(lsp::Location {
-                    uri: path_to_uri(&abs_path),
-                    range: lsp::Range {
-                        start: lsp::Position { line, character: 0 },
-                        end: lsp::Position { line, character: 0 },
-                    },
-                });
             }
+            let line = link.line.saturating_sub(1) as u32;
+            locations.push(lsp::Location {
+                uri: path_to_uri(abs),
+                range: lsp::Range {
+                    start: lsp::Position { line, character: 0 },
+                    end: lsp::Position { line, character: 0 },
+                },
+            });
         }
     }
 
@@ -1837,8 +2182,8 @@ fn go_to_implementation(
     let (workspace, rel_path) = workspaces.resolve_document(&params.text_document.uri)?;
     let file_data = workspace.file(&rel_path)?;
 
-    implementation_from_body_link(workspace, &rel_path, file_data, params)
-        .or_else(|| implementation_from_backlink(workspace, &rel_path, file_data, params))
+    implementation_from_body_link(&workspace, &rel_path, file_data, params)
+        .or_else(|| implementation_from_backlink(&workspace, &rel_path, file_data, params))
 }
 
 /// Body-link entry point for [`go_to_implementation`].
@@ -1854,7 +2199,7 @@ fn go_to_implementation(
     reason = "line numbers in markdown files won't exceed u32::MAX"
 )]
 fn implementation_from_body_link(
-    workspace: &Workspace,
+    workspace: &WorkspaceView,
     rel_path: &Path,
     file_data: &FileData,
     params: &lsp::TextDocumentPositionParams,
@@ -1926,7 +2271,7 @@ fn implementation_from_body_link(
     reason = "line numbers in markdown files won't exceed u32::MAX"
 )]
 fn implementation_from_backlink(
-    workspace: &Workspace,
+    workspace: &WorkspaceView,
     rel_path: &Path,
     file_data: &FileData,
     params: &lsp::TextDocumentPositionParams,
@@ -2132,34 +2477,35 @@ fn call_hierarchy_incoming(
 
     let mut calls = Vec::new();
 
-    for (root, ws) in workspaces.iter() {
-        for (src_path, file_data) in ws.files() {
-            let links = file_data.tree.links(src_path);
-            let headings = file_data.tree.headings();
-            for link in &links {
-                let LinkKind::IntraProject { target, .. } = &link.kind else {
-                    continue;
-                };
-                if target != &rel_path {
-                    continue;
-                }
-                let abs_src = root.join(src_path);
-                let caller_heading = enclosing_heading(&headings, link.line);
-
-                let caller_item = caller_heading.map_or_else(
-                    || file_hierarchy_item(&abs_src, src_path),
-                    |ch| heading_to_hierarchy_item(ch, &abs_src),
-                );
-
-                let line = link.line.saturating_sub(1) as u32;
-                calls.push(lsp::CallHierarchyIncomingCall {
-                    from: caller_item,
-                    from_ranges: vec![lsp::Range {
-                        start: lsp::Position { line, character: 0 },
-                        end: lsp::Position { line, character: 0 },
-                    }],
-                });
+    for (abs, doc) in &workspaces.documents {
+        let Some(root) = doc.primary_root.as_deref() else {
+            continue;
+        };
+        let src_path = abs.strip_prefix(root).unwrap_or(abs);
+        let links = doc.data.tree.links(src_path);
+        let headings = doc.data.tree.headings();
+        for link in &links {
+            let LinkKind::IntraProject { target, .. } = &link.kind else {
+                continue;
+            };
+            if target != &rel_path {
+                continue;
             }
+            let caller_heading = enclosing_heading(&headings, link.line);
+
+            let caller_item = caller_heading.map_or_else(
+                || file_hierarchy_item(abs, src_path),
+                |ch| heading_to_hierarchy_item(ch, abs),
+            );
+
+            let line = link.line.saturating_sub(1) as u32;
+            calls.push(lsp::CallHierarchyIncomingCall {
+                from: caller_item,
+                from_ranges: vec![lsp::Range {
+                    start: lsp::Position { line, character: 0 },
+                    end: lsp::Position { line, character: 0 },
+                }],
+            });
         }
     }
 
@@ -2293,7 +2639,7 @@ fn document_links(workspaces: &Workspaces, uri: &str) -> Vec<lsp::DocumentLink> 
 
 /// Collect all diagnostics for a workspace: structural (unconditional) +
 /// graph (gated by `.lattice.toml`).
-fn collect_all_diagnostics(workspace: &Workspace) -> Vec<Diagnostic> {
+fn collect_all_diagnostics(workspace: &WorkspaceView) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
 
     // Structural diagnostics: always run, no config required. Read from the
@@ -2344,7 +2690,10 @@ fn file_local_diagnostics(file_data: &FileData, rel_path: &Path) -> Vec<Diagnost
 /// This is the structural-tier slice of the full desired set; it excludes graph
 /// diagnostics, so [`diff_file_diagnostics`] is sound only in the structural
 /// tier (its callers gate on `!has_config()`).
-fn file_desired(workspace: &Workspace, rel_path: &Path) -> (Vec<Diagnostic>, Vec<lsp::Diagnostic>) {
+fn file_desired(
+    workspace: &WorkspaceView,
+    rel_path: &Path,
+) -> (Vec<Diagnostic>, Vec<lsp::Diagnostic>) {
     let Some(file_data) = workspace.file(rel_path) else {
         return (Vec::new(), Vec::new());
     };
@@ -2362,7 +2711,7 @@ fn file_desired(workspace: &Workspace, rel_path: &Path) -> (Vec<Diagnostic>, Vec
 /// Return diagnostics for a single document.
 fn document_diagnostic(workspaces: &Workspaces, uri: &str) -> lsp::FullDocumentDiagnosticReport {
     let items = if let Some((workspace, rel_path)) = workspaces.resolve(uri) {
-        let all = collect_all_diagnostics(workspace);
+        let all = collect_all_diagnostics(&workspace);
         let fd = workspace.file(&rel_path);
         let source = fd.map_or("", |fd| fd.tree.source());
         let empty = LineIndex::default();
@@ -2386,8 +2735,9 @@ fn workspace_diagnostic(workspaces: &Workspaces) -> lsp::WorkspaceDiagnosticRepo
     let mut reports = Vec::new();
 
     let empty = LineIndex::default();
-    for (root, workspace) in workspaces.iter() {
-        let all = collect_all_diagnostics(workspace);
+    for root in workspaces.roots.keys() {
+        let workspace = workspaces.root_view(root);
+        let all = collect_all_diagnostics(&workspace);
         let mut by_file: BTreeMap<PathBuf, Vec<lsp::Diagnostic>> = BTreeMap::new();
 
         for diag in &all {
@@ -3155,10 +3505,10 @@ fn completion(
     let pos = params.position;
     let items = match context {
         CompletionContext::Path { partial } => {
-            complete_path(workspace, &rel_path, partial, source, offset, pos)
+            complete_path(&workspace, &rel_path, partial, source, offset, pos)
         }
         CompletionContext::Fragment { target, partial } => {
-            complete_fragment(workspace, &rel_path, target, partial, source, offset, pos)
+            complete_fragment(&workspace, &rel_path, target, partial, source, offset, pos)
         }
         CompletionContext::Predicate { target, partial } => {
             complete_predicate(workspace.config(), target, partial, source, offset, pos)
@@ -3238,7 +3588,7 @@ fn matches_prefix(candidate: &str, partial: &str) -> bool {
 /// directories under the typed (relative) directory, with only the trailing
 /// filename segment replaced.
 fn complete_path(
-    workspace: &Workspace,
+    workspace: &WorkspaceView,
     rel_path: &Path,
     partial: &str,
     source: &str,
@@ -3304,7 +3654,7 @@ fn complete_path(
 /// Complete heading fragments: the target document's anchors (explicit `{#id}`
 /// and computed slugs), or the current document's for an in-doc `#`.
 fn complete_fragment(
-    workspace: &Workspace,
+    workspace: &WorkspaceView,
     rel_path: &Path,
     target: &str,
     partial: &str,
@@ -3541,20 +3891,13 @@ fn handle_notification(
         }
         lsp::method::DID_SAVE => {
             let params: lsp::DidSaveTextDocumentParams = serde_json::from_value(notif.params)?;
-            if let Some((ws, rel_path)) = workspaces.resolve_mut(&params.text_document.uri) {
-                if let Some(text) = &params.text {
-                    ws.update_content(&rel_path, text);
-                } else {
-                    let _ = ws.update(&rel_path);
-                }
-            } else if let Some(text) = &params.text {
-                // Single-file document (issue 051): refresh its buffer from the
-                // save payload.
-                workspaces.upsert_single_file(&params.text_document.uri, text);
+            if let Some(text) = &params.text {
+                // The save payload carries the text: upsert it by path.
+                workspaces.sync_document_content(&params.text_document.uri, text);
             } else {
-                // No text in the save payload: reconcile the single-file
-                // document to disk instead.
-                workspaces.refresh_single_file_from_disk(&params.text_document.uri);
+                // No text in the save payload: reconcile the document to disk.
+                let abs = uri_to_path(&params.text_document.uri);
+                workspaces.update_from_disk(&abs);
             }
             publish_all_diagnostics(connection, workspaces, &one_uri(&params.text_document.uri))?;
         }
@@ -3562,29 +3905,32 @@ fn handle_notification(
             let params: lsp::DidChangeTextDocumentParams = serde_json::from_value(notif.params)?;
             if let Some(change) = params.content_changes.into_iter().last() {
                 // A didChange targets an already-open (already-indexed) document,
-                // so it never changes workspace membership. In the structural
-                // tier that means only the edited file's diagnostics can change,
-                // so publish just its delta instead of an O(workspace) recompute
-                // (issue 013 — stage 2.5). The graph tier takes the full path —
-                // a link/backlink edit reaches other files — but that path now
-                // re-materializes only the files the whole-graph recompute shows
-                // actually changed (ticket perf 02), with the edited URI passed
-                // so its own materialization is refreshed unconditionally.
+                // so it never changes membership. Upsert the buffer, then choose
+                // the publish path from the document's placement:
                 //
-                // A single-file document (issue 051) outside every folder takes
-                // neither path: it updates its own buffer so its document-scoped
-                // features track the edit, and publishes nothing (the graph tier
-                // has nothing to say). `Some(has_config)` selects the graph
-                // (`true`) or structural-delta (`false`) publish; `None` is the
-                // single-file case.
-                let publish = if let Some((ws, rel_path)) =
-                    workspaces.resolve_mut(&params.text_document.uri)
+                // - rooted with `.lattice.toml`: the full graph path — a
+                //   link/backlink edit reaches other files — re-materializing
+                //   only the files the whole-graph recompute shows changed
+                //   (ticket perf 02), with the edited URI forced.
+                // - rooted without config: the cheap structural-tier delta —
+                //   only the edited file's diagnostics can change (issue 013 —
+                //   stage 2.5).
+                // - rootless (issue 051): publish nothing; the graph tier has
+                //   nothing to say for a single file.
+                workspaces.sync_document_content(&params.text_document.uri, &change.text);
+                let abs = uri_to_path(&params.text_document.uri);
+                let publish = match workspaces
+                    .documents
+                    .get(&abs)
+                    .and_then(|doc| doc.primary_root.clone())
                 {
-                    ws.update_content(&rel_path, &change.text);
-                    Some(ws.has_config())
-                } else {
-                    workspaces.upsert_single_file(&params.text_document.uri, &change.text);
-                    None
+                    Some(root) => Some(
+                        workspaces
+                            .roots
+                            .get(&root)
+                            .is_some_and(|meta| meta.has_config),
+                    ),
+                    None => None,
                 };
                 match publish {
                     Some(true) => publish_all_diagnostics(
@@ -3607,13 +3953,15 @@ fn handle_notification(
             let params: lsp::DidChangeWorkspaceFoldersParams =
                 serde_json::from_value(notif.params)?;
             for removed in &params.event.removed {
-                workspaces.remove(&removed.uri);
+                workspaces.remove_folder(&removed.uri);
             }
             for added in &params.event.added {
-                workspaces.add(&added.uri);
+                workspaces.add_folder(&added.uri);
             }
             // No single file's text changed — added folders bring cache-miss
-            // files that re-materialize regardless, removed ones are cleared.
+            // files that re-materialize regardless, and removed ones are cleared
+            // by the diff's absent-file pass. Open documents kept their buffers
+            // across the change (buffer-wins), so no dark window.
             publish_all_diagnostics(connection, workspaces, &HashSet::new())?;
         }
         lsp::method::DID_CHANGE_WATCHED_FILES => {
@@ -3655,9 +4003,9 @@ fn handle_watched_files_change(
         if !change.uri.ends_with(".lattice.toml") {
             continue;
         }
-        if let Some(workspace) = workspaces.resolve_marker_workspace(&change.uri) {
-            if reloaded_roots.insert(workspace.root().to_path_buf()) {
-                workspace.reload_config();
+        if let Some(root) = workspaces.root_for_marker(&change.uri) {
+            if reloaded_roots.insert(root.clone()) {
+                workspaces.reload_root_config(&root);
                 reloaded = true;
             }
         } else {
@@ -3691,14 +4039,17 @@ fn handle_watched_files_change(
             lsp::file_change_type::CHANGED if workspaces.open_documents.contains(&change.uri) => {}
             // created / deleted are membership changes honored regardless of
             // open state; a non-open `changed` re-reads disk. All three route
-            // through `Workspace::update`, which re-reads disk — reparsing a
+            // through `update_from_disk`, which re-reads disk — reparsing a
             // created/changed file and dropping a deleted one — and refreshes
-            // the structural caches.
+            // the structural caches. Only files under a folder are tracked (the
+            // watcher glob is folder-scoped), so an event outside every root is
+            // ignored.
             lsp::file_change_type::CREATED
             | lsp::file_change_type::CHANGED
             | lsp::file_change_type::DELETED => {
-                if let Some((workspace, rel_path)) = workspaces.resolve_mut(&change.uri) {
-                    let _ = workspace.update(&rel_path);
+                let abs = uri_to_path(&change.uri);
+                if workspaces.deepest_root_for(&abs).is_some() {
+                    workspaces.update_from_disk(&abs);
                     changed_docs.insert(change.uri.clone());
                 }
             }
@@ -3736,23 +4087,32 @@ fn handle_watched_files_change(
 /// Re-publishes through the graph-aware [`publish_all_diagnostics`] path,
 /// naming the URI: reverting from buffer to disk content can move cross-file
 /// backlink/forward edges, so this mirrors the watched-file `changed` branch
-/// for closed files. A URI outside every workspace folder is a single-file
-/// document (issue 051), which is simply dropped — it has no disk-backed
-/// workspace to revert to and published no diagnostics to clear.
+/// for closed files. A rootless document (issue 051) is simply dropped — it has
+/// no disk-backed root to revert to and published no diagnostics to clear.
 fn reconcile_closed_document(
     connection: &Connection,
     workspaces: &mut Workspaces,
     uri: &str,
 ) -> Result<()> {
-    let Some((workspace, rel_path)) = workspaces.resolve_mut(uri) else {
-        // A single-file document (issue 051): the buffer is gone and there is no
-        // disk-backed workspace to revert to, so drop it. It published no
-        // diagnostics, so nothing needs clearing.
-        workspaces.remove_single_file(uri);
-        return Ok(());
-    };
-    let _ = workspace.update(&rel_path);
-    publish_all_diagnostics(connection, workspaces, &one_uri(uri))
+    let abs = uri_to_path(uri);
+    match workspaces
+        .documents
+        .get(&abs)
+        .map(|doc| doc.primary_root.is_some())
+    {
+        Some(true) => {
+            // Rooted: content authority reverts to the filesystem — reconcile
+            // to disk (reparse, or drop if gone) and re-publish.
+            workspaces.update_from_disk(&abs);
+            publish_all_diagnostics(connection, workspaces, &one_uri(uri))
+        }
+        // Rootless single-file document: drop it; it published nothing.
+        Some(false) => {
+            workspaces.remove_single_file(uri);
+            Ok(())
+        }
+        None => Ok(()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3833,7 +4193,7 @@ fn diff_file_diagnostics(
     let (canonical, lattice, lsp) = {
         let (workspace, rel_path) = workspaces.resolve(uri)?;
         let canonical = path_to_uri(&workspace.root().join(&rel_path));
-        let (lattice, lsp) = file_desired(workspace, &rel_path);
+        let (lattice, lsp) = file_desired(&workspace, &rel_path);
         (canonical, lattice, lsp)
     };
 
@@ -3878,8 +4238,12 @@ fn desired_diagnostics(workspaces: &Workspaces) -> BTreeMap<String, Vec<lsp::Dia
     let mut desired: BTreeMap<String, Vec<lsp::Diagnostic>> = BTreeMap::new();
     let empty = LineIndex::default();
 
-    for (root, workspace) in workspaces.iter() {
-        let all_diagnostics = collect_all_diagnostics(workspace);
+    // Ascending root order: a document under overlapping folders is inserted by
+    // the shallow root first and overwritten by the deepest, so the deepest
+    // workspace's set wins the shared URI (matching `diff_diagnostics`).
+    for root in workspaces.roots.keys() {
+        let workspace = workspaces.root_view(root);
+        let all_diagnostics = collect_all_diagnostics(&workspace);
 
         let mut by_file: BTreeMap<PathBuf, Vec<lsp::Diagnostic>> = BTreeMap::new();
         for diag in &all_diagnostics {
@@ -3955,96 +4319,99 @@ fn diff_diagnostics(
     RECOMPUTE_COUNT.with(|count| count.set(count.get() + 1));
 
     // Canonicalize each changed URI to the form the cache is keyed by, so the
-    // force-re-materialize check below lines up with the per-file URIs.
+    // force-re-materialize check below lines up with the per-file URIs. A
+    // document's canonical form joins its primary root's canonical scan path
+    // (which differs from the client-supplied folder key only under a symlink —
+    // issue 047).
     let changed_canonical: HashSet<String> = changed_uris
         .iter()
         .filter_map(|uri| {
-            workspaces
-                .resolve(uri)
-                .map(|(workspace, rel_path)| path_to_uri(&workspace.root().join(rel_path)))
+            let abs = uri_to_path(uri);
+            let doc = workspaces.documents.get(&abs)?;
+            let root = doc.primary_root.as_ref()?;
+            let meta = workspaces.roots.get(root)?;
+            let rel = abs.strip_prefix(root).ok()?;
+            Some(path_to_uri(&meta.canonical_root.join(rel)))
         })
         .collect();
 
-    // Phase 1 — detection. With an immutable view of the workspaces and the
-    // published cache, recompute each file's Lattice vector, decide whether it
-    // changed, and materialize only the changed files. Collect owned results so
-    // the cache can be mutated afterward.
-    let inner = &workspaces.inner;
-    let published = &workspaces.published;
     let mut materialized: Vec<Materialized> = Vec::new();
     let mut present: HashSet<String> = HashSet::new();
-    // Fallback index for the defensive unindexed-file path (a diagnostic whose
-    // file is not in the index); real files use their own cached `line_index`.
-    let empty = LineIndex::default();
 
-    // Deepest root first (reverse key order), and each URI is claimed by the
-    // first workspace that indexes it: overlapping workspace folders (one root
-    // nested inside another) index the same absolute file twice, and letting
-    // both compute the same publish-cache key makes successive passes
-    // alternate between the two workspaces' diagnostic sets — the deeper
-    // workspace's vector one pass, the shallower's the next, each seeing the
-    // other's cache entry as "changed" (issue 050's flip-flop shape). The
-    // deepest root owning the file matches how `resolve` routes document
-    // events, and how the test oracle `desired_diagnostics` settles the same
-    // URI (its ascending-order overwrite keeps the deepest workspace's set).
-    for (root, workspace) in inner.iter().rev() {
-        let mut by_file: BTreeMap<PathBuf, Vec<Diagnostic>> = BTreeMap::new();
-        for diag in collect_all_diagnostics(workspace) {
-            by_file.entry(diag.file.clone()).or_default().push(diag);
-        }
+    // Phase 1 — detection. With an immutable view of the store and the published
+    // cache, recompute each file's Lattice vector, decide whether it changed,
+    // and materialize only the changed files. Collect owned results so the cache
+    // can be mutated afterward.
+    {
+        let published = &workspaces.published;
+        // Fallback index for the defensive unindexed-file path; real files use
+        // their own cached `line_index`.
+        let empty = LineIndex::default();
 
-        // The publish/cache URI is keyed by the client-supplied folder path
-        // (`root`), but the force-re-materialize check below must line up with
-        // `changed_canonical`, which is derived from the workspace's canonical
-        // root (`Workspace::scan` canonicalizes its `start`). The two bases
-        // coincide unless the client opened the folder through a symlink (or
-        // otherwise sent a non-canonical folder URI); when they differ, the
-        // comparison is run on the canonical root so a moved diagnostic on the
-        // edited file is not skipped (issue 047). `workspace.root()` is already
-        // canonical, so this adds no filesystem syscall, and the per-file
-        // canonical URI is rebuilt only in the rare symlinked case.
-        let root_is_canonical = root.as_path() == workspace.root();
-
-        for rel_path in workspace.files().keys() {
-            let uri = path_to_uri(&root.join(rel_path));
-            if !present.insert(uri.clone()) {
-                // Already claimed by a deeper workspace in this pass.
-                continue;
+        // Deepest root first (reverse key order), and each absolute URI is
+        // claimed by the first (deepest) root that indexes it: nested roots
+        // range-scan the same absolute file, and letting both compute the same
+        // publish-cache key makes successive passes alternate between the two
+        // roots' diagnostic sets — the deeper one's vector one pass, the
+        // shallower's the next (issue 050's flip-flop shape). The deepest root
+        // owning the URI matches how `resolve` routes document events and how
+        // the test oracle `desired_diagnostics` settles the same URI.
+        for (root, meta) in workspaces.roots.iter().rev() {
+            let workspace = workspaces.root_view(root);
+            let mut by_file: BTreeMap<PathBuf, Vec<Diagnostic>> = BTreeMap::new();
+            for diag in collect_all_diagnostics(&workspace) {
+                by_file.entry(diag.file.clone()).or_default().push(diag);
             }
 
-            let lattice = by_file.remove(rel_path).unwrap_or_default();
-            let cached = published.get(&uri);
-            let force = if root_is_canonical {
-                changed_canonical.contains(&uri)
-            } else {
-                changed_canonical.contains(&path_to_uri(&workspace.root().join(rel_path)))
-            };
+            // The publish/cache URI is keyed by the client-supplied folder path
+            // (`root`); the force-re-materialize check lines up with
+            // `changed_canonical`, derived from the root's canonical scan path.
+            // The two bases coincide unless the client opened the folder through
+            // a symlink; when they differ, the comparison is run on the
+            // canonical root so a moved diagnostic is not skipped (issue 047).
+            let root_is_canonical = root.as_path() == meta.canonical_root.as_path();
 
-            // Reuse the cached materialization when this file's source is
-            // unchanged (it is not the edited file) and its Lattice vector still
-            // matches what produced the cached LSP form.
-            if !force {
-                match cached {
-                    Some(prev) if prev.lattice == lattice => continue,
-                    None if lattice.is_empty() => continue,
-                    _ => {}
+            for rel_path in workspace.files().keys() {
+                let uri = path_to_uri(&root.join(rel_path));
+                if !present.insert(uri.clone()) {
+                    // Already claimed by a deeper root in this pass.
+                    continue;
                 }
-            }
 
-            let fd = workspace.file(rel_path);
-            let source = fd.map_or("", |fd| fd.tree.source());
-            let index = fd.map_or(&empty, |fd| &fd.line_index);
-            let lsp: Vec<lsp::Diagnostic> = lattice
-                .iter()
-                .map(|d| to_lsp_diagnostic(d, source, index))
-                .collect();
-            let send = cached.map_or(!lsp.is_empty(), |prev| prev.lsp != lsp);
-            materialized.push(Materialized {
-                uri,
-                lattice,
-                lsp,
-                send,
-            });
+                let lattice = by_file.remove(rel_path).unwrap_or_default();
+                let cached = published.get(&uri);
+                let force = if root_is_canonical {
+                    changed_canonical.contains(&uri)
+                } else {
+                    changed_canonical.contains(&path_to_uri(&meta.canonical_root.join(rel_path)))
+                };
+
+                // Reuse the cached materialization when this file's source is
+                // unchanged (it is not the edited file) and its Lattice vector
+                // still matches what produced the cached LSP form.
+                if !force {
+                    match cached {
+                        Some(prev) if prev.lattice == lattice => continue,
+                        None if lattice.is_empty() => continue,
+                        _ => {}
+                    }
+                }
+
+                let fd = workspace.file(rel_path);
+                let source = fd.map_or("", |fd| fd.tree.source());
+                let index = fd.map_or(&empty, |fd| &fd.line_index);
+                let lsp: Vec<lsp::Diagnostic> = lattice
+                    .iter()
+                    .map(|d| to_lsp_diagnostic(d, source, index))
+                    .collect();
+                let send = cached.map_or(!lsp.is_empty(), |prev| prev.lsp != lsp);
+                materialized.push(Materialized {
+                    uri,
+                    lattice,
+                    lsp,
+                    send,
+                });
+            }
         }
     }
 
@@ -4102,6 +4469,14 @@ thread_local! {
 #[cfg(test)]
 thread_local! {
     static RECOMPUTE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+// Counts `recompute_all_structural` sweeps — the O(workspace) structural-cache
+// pass a membership change forces — so tests can assert which store mutations
+// pay it (a rootless open must not). Compiled out of release builds.
+#[cfg(test)]
+thread_local! {
+    static STRUCTURAL_SWEEP_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Convert a Lattice diagnostic to an LSP diagnostic.
@@ -4196,16 +4571,11 @@ mod tests {
         dir
     }
 
-    /// Build a `Workspaces` from a temp directory.
+    /// Build a `Workspaces` with one scanned folder from a temp directory.
     fn scan_workspaces(dir: &tempfile::TempDir) -> Workspaces {
-        let root = dir.path().to_path_buf();
-        let ws = Workspace::scan(&root).expect("scan should succeed");
-        Workspaces {
-            inner: BTreeMap::from([(root, ws)]),
-            published: HashMap::new(),
-            open_documents: HashSet::new(),
-            singletons: BTreeMap::new(),
-        }
+        let mut workspaces = Workspaces::new();
+        workspaces.add_folder(&path_to_uri(dir.path()));
+        workspaces
     }
 
     /// Build a file URI from a temp directory and a relative path.
@@ -7106,14 +7476,16 @@ mod tests {
     // Publication diffing (issue 013)
     // -----------------------------------------------------------------------
 
-    /// Replace a file's content in the single-workspace test set.
+    /// Replace a file's content in the single-workspace test set, keyed under
+    /// the sole root's path.
     fn edit(workspaces: &mut Workspaces, rel: &str, content: &str) {
-        let ws = workspaces
-            .inner
-            .values_mut()
+        let root = workspaces
+            .roots
+            .keys()
             .next()
-            .expect("test workspace exists");
-        ws.update_content(Path::new(rel), content);
+            .expect("test workspace exists")
+            .clone();
+        workspaces.sync_document_content(&path_to_uri(&root.join(rel)), content);
     }
 
     #[test]
@@ -7218,16 +7590,9 @@ mod tests {
         let first = diff_diagnostics(&mut workspaces, &HashSet::new());
         assert_eq!(first.len(), 1, "first pass publishes a.md");
 
-        // Delete a.md from disk and drop it from the index.
+        // Delete a.md from disk and reconcile it out of the store.
         fs::remove_file(dir.path().join("a.md")).expect("remove a.md");
-        {
-            let ws = workspaces
-                .inner
-                .values_mut()
-                .next()
-                .expect("test workspace exists");
-            ws.update(Path::new("a.md")).expect("update after delete");
-        }
+        workspaces.update_from_disk(&dir.path().join("a.md"));
 
         let second = diff_diagnostics(&mut workspaces, &HashSet::new());
         assert_eq!(
@@ -7271,21 +7636,17 @@ mod tests {
         let link = link_parent.path().join("ws");
         std::os::unix::fs::symlink(real.path(), &link).expect("create workspace symlink");
 
-        // Scan through the symlink (scan canonicalizes to the real root) but key
-        // the map by the symlinked path, as `Workspaces::from_params` does for a
-        // client that opened the folder through the symlink.
-        let ws = Workspace::scan(&link).expect("scan should succeed");
+        // Add the folder through the symlink: `add_folder` scans (canonicalizing
+        // to the real root) but keys `roots`/`documents` by the symlinked path
+        // the client sent, so the map key and `canonical_root` diverge — exactly
+        // the issue 047 condition.
+        let mut workspaces = Workspaces::new();
+        workspaces.add_folder(&path_to_uri(&link));
         assert_ne!(
-            ws.root(),
+            workspaces.roots[&link].canonical_root.as_path(),
             link.as_path(),
             "test setup: the symlinked folder path must differ from the canonical root"
         );
-        let mut workspaces = Workspaces {
-            inner: BTreeMap::from([(link.clone(), ws)]),
-            published: HashMap::new(),
-            open_documents: HashSet::new(),
-            singletons: BTreeMap::new(),
-        };
 
         // Seed the client cache: a.md publishes its trailing-whitespace warning at
         // UTF-16 column 4 (after four ASCII chars), keyed by the symlinked URI.
@@ -7357,6 +7718,16 @@ mod tests {
         RECOMPUTE_COUNT.with(|count| count.set(0));
         let value = f();
         let count = RECOMPUTE_COUNT.with(std::cell::Cell::get);
+        (count, value)
+    }
+
+    /// Run `f` and return how many `recompute_all_structural` sweeps it drove —
+    /// the O(workspace) structural pass a membership change forces — so a test
+    /// can assert which store mutations pay it (a rootless open must not).
+    fn count_structural_sweeps<T>(f: impl FnOnce() -> T) -> (usize, T) {
+        STRUCTURAL_SWEEP_COUNT.with(|count| count.set(0));
+        let value = f();
+        let count = STRUCTURAL_SWEEP_COUNT.with(std::cell::Cell::get);
         (count, value)
     }
 
@@ -8216,12 +8587,7 @@ mod tests {
 
     /// A `Workspaces` with no scanned workspace folders — a rootless session.
     fn rootless_workspaces() -> Workspaces {
-        Workspaces {
-            inner: BTreeMap::new(),
-            published: HashMap::new(),
-            open_documents: HashSet::new(),
-            singletons: BTreeMap::new(),
-        }
+        Workspaces::new()
     }
 
     /// Position params for `uri` at `(line, character)`.
@@ -8375,6 +8741,206 @@ mod tests {
         assert!(
             decode_tokens(&semantic_tokens_full(&workspaces, uri)).is_empty(),
             "the closed single-file document no longer resolves"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Workspace-folder changes over the flat document store (ticket server 10)
+    //
+    // These drive the exact store mutations the `DID_CHANGE_WORKSPACE_FOLDERS`
+    // handler dispatches to (`add_folder` / `remove_folder`) with an open
+    // buffer simulated as `didOpen` does (`open_documents` + a diverging
+    // `sync_document_content`), then assert the buffer-authority, eviction, and
+    // deepest-owns contracts on the observable feature/diagnostic surface.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn folder_add_over_open_rootless_document_keeps_buffer_and_leaves_no_orphan() {
+        // Disk holds one content; the open editor buffer diverges. Adding a
+        // folder that covers the open document must keep the BUFFER (decision
+        // 017 §3), gain the root, and leave exactly one document — no orphaned
+        // rootless entry shadowed by disk.
+        let dir = workspace_with_files(&[("doc.md", "# On Disk\n")]);
+        let root = fs::canonicalize(dir.path()).expect("canonicalize temp dir");
+        let abs = root.join("doc.md");
+        let uri = path_to_uri(&abs);
+
+        let mut workspaces = Workspaces::new();
+        // didOpen with an unsaved buffer diverging from disk, before any folder.
+        workspaces.open_documents.insert(uri.clone());
+        workspaces.sync_document_content(&uri, "# In Buffer\n\n# In Buffer\n");
+        assert!(
+            workspaces
+                .documents
+                .get(&abs)
+                .is_some_and(|d| d.primary_root.is_none()),
+            "the open document is rootless before the folder is added"
+        );
+
+        // DID_CHANGE_WORKSPACE_FOLDERS add.
+        workspaces.add_folder(&path_to_uri(&root));
+
+        assert_eq!(
+            workspaces.documents.len(),
+            1,
+            "the open buffer gained a root — no orphaned rootless entry remains"
+        );
+        let doc = workspaces.documents.get(&abs).expect("document present");
+        assert_eq!(
+            doc.primary_root.as_deref(),
+            Some(root.as_path()),
+            "the document now belongs to the added folder"
+        );
+        assert!(
+            doc.data.tree.source().contains("In Buffer")
+                && !doc.data.tree.source().contains("On Disk"),
+            "the editor buffer is served across the transition, not stale disk"
+        );
+
+        // Now rooted, the buffer's duplicate heading publishes as a structural
+        // diagnostic — proving the graph/diagnostic tier now sees it.
+        let sent = diff_diagnostics(&mut workspaces, &HashSet::new());
+        assert!(
+            sent.iter().any(|(u, d)| u == &uri && !d.is_empty()),
+            "the newly-rooted buffer publishes its diagnostics: {sent:?}"
+        );
+    }
+
+    #[test]
+    fn folder_remove_under_open_document_keeps_serving_rootless() {
+        // A folder removed under an open document must not create a dark window:
+        // the document recomputes to `primary_root: None` and keeps serving its
+        // document-scoped features, now diagnostic-quiet (issue 051).
+        let dir = workspace_with_files(&[("doc.md", "# Title\n\n## Section\n")]);
+        let root = fs::canonicalize(dir.path()).expect("canonicalize temp dir");
+        let abs = root.join("doc.md");
+        let uri = path_to_uri(&abs);
+
+        let mut workspaces = Workspaces::new();
+        workspaces.add_folder(&path_to_uri(&root));
+        workspaces.open_documents.insert(uri.clone());
+        workspaces.sync_document_content(&uri, "# Title\n\n## Section\n");
+        assert!(
+            document_symbols(&workspaces, &uri).is_some_and(|s| !s.is_empty()),
+            "the rooted open document serves symbols before the removal"
+        );
+
+        // DID_CHANGE_WORKSPACE_FOLDERS remove while the document is open.
+        workspaces.remove_folder(&path_to_uri(&root));
+
+        let doc = workspaces.documents.get(&abs).expect("open document kept");
+        assert!(
+            doc.primary_root.is_none(),
+            "the open document recomputed to rootless"
+        );
+        assert!(
+            document_symbols(&workspaces, &uri).is_some_and(|s| !s.is_empty()),
+            "document-scoped features keep serving with no dark window"
+        );
+        assert!(
+            document_diagnostic(&workspaces, &uri).items.is_empty(),
+            "a rootless document pulls no diagnostics"
+        );
+    }
+
+    #[test]
+    fn folder_remove_evicts_scan_only_documents() {
+        // A removed folder's scan-only documents (not open in the editor) are
+        // evicted; only the open document survives, now rootless.
+        let dir = workspace_with_files(&[("a.md", "# A\n"), ("b.md", "# B\n")]);
+        let root = fs::canonicalize(dir.path()).expect("canonicalize temp dir");
+        let a_abs = root.join("a.md");
+        let b_abs = root.join("b.md");
+
+        let mut workspaces = Workspaces::new();
+        workspaces.add_folder(&path_to_uri(&root));
+        // Open a.md; b.md stays scan-only.
+        let a_uri = path_to_uri(&a_abs);
+        workspaces.open_documents.insert(a_uri.clone());
+        workspaces.sync_document_content(&a_uri, "# A\n");
+        assert_eq!(workspaces.documents.len(), 2, "two documents were scanned");
+
+        workspaces.remove_folder(&path_to_uri(&root));
+
+        assert!(
+            workspaces.documents.contains_key(&a_abs),
+            "the open document survives the removal (rootless)"
+        );
+        assert!(
+            !workspaces.documents.contains_key(&b_abs),
+            "the scan-only document is evicted"
+        );
+        assert_eq!(
+            workspaces.documents.len(),
+            1,
+            "only the open document remains"
+        );
+    }
+
+    #[test]
+    fn nested_roots_ancestor_graph_sees_descendant_and_deepest_owns_resolution() {
+        // With a nested root, the ancestor's graph must still see descendant-root
+        // files (the range scan includes them), so a forward link from an
+        // ancestor-only file into the nested subtree resolves rather than
+        // dangling — while the deepest root owns resolution of the shared file.
+        let dir = workspace_with_files(&[
+            (".lattice.toml", ""),
+            ("top.md", "[to inner](sub/inner.md \"references\")\n"),
+            ("sub/inner.md", "# Inner\n"),
+        ]);
+        let root = fs::canonicalize(dir.path()).expect("canonicalize temp dir");
+        let sub = root.join("sub");
+
+        let mut workspaces = Workspaces::new();
+        workspaces.add_folder(&path_to_uri(&root));
+        workspaces.add_folder(&path_to_uri(&sub));
+
+        // The ancestor root (with config) runs its graph over a range scan that
+        // includes `sub/inner.md`, so `top.md`'s link resolves.
+        let ancestor = workspaces.root_view(&root);
+        let diags = collect_all_diagnostics(&ancestor);
+        assert!(
+            !diags
+                .iter()
+                .any(|d| d.file.as_path() == Path::new("top.md")
+                    && d.message.contains("does not exist")),
+            "the ancestor graph sees the descendant-root file, so the link resolves: {diags:?}"
+        );
+
+        // The shared descendant file resolves against its deepest root.
+        let inner_uri = path_to_uri(&sub.join("inner.md"));
+        let (inner_view, _) = workspaces
+            .resolve(&inner_uri)
+            .expect("the descendant file resolves");
+        assert_eq!(
+            inner_view.root(),
+            sub.as_path(),
+            "the deepest root owns resolution of the shared descendant file"
+        );
+    }
+
+    #[test]
+    fn rootless_open_skips_workspace_structural_sweep() {
+        // A rootless document appears in no root's range scan, so opening one
+        // cannot flip any rooted document's bare-path existence answer — it
+        // must not pay the O(workspace) structural sweep. A rooted open that
+        // grows membership still must (ticket server 10 review).
+        let dir = workspace_with_files(&[("a.md", "# A\n"), ("b.md", "# B\n")]);
+        let root = fs::canonicalize(dir.path()).expect("canonicalize temp dir");
+        let mut workspaces = Workspaces::new();
+        workspaces.add_folder(&path_to_uri(&root));
+
+        let (sweeps, ()) = count_structural_sweeps(|| {
+            workspaces.sync_document_content("file:///tmp/lattice-10r-scratch.md", "# S\n");
+        });
+        assert_eq!(sweeps, 0, "a rootless open sweeps no structural caches");
+
+        let (sweeps, ()) = count_structural_sweeps(|| {
+            workspaces.sync_document_content(&path_to_uri(&root.join("new.md")), "# N\n");
+        });
+        assert_eq!(
+            sweeps, 1,
+            "a rooted open that grows membership sweeps exactly once"
         );
     }
 
@@ -9369,18 +9935,16 @@ mod tests {
         ]);
         let root = fs::canonicalize(dir.path()).expect("canonicalize temp dir");
         let sub = root.join("sub");
-        let ws_root = Workspace::scan(&root).expect("scan the shallow folder");
-        let ws_sub = Workspace::scan(&sub).expect("scan the deep folder");
+        // Add both folders: the shallow root first, then the nested one. The
+        // shared `sub/doc.md` is scanned once by each, but the flat store keeps
+        // one document whose deepest (primary) root is `sub`.
+        let mut workspaces = Workspaces::new();
+        workspaces.add_folder(&path_to_uri(&root));
+        workspaces.add_folder(&path_to_uri(&sub));
         assert!(
-            !ws_root.has_config() && ws_sub.has_config(),
+            !workspaces.roots[&root].has_config && workspaces.roots[&sub].has_config,
             "test setup: only the deep folder sees the marker"
         );
-        let mut workspaces = Workspaces {
-            inner: BTreeMap::from([(root.clone(), ws_root), (sub, ws_sub)]),
-            published: HashMap::new(),
-            open_documents: HashSet::new(),
-            singletons: BTreeMap::new(),
-        };
         let doc_uri = path_to_uri(&root.join("sub/doc.md"));
 
         // First pass: exactly one publish for the shared URI, computed by the

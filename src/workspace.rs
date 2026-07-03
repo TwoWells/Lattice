@@ -26,7 +26,10 @@ use crate::yaml;
 /// Errors that can occur during workspace operations.
 #[derive(Debug, Error)]
 pub enum WorkspaceError {
-    /// Failed to read a markdown file.
+    /// Failed to read a markdown file. Only produced by the test-only
+    /// incremental [`Workspace::update`]; the LSP server drives incremental
+    /// sync through its flat document store (ticket server 10).
+    #[cfg(test)]
     #[error("failed to read {path}: {source}")]
     Read {
         /// Path that could not be read.
@@ -248,55 +251,20 @@ impl Workspace {
         Ok(workspace)
     }
 
-    /// Build a workspace holding exactly one in-memory document, for a markdown
-    /// file opened outside every workspace folder (issue 051 — single-file
-    /// mode).
-    ///
-    /// No directory is scanned and no `.lattice.toml` is consulted: the root is
-    /// the file's parent directory (or the file itself when it has no parent),
-    /// `has_config` is `false`, and the sole indexed entry is `content` parsed
-    /// under the file's name. Document-scoped features (semantic tokens,
-    /// folding, symbols, hover, formatting, document links, …) resolve against
-    /// it exactly as they do for a scanned workspace, while the graph tier stays
-    /// inert — it is gated on [`Workspace::has_config`] and, with a single
-    /// indexed file under default config, has nothing to say.
-    ///
-    /// The structural cache is intentionally left unpopulated. A single-file
-    /// document carries no workspace-tier diagnostics, so running the bare-path
-    /// existence check against a one-file membership would only manufacture
-    /// misleading verdicts; the server never publishes diagnostics for these
-    /// documents (they are absent from the diagnostic-publish loop, which
-    /// enumerates scanned workspaces only).
-    #[must_use]
-    pub fn single_file(abs_path: &Path, content: &str) -> Self {
-        let (root, rel_path) = match (abs_path.parent(), abs_path.file_name()) {
-            (Some(parent), Some(name)) => (parent.to_path_buf(), PathBuf::from(name)),
-            // A path with no parent or no file name (a root-only or empty path):
-            // index it whole against an empty root so the URI still round-trips
-            // back to this document.
-            _ => (PathBuf::new(), abs_path.to_path_buf()),
-        };
-        let config = Config::default();
-        let data = parse_content(content, &rel_path, &config);
-        let mut files = BTreeMap::new();
-        files.insert(rel_path, data);
-        Self {
-            root,
-            config,
-            config_error: None,
-            has_config: false,
-            files,
-        }
-    }
-
     /// Re-parse a single file and update the workspace index.
     ///
     /// `rel_path` must be relative to the workspace root. If the file no
     /// longer exists, it is removed from the index.
     ///
+    /// Retained as the owning-workspace incremental engine that the shared
+    /// parse/structural helpers are regression-tested through; the LSP server
+    /// now drives incremental sync through its flat document store
+    /// (ticket server 10), so this is exercised by tests only.
+    ///
     /// # Errors
     ///
     /// Returns [`WorkspaceError::Read`] if the file exists but cannot be read.
+    #[cfg(test)]
     pub fn update(&mut self, rel_path: &Path) -> Result<(), WorkspaceError> {
         let abs_path = self.root.join(rel_path);
 
@@ -330,8 +298,9 @@ impl Workspace {
     /// Update the index for a file using in-memory content.
     ///
     /// `rel_path` must be relative to the workspace root. The content is
-    /// parsed directly without reading from disk, which is used by the LSP
-    /// server for unsaved editor buffers.
+    /// parsed directly without reading from disk. Test-only (see
+    /// [`Workspace::update`]).
+    #[cfg(test)]
     pub fn update_content(&mut self, rel_path: &Path, content: &str) {
         let membership_changed = !self.files.contains_key(rel_path);
         let data = parse_content(content, rel_path, &self.config);
@@ -351,10 +320,12 @@ impl Workspace {
     /// in-memory source (the editor buffer, never re-read from disk), so an
     /// unsaved buffer is not clobbered by a marker edit.
     ///
-    /// Used by the LSP server to hot-reload `.lattice.toml` on a
-    /// `workspace/didChangeWatchedFiles` event for the marker (issue 044,
-    /// ticket server 08). A parse/read error leaves the workspace on default
-    /// config with the error recorded, matching [`Workspace::scan`].
+    /// Mirrors the hot-reload the LSP server now performs per root over its
+    /// flat document store (issue 044, ticket server 08 / 10); retained as a
+    /// regression test of the shared config-reload semantics, so test-only. A
+    /// parse/read error leaves the workspace on default config with the error
+    /// recorded, matching [`Workspace::scan`].
+    #[cfg(test)]
     pub fn reload_config(&mut self) {
         let (config, config_error) = match Config::load(&self.root) {
             Ok(c) => (c, None),
@@ -390,6 +361,8 @@ impl Workspace {
     /// An edit that does not change membership only invalidates the edited
     /// file's cache. A membership change (a file added or removed) can flip a
     /// bare-path existence answer in *any* file, so it forces a full recompute.
+    /// Only reached from the test-only incremental methods.
+    #[cfg(test)]
     fn refresh_structural_after_update(&mut self, rel_path: &Path, membership_changed: bool) {
         if membership_changed {
             self.recompute_all_structural();
@@ -406,51 +379,8 @@ impl Workspace {
             return;
         };
         let file_exists = |target: &Path| self.files.contains_key(target);
-        // External-namespace (`{Name}/…`) references resolve existence-only
-        // against the configured alias directories, which live *outside* the
-        // workspace index — so this oracle `stat`s the real filesystem rather
-        // than consulting workspace membership (issue 030, decision 010). It
-        // only ever `stat`s; the aliased repository is never read or indexed.
-        // The verdict is tri-state: a *failed* stat answers `Unknown`, not
-        // "absent", so an I/O flake surfaces instead of silently exempting
-        // the reference (issue 050).
-        let external_exists = |path: &Path| structural::ExternalExistence::stat(path);
-        // The `exceptions` frontmatter block (issue 031) is per-file and lives
-        // in this file's own frontmatter; an empty default applies when there
-        // is no frontmatter. The structural pass suppresses a matching live
-        // diagnostic and reconciles the rest as unused.
-        let empty_exceptions = fm::Exceptions::default();
-        let exceptions = file_data
-            .frontmatter
-            .as_ref()
-            .map_or(&empty_exceptions, |fm| &fm.exceptions);
-        // Resolve this file's effective 028-family policy by applying any
-        // matching `[[override]]` level entries (issue 037, decision 012). Only
-        // an override that sets `stale_references` / `bare_paths` as a *level*
-        // changes the per-file collect (a `disabled` freeze, or a raise such as
-        // `warn` → `deny`); an `{ expect = N }` aggregate leaves the per-file
-        // level alone and is reconciled later by the lint loop's expect pass.
-        // The clone is taken only when an override actually moves this file's
-        // policy — the common no-override file reuses the base config directly.
-        let effective_policy = self.config.effective_policy(rel_path);
-        let effective_config;
-        let config: &Config = if effective_policy == self.config.policy {
-            &self.config
-        } else {
-            effective_config = Config {
-                policy: effective_policy,
-                ..self.config.clone()
-            };
-            &effective_config
-        };
-        let (diagnostics, suppressions) = structural::collect_with_suppressions(
-            &file_data.tree,
-            rel_path,
-            config,
-            &file_exists,
-            &external_exists,
-            exceptions,
-        );
+        let (diagnostics, suppressions) =
+            compute_structural(file_data, rel_path, &self.config, &file_exists);
         if let Some(file_data) = self.files.get_mut(rel_path) {
             file_data.structural = diagnostics;
             file_data.suppressions = suppressions;
@@ -509,6 +439,232 @@ impl Workspace {
     pub fn file(&self, rel_path: &Path) -> Option<&FileData> {
         self.files.get(rel_path)
     }
+
+    /// Consume this workspace into its scanned parts.
+    ///
+    /// Lets the LSP server's flat document store (ticket server 10) take
+    /// ownership of the parsed files a folder scan produced without re-parsing
+    /// them: the store reuses [`Workspace::scan`]'s canonicalization, root
+    /// discovery, gitignore-aware walk, and parse loop, then folds each file
+    /// into its single-owner `Document` keyed by absolute path.
+    #[must_use]
+    pub fn into_parts(self) -> WorkspaceParts {
+        WorkspaceParts {
+            root: self.root,
+            config: self.config,
+            config_error: self.config_error,
+            has_config: self.has_config,
+            files: self.files,
+        }
+    }
+}
+
+/// The owned parts of a scanned [`Workspace`], produced by
+/// [`Workspace::into_parts`]. The `root` is the canonical scan root; `files` is
+/// keyed by path relative to that root.
+#[derive(Debug)]
+pub struct WorkspaceParts {
+    /// Canonical scan root (the directory `.lattice.toml`/`.git` was found in).
+    pub root: PathBuf,
+    /// Configuration loaded from the root.
+    pub config: Config,
+    /// Error from loading `.lattice.toml`, if any.
+    pub config_error: Option<ConfigError>,
+    /// Whether a `.lattice.toml` was found at the root.
+    pub has_config: bool,
+    /// Parsed file data keyed by root-relative path.
+    pub files: BTreeMap<PathBuf, FileData>,
+}
+
+/// The read-only surface the graph and structural diagnostic pipeline consumes
+/// from a workspace: its config, membership, and per-file parsed data.
+///
+/// Implemented by both the owning [`Workspace`] (the CLI's single-root index)
+/// and the borrowed [`WorkspaceView`] the LSP server derives per root from its
+/// flat document store by range scan (ticket server 10). Making the validators
+/// generic over this trait lets the two storage models share one pipeline
+/// without either one owning the file map twice.
+pub trait WorkspaceLike {
+    /// The workspace root the file map's keys are relative to.
+    fn root(&self) -> &Path;
+    /// The effective configuration.
+    fn config(&self) -> &Config;
+    /// Whether the graph diagnostic tier is enabled (a `.lattice.toml` exists).
+    fn has_config(&self) -> bool;
+    /// Parsed data for one file by its workspace-relative path.
+    fn file(&self, rel_path: &Path) -> Option<&FileData>;
+    /// Iterate every file as `(relative path, parsed data)`.
+    fn files_iter(&self) -> impl Iterator<Item = (&PathBuf, &FileData)>;
+    /// Resolve a relative path to the stored key it matches (existence probe
+    /// that also yields a borrow living as long as the workspace), or `None`.
+    fn resolve_key(&self, rel_path: &Path) -> Option<&Path>;
+}
+
+impl WorkspaceLike for Workspace {
+    fn root(&self) -> &Path {
+        &self.root
+    }
+    fn config(&self) -> &Config {
+        &self.config
+    }
+    fn has_config(&self) -> bool {
+        self.has_config
+    }
+    fn file(&self, rel_path: &Path) -> Option<&FileData> {
+        self.files.get(rel_path)
+    }
+    fn files_iter(&self) -> impl Iterator<Item = (&PathBuf, &FileData)> {
+        self.files.iter()
+    }
+    fn resolve_key(&self, rel_path: &Path) -> Option<&Path> {
+        self.files.get_key_value(rel_path).map(|(k, _)| k.as_path())
+    }
+}
+
+/// A borrowed, per-root view over a set of parsed documents.
+///
+/// The LSP server's flat document store builds one of these per root by range
+/// scan over its membership (ticket server 10), presenting the same read API
+/// the owning [`Workspace`] does so the diagnostic tier, navigation,
+/// completion, and structural existence oracle port mechanically. It borrows
+/// each file's [`FileData`]; the map is keyed by the path each file was parsed
+/// relative to — the view's root for a rooted view, or the file name for a
+/// single-file (rootless) view.
+#[derive(Debug)]
+pub struct WorkspaceView<'a> {
+    root: PathBuf,
+    config: &'a Config,
+    has_config: bool,
+    files: BTreeMap<PathBuf, &'a FileData>,
+}
+
+impl<'a> WorkspaceView<'a> {
+    /// Construct a view from its parts. `files` maps each document's
+    /// view-relative path to its parsed data.
+    #[must_use]
+    pub fn new(
+        root: PathBuf,
+        config: &'a Config,
+        has_config: bool,
+        files: BTreeMap<PathBuf, &'a FileData>,
+    ) -> Self {
+        Self {
+            root,
+            config,
+            has_config,
+            files,
+        }
+    }
+
+    /// The view's root.
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+    /// The effective configuration.
+    #[must_use]
+    pub fn config(&self) -> &Config {
+        self.config
+    }
+    /// Whether the graph diagnostic tier is enabled for this root.
+    #[must_use]
+    pub fn has_config(&self) -> bool {
+        self.has_config
+    }
+    /// The borrowed file map, keyed by view-relative path.
+    #[must_use]
+    pub fn files(&self) -> &BTreeMap<PathBuf, &'a FileData> {
+        &self.files
+    }
+    /// Parsed data for one file by its view-relative path.
+    #[must_use]
+    pub fn file(&self, rel_path: &Path) -> Option<&FileData> {
+        self.files.get(rel_path).copied()
+    }
+}
+
+impl WorkspaceLike for WorkspaceView<'_> {
+    fn root(&self) -> &Path {
+        &self.root
+    }
+    fn config(&self) -> &Config {
+        self.config
+    }
+    fn has_config(&self) -> bool {
+        self.has_config
+    }
+    fn file(&self, rel_path: &Path) -> Option<&FileData> {
+        self.files.get(rel_path).copied()
+    }
+    fn files_iter(&self) -> impl Iterator<Item = (&PathBuf, &FileData)> {
+        self.files.iter().map(|(path, data)| (path, *data))
+    }
+    fn resolve_key(&self, rel_path: &Path) -> Option<&Path> {
+        self.files.get_key_value(rel_path).map(|(k, _)| k.as_path())
+    }
+}
+
+/// Compute the structural diagnostics and suppression ledger for one parsed
+/// file against a membership oracle.
+///
+/// Factored out of [`Workspace::recompute_structural`] so the LSP server's flat
+/// document store (ticket server 10) computes structural caches identically:
+/// the same external-existence stat oracle, the same per-file `exceptions`
+/// wiring, and the same `[[override]]` effective-policy resolution.
+/// `file_exists` answers workspace membership for the bare-path existence
+/// check; the caller supplies it from whatever membership representation it
+/// owns (a rel-path map for [`Workspace`], a range scan for the server).
+#[must_use]
+pub fn compute_structural(
+    file_data: &FileData,
+    rel_path: &Path,
+    config: &Config,
+    file_exists: &dyn Fn(&Path) -> bool,
+) -> (Vec<Diagnostic>, structural::FileSuppressions) {
+    // External-namespace (`{Name}/…`) references resolve existence-only against
+    // the configured alias directories, which live *outside* the workspace
+    // index — so this oracle `stat`s the real filesystem rather than consulting
+    // workspace membership (issue 030, decision 010). It only ever `stat`s; the
+    // aliased repository is never read or indexed. The verdict is tri-state: a
+    // *failed* stat answers `Unknown`, not "absent", so an I/O flake surfaces
+    // instead of silently exempting the reference (issue 050).
+    let external_exists = |path: &Path| structural::ExternalExistence::stat(path);
+    // The `exceptions` frontmatter block (issue 031) is per-file and lives in
+    // this file's own frontmatter; an empty default applies when there is no
+    // frontmatter. The structural pass suppresses a matching live diagnostic
+    // and reconciles the rest as unused.
+    let empty_exceptions = fm::Exceptions::default();
+    let exceptions = file_data
+        .frontmatter
+        .as_ref()
+        .map_or(&empty_exceptions, |fm| &fm.exceptions);
+    // Resolve this file's effective 028-family policy by applying any matching
+    // `[[override]]` level entries (issue 037, decision 012). Only an override
+    // that sets `stale_references` / `bare_paths` as a *level* changes the
+    // per-file collect (a `disabled` freeze, or a raise such as `warn` →
+    // `deny`); an `{ expect = N }` aggregate leaves the per-file level alone and
+    // is reconciled later by the lint loop's expect pass. The clone is taken
+    // only when an override actually moves this file's policy — the common
+    // no-override file reuses the base config directly.
+    let effective_policy = config.effective_policy(rel_path);
+    let effective_config;
+    let config: &Config = if effective_policy == config.policy {
+        config
+    } else {
+        effective_config = Config {
+            policy: effective_policy,
+            ..config.clone()
+        };
+        &effective_config
+    };
+    structural::collect_with_suppressions(
+        &file_data.tree,
+        rel_path,
+        config,
+        file_exists,
+        &external_exists,
+        exceptions,
+    )
 }
 
 // --- Internal helpers ---

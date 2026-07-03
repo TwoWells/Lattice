@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use crate::block::{self, HeadingId, LinkKind};
 use crate::config::{Config, ConnectivityPolicy, FragmentAlgorithm, PredicatePolicy};
 use crate::span::Span;
-use crate::workspace::Workspace;
+use crate::workspace::WorkspaceLike;
 
 /// Diagnostic severity level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,11 +55,11 @@ pub struct Diagnostic {
 /// - Predicate membership in the configured vocabulary.
 /// - Predicate policy compliance (optional vs required).
 /// - Fragment resolution against headings in the target document.
-pub fn validate_forward_links(workspace: &Workspace) -> Vec<Diagnostic> {
+pub fn validate_forward_links(workspace: &impl WorkspaceLike) -> Vec<Diagnostic> {
     let config = workspace.config();
     let mut diagnostics = Vec::new();
 
-    for (file_path, file_data) in workspace.files() {
+    for (file_path, file_data) in workspace.files_iter() {
         for link in &file_data.links {
             match &link.kind {
                 LinkKind::External { .. } => {}
@@ -139,7 +139,7 @@ pub fn validate_forward_links(workspace: &Workspace) -> Vec<Diagnostic> {
 
 /// Check that a link target exists as a file in the workspace or on disk.
 fn check_target_exists(
-    workspace: &Workspace,
+    workspace: &impl WorkspaceLike,
     source: &Path,
     line: usize,
     span: Span,
@@ -223,7 +223,7 @@ fn check_predicate(
 /// Computes expected backlinks from forward links, diffs against actual
 /// frontmatter, and emits warnings for missing or stale backlinks.
 /// Returns an empty list when `backlinks = false` in the policy.
-pub fn validate_backlinks(workspace: &Workspace) -> Vec<Diagnostic> {
+pub fn validate_backlinks(workspace: &impl WorkspaceLike) -> Vec<Diagnostic> {
     if !workspace.config().policy.backlinks {
         return Vec::new();
     }
@@ -266,11 +266,11 @@ type ExpectedBacklinks = HashMap<PathBuf, HashMap<String, BTreeMap<PathBuf, Expe
 /// Returns a map keyed by target file. Each source carries the position of
 /// the forward link that created the expectation, so missing-backlink
 /// diagnostics can anchor on the source.
-fn build_expected_backlinks(workspace: &Workspace) -> ExpectedBacklinks {
+fn build_expected_backlinks(workspace: &impl WorkspaceLike) -> ExpectedBacklinks {
     let config = workspace.config();
     let mut expected: ExpectedBacklinks = HashMap::new();
 
-    for (source_path, file_data) in workspace.files() {
+    for (source_path, file_data) in workspace.files_iter() {
         for link in &file_data.links {
             if let LinkKind::IntraProject {
                 target, predicate, ..
@@ -365,7 +365,7 @@ fn file_relative(from: &Path, to: &Path) -> PathBuf {
 /// matching paired predicate (decision 008). A warning fires only when
 /// neither exists.
 fn check_missing_backlinks(
-    workspace: &Workspace,
+    workspace: &impl WorkspaceLike,
     expected: &ExpectedBacklinks,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
@@ -418,7 +418,7 @@ fn check_missing_backlinks(
 /// (it is `opposite_of` the source's link predicate), so the reciprocal link
 /// satisfies it exactly when its predicate equals that label.
 fn has_reciprocal_forward_link(
-    workspace: &Workspace,
+    workspace: &impl WorkspaceLike,
     target: &Path,
     source: &Path,
     predicate: &str,
@@ -437,11 +437,11 @@ fn has_reciprocal_forward_link(
 
 /// Emit warnings for frontmatter backlinks with no corresponding forward link.
 fn check_stale_backlinks(
-    workspace: &Workspace,
+    workspace: &impl WorkspaceLike,
     expected: &ExpectedBacklinks,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    for (file_path, file_data) in workspace.files() {
+    for (file_path, file_data) in workspace.files_iter() {
         let Some(fm) = &file_data.frontmatter else {
             continue;
         };
@@ -484,7 +484,7 @@ fn check_stale_backlinks(
     reason = "validation context parameters are distinct concerns"
 )]
 fn check_fragment(
-    workspace: &Workspace,
+    workspace: &impl WorkspaceLike,
     config: &Config,
     source: &Path,
     line: usize,
@@ -569,19 +569,17 @@ fn check_fragment(
 /// no configured root resolves to an indexed file, `no-islands` and
 /// `reachable` emit nothing (they have no anchor to traverse from), while
 /// `no-orphans` still runs (it uses roots only for exemption).
-pub fn validate_connectivity(workspace: &Workspace) -> Vec<Diagnostic> {
+pub fn validate_connectivity(workspace: &impl WorkspaceLike) -> Vec<Diagnostic> {
     let level = workspace.config().policy.connectivity;
     if level == ConnectivityPolicy::Off {
         return Vec::new();
     }
 
-    let files = workspace.files();
-
     // Build forward (directed) and undirected adjacency over valid
     // intra-project markdown edges in a single pass.
     let mut forward: HashMap<&Path, BTreeSet<&Path>> = HashMap::new();
     let mut undirected: HashMap<&Path, BTreeSet<&Path>> = HashMap::new();
-    for (source, file_data) in files {
+    for (source, file_data) in workspace.files_iter() {
         let src = source.as_path();
         for link in &file_data.links {
             let LinkKind::IntraProject { target, .. } = &link.kind else {
@@ -589,11 +587,11 @@ pub fn validate_connectivity(workspace: &Workspace) -> Vec<Diagnostic> {
             };
             // Skip broken targets (forward validation handles those) and
             // self-loops (a document linking to itself does not connect it to
-            // any *other* document).
-            let Some((target_key, _)) = files.get_key_value(target) else {
+            // any *other* document). `resolve_key` doubles as the existence
+            // probe and yields a borrow living as long as the workspace.
+            let Some(dst) = workspace.resolve_key(target) else {
                 continue;
             };
-            let dst = target_key.as_path();
             if dst == src {
                 continue;
             }
@@ -609,11 +607,7 @@ pub fn validate_connectivity(workspace: &Workspace) -> Vec<Diagnostic> {
         .policy
         .roots
         .iter()
-        .filter_map(|r| {
-            files
-                .get_key_value(&block::normalize_path(r))
-                .map(|(k, _)| k.as_path())
-        })
+        .filter_map(|r| workspace.resolve_key(&block::normalize_path(r)))
         .collect();
 
     let mut diagnostics = Vec::new();
@@ -630,7 +624,7 @@ pub fn validate_connectivity(workspace: &Workspace) -> Vec<Diagnostic> {
     match level {
         ConnectivityPolicy::Off => {}
         ConnectivityPolicy::NoOrphans => {
-            for path in files.keys() {
+            for (path, _) in workspace.files_iter() {
                 let node = path.as_path();
                 if root_set.contains(node) {
                     continue;
@@ -663,7 +657,7 @@ pub fn validate_connectivity(workspace: &Workspace) -> Vec<Diagnostic> {
                 )
             };
             let visited = flood(&root_set, adjacency);
-            for path in files.keys() {
+            for (path, _) in workspace.files_iter() {
                 let node = path.as_path();
                 if root_set.contains(node) {
                     continue;
@@ -710,7 +704,7 @@ fn flood<'a>(
 /// paths), collects unknown backlink predicate errors from frontmatter, and
 /// includes frontmatter parse errors. Returns diagnostics sorted by
 /// file then line number.
-pub fn collect_all(workspace: &Workspace) -> Vec<Diagnostic> {
+pub fn collect_all(workspace: &impl WorkspaceLike) -> Vec<Diagnostic> {
     if !workspace.has_config() {
         return Vec::new();
     }
@@ -722,7 +716,7 @@ pub fn collect_all(workspace: &Workspace) -> Vec<Diagnostic> {
     // Note: bare paths are emitted by the structural diagnostics layer
     // unconditionally — not duplicated here.
 
-    for (path, file_data) in workspace.files() {
+    for (path, file_data) in workspace.files_iter() {
         for bd in &file_data.backlink_diagnostics {
             diagnostics.push(Diagnostic {
                 file: path.clone(),
