@@ -3,7 +3,7 @@
 A `..`-relative reference `../claude_code/PostToolUse.md` and a
 repo-root-relative citation `tickets/acquire/DESIGN.md` written in prose.
 
-Excluded shapes that are not workspace paths: `~/Projects/Catenary/AGENTS.md`
+Excluded shapes that are not workspace paths: `~/Projects/Archive/AGENTS.md`
 (home-relative), `<name>/SKILL.md` (placeholder), and `NN_*.md` (glob).
 
 A bare `../sibling.md` and a bare `tickets/acquire/DESIGN.md` for the

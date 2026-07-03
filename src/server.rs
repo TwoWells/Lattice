@@ -133,6 +133,34 @@ impl Workspaces {
         })
     }
 
+    /// Find the workspace that owns a `.lattice.toml` marker URI.
+    ///
+    /// Tries the ordinary folder-key prefix match first — the same basis
+    /// document URIs resolve on. When that misses, retries against each
+    /// workspace's canonical scan root: the client's file watcher can report
+    /// the marker under a different spelling of the folder path (one side
+    /// through a symlink — the issue 047 class), and a config event dropped on
+    /// a spelling mismatch is the difference between "config live" and
+    /// "config silently dead" (issue 050). `Workspace::root()` is already
+    /// canonical, so only the marker's directory needs canonicalizing — the
+    /// directory rather than the marker itself, so a `deleted` event for a
+    /// just-removed marker still resolves.
+    fn resolve_marker_workspace(&mut self, uri: &str) -> Option<&mut Workspace> {
+        let path = uri_to_path(uri);
+        let key =
+            self.inner
+                .iter()
+                .rev()
+                .find_map(|(root, _)| path.strip_prefix(root).ok().map(|_| root.clone()))
+                .or_else(|| {
+                    let dir = std::fs::canonicalize(path.parent()?).ok()?;
+                    self.inner.iter().rev().find_map(|(root, ws)| {
+                        dir.strip_prefix(ws.root()).ok().map(|_| root.clone())
+                    })
+                })?;
+        self.inner.get_mut(&key)
+    }
+
     /// Iterate over all workspaces.
     fn iter(&self) -> impl Iterator<Item = (&PathBuf, &Workspace)> {
         self.inner.iter()
@@ -3483,76 +3511,110 @@ fn handle_notification(
         }
         lsp::method::DID_CHANGE_WATCHED_FILES => {
             let params: lsp::DidChangeWatchedFilesParams = serde_json::from_value(notif.params)?;
-            // Two registered globs (decision 017): the `.lattice.toml` marker
-            // (ticket server 08) and `**/*.md` documents (ticket server 09).
-            // Branch on the URI so each takes its own reconciliation path.
-            let mut reloaded = false;
-            // `.md` URIs whose on-disk state was applied. The whole batch is
-            // re-published in a single graph-aware pass below — a content or
-            // membership change can move *other* files' backlink/forward edges,
-            // so this mirrors how `didSave` re-publishes through
-            // `publish_all_diagnostics`, but folds N changed files into one
-            // O(workspace) recompute instead of N (ticket perf 07).
-            let mut changed_docs: HashSet<String> = HashSet::new();
-            for change in &params.changes {
-                if change.uri.ends_with(".lattice.toml") {
-                    // The marker watch is config: any event reloads it. Guard on
-                    // the suffix so an unrelated future glob can never trigger a
-                    // config reload.
-                    if let Some((workspace, _rel)) = workspaces.resolve_mut(&change.uri) {
-                        workspace.reload_config();
-                        reloaded = true;
-                    }
-                    continue;
-                }
-                if !is_markdown_uri(&change.uri) {
-                    continue;
-                }
-                match change.change_type {
-                    // `changed` carries disk content; for a file open in the
-                    // editor the synced buffer wins, so the event is dropped
-                    // (decision 017 §3). The open file already reaches the server
-                    // through `didChange`, so honoring the watcher too would also
-                    // double-deliver (the issue 009 class).
-                    lsp::file_change_type::CHANGED
-                        if workspaces.open_documents.contains(&change.uri) => {}
-                    // created / deleted are membership changes honored regardless
-                    // of open state; a non-open `changed` re-reads disk. All three
-                    // route through `Workspace::update`, which re-reads disk —
-                    // reparsing a created/changed file and dropping a deleted one —
-                    // and refreshes the structural caches.
-                    lsp::file_change_type::CREATED
-                    | lsp::file_change_type::CHANGED
-                    | lsp::file_change_type::DELETED => {
-                        if let Some((workspace, rel_path)) = workspaces.resolve_mut(&change.uri) {
-                            let _ = workspace.update(&rel_path);
-                            changed_docs.insert(change.uri.clone());
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            // A marker change invalidates the whole workspace (predicates,
-            // artifacts, overrides, and external aliases all feed parse and
-            // structural analysis), so take the full re-publish path, not the
-            // `has_config()`-gated single-file delta (decision 017). When `.md`
-            // files also changed, the batched publish below already runs the
-            // full graph diff against the freshly reloaded config, so a
-            // marker-only notification is the only case that needs this
-            // empty-set publish.
-            if reloaded && changed_docs.is_empty() {
-                publish_all_diagnostics(connection, workspaces, &HashSet::new())?;
-            }
-            // Re-publish the whole applied `.md` batch in ONE graph-aware pass,
-            // naming every changed document so each one's materialization is
-            // refreshed unconditionally (its disk content changed). The single
-            // whole-graph diff also catches any other file whose edges moved —
-            // one recompute for the batch, not one per file (ticket perf 07).
-            if !changed_docs.is_empty() {
-                publish_all_diagnostics(connection, workspaces, &changed_docs)?;
-            }
+            handle_watched_files_change(connection, workspaces, &params)?;
         }
         _ => {}
+    }
+    Ok(())
+}
+
+/// Apply one `workspace/didChangeWatchedFiles` batch and re-publish.
+///
+/// Two registered globs (decision 017): the `.lattice.toml` marker (ticket
+/// server 08) and `**/*.md` documents (ticket server 09). Each URI takes its
+/// own reconciliation path, in two passes over the batch.
+///
+/// The marker pass runs FIRST, over the whole batch, before any `.md` change
+/// is applied: a client watcher that debounces coalesces a config edit and
+/// the document edits around it into one notification, in arbitrary order,
+/// and every document (re)parse below must happen under the config that was
+/// on disk with it. `reload_config` re-parsing the whole index would paper
+/// over the wrong order today, but ordering the passes makes the correctness
+/// structural instead of incidental (issue 050).
+fn handle_watched_files_change(
+    connection: &Connection,
+    workspaces: &mut Workspaces,
+    params: &lsp::DidChangeWatchedFilesParams,
+) -> Result<()> {
+    let mut reloaded = false;
+    // Workspace roots already reloaded in this batch: a create+modify pair
+    // coalesced into one notification reloads once, not twice — each reload
+    // is a full reparse of the workspace.
+    let mut reloaded_roots: HashSet<PathBuf> = HashSet::new();
+    for change in &params.changes {
+        // The marker watch is config: any event type reloads it. Guard on the
+        // suffix so an unrelated future glob can never trigger a config
+        // reload.
+        if !change.uri.ends_with(".lattice.toml") {
+            continue;
+        }
+        if let Some(workspace) = workspaces.resolve_marker_workspace(&change.uri) {
+            if reloaded_roots.insert(workspace.root().to_path_buf()) {
+                workspace.reload_config();
+                reloaded = true;
+            }
+        } else {
+            // A dropped config event leaves the workspace silently on stale
+            // (or default) config until the next marker event — the
+            // config-dead failure shape of issue 050 — so a miss is worth a
+            // trace even though there is nothing to reload.
+            tracing::warn!(
+                uri = %change.uri,
+                "config marker event matches no workspace; reload skipped"
+            );
+        }
+    }
+    // `.md` URIs whose on-disk state was applied. The whole batch is
+    // re-published in a single graph-aware pass below — a content or
+    // membership change can move *other* files' backlink/forward edges, so
+    // this mirrors how `didSave` re-publishes through
+    // `publish_all_diagnostics`, but folds N changed files into one
+    // O(workspace) recompute instead of N (ticket perf 07).
+    let mut changed_docs: HashSet<String> = HashSet::new();
+    for change in &params.changes {
+        if !is_markdown_uri(&change.uri) {
+            continue;
+        }
+        match change.change_type {
+            // `changed` carries disk content; for a file open in the editor
+            // the synced buffer wins, so the event is dropped (decision 017
+            // §3). The open file already reaches the server through
+            // `didChange`, so honoring the watcher too would also
+            // double-deliver (the issue 009 class).
+            lsp::file_change_type::CHANGED if workspaces.open_documents.contains(&change.uri) => {}
+            // created / deleted are membership changes honored regardless of
+            // open state; a non-open `changed` re-reads disk. All three route
+            // through `Workspace::update`, which re-reads disk — reparsing a
+            // created/changed file and dropping a deleted one — and refreshes
+            // the structural caches.
+            lsp::file_change_type::CREATED
+            | lsp::file_change_type::CHANGED
+            | lsp::file_change_type::DELETED => {
+                if let Some((workspace, rel_path)) = workspaces.resolve_mut(&change.uri) {
+                    let _ = workspace.update(&rel_path);
+                    changed_docs.insert(change.uri.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    // A marker change invalidates the whole workspace (predicates, artifacts,
+    // overrides, and external aliases all feed parse and structural
+    // analysis), so take the full re-publish path, not the
+    // `has_config()`-gated single-file delta (decision 017). When `.md` files
+    // also changed, the batched publish below already runs the full graph
+    // diff against the freshly reloaded config, so a marker-only notification
+    // is the only case that needs this empty-set publish.
+    if reloaded && changed_docs.is_empty() {
+        publish_all_diagnostics(connection, workspaces, &HashSet::new())?;
+    }
+    // Re-publish the whole applied `.md` batch in ONE graph-aware pass,
+    // naming every changed document so each one's materialization is
+    // refreshed unconditionally (its disk content changed). The single
+    // whole-graph diff also catches any other file whose edges moved — one
+    // recompute for the batch, not one per file (ticket perf 07).
+    if !changed_docs.is_empty() {
+        publish_all_diagnostics(connection, workspaces, &changed_docs)?;
     }
     Ok(())
 }
@@ -3802,7 +3864,17 @@ fn diff_diagnostics(
     // file is not in the index); real files use their own cached `line_index`.
     let empty = LineIndex::default();
 
-    for (root, workspace) in inner {
+    // Deepest root first (reverse key order), and each URI is claimed by the
+    // first workspace that indexes it: overlapping workspace folders (one root
+    // nested inside another) index the same absolute file twice, and letting
+    // both compute the same publish-cache key makes successive passes
+    // alternate between the two workspaces' diagnostic sets — the deeper
+    // workspace's vector one pass, the shallower's the next, each seeing the
+    // other's cache entry as "changed" (issue 050's flip-flop shape). The
+    // deepest root owning the file matches how `resolve` routes document
+    // events, and how the test oracle `desired_diagnostics` settles the same
+    // URI (its ascending-order overwrite keeps the deepest workspace's set).
+    for (root, workspace) in inner.iter().rev() {
         let mut by_file: BTreeMap<PathBuf, Vec<Diagnostic>> = BTreeMap::new();
         for diag in collect_all_diagnostics(workspace) {
             by_file.entry(diag.file.clone()).or_default().push(diag);
@@ -3822,7 +3894,10 @@ fn diff_diagnostics(
 
         for rel_path in workspace.files().keys() {
             let uri = path_to_uri(&root.join(rel_path));
-            present.insert(uri.clone());
+            if !present.insert(uri.clone()) {
+                // Already claimed by a deeper workspace in this pass.
+                continue;
+            }
 
             let lattice = by_file.remove(rel_path).unwrap_or_default();
             let cached = published.get(&uri);
@@ -8133,7 +8208,7 @@ mod tests {
         // reference is cleared by the new `[graph] artifacts` entry.
         let dir = workspace_with_files(&[
             (".lattice.toml", ""),
-            ("doc.md", "See `catenary.md` here.\n"),
+            ("doc.md", "See `artifact.md` here.\n"),
         ]);
         let root = fs::canonicalize(dir.path()).expect("canonicalize temp dir");
         let root_uri = path_to_uri(&root);
@@ -8170,7 +8245,7 @@ mod tests {
         );
 
         // Opening doc.md surfaces the stale-reference diagnostic.
-        open_doc(&client, &doc_uri, "See `catenary.md` here.\n");
+        open_doc(&client, &doc_uri, "See `artifact.md` here.\n");
         let before = recv_publish_for(&client, &doc_uri);
         assert!(
             !before.is_empty(),
@@ -8180,7 +8255,7 @@ mod tests {
         // Edit the marker on disk, then deliver the watched-file change.
         fs::write(
             root.join(".lattice.toml"),
-            "[graph]\nartifacts = [\"catenary.md\"]\n",
+            "[graph]\nartifacts = [\"artifact.md\"]\n",
         )
         .expect("rewrite the marker");
         send_notification(
@@ -8204,7 +8279,7 @@ mod tests {
         // A client that does not advertise dynamic registration must receive no
         // registration, and the server must keep working (decision 017's
         // graceful degradation — no own-watcher, no panic).
-        let dir = workspace_with_files(&[("doc.md", "See `catenary.md` here.\n")]);
+        let dir = workspace_with_files(&[("doc.md", "See `artifact.md` here.\n")]);
         let root = fs::canonicalize(dir.path()).expect("canonicalize temp dir");
         let root_uri = path_to_uri(&root);
         let doc_uri = path_to_uri(&root.join("doc.md"));
@@ -8225,7 +8300,7 @@ mod tests {
         );
 
         // The server still serves: a didOpen yields diagnostics.
-        open_doc(&client, &doc_uri, "See `catenary.md` here.\n");
+        open_doc(&client, &doc_uri, "See `artifact.md` here.\n");
         let publish = recv_publish_for(&client, &doc_uri);
         assert!(
             !publish.is_empty(),
@@ -8240,7 +8315,7 @@ mod tests {
         // Ticket 06 resilience holds: a malformed `didChangeWatchedFiles`
         // payload is logged-and-dropped, never fatal — a follow-up didOpen
         // still publishes.
-        let dir = workspace_with_files(&[("doc.md", "See `catenary.md` here.\n")]);
+        let dir = workspace_with_files(&[("doc.md", "See `artifact.md` here.\n")]);
         let root = fs::canonicalize(dir.path()).expect("canonicalize temp dir");
         let root_uri = path_to_uri(&root);
         let doc_uri = path_to_uri(&root.join("doc.md"));
@@ -8263,7 +8338,7 @@ mod tests {
         );
 
         // The server survived: a follow-up didOpen still publishes.
-        open_doc(&client, &doc_uri, "See `catenary.md` here.\n");
+        open_doc(&client, &doc_uri, "See `artifact.md` here.\n");
         let publish = recv_publish_for(&client, &doc_uri);
         assert!(
             !publish.is_empty(),
@@ -8794,6 +8869,180 @@ mod tests {
         assert!(
             any_message_contains(diags, "stale reference"),
             "the single closed file's on-disk change re-materialized, got {diags:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Config hot-reload hardening (issue 050)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn watched_batch_applies_config_change_before_md_changes() {
+        // Issue 050: a debouncing client watcher coalesces a config edit and
+        // the document edits around it into ONE notification, in arbitrary
+        // order. The marker pass runs first regardless, so every `.md`
+        // re-read in the batch parses under the config that was on disk with
+        // it. This drives the adversarial order — the md change listed
+        // before the marker CREATED event (the mid-session creation case).
+        let dir = workspace_with_files(&[("doc.md", "# Clean\n")]);
+        let mut workspaces = scan_workspaces(&dir);
+        let initial = diff_diagnostics(&mut workspaces, &HashSet::new());
+        assert!(
+            initial.is_empty(),
+            "the clean file publishes nothing initially: {initial:?}"
+        );
+
+        fs::write(
+            dir.path().join(".lattice.toml"),
+            "[graph]\nartifacts = [\"artifact.md\"]\n",
+        )
+        .expect("create the marker mid-session");
+        fs::write(
+            dir.path().join("doc.md"),
+            "See `artifact.md` and `dead.md` here.\n",
+        )
+        .expect("rewrite doc.md on disk");
+        let doc_uri = file_uri(&dir, "doc.md");
+        let marker_uri = file_uri(&dir, ".lattice.toml");
+        let notif = Notification::new(
+            lsp::method::DID_CHANGE_WATCHED_FILES.to_string(),
+            serde_json::json!({ "changes": [
+                { "uri": doc_uri, "type": lsp::file_change_type::CHANGED },
+                { "uri": marker_uri, "type": lsp::file_change_type::CREATED },
+            ] }),
+        );
+
+        let (server, client) = Connection::memory();
+        handle_notification(&server, &mut workspaces, notif).expect("handle the mixed batch");
+
+        let published = drain_publishes(&client);
+        let diags = published
+            .get(&doc_uri)
+            .expect("doc.md was published in the batch pass");
+        assert!(
+            any_message_contains(diags, "dead.md"),
+            "the md change itself was applied — `dead.md` is a stale reference: {diags:?}"
+        );
+        assert!(
+            !any_message_contains(diags, "artifact.md"),
+            "the md change parsed under the batch's own freshly created config — \
+             `artifact.md` is glossary-suppressed: {diags:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn marker_event_under_canonical_spelling_still_reloads() {
+        // Issue 050: a config event dropped on a URI-spelling mismatch leaves
+        // the workspace silently on stale config. The folder is opened
+        // through a symlink (the map key), while the watcher reports the
+        // mid-session marker creation under the canonical root — the reload
+        // must still find the workspace via its canonical scan root.
+        let real = workspace_with_files(&[("doc.md", "See `artifact.md` here.\n")]);
+        let canonical_root = fs::canonicalize(real.path()).expect("canonicalize real root");
+        let link_parent = tempfile::tempdir().expect("create symlink parent dir");
+        let link = link_parent.path().join("ws");
+        std::os::unix::fs::symlink(real.path(), &link).expect("create workspace symlink");
+        let link_uri = path_to_uri(&link);
+        let doc_uri = path_to_uri(&link.join("doc.md"));
+
+        let (server, client) = Connection::memory();
+        let server_thread = std::thread::spawn(move || serve(&server));
+
+        handshake(&client, &link_uri, true);
+        let reg = recv_message(&client);
+        assert!(
+            matches!(reg, Message::Request(_)),
+            "the registration request precedes the marker event, got {reg:?}"
+        );
+
+        open_doc(&client, &doc_uri, "See `artifact.md` here.\n");
+        let before = recv_publish_for(&client, &doc_uri);
+        assert!(
+            any_message_contains(&before, "stale reference"),
+            "doc.md starts with the stale-reference diagnostic, got {before:?}"
+        );
+
+        // Create the marker mid-session and deliver its watcher event under
+        // the canonical spelling, not the symlinked folder's.
+        fs::write(
+            canonical_root.join(".lattice.toml"),
+            "[graph]\nartifacts = [\"artifact.md\"]\n",
+        )
+        .expect("create the marker mid-session");
+        let marker_uri = path_to_uri(&canonical_root.join(".lattice.toml"));
+        send_watched_change(&client, &marker_uri, lsp::file_change_type::CREATED);
+
+        let after = recv_publish_for(&client, &doc_uri);
+        assert!(
+            after.is_empty(),
+            "the canonically-spelled marker event reloads the symlink-keyed workspace: {after:?}"
+        );
+
+        shutdown(&client, server_thread);
+    }
+
+    #[test]
+    fn overlapping_folders_do_not_alternate_publishes() {
+        // Issue 050's flip-flop shape: two workspace folders, one nested in
+        // the other, index the same absolute file. The shallow folder cannot
+        // see the deep folder's `.lattice.toml` (config discovery walks up,
+        // not down), so the two workspaces disagree about the file's
+        // diagnostics — and with both feeding the URI-keyed publish cache,
+        // successive passes alternated between the config-aware set and the
+        // config-less one. The deepest workspace must own the URI, matching
+        // how `resolve` routes the file's document events.
+        let dir = workspace_with_files(&[
+            (
+                "sub/.lattice.toml",
+                "[graph]\nartifacts = [\"artifact.md\"]\n",
+            ),
+            ("sub/doc.md", "See `artifact.md` and `dead.md` here.\n"),
+        ]);
+        let root = fs::canonicalize(dir.path()).expect("canonicalize temp dir");
+        let sub = root.join("sub");
+        let ws_root = Workspace::scan(&root).expect("scan the shallow folder");
+        let ws_sub = Workspace::scan(&sub).expect("scan the deep folder");
+        assert!(
+            !ws_root.has_config() && ws_sub.has_config(),
+            "test setup: only the deep folder sees the marker"
+        );
+        let mut workspaces = Workspaces {
+            inner: BTreeMap::from([(root.clone(), ws_root), (sub, ws_sub)]),
+            published: HashMap::new(),
+            open_documents: HashSet::new(),
+        };
+        let doc_uri = path_to_uri(&root.join("sub/doc.md"));
+
+        // First pass: exactly one publish for the shared URI, computed by the
+        // deep (config-aware) workspace — `artifact.md` glossary-suppressed,
+        // `dead.md` stale.
+        let first = diff_diagnostics(&mut workspaces, &HashSet::new());
+        assert_eq!(
+            first.len(),
+            1,
+            "the shared file publishes exactly once: {first:?}"
+        );
+        assert_eq!(first[0].0, doc_uri, "the publish is for the shared URI");
+        let messages: Vec<&str> = first[0].1.iter().map(|d| d.message.as_str()).collect();
+        assert!(
+            messages.iter().any(|m| m.contains("dead.md"))
+                && !messages.iter().any(|m| m.contains("artifact.md")),
+            "the deep workspace's config-aware set wins: {messages:?}"
+        );
+
+        // Follow-up passes with nothing changed must publish nothing — under
+        // the shared-cache bug, each pass flipped the URI to whichever
+        // workspace's set the cache did not currently hold.
+        let forced = diff_diagnostics(&mut workspaces, &one_uri(&doc_uri));
+        assert!(
+            forced.is_empty(),
+            "a forced re-materialization of the unchanged file publishes nothing: {forced:?}"
+        );
+        let idle = diff_diagnostics(&mut workspaces, &HashSet::new());
+        assert!(
+            idle.is_empty(),
+            "an idle pass publishes nothing — no alternation: {idle:?}"
         );
     }
 }

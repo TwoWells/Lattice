@@ -7246,18 +7246,18 @@ mod tests {
         // Issue 030: the `{Name}/…` external-namespace escape applies only to
         // *citations* (backtick/quoted/bare), never to markdown *links*. A
         // clickable cross-repo link is not navigable on GitHub, so a
-        // `[x]({Catenary}/…)` link keeps strict intra-project resolution — the
-        // literal `{Catenary}` is dir-joined as an ordinary `.md` target, not
+        // `[x]({Archive}/…)` link keeps strict intra-project resolution — the
+        // literal `{Archive}` is dir-joined as an ordinary `.md` target, not
         // exempted by any alias.
-        let tree = parse("[x]({Catenary}/docs/configuration.md)\n");
+        let tree = parse("[x]({Archive}/docs/configuration.md)\n");
         let links = tree.links(Path::new("a/b/c.md"));
         assert_eq!(links.len(), 1, "one link extracted: {links:?}");
         match &links[0].kind {
             LinkKind::IntraProject { target, .. } => {
                 assert_eq!(
                     target,
-                    Path::new("a/b/{Catenary}/docs/configuration.md"),
-                    "the `{{Catenary}}` link target is dir-joined verbatim, not aliased",
+                    Path::new("a/b/{Archive}/docs/configuration.md"),
+                    "the `{{Archive}}` link target is dir-joined verbatim, not aliased",
                 );
             }
             other => panic!("expected a strict intra-project markdown link, got {other:?}"),

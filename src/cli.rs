@@ -173,9 +173,9 @@ an aliased directory: never read, parsed, indexed, or treated as a graph edge.
 Table shape — `Name = \"dir\"`, one entry per alias:
 
     [external]
-    Catenary = \"../Catenary\"      # relative: preferred sibling-checkout form
-    HedgeMaze = \"/opt/HedgeMaze\"  # absolute: taken verbatim
-    Archive = \"~/Projects/Archive\" # ~ expands against the home directory
+    Archive = \"../Archive\"       # relative: preferred sibling-checkout form
+    Vault = \"/opt/Vault\"         # absolute: taken verbatim
+    Notes = \"~/Projects/Notes\"   # ~ expands against the home directory
 
 A relative value resolves against the config file's directory; an absolute
 value is taken verbatim; a `~`-leading value expands against the home
@@ -232,7 +232,7 @@ document's own frontmatter — a block sibling to `backlinks`:
     exceptions:
       stale_references:
         \"tickets/acquire/DESIGN.md\": \"hypothetical path in the worked example\"
-        \"{Catenary}/old/layout.md\": \"pre-refactor path, kept for the changelog\"
+        \"{Archive}/old/layout.md\": \"pre-refactor path, kept for the changelog\"
       bare_paths:
         \"README.md\": \"naming the file, deliberately not a link\"
     ---
@@ -264,7 +264,7 @@ reference:
     ---
     exceptions:
       stale_references:
-        \"{Catenary}/old/layout.md\": \"a kept literal, carved out first\"
+        \"{Archive}/old/layout.md\": \"a kept literal, carved out first\"
         31: \"consolidation migration table — every path is a record, not a live reference\"
     ---
 

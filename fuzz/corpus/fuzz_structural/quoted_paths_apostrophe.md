@@ -5,4 +5,4 @@ See "docs/other.md" and 'docs/外部.md' for café details.
 rock 'n' roll mixes 'quotes' and "quotes" on one line.
 A zero-width​span before '日本語/x.md' must not panic.
 Unbalanced: a lone " quote and a lone ' apostrophe here.
-'{Catenary}/gone.md' is the external single-quoted form.
+'{Archive}/gone.md' is the external single-quoted form.

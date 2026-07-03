@@ -328,7 +328,7 @@ pub struct Config {
     /// Populated from the `[external]` table in `.lattice.toml` (issue 030,
     /// decision 010). Each value is resolved to an absolute path at load time:
     /// a relative value (the preferred sibling-checkout form, e.g.
-    /// `../Catenary`) against the config file's directory, a `~`-leading value
+    /// `../Archive`) against the config file's directory, a `~`-leading value
     /// against the home directory, and an absolute value verbatim. A
     /// `{Name}/path` citation is checked **existence-only** against the matching
     /// alias directory — never read, parsed, indexed, or treated as a graph edge.
@@ -628,10 +628,10 @@ fn default_predicates() -> BTreeMap<String, String> {
 /// file's directory (the workspace root in the normal case). Resolution follows
 /// the three accepted forms (issue 030):
 ///
-/// - an **absolute** path (`/srv/Catenary`) is taken verbatim;
-/// - a **`~`-leading** path (`~/Projects/Catenary`) is expanded against the
+/// - an **absolute** path (`/srv/Archive`) is taken verbatim;
+/// - a **`~`-leading** path (`~/Projects/Archive`) is expanded against the
 ///   home directory — a machine-specific form the spec discourages but accepts;
-/// - a **relative** path (`../Catenary`, the preferred sibling-checkout form) is
+/// - a **relative** path (`../Archive`, the preferred sibling-checkout form) is
 ///   joined onto `base_dir`.
 ///
 /// The result is not normalized or canonicalized: it is only ever `stat`-ed for
@@ -1359,24 +1359,24 @@ image_empty_alt = true
     fn external_relative_alias_resolves_against_config_dir() {
         // The preferred sibling-checkout form: a relative value resolves against
         // the config file's directory.
-        let dir = temp_dir_with(Some("[external]\nCatenary = \"../Catenary\""));
+        let dir = temp_dir_with(Some("[external]\nArchive = \"../Archive\""));
         let config = Config::load(dir.path()).expect("load should succeed");
 
         assert_eq!(
-            config.external.get("Catenary"),
-            Some(&dir.path().join("../Catenary")),
+            config.external.get("Archive"),
+            Some(&dir.path().join("../Archive")),
             "relative alias resolves against the config file's directory"
         );
     }
 
     #[test]
     fn external_absolute_alias_parses_verbatim() {
-        let dir = temp_dir_with(Some("[external]\nCatenary = \"/srv/Catenary\""));
+        let dir = temp_dir_with(Some("[external]\nArchive = \"/srv/Archive\""));
         let config = Config::load(dir.path()).expect("load should succeed");
 
         assert_eq!(
-            config.external.get("Catenary"),
-            Some(&PathBuf::from("/srv/Catenary")),
+            config.external.get("Archive"),
+            Some(&PathBuf::from("/srv/Archive")),
             "an absolute alias value is taken verbatim"
         );
     }
@@ -1385,23 +1385,23 @@ image_empty_alt = true
     fn external_home_alias_parses() {
         // A `~`-leading value parses (machine-specific, discouraged, but
         // accepted) and expands against the home directory when one is known.
-        let dir = temp_dir_with(Some("[external]\nCatenary = \"~/Projects/Catenary\""));
+        let dir = temp_dir_with(Some("[external]\nArchive = \"~/Projects/Archive\""));
         let config = Config::load(dir.path()).expect("load should succeed");
 
         let resolved = config
             .external
-            .get("Catenary")
+            .get("Archive")
             .expect("home-relative alias parses");
         if let Some(home) = std::env::home_dir() {
             assert_eq!(
                 resolved,
-                &home.join("Projects/Catenary"),
+                &home.join("Projects/Archive"),
                 "`~/` expands against the home directory"
             );
         } else {
             assert_eq!(
                 resolved,
-                &PathBuf::from("~/Projects/Catenary"),
+                &PathBuf::from("~/Projects/Archive"),
                 "with no home directory the `~` is left literal (resolves to absent → exempt)"
             );
         }
@@ -1410,19 +1410,19 @@ image_empty_alt = true
     #[test]
     fn external_table_round_trips_multiple_aliases() {
         let dir = temp_dir_with(Some(
-            "[external]\nCatenary = \"../Catenary\"\nHedgeMaze = \"/opt/HedgeMaze\"",
+            "[external]\nArchive = \"../Archive\"\nVault = \"/opt/Vault\"",
         ));
         let config = Config::load(dir.path()).expect("load should succeed");
 
         assert_eq!(config.external.len(), 2, "both aliases round-trip");
         assert_eq!(
-            config.external.get("Catenary"),
-            Some(&dir.path().join("../Catenary")),
+            config.external.get("Archive"),
+            Some(&dir.path().join("../Archive")),
             "relative alias preserved"
         );
         assert_eq!(
-            config.external.get("HedgeMaze"),
-            Some(&PathBuf::from("/opt/HedgeMaze")),
+            config.external.get("Vault"),
+            Some(&PathBuf::from("/opt/Vault")),
             "absolute alias preserved"
         );
     }

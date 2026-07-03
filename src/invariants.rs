@@ -899,7 +899,10 @@ pub fn carrier_backlinks(source: &str) -> HashMap<String, Vec<String>> {
 /// rather than the filesystem or workspace membership, so a fuzzed reference can
 /// land on either branch of every existence-gated check — the "make it a link"
 /// hint when present and the dangling / stale path when absent — without any
-/// I/O. `rel_path` is fixed to `fuzz.md` so resolution is reproducible across runs.
+/// I/O. The external oracle folds in the third verdict,
+/// [`structural::ExternalExistence::Unknown`] (a failed `stat`, issue 050),
+/// via [`external_exists_oracle`], so the cannot-verify arm is fuzzed too.
+/// `rel_path` is fixed to `fuzz.md` so resolution is reproducible across runs.
 #[must_use]
 pub fn collect_structural(source: &str) -> Vec<Diagnostic> {
     let rel_path = Path::new("fuzz.md");
@@ -911,7 +914,7 @@ pub fn collect_structural(source: &str) -> Vec<Diagnostic> {
         .as_ref()
         .map_or(&empty_exceptions, |fm| &fm.exceptions);
     let file_exists = |target: &Path| path_exists_oracle(target);
-    let external_exists = |target: &Path| path_exists_oracle(target);
+    let external_exists = |target: &Path| external_exists_oracle(target);
     structural::collect(
         &file.tree,
         rel_path,
@@ -938,6 +941,30 @@ fn path_exists_oracle(path: &Path) -> bool {
         .map(|&b| u32::from(b))
         .sum();
     sum.is_multiple_of(2)
+}
+
+/// Deterministic tri-state oracle for the external-alias arm (issue 050).
+///
+/// Like [`path_exists_oracle`], the verdict is a pure function of the path's
+/// bytes. `sum % 4 == 3` answers [`structural::ExternalExistence::Unknown`] —
+/// the failed-`stat` verdict — so the cannot-verify branch of `{Name}/…`
+/// resolution is reachable by the fuzzer; the remaining paths keep the
+/// even/odd present/absent split.
+#[must_use]
+fn external_exists_oracle(path: &Path) -> structural::ExternalExistence {
+    let sum: u32 = path
+        .as_os_str()
+        .as_encoded_bytes()
+        .iter()
+        .map(|&b| u32::from(b))
+        .sum();
+    if sum % 4 == 3 {
+        structural::ExternalExistence::Unknown
+    } else if sum.is_multiple_of(2) {
+        structural::ExternalExistence::Present
+    } else {
+        structural::ExternalExistence::Absent
+    }
 }
 
 /// Assert every structural diagnostic carries a location the LSP layer can

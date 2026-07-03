@@ -598,7 +598,7 @@ fn base_level_lint_diagnostics(
         return Vec::new();
     };
     let file_exists = |target: &Path| workspace.file(target).is_some();
-    let external_exists = |path: &Path| path.exists();
+    let external_exists = |path: &Path| structural::ExternalExistence::stat(path);
     let empty_exceptions = Exceptions::default();
     let exceptions = file_data
         .frontmatter

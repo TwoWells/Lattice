@@ -24,6 +24,40 @@ use crate::validation::{Diagnostic, Severity};
 // Entry point
 // ---------------------------------------------------------------------------
 
+/// Existence verdict from the external-alias `stat` oracle (issue 050).
+///
+/// A `stat` can fail without answering the existence question — permissions,
+/// descriptor exhaustion, transient I/O. Folding that failure into "absent"
+/// silently degraded a defined `{Name}/…` alias to the exempt tier and
+/// misreported its frontmatter exception as unused, so the failure case is
+/// kept distinct: the caller surfaces it instead of exempting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExternalExistence {
+    /// The path exists.
+    Present,
+    /// `stat` answered: the path definitively does not exist.
+    Absent,
+    /// The `stat` itself failed — existence is unknown, not "absent".
+    Unknown,
+}
+
+impl ExternalExistence {
+    /// Classify `path` by `stat`, mapping the three outcomes of
+    /// [`Path::try_exists`]: found, definitively absent, and "the check
+    /// itself failed". The production oracles (workspace loader and CLI)
+    /// use this; test and fuzz harnesses substitute deterministic verdicts.
+    pub fn stat(path: &Path) -> Self {
+        match path.try_exists() {
+            Ok(true) => Self::Present,
+            Ok(false) => Self::Absent,
+            Err(err) => {
+                tracing::warn!(path = %path.display(), "external-alias stat failed: {err}");
+                Self::Unknown
+            }
+        }
+    }
+}
+
 /// Collect all structural diagnostics for a single file.
 ///
 /// `rel_path` is the workspace-relative path, used for bare path existence
@@ -34,7 +68,10 @@ use crate::validation::{Diagnostic, Severity};
 /// existence-only resolution of `{Name}/…` external-namespace references (issue
 /// 030, decision 010). Unlike `file_exists`, which answers workspace membership,
 /// `external_exists` reaches outside the workspace to the configured alias
-/// directory — but only ever to `stat`, never to read or index.
+/// directory — but only ever to `stat`, never to read or index. Its verdict is
+/// the tri-state [`ExternalExistence`]: a failed `stat` is `Unknown`, not
+/// "absent", so an I/O flake surfaces as a diagnostic instead of silently
+/// exempting the reference (issue 050).
 ///
 /// `exceptions` is this file's parsed `exceptions` frontmatter block (issue 031,
 /// decision 011): a path-shaped diagnostic whose reference matches an entry in
@@ -53,7 +90,7 @@ pub fn collect(
     rel_path: &Path,
     config: &Config,
     file_exists: &dyn Fn(&Path) -> bool,
-    external_exists: &dyn Fn(&Path) -> bool,
+    external_exists: &dyn Fn(&Path) -> ExternalExistence,
     exceptions: &Exceptions,
 ) -> Vec<Diagnostic> {
     collect_with_suppressions(
@@ -82,7 +119,7 @@ pub fn collect_with_suppressions(
     rel_path: &Path,
     config: &Config,
     file_exists: &dyn Fn(&Path) -> bool,
-    external_exists: &dyn Fn(&Path) -> bool,
+    external_exists: &dyn Fn(&Path) -> ExternalExistence,
     exceptions: &Exceptions,
 ) -> (Vec<Diagnostic>, FileSuppressions) {
     let mut diagnostics = Vec::new();
@@ -674,7 +711,7 @@ fn emit_tree_bare_paths(
     rel_path: &Path,
     config: &Config,
     file_exists: &dyn Fn(&Path) -> bool,
-    external_exists: &dyn Fn(&Path) -> bool,
+    external_exists: &dyn Fn(&Path) -> ExternalExistence,
     lookup: &ExceptionLookup,
     out: &mut Vec<Diagnostic>,
 ) {
@@ -980,6 +1017,53 @@ fn build_external_stale_reference(
     })
 }
 
+/// Build the cannot-verify diagnostic for an external `{Name}/…` reference
+/// whose existence `stat` failed (issue 050,
+/// [`ExternalResolution::Unverifiable`]).
+///
+/// A failed `stat` is not "absent": degrading it to the exempt tier silently
+/// converted an I/O flake into exemption and misreported the reference's
+/// frontmatter exception as unused. Surfacing it keeps the failure visible; a
+/// `{Name}/…`-keyed `stale_references` exception still suppresses it, so an
+/// excepted reference reports as suppressed, not unused. The `stale
+/// reference:` prefix keeps [`classify_028_lint`] routing it to the same
+/// ledger row and exception namespace as the resolution it stands in for.
+/// Severity tracks [`StaleReferencePolicy`], mirroring
+/// [`build_external_stale_reference`].
+fn build_external_unverifiable_reference(
+    policy: StaleReferencePolicy,
+    rel_path: &Path,
+    line: usize,
+    span: Option<Span>,
+    reference: &str,
+    alias: &str,
+    config: &Config,
+) -> Option<Diagnostic> {
+    let severity = match policy {
+        StaleReferencePolicy::Disabled => return None,
+        StaleReferencePolicy::Hint => Severity::Hint,
+        StaleReferencePolicy::Warn => Severity::Warning,
+        StaleReferencePolicy::Deny => Severity::Error,
+    };
+    // `Unverifiable` is reached only for a defined alias, so the lookup is
+    // present; the fallback keeps the message coherent rather than panicking
+    // if that ever changes.
+    let dir = config
+        .external
+        .get(alias)
+        .map_or_else(String::new, |p| p.display().to_string());
+
+    Some(Diagnostic {
+        file: rel_path.to_path_buf(),
+        line,
+        severity,
+        message: format!(
+            "stale reference: `{reference}` — external alias `{alias}` resolves to `{dir}`, but checking existence there failed (stat error, not \"absent\"); if this persists, check permissions on that directory"
+        ),
+        span,
+    })
+}
+
 /// Emit diagnostics for bare URLs, quoted paths, and backticked paths found in
 /// inline-host text — paragraphs and table cells alike, matching the cells the
 /// link/edge extractor already walks.
@@ -994,7 +1078,7 @@ fn emit_bare_path_diagnostics(
     rel_path: &Path,
     config: &Config,
     file_exists: &dyn Fn(&Path) -> bool,
-    external_exists: &dyn Fn(&Path) -> bool,
+    external_exists: &dyn Fn(&Path) -> ExternalExistence,
     lookup: &ExceptionLookup,
     out: &mut Vec<Diagnostic>,
 ) {
@@ -1110,7 +1194,7 @@ fn scan_text_for_paths(
     policy: BarePathPolicy,
     stale: StaleReferencePolicy,
     file_exists: &dyn Fn(&Path) -> bool,
-    external_exists: &dyn Fn(&Path) -> bool,
+    external_exists: &dyn Fn(&Path) -> ExternalExistence,
     config: &Config,
     lookup: &ExceptionLookup,
     excluded: &[Span],
@@ -1286,7 +1370,7 @@ fn scan_line_for_quoted_paths(
     policy: BarePathPolicy,
     stale: StaleReferencePolicy,
     file_exists: &dyn Fn(&Path) -> bool,
-    external_exists: &dyn Fn(&Path) -> bool,
+    external_exists: &dyn Fn(&Path) -> ExternalExistence,
     config: &Config,
     lookup: &ExceptionLookup,
     excluded: &[Span],
@@ -1393,7 +1477,7 @@ fn strip_backtick_delimiters(s: &str) -> &str {
 ///
 /// Shapes that are not workspace paths at all are rejected outright (no
 /// make-it-a-link hint, no stale-reference warning): a `~`-leading token
-/// (home-relative, out of the repo, e.g. `~/Projects/Catenary/AGENTS.md`); a
+/// (home-relative, out of the repo, e.g. `~/Projects/Archive/AGENTS.md`); a
 /// token containing `<` or `>` (a placeholder, e.g. `<name>/SKILL.md`); a token
 /// containing `*` (a glob, e.g. `NN_*.md`); and a token containing an ellipsis —
 /// `…` (U+2026) or `...` — which is documentation shorthand for a path shape
@@ -1448,9 +1532,15 @@ enum ExternalResolution {
     /// The alias directory is present but the referenced file is missing — a
     /// genuinely broken cross-repo reference.
     Stale,
+    /// The alias is defined but a `stat` failed while resolving, so existence
+    /// is unknown — the reference is neither validated nor exempted (issue
+    /// 050). Surfaced as its own diagnostic rather than degraded to
+    /// [`Exempt`](Self::Exempt), which masked an I/O failure as exemption and
+    /// misreported the reference's frontmatter exception as unused.
+    Unverifiable,
 }
 
-/// Resolve an external-namespace reference to its three-tier disposition.
+/// Resolve an external-namespace reference to its tiered disposition.
 ///
 /// `alias`/`rest` come from [`block::external_namespace`]; `external_exists`
 /// `stat`s an absolute filesystem path (decision 010 — existence-only, edge-free: the
@@ -1461,22 +1551,28 @@ enum ExternalResolution {
 /// 2. alias defined, its directory absent → [`Exempt`](ExternalResolution::Exempt);
 /// 3. alias defined, directory present, file present → [`Valid`](ExternalResolution::Valid);
 /// 4. alias defined, directory present, file missing → [`Stale`](ExternalResolution::Stale).
+///
+/// A `stat` that *fails* (as opposed to answering "absent") lands in none of
+/// the four tiers: either check reporting
+/// [`Unknown`](ExternalExistence::Unknown) makes the disposition
+/// [`Unverifiable`](ExternalResolution::Unverifiable) (issue 050).
 fn resolve_external(
     config: &Config,
-    external_exists: &dyn Fn(&Path) -> bool,
+    external_exists: &dyn Fn(&Path) -> ExternalExistence,
     alias: &str,
     rest: &str,
 ) -> ExternalResolution {
     let Some(dir) = config.external.get(alias) else {
         return ExternalResolution::Exempt;
     };
-    if !external_exists(dir) {
-        return ExternalResolution::Exempt;
-    }
-    if external_exists(&dir.join(rest)) {
-        ExternalResolution::Valid
-    } else {
-        ExternalResolution::Stale
+    match external_exists(dir) {
+        ExternalExistence::Absent => ExternalResolution::Exempt,
+        ExternalExistence::Unknown => ExternalResolution::Unverifiable,
+        ExternalExistence::Present => match external_exists(&dir.join(rest)) {
+            ExternalExistence::Present => ExternalResolution::Valid,
+            ExternalExistence::Absent => ExternalResolution::Stale,
+            ExternalExistence::Unknown => ExternalResolution::Unverifiable,
+        },
     }
 }
 
@@ -1487,10 +1583,11 @@ fn resolve_external(
 /// existence-only and never a local link, so it skips both the make-it-a-link
 /// nudge and intra-repo resolution (issue 030, decision 010). On the stale tier
 /// (a defined, present alias whose target is missing) it emits the
-/// external-specific stale diagnostic, routed through the exception lookup so a
-/// `{Name}/…`-keyed `stale_references` exception still suppresses it (issue
-/// 031). Returns `None` when the token is not external, so the caller falls
-/// through to ordinary `.md` resolution.
+/// external-specific stale diagnostic, and on the unverifiable disposition (a
+/// `stat` failure, issue 050) the cannot-verify one — both routed through the
+/// exception lookup so a `{Name}/…`-keyed `stale_references` exception still
+/// suppresses them (issue 031). Returns `None` when the token is not external,
+/// so the caller falls through to ordinary `.md` resolution.
 ///
 /// `reference` is the displayed token; any `#fragment` is stripped before
 /// recognition and existence resolution (the fragment is a heading anchor and
@@ -1501,7 +1598,7 @@ fn resolve_external(
 )]
 fn route_external_reference(
     config: &Config,
-    external_exists: &dyn Fn(&Path) -> bool,
+    external_exists: &dyn Fn(&Path) -> ExternalExistence,
     policy: StaleReferencePolicy,
     rel_path: &Path,
     line: usize,
@@ -1512,10 +1609,16 @@ fn route_external_reference(
 ) -> Option<()> {
     let path = split_path_fragment(reference).0;
     let (alias, rest) = block::external_namespace(path)?;
-    if resolve_external(config, external_exists, alias, rest) == ExternalResolution::Stale
-        && let Some(diag) =
+    let diag = match resolve_external(config, external_exists, alias, rest) {
+        ExternalResolution::Exempt | ExternalResolution::Valid => None,
+        ExternalResolution::Stale => {
             build_external_stale_reference(policy, rel_path, line, span, reference, alias, config)
-    {
+        }
+        ExternalResolution::Unverifiable => build_external_unverifiable_reference(
+            policy, rel_path, line, span, reference, alias, config,
+        ),
+    };
+    if let Some(diag) = diag {
         lookup.route(ExceptionLint::StaleReferences, reference, diag, out);
     }
     Some(())
@@ -2057,13 +2160,22 @@ mod tests {
         let tree = block::parse_tree(content, fm_span);
         let rel_path = std::path::Path::new("test.md");
         let exceptions = exceptions_of(content);
-        collect(&tree, rel_path, config, &|_| false, &|_| false, &exceptions)
+        collect(
+            &tree,
+            rel_path,
+            config,
+            &|_| false,
+            &|_| ExternalExistence::Absent,
+            &exceptions,
+        )
     }
 
     /// Like [`diagnose_with_config`], but with an explicit external-existence
     /// oracle: `external_present` lists the absolute filesystem paths
     /// (alias directories and their joined files) that `stat` finds, backing the
-    /// three-tier `{Name}/…` resolution (issue 030).
+    /// three-tier `{Name}/…` resolution (issue 030). Every other path is
+    /// definitively absent; [`diagnose_with_external_unknown`] covers the
+    /// stat-failure verdict (issue 050).
     fn diagnose_with_external(
         content: &str,
         config: &Config,
@@ -2080,7 +2192,48 @@ mod tests {
             rel_path,
             config,
             &|_| false,
-            &|p| present.contains(p.to_str().unwrap_or("")),
+            &|p| {
+                if present.contains(p.to_str().unwrap_or("")) {
+                    ExternalExistence::Present
+                } else {
+                    ExternalExistence::Absent
+                }
+            },
+            &exceptions,
+        )
+    }
+
+    /// Like [`diagnose_with_external`], but paths in `unknown` answer the
+    /// stat-failure verdict [`ExternalExistence::Unknown`] instead of a
+    /// definitive presence answer (issue 050).
+    fn diagnose_with_external_unknown(
+        content: &str,
+        config: &Config,
+        external_present: &[&str],
+        unknown: &[&str],
+    ) -> Vec<Diagnostic> {
+        let fm = yaml::parse_frontmatter_block(content);
+        let fm_span = fm.as_ref().map(|b| b.span);
+        let tree = block::parse_tree(content, fm_span);
+        let rel_path = std::path::Path::new("test.md");
+        let present: HashSet<&str> = external_present.iter().copied().collect();
+        let unknown: HashSet<&str> = unknown.iter().copied().collect();
+        let exceptions = exceptions_of(content);
+        collect(
+            &tree,
+            rel_path,
+            config,
+            &|_| false,
+            &|p| {
+                let key = p.to_str().unwrap_or("");
+                if unknown.contains(key) {
+                    ExternalExistence::Unknown
+                } else if present.contains(key) {
+                    ExternalExistence::Present
+                } else {
+                    ExternalExistence::Absent
+                }
+            },
             &exceptions,
         )
     }
@@ -2111,7 +2264,7 @@ mod tests {
             rel_path,
             &config,
             &|p| existing_set.contains(p.to_str().unwrap_or("")),
-            &|_| false,
+            &|_| ExternalExistence::Absent,
             &exceptions,
         )
     }
@@ -2659,11 +2812,11 @@ mod tests {
         // The `{Name}/…` quoted form (present alias dir, missing file) is the
         // external-namespace variant of the same shape: exactly one stale
         // diagnostic, not two.
-        let config = config_with_catenary_alias();
+        let config = config_with_archive_alias();
         let diags = diagnose_with_external(
-            "See \"{Catenary}/gone.md\" for details.\n",
+            "See \"{Archive}/gone.md\" for details.\n",
             &config,
-            &["/ext/Catenary"],
+            &["/ext/Archive"],
         );
         assert_eq!(
             count_matching(&diags, Severity::Warning, "stale reference"),
@@ -2830,11 +2983,11 @@ mod tests {
     fn single_quoted_external_dir_path_dangling_emits_one_stale() {
         // The `{Name}/…` external form in single quotes (defined alias, missing
         // file) is stale exactly once.
-        let config = config_with_catenary_alias();
+        let config = config_with_archive_alias();
         let diags = diagnose_with_external(
-            "See '{Catenary}/gone.md' for details.\n",
+            "See '{Archive}/gone.md' for details.\n",
             &config,
-            &["/ext/Catenary"],
+            &["/ext/Archive"],
         );
         assert_eq!(
             count_matching(&diags, Severity::Warning, "stale reference"),
@@ -3018,7 +3171,7 @@ mod tests {
             rel_path,
             &config,
             &|p| existing_set.contains(p.to_str().unwrap_or("")),
-            &|_| false,
+            &|_| ExternalExistence::Absent,
             &exceptions,
         )
     }
@@ -3081,7 +3234,7 @@ mod tests {
             rel_path,
             &config,
             &|_| false,
-            &|_| false,
+            &|_| ExternalExistence::Absent,
             &Exceptions::default(),
         );
         assert_eq!(
@@ -3172,13 +3325,13 @@ mod tests {
     #[test]
     fn dir_relative_dotdot_is_normalized_no_stale() {
         // Bug 2 repro: a backtick `../claude_code/PostToolUse.md` in
-        // `architecture/catenary/Hook.md` joins to
-        // `architecture/catenary/../claude_code/PostToolUse.md`, which must
+        // `architecture/hooks/Hook.md` joins to
+        // `architecture/hooks/../claude_code/PostToolUse.md`, which must
         // normalize (collapse `..`) to the clean workspace key
         // `architecture/claude_code/PostToolUse.md` — so the reference resolves
         // and draws the make-it-a-link hint, not a stale-reference warning.
         let diags = diagnose_at_path_with_files(
-            "architecture/catenary/Hook.md",
+            "architecture/hooks/Hook.md",
             "See `../claude_code/PostToolUse.md` for details.\n",
             &["architecture/claude_code/PostToolUse.md"],
         );
@@ -3241,11 +3394,7 @@ mod tests {
         // `*`-bearing (glob) tokens are not workspace paths at all: no
         // make-it-a-link hint and no stale-reference warning, whether or not a
         // same-named file exists.
-        for token in [
-            "~/Projects/Catenary/AGENTS.md",
-            "<name>/SKILL.md",
-            "NN_*.md",
-        ] {
+        for token in ["~/Projects/Archive/AGENTS.md", "<name>/SKILL.md", "NN_*.md"] {
             let backtick = format!("See `{token}` for details.\n");
             // Once with nothing present, once with the literal token present.
             let dangling = diagnose(&backtick);
@@ -3324,12 +3473,12 @@ mod tests {
 
     // -- External-namespace `{Name}/…` references (issue 030, decision 010) --
 
-    /// A config with `Catenary` aliased to a fixed (test-only) directory.
-    fn config_with_catenary_alias() -> Config {
+    /// A config with `Archive` aliased to a fixed (test-only) directory.
+    fn config_with_archive_alias() -> Config {
         let mut config = Config::default();
         config.external.insert(
-            "Catenary".to_string(),
-            std::path::PathBuf::from("/ext/Catenary"),
+            "Archive".to_string(),
+            std::path::PathBuf::from("/ext/Archive"),
         );
         config
     }
@@ -3337,8 +3486,8 @@ mod tests {
     #[test]
     fn external_namespace_recognizer() {
         assert_eq!(
-            block::external_namespace("{Catenary}/docs/x.md"),
-            Some(("Catenary", "docs/x.md")),
+            block::external_namespace("{Archive}/docs/x.md"),
+            Some(("Archive", "docs/x.md")),
             "a leading `{{ident}}/` is recognized, splitting alias from the remainder"
         );
         assert_eq!(
@@ -3361,12 +3510,12 @@ mod tests {
         );
         // Not external references — these fall through to ordinary handling.
         for token in [
-            "{Catenary}",         // no trailing `/`
-            "{Catenary}/",        // empty remainder
-            "{}/x.md",            // empty identifier
-            "{a b}/x.md",         // space (not an identifier)
-            "docs/{Catenary}.md", // brace not at the start
-            "Catenary/x.md",      // no braces
+            "{Archive}",         // no trailing `/`
+            "{Archive}/",        // empty remainder
+            "{}/x.md",           // empty identifier
+            "{a b}/x.md",        // space (not an identifier)
+            "docs/{Archive}.md", // brace not at the start
+            "Archive/x.md",      // no braces
         ] {
             assert_eq!(
                 block::external_namespace(token),
@@ -3380,7 +3529,7 @@ mod tests {
     fn external_undefined_alias_is_exempt() {
         // Tier 1 (the exempt floor): with no `[external]` table, a `{Name}/…`
         // citation is external and unverified — no diagnostic, no config needed.
-        let diags = diagnose("See `{Catenary}/docs/configuration.md` for details.\n");
+        let diags = diagnose("See `{Archive}/docs/configuration.md` for details.\n");
         assert!(
             !has_any(&diags, "stale reference")
                 && !has_any(&diags, "backticked path")
@@ -3393,9 +3542,9 @@ mod tests {
     fn external_alias_dir_absent_is_exempt() {
         // Tier 2 (the CI / partial-checkout guard): the alias is defined but its
         // directory is not present on disk — exempt, never a false break.
-        let config = config_with_catenary_alias();
+        let config = config_with_archive_alias();
         let diags = diagnose_with_external(
-            "See `{Catenary}/docs/configuration.md` for details.\n",
+            "See `{Archive}/docs/configuration.md` for details.\n",
             &config,
             // Nothing present: not even the alias directory.
             &[],
@@ -3411,11 +3560,11 @@ mod tests {
         // Tier 3: directory present and the referenced file exists under it —
         // valid, no diagnostic. Notably no make-it-a-link nudge either: an
         // external reference is never a local link.
-        let config = config_with_catenary_alias();
+        let config = config_with_archive_alias();
         let diags = diagnose_with_external(
-            "See `{Catenary}/docs/configuration.md` for details.\n",
+            "See `{Archive}/docs/configuration.md` for details.\n",
             &config,
-            &["/ext/Catenary", "/ext/Catenary/docs/configuration.md"],
+            &["/ext/Archive", "/ext/Archive/docs/configuration.md"],
         );
         assert!(
             !has_any(&diags, "stale reference")
@@ -3430,17 +3579,82 @@ mod tests {
         // Tier 4: directory present but the referenced file is missing — a
         // genuinely broken cross-repo reference draws the stale-reference
         // warning.
-        let config = config_with_catenary_alias();
+        let config = config_with_archive_alias();
         let diags = diagnose_with_external(
-            "See `{Catenary}/docs/configuration.md` for details.\n",
+            "See `{Archive}/docs/configuration.md` for details.\n",
             &config,
             // The alias directory exists; the file under it does not.
-            &["/ext/Catenary"],
+            &["/ext/Archive"],
         );
         assert_eq!(
             count_matching(&diags, Severity::Warning, "stale reference"),
             1,
             "a missing file under a present alias directory is stale: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn external_stat_failure_is_surfaced_not_exempted() {
+        // Issue 050: a failed `stat` is not "absent". Degrading it to the
+        // exempt tier silently converted an I/O flake into exemption; it must
+        // surface as its own diagnostic instead, on either check.
+        let config = config_with_archive_alias();
+        // Alias directory stat fails.
+        let dir_unknown = diagnose_with_external_unknown(
+            "See `{Archive}/docs/configuration.md` for details.\n",
+            &config,
+            &[],
+            &["/ext/Archive"],
+        );
+        assert_eq!(
+            count_matching(
+                &dir_unknown,
+                Severity::Warning,
+                "checking existence there failed"
+            ),
+            1,
+            "a dir-level stat failure surfaces the cannot-verify diagnostic: {dir_unknown:?}"
+        );
+        // Directory present, file stat fails.
+        let file_unknown = diagnose_with_external_unknown(
+            "See `{Archive}/docs/configuration.md` for details.\n",
+            &config,
+            &["/ext/Archive"],
+            &["/ext/Archive/docs/configuration.md"],
+        );
+        assert_eq!(
+            count_matching(
+                &file_unknown,
+                Severity::Warning,
+                "checking existence there failed"
+            ),
+            1,
+            "a file-level stat failure surfaces the cannot-verify diagnostic: {file_unknown:?}"
+        );
+    }
+
+    #[test]
+    fn external_stat_failure_suppressed_by_exception_without_unused_misreport() {
+        // Issue 050's partial signature: under the old exempt degradation, a
+        // stat flake made the reference's exception misreport as "unused …
+        // no longer in the document". The cannot-verify diagnostic routes
+        // through the same exception lookup, so a `{Name}/…`-keyed exception
+        // suppresses it and stays used.
+        let config = config_with_archive_alias();
+        let content = "---\n\
+             exceptions:\n  \
+               stale_references:\n    \
+                 \"{Archive}/docs/configuration.md\": \"deliberately absent in that repo\"\n\
+             ---\n\
+             See `{Archive}/docs/configuration.md` for details.\n";
+        let diags = diagnose_with_external_unknown(content, &config, &[], &["/ext/Archive"]);
+        assert!(
+            !has_any(&diags, "checking existence there failed"),
+            "the exception suppresses the cannot-verify diagnostic: {diags:?}"
+        );
+        assert!(
+            !has_any(&diags, "unused exception"),
+            "a stat failure must not misreport the exception as unused: {diags:?}"
         );
     }
 
@@ -3452,13 +3666,13 @@ mod tests {
         // gave quoted spans a single owner (the structural quoted scanner), so
         // the bare-path surface no longer claims the inner string. Both surfaces
         // therefore assert "exactly one."
-        let config = config_with_catenary_alias();
+        let config = config_with_archive_alias();
         for content in [
-            "See \"{Catenary}/docs/configuration.md\" for details.\n",
-            "See {Catenary}/docs/configuration.md for details.\n",
+            "See \"{Archive}/docs/configuration.md\" for details.\n",
+            "See {Archive}/docs/configuration.md for details.\n",
         ] {
             // Present dir, missing file → stale (tier 4).
-            let stale = diagnose_with_external(content, &config, &["/ext/Catenary"]);
+            let stale = diagnose_with_external(content, &config, &["/ext/Archive"]);
             assert_eq!(
                 count_matching(&stale, Severity::Warning, "stale reference"),
                 1,
@@ -3487,20 +3701,20 @@ mod tests {
     #[test]
     fn external_directory_and_non_md_references_are_checked() {
         // An external `{Name}/…` reference is existence-checked regardless of
-        // extension: a cross-repo *directory* (`{Catenary}/docs`) or non-`.md`
-        // file (`{Catenary}/schema.txt`) is a real reference. It is edge-free and
+        // extension: a cross-repo *directory* (`{Archive}/docs`) or non-`.md`
+        // file (`{Archive}/schema.txt`) is a real reference. It is edge-free and
         // never a local link (decision 010), so the `.md` graph-edge scope that
         // gates intra-repo dark matter does not apply. Covered on every citation
         // surface: bare, backtick, quoted.
-        let config = config_with_catenary_alias();
-        for reference in ["{Catenary}/docs", "{Catenary}/schema.txt"] {
+        let config = config_with_archive_alias();
+        for reference in ["{Archive}/docs", "{Archive}/schema.txt"] {
             for content in [
                 format!("See {reference} for details.\n"),     // bare
                 format!("See `{reference}` for details.\n"),   // backtick
                 format!("See \"{reference}\" for details.\n"), // quoted
             ] {
                 // Tier 4: alias dir present, target missing under it → stale.
-                let stale = diagnose_with_external(&content, &config, &["/ext/Catenary"]);
+                let stale = diagnose_with_external(&content, &config, &["/ext/Archive"]);
                 assert_eq!(
                     count_matching(&stale, Severity::Warning, "stale reference"),
                     1,
@@ -3528,11 +3742,11 @@ mod tests {
         // directory exists under it → valid, and (unlike a resolving intra-repo
         // path) no make-it-a-link nudge, because an external reference is never
         // a local link.
-        let config = config_with_catenary_alias();
+        let config = config_with_archive_alias();
         let diags = diagnose_with_external(
-            "See `{Catenary}/docs` for details.\n",
+            "See `{Archive}/docs` for details.\n",
             &config,
-            &["/ext/Catenary", "/ext/Catenary/docs"],
+            &["/ext/Archive", "/ext/Archive/docs"],
         );
         assert!(
             !has_any(&diags, "stale reference") && !has_any(&diags, "backticked path"),
@@ -3547,14 +3761,14 @@ mod tests {
         // already `{repo}/…` (so teaching that escape is noise), and may name a
         // directory rather than a "markdown file". It names the alias and the
         // directory it resolved to instead.
-        let config = config_with_catenary_alias();
+        let config = config_with_archive_alias();
         let diags = diagnose_with_external(
-            "See `{Catenary}/docs` for details.\n",
+            "See `{Archive}/docs` for details.\n",
             &config,
-            &["/ext/Catenary"],
+            &["/ext/Archive"],
         );
         assert!(
-            has_matching(&diags, Severity::Warning, "external alias `Catenary`"),
+            has_matching(&diags, Severity::Warning, "external alias `Archive`"),
             "the external stale message names the alias: {diags:?}"
         );
         assert!(
@@ -3576,8 +3790,8 @@ mod tests {
         // could break). Without this, the syntax description would flag itself —
         // the regression dogfooding caught when external refs stopped being
         // `.md`-scoped.
-        let config = config_with_catenary_alias();
-        for placeholder in ["{Catenary}/…", "{Catenary}/..."] {
+        let config = config_with_archive_alias();
+        for placeholder in ["{Archive}/…", "{Archive}/..."] {
             for content in [
                 format!("Write it as {placeholder} for a cross-repo ref.\n"),
                 format!("Write it as `{placeholder}` for a cross-repo ref.\n"),
@@ -3585,7 +3799,7 @@ mod tests {
             ] {
                 // Alias dir present (tier-4 territory for a concrete path), yet
                 // the ellipsis placeholder draws nothing.
-                let diags = diagnose_with_external(&content, &config, &["/ext/Catenary"]);
+                let diags = diagnose_with_external(&content, &config, &["/ext/Archive"]);
                 assert!(
                     !has_any(&diags, "stale reference") && !has_any(&diags, "external alias"),
                     "the `{placeholder}` placeholder is exempt, not a stale reference: {diags:?}"
@@ -3600,7 +3814,7 @@ mod tests {
         // a backtick/quoted/bare citation, not a markdown link, so it never
         // appears in link extraction — assert nothing comes out of `links()`.
         let tree = block::parse_tree(
-            "See `{Catenary}/docs/configuration.md` and {Catenary}/x.md.\n",
+            "See `{Archive}/docs/configuration.md` and {Archive}/x.md.\n",
             None,
         );
         let links = tree.links(std::path::Path::new("test.md"));
@@ -3765,7 +3979,7 @@ mod tests {
             rel_path,
             &config,
             &|_| false,
-            &|_| false,
+            &|_| ExternalExistence::Absent,
             &Exceptions::default(),
         );
         assert!(
@@ -3787,7 +4001,7 @@ mod tests {
             rel_path,
             &config,
             &|_| false,
-            &|_| false,
+            &|_| ExternalExistence::Absent,
             &Exceptions::default(),
         );
         assert_eq!(
@@ -3817,7 +4031,7 @@ mod tests {
             rel_path,
             &config,
             &|p| existing_set.contains(p.to_str().unwrap_or("")),
-            &|_| false,
+            &|_| ExternalExistence::Absent,
             &exceptions,
         )
     }
@@ -4011,15 +4225,15 @@ mod tests {
         // A `{Name}/…`-keyed exception flows through identically: a defined,
         // present alias whose target file is missing is a stale reference, and
         // the literal `{Name}/…` key suppresses it (decision 011).
-        let config = config_with_catenary_alias();
+        let config = config_with_archive_alias();
         let content = "---\n\
             exceptions:\n  \
               stale_references:\n    \
-                \"{Catenary}/old/layout.md\": \"pre-refactor path, kept for the changelog note\"\n\
+                \"{Archive}/old/layout.md\": \"pre-refactor path, kept for the changelog note\"\n\
             ---\n\
-            See `{Catenary}/old/layout.md` for the old shape.\n";
+            See `{Archive}/old/layout.md` for the old shape.\n";
         // Alias directory present, file under it missing → tier 4 (stale).
-        let diags = diagnose_with_external(content, &config, &["/ext/Catenary"]);
+        let diags = diagnose_with_external(content, &config, &["/ext/Archive"]);
         assert!(
             !has_any(&diags, "stale reference"),
             "a `{{Name}}/…`-keyed exception suppresses the present-missing stale: {diags:?}"
@@ -4124,7 +4338,7 @@ mod tests {
             exceptions:\n  \
               stale_references:\n    \
                 \"tickets/acquire/DESIGN.md\": \"hypothetical path in the worked example\"\n    \
-                \"{Catenary}/old/layout.md\": \"pre-refactor path\"\n  \
+                \"{Archive}/old/layout.md\": \"pre-refactor path\"\n  \
               bare_paths:\n    \
                 \"README\": \"naming the file, deliberately not a link\"\n\
             ---\n\
@@ -4145,7 +4359,7 @@ mod tests {
             "the first stale key is the literal reference: {exceptions:?}"
         );
         assert_eq!(
-            exceptions.stale_references[1].reference, "{Catenary}/old/layout.md",
+            exceptions.stale_references[1].reference, "{Archive}/old/layout.md",
             "the `{{Name}}/…` key is retained verbatim: {exceptions:?}"
         );
         assert_eq!(
@@ -4348,7 +4562,7 @@ mod tests {
             rel_path,
             config,
             &|p| existing_set.contains(p.to_str().unwrap_or("")),
-            &|_| false,
+            &|_| ExternalExistence::Absent,
             &exceptions,
         )
     }

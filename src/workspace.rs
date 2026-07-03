@@ -370,7 +370,10 @@ impl Workspace {
         // workspace index — so this oracle `stat`s the real filesystem rather
         // than consulting workspace membership (issue 030, decision 010). It
         // only ever `stat`s; the aliased repository is never read or indexed.
-        let external_exists = |path: &Path| path.exists();
+        // The verdict is tri-state: a *failed* stat answers `Unknown`, not
+        // "absent", so an I/O flake surfaces instead of silently exempting
+        // the reference (issue 050).
+        let external_exists = |path: &Path| structural::ExternalExistence::stat(path);
         // The `exceptions` frontmatter block (issue 031) is per-file and lives
         // in this file's own frontmatter; an empty default applies when there
         // is no frontmatter. The structural pass suppresses a matching live
@@ -1108,7 +1111,7 @@ mod tests {
     fn assert_cache_matches_recompute(ws: &Workspace) {
         for (path, file_data) in ws.files() {
             let file_exists = |target: &Path| ws.file(target).is_some();
-            let external_exists = |p: &Path| p.exists();
+            let external_exists = |p: &Path| structural::ExternalExistence::stat(p);
             let empty_exceptions = fm::Exceptions::default();
             let exceptions = file_data
                 .frontmatter
@@ -1221,13 +1224,13 @@ mod tests {
 
     #[test]
     fn reload_config_applies_new_artifacts() {
-        // Issue 044 / decision 017: a bare reference to the absent `catenary.md`
-        // raises a stale-reference diagnostic. Adding `catenary.md` to
+        // Issue 044 / decision 017: a bare reference to the absent `artifact.md`
+        // raises a stale-reference diagnostic. Adding `artifact.md` to
         // `[graph] artifacts` in `.lattice.toml` and reloading must clear that
         // diagnostic workspace-wide — no re-scan, no server restart.
         let dir = workspace_with_files(&[
             (".lattice.toml", ""),
-            ("doc.md", "See `catenary.md` here.\n"),
+            ("doc.md", "See `artifact.md` here.\n"),
         ]);
         let mut ws = Workspace::scan(dir.path()).expect("scan should succeed");
         assert!(
@@ -1237,19 +1240,19 @@ mod tests {
         assert_eq!(
             stale_reference_severity(&ws, Path::new("doc.md")),
             Some(crate::validation::Severity::Warning),
-            "the backticked reference to the absent catenary.md is a stale reference before the edit"
+            "the backticked reference to the absent artifact.md is a stale reference before the edit"
         );
 
-        // Edit the marker on disk to glossary-exempt `catenary.md`.
+        // Edit the marker on disk to glossary-exempt `artifact.md`.
         fs::write(
             dir.path().join(".lattice.toml"),
-            "[graph]\nartifacts = [\"catenary.md\"]\n",
+            "[graph]\nartifacts = [\"artifact.md\"]\n",
         )
         .expect("rewrite .lattice.toml");
         ws.reload_config();
 
         assert!(
-            ws.config().artifacts.contains("catenary.md"),
+            ws.config().artifacts.contains("artifact.md"),
             "reload picks up the new artifact from the rewritten marker"
         );
         assert_eq!(
@@ -1310,7 +1313,7 @@ mod tests {
 
         fs::write(
             dir.path().join(".lattice.toml"),
-            "[graph]\nartifacts = [\"catenary.md\"]\n",
+            "[graph]\nartifacts = [\"artifact.md\"]\n",
         )
         .expect("rewrite .lattice.toml");
         ws.reload_config();
