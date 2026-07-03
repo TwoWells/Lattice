@@ -67,6 +67,22 @@ struct Workspaces {
     /// event is therefore dropped while its URI is in this set; create/delete
     /// membership events are honored regardless (ticket server 09).
     open_documents: HashSet<String>,
+    /// Single-file documents opened outside every workspace folder (issue 051),
+    /// keyed by document URI.
+    ///
+    /// Lattice is always a markdown language server: a `didOpen` with no
+    /// ancestor `.lattice.toml`/`.git` (a rootless session, or an open-from-
+    /// outside in a rooted one) still parses and serves its own document-scoped
+    /// features (semantic tokens, folding, symbols, hover, formatting, document
+    /// links, …). Each entry is a self-contained single-file [`Workspace`]
+    /// (`has_config == false`, one indexed document) so those features resolve
+    /// uniformly via [`Workspaces::resolve_document`].
+    ///
+    /// These documents are deliberately absent from `inner`, so the
+    /// graph/structural diagnostic-publish loop (which enumerates `inner`) never
+    /// touches them — the graph tier simply has nothing to say for a single
+    /// file.
+    singletons: BTreeMap<String, Workspace>,
 }
 
 impl Workspaces {
@@ -95,6 +111,7 @@ impl Workspaces {
             inner,
             published: HashMap::new(),
             open_documents: HashSet::new(),
+            singletons: BTreeMap::new(),
         }
     }
 
@@ -164,6 +181,70 @@ impl Workspaces {
     /// Iterate over all workspaces.
     fn iter(&self) -> impl Iterator<Item = (&PathBuf, &Workspace)> {
         self.inner.iter()
+    }
+
+    /// Resolve `uri` to the workspace and workspace-relative path that serve its
+    /// document-scoped features (semantic tokens, folding, symbols, hover,
+    /// formatting, document links, completion, navigation, …).
+    ///
+    /// A URI inside a scanned workspace folder resolves there, exactly as
+    /// [`resolve`](Self::resolve) does. A URI outside every folder — the
+    /// rootless or open-from-outside case (issue 051) — resolves to its
+    /// single-file document, so the feature is served without a workspace.
+    ///
+    /// The graph tier is unaffected: it is driven off `self.inner` alone (see
+    /// `diff_diagnostics` and `document_diagnostic`, which use
+    /// [`resolve`](Self::resolve)), so a single-file document contributes no
+    /// backlink/predicate/connectivity diagnostics.
+    fn resolve_document(&self, uri: &str) -> Option<(&Workspace, PathBuf)> {
+        if let Some(resolved) = self.resolve(uri) {
+            return Some(resolved);
+        }
+        let workspace = self.singletons.get(uri)?;
+        let rel_path = workspace.files().keys().next()?.clone();
+        Some((workspace, rel_path))
+    }
+
+    /// Sync an opened or edited document's in-memory content into the index.
+    ///
+    /// A URI inside a scanned workspace folder updates that workspace's buffer;
+    /// a URI outside every folder is a single-file document (issue 051) held on
+    /// its own, so its document-scoped features track the edit without a
+    /// workspace.
+    fn sync_document_content(&mut self, uri: &str, content: &str) {
+        if let Some((workspace, rel_path)) = self.resolve_mut(uri) {
+            workspace.update_content(&rel_path, content);
+        } else {
+            self.upsert_single_file(uri, content);
+        }
+    }
+
+    /// Create or replace the single-file document for `uri` from in-memory text
+    /// (issue 051).
+    fn upsert_single_file(&mut self, uri: &str, content: &str) {
+        let abs_path = uri_to_path(uri);
+        self.singletons
+            .insert(uri.to_string(), Workspace::single_file(&abs_path, content));
+    }
+
+    /// Refresh a single-file document from disk — used by a `didSave` that
+    /// carries no text. A no-op when `uri` is not a single-file document or the
+    /// file cannot be read (the in-memory buffer is then left as-is).
+    fn refresh_single_file_from_disk(&mut self, uri: &str) {
+        if !self.singletons.contains_key(uri) {
+            return;
+        }
+        let abs_path = uri_to_path(uri);
+        if let Ok(content) = std::fs::read_to_string(&abs_path) {
+            self.singletons
+                .insert(uri.to_string(), Workspace::single_file(&abs_path, &content));
+        }
+    }
+
+    /// Drop the single-file document for `uri`, if present (issue 051) — used on
+    /// `didClose`, when the editor discards the buffer.
+    fn remove_single_file(&mut self, uri: &str) {
+        self.singletons.remove(uri);
     }
 }
 
@@ -960,7 +1041,7 @@ fn node_range(tree: &Tree, node_id: NodeId) -> lsp::Range {
 
 /// Build document symbols for a file by walking the tree.
 fn document_symbols(workspaces: &Workspaces, uri: &str) -> Option<Vec<lsp::DocumentSymbol>> {
-    let (workspace, rel_path) = workspaces.resolve(uri)?;
+    let (workspace, rel_path) = workspaces.resolve_document(uri)?;
     let file_data = workspace.file(&rel_path)?;
     let tree = &file_data.tree;
     let root = 0; // Document root is always node 0
@@ -1399,7 +1480,7 @@ fn prepare_rename(
     workspaces: &Workspaces,
     params: &lsp::TextDocumentPositionParams,
 ) -> Option<lsp::Range> {
-    let (workspace, rel_path) = workspaces.resolve(&params.text_document.uri)?;
+    let (workspace, rel_path) = workspaces.resolve_document(&params.text_document.uri)?;
     let file_data = workspace.file(&rel_path)?;
     let headings = file_data.tree.headings();
     let heading = heading_at_line(&headings, params.position.line)?;
@@ -1416,7 +1497,7 @@ fn prepare_rename(
 /// Uses the tree's `text_span` for the edit range, supporting ATX, setext,
 /// and HTML headings.
 fn do_rename(workspaces: &Workspaces, params: &lsp::RenameParams) -> Option<lsp::WorkspaceEdit> {
-    let (workspace, rel_path) = workspaces.resolve(&params.text_document.uri)?;
+    let (workspace, rel_path) = workspaces.resolve_document(&params.text_document.uri)?;
     let file_data = workspace.file(&rel_path)?;
     let headings = file_data.tree.headings();
     let heading = heading_at_line(&headings, params.position.line)?;
@@ -1463,7 +1544,7 @@ fn heading_at_line(headings: &[Heading], lsp_line: u32) -> Option<&Heading> {
     reason = "line numbers in markdown files won't exceed u32::MAX"
 )]
 fn find_references(workspaces: &Workspaces, params: &lsp::ReferenceParams) -> Vec<lsp::Location> {
-    let Some((workspace, rel_path)) = workspaces.resolve(&params.text_document.uri) else {
+    let Some((workspace, rel_path)) = workspaces.resolve_document(&params.text_document.uri) else {
         return Vec::new();
     };
     let Some(file_data) = workspace.file(&rel_path) else {
@@ -1526,7 +1607,7 @@ fn find_references(workspaces: &Workspaces, params: &lsp::ReferenceParams) -> Ve
     reason = "line numbers in markdown files won't exceed u32::MAX"
 )]
 fn find_ref_def_call_sites(workspaces: &Workspaces, uri: &str, label: &str) -> Vec<lsp::Location> {
-    let Some((workspace, rel_path)) = workspaces.resolve(uri) else {
+    let Some((workspace, rel_path)) = workspaces.resolve_document(uri) else {
         return Vec::new();
     };
     let Some(file_data) = workspace.file(&rel_path) else {
@@ -1588,7 +1669,7 @@ fn go_to_declaration(
     workspaces: &Workspaces,
     params: &lsp::TextDocumentPositionParams,
 ) -> Option<lsp::Location> {
-    let (workspace, rel_path) = workspaces.resolve(&params.text_document.uri)?;
+    let (workspace, rel_path) = workspaces.resolve_document(&params.text_document.uri)?;
     let file_data = workspace.file(&rel_path)?;
     let source = file_data.tree.source();
     let offset = lsp_position_to_byte_offset(source, params.position);
@@ -1623,7 +1704,7 @@ fn go_to_definition(
     workspaces: &Workspaces,
     params: &lsp::TextDocumentPositionParams,
 ) -> Option<lsp::Location> {
-    let (workspace, rel_path) = workspaces.resolve(&params.text_document.uri)?;
+    let (workspace, rel_path) = workspaces.resolve_document(&params.text_document.uri)?;
     let file_data = workspace.file(&rel_path)?;
     let source = file_data.tree.source();
     let offset = lsp_position_to_byte_offset(source, params.position);
@@ -1680,7 +1761,7 @@ fn go_to_type_definition(
     workspaces: &Workspaces,
     params: &lsp::TextDocumentPositionParams,
 ) -> Option<lsp::Location> {
-    let (workspace, rel_path) = workspaces.resolve(&params.text_document.uri)?;
+    let (workspace, rel_path) = workspaces.resolve_document(&params.text_document.uri)?;
     let file_data = workspace.file(&rel_path)?;
     let source = file_data.tree.source();
     let offset = lsp_position_to_byte_offset(source, params.position);
@@ -1753,7 +1834,7 @@ fn go_to_implementation(
     workspaces: &Workspaces,
     params: &lsp::TextDocumentPositionParams,
 ) -> Option<lsp::Location> {
-    let (workspace, rel_path) = workspaces.resolve(&params.text_document.uri)?;
+    let (workspace, rel_path) = workspaces.resolve_document(&params.text_document.uri)?;
     let file_data = workspace.file(&rel_path)?;
 
     implementation_from_body_link(workspace, &rel_path, file_data, params)
@@ -1935,7 +2016,7 @@ fn prepare_type_hierarchy(
     workspaces: &Workspaces,
     params: &lsp::TextDocumentPositionParams,
 ) -> Option<Vec<lsp::HierarchyItem>> {
-    let (workspace, rel_path) = workspaces.resolve(&params.text_document.uri)?;
+    let (workspace, rel_path) = workspaces.resolve_document(&params.text_document.uri)?;
     let file_data = workspace.file(&rel_path)?;
     let headings = file_data.tree.headings();
     let heading = heading_at_line(&headings, params.position.line)?;
@@ -1952,7 +2033,7 @@ fn type_hierarchy_supertypes(
     workspaces: &Workspaces,
     item: &lsp::HierarchyItem,
 ) -> Option<Vec<lsp::HierarchyItem>> {
-    let (workspace, rel_path) = workspaces.resolve(&item.uri)?;
+    let (workspace, rel_path) = workspaces.resolve_document(&item.uri)?;
     let file_data = workspace.file(&rel_path)?;
     let abs_path = workspace.root().join(&rel_path);
     let headings = file_data.tree.headings();
@@ -1984,7 +2065,7 @@ fn type_hierarchy_subtypes(
     workspaces: &Workspaces,
     item: &lsp::HierarchyItem,
 ) -> Option<Vec<lsp::HierarchyItem>> {
-    let (workspace, rel_path) = workspaces.resolve(&item.uri)?;
+    let (workspace, rel_path) = workspaces.resolve_document(&item.uri)?;
     let file_data = workspace.file(&rel_path)?;
     let abs_path = workspace.root().join(&rel_path);
     let headings = file_data.tree.headings();
@@ -2028,7 +2109,7 @@ fn prepare_call_hierarchy(
     workspaces: &Workspaces,
     params: &lsp::TextDocumentPositionParams,
 ) -> Option<Vec<lsp::HierarchyItem>> {
-    let (workspace, rel_path) = workspaces.resolve(&params.text_document.uri)?;
+    let (workspace, rel_path) = workspaces.resolve_document(&params.text_document.uri)?;
     let file_data = workspace.file(&rel_path)?;
     let headings = file_data.tree.headings();
     let heading = heading_at_line(&headings, params.position.line)?;
@@ -2045,7 +2126,7 @@ fn call_hierarchy_incoming(
     workspaces: &Workspaces,
     item: &lsp::HierarchyItem,
 ) -> Vec<lsp::CallHierarchyIncomingCall> {
-    let Some((_, rel_path)) = workspaces.resolve(&item.uri) else {
+    let Some((_, rel_path)) = workspaces.resolve_document(&item.uri) else {
         return Vec::new();
     };
 
@@ -2094,7 +2175,7 @@ fn call_hierarchy_outgoing(
     workspaces: &Workspaces,
     item: &lsp::HierarchyItem,
 ) -> Vec<lsp::CallHierarchyOutgoingCall> {
-    let Some((workspace, rel_path)) = workspaces.resolve(&item.uri) else {
+    let Some((workspace, rel_path)) = workspaces.resolve_document(&item.uri) else {
         return Vec::new();
     };
     let Some(file_data) = workspace.file(&rel_path) else {
@@ -2165,7 +2246,7 @@ fn call_hierarchy_outgoing(
     reason = "line numbers in markdown files won't exceed u32::MAX"
 )]
 fn document_links(workspaces: &Workspaces, uri: &str) -> Vec<lsp::DocumentLink> {
-    let Some((workspace, rel_path)) = workspaces.resolve(uri) else {
+    let Some((workspace, rel_path)) = workspaces.resolve_document(uri) else {
         return Vec::new();
     };
     let Some(file_data) = workspace.file(&rel_path) else {
@@ -2344,7 +2425,7 @@ fn hover_preview(
     workspaces: &Workspaces,
     params: &lsp::TextDocumentPositionParams,
 ) -> Option<lsp::Hover> {
-    let (workspace, rel_path) = workspaces.resolve(&params.text_document.uri)?;
+    let (workspace, rel_path) = workspaces.resolve_document(&params.text_document.uri)?;
     let file_data = workspace.file(&rel_path)?;
     let file_links = file_data.tree.links(&rel_path);
 
@@ -2439,7 +2520,7 @@ fn build_hover_preview(target_data: &crate::workspace::FileData, fragment: Optio
     reason = "line numbers in markdown files won't exceed u32::MAX"
 )]
 fn folding_ranges(workspaces: &Workspaces, uri: &str) -> Vec<lsp::FoldingRange> {
-    let Some((workspace, rel_path)) = workspaces.resolve(uri) else {
+    let Some((workspace, rel_path)) = workspaces.resolve_document(uri) else {
         return Vec::new();
     };
     let Some(file_data) = workspace.file(&rel_path) else {
@@ -2661,7 +2742,7 @@ fn encode_semantic_tokens(
 /// "what changed since last parse" diff rather than recompute one — wire it
 /// here once that lands (ticket integration 15, perf seam).
 fn semantic_tokens_full(workspaces: &Workspaces, uri: &str) -> lsp::SemanticTokens {
-    let Some((workspace, rel_path)) = workspaces.resolve(uri) else {
+    let Some((workspace, rel_path)) = workspaces.resolve_document(uri) else {
         return lsp::SemanticTokens::default();
     };
     let Some(file_data) = workspace.file(&rel_path) else {
@@ -2681,7 +2762,7 @@ fn semantic_tokens_range(
     uri: &str,
     range: &lsp::Range,
 ) -> lsp::SemanticTokens {
-    let Some((workspace, rel_path)) = workspaces.resolve(uri) else {
+    let Some((workspace, rel_path)) = workspaces.resolve_document(uri) else {
         return lsp::SemanticTokens::default();
     };
     let Some(file_data) = workspace.file(&rel_path) else {
@@ -2708,7 +2789,7 @@ fn semantic_tokens_range(
     reason = "line numbers in markdown files won't exceed u32::MAX"
 )]
 fn format_document(workspaces: &Workspaces, uri: &str) -> Option<Vec<lsp::TextEdit>> {
-    let (workspace, rel_path) = workspaces.resolve(uri)?;
+    let (workspace, rel_path) = workspaces.resolve_document(uri)?;
     let file_data = workspace.file(&rel_path)?;
 
     let has_backlinks = file_data
@@ -3054,7 +3135,7 @@ fn completion(
     workspaces: &Workspaces,
     params: &lsp::TextDocumentPositionParams,
 ) -> Option<lsp::CompletionList> {
-    let (workspace, rel_path) = workspaces.resolve(&params.text_document.uri)?;
+    let (workspace, rel_path) = workspaces.resolve_document(&params.text_document.uri)?;
     let file_data = workspace.file(&rel_path)?;
     let tree = &file_data.tree;
     let source = tree.source();
@@ -3440,9 +3521,13 @@ fn handle_notification(
             workspaces
                 .open_documents
                 .insert(params.text_document.uri.clone());
-            if let Some((ws, rel_path)) = workspaces.resolve_mut(&params.text_document.uri) {
-                ws.update_content(&rel_path, &params.text_document.text);
-            }
+            // Index the buffer wherever it belongs: a document inside a scanned
+            // workspace folder updates that workspace; one opened outside every
+            // folder becomes a single-file document (issue 051) so its
+            // document-scoped features are served without a workspace. The
+            // publish below enumerates scanned workspaces only, so a single-file
+            // document emits no diagnostics — the graph tier has nothing to say.
+            workspaces.sync_document_content(&params.text_document.uri, &params.text_document.text);
             publish_all_diagnostics(connection, workspaces, &one_uri(&params.text_document.uri))?;
         }
         lsp::method::DID_CLOSE => {
@@ -3462,6 +3547,14 @@ fn handle_notification(
                 } else {
                     let _ = ws.update(&rel_path);
                 }
+            } else if let Some(text) = &params.text {
+                // Single-file document (issue 051): refresh its buffer from the
+                // save payload.
+                workspaces.upsert_single_file(&params.text_document.uri, text);
+            } else {
+                // No text in the save payload: reconcile the single-file
+                // document to disk instead.
+                workspaces.refresh_single_file_from_disk(&params.text_document.uri);
             }
             publish_all_diagnostics(connection, workspaces, &one_uri(&params.text_document.uri))?;
         }
@@ -3477,22 +3570,36 @@ fn handle_notification(
                 // re-materializes only the files the whole-graph recompute shows
                 // actually changed (ticket perf 02), with the edited URI passed
                 // so its own materialization is refreshed unconditionally.
-                let incremental = if let Some((ws, rel_path)) =
+                //
+                // A single-file document (issue 051) outside every folder takes
+                // neither path: it updates its own buffer so its document-scoped
+                // features track the edit, and publishes nothing (the graph tier
+                // has nothing to say). `Some(has_config)` selects the graph
+                // (`true`) or structural-delta (`false`) publish; `None` is the
+                // single-file case.
+                let publish = if let Some((ws, rel_path)) =
                     workspaces.resolve_mut(&params.text_document.uri)
                 {
                     ws.update_content(&rel_path, &change.text);
-                    !ws.has_config()
+                    Some(ws.has_config())
                 } else {
-                    false
+                    workspaces.upsert_single_file(&params.text_document.uri, &change.text);
+                    None
                 };
-                if incremental {
-                    publish_file_diagnostics(connection, workspaces, &params.text_document.uri)?;
-                } else {
-                    publish_all_diagnostics(
+                match publish {
+                    Some(true) => publish_all_diagnostics(
                         connection,
                         workspaces,
                         &one_uri(&params.text_document.uri),
-                    )?;
+                    )?,
+                    Some(false) => {
+                        publish_file_diagnostics(
+                            connection,
+                            workspaces,
+                            &params.text_document.uri,
+                        )?;
+                    }
+                    None => {}
                 }
             }
         }
@@ -3629,13 +3736,19 @@ fn handle_watched_files_change(
 /// Re-publishes through the graph-aware [`publish_all_diagnostics`] path,
 /// naming the URI: reverting from buffer to disk content can move cross-file
 /// backlink/forward edges, so this mirrors the watched-file `changed` branch
-/// for closed files. A URI in no workspace is a no-op.
+/// for closed files. A URI outside every workspace folder is a single-file
+/// document (issue 051), which is simply dropped — it has no disk-backed
+/// workspace to revert to and published no diagnostics to clear.
 fn reconcile_closed_document(
     connection: &Connection,
     workspaces: &mut Workspaces,
     uri: &str,
 ) -> Result<()> {
     let Some((workspace, rel_path)) = workspaces.resolve_mut(uri) else {
+        // A single-file document (issue 051): the buffer is gone and there is no
+        // disk-backed workspace to revert to, so drop it. It published no
+        // diagnostics, so nothing needs clearing.
+        workspaces.remove_single_file(uri);
         return Ok(());
     };
     let _ = workspace.update(&rel_path);
@@ -4091,6 +4204,7 @@ mod tests {
             inner: BTreeMap::from([(root, ws)]),
             published: HashMap::new(),
             open_documents: HashSet::new(),
+            singletons: BTreeMap::new(),
         }
     }
 
@@ -7170,6 +7284,7 @@ mod tests {
             inner: BTreeMap::from([(link.clone(), ws)]),
             published: HashMap::new(),
             open_documents: HashSet::new(),
+            singletons: BTreeMap::new(),
         };
 
         // Seed the client cache: a.md publishes its trailing-whitespace warning at
@@ -8088,6 +8203,259 @@ mod tests {
             tokens.is_empty(),
             "an unknown document yields an empty token set"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Single-file (rootless) documents (issue 051)
+    //
+    // Lattice is always a markdown language server: a document opened outside
+    // every workspace folder — a fully rootless session, or an open-from-
+    // outside in a rooted one — must still serve its document-scoped features,
+    // while the graph tier stays quiet (it has nothing to say for one file).
+    // -----------------------------------------------------------------------
+
+    /// A `Workspaces` with no scanned workspace folders — a rootless session.
+    fn rootless_workspaces() -> Workspaces {
+        Workspaces {
+            inner: BTreeMap::new(),
+            published: HashMap::new(),
+            open_documents: HashSet::new(),
+            singletons: BTreeMap::new(),
+        }
+    }
+
+    /// Position params for `uri` at `(line, character)`.
+    fn position_params(uri: &str, line: u32, character: u32) -> lsp::TextDocumentPositionParams {
+        lsp::TextDocumentPositionParams {
+            text_document: lsp::TextDocumentIdentifier {
+                uri: uri.to_string(),
+            },
+            position: lsp::Position { line, character },
+        }
+    }
+
+    #[test]
+    fn single_file_rootless_serves_semantic_tokens() {
+        // The headline of issue 051: a rootless `didOpen` must serve semantic
+        // tokens, not the silent `{ "data": [] }` degradation. The buffer is
+        // in-memory, so no file needs to exist on disk.
+        let mut workspaces = rootless_workspaces();
+        let uri = "file:///tmp/lattice-051-scratch.md";
+        workspaces.sync_document_content(uri, "**bold**, *italic*, and ~~strikethrough~~\n");
+
+        let tokens = decode_tokens(&semantic_tokens_full(&workspaces, uri));
+        assert_sorted_non_overlapping(&tokens);
+        let modifiers: Vec<u32> = tokens.iter().map(|t| t.modifiers).collect();
+        assert!(
+            modifiers.contains(&SEMANTIC_MODIFIER_BOLD_BIT),
+            "rootless tokens must include the bold run, got {tokens:?}"
+        );
+        assert!(
+            modifiers.contains(&SEMANTIC_MODIFIER_ITALIC_BIT),
+            "rootless tokens must include the italic run, got {tokens:?}"
+        );
+        assert!(
+            modifiers.contains(&SEMANTIC_MODIFIER_STRIKETHROUGH_BIT),
+            "rootless tokens must include the strikethrough run, got {tokens:?}"
+        );
+    }
+
+    #[test]
+    fn single_file_rootless_serves_document_scoped_features() {
+        // Beyond semantic tokens: symbols, folding, document links, formatting,
+        // and hover must all serve a rootless document. The document is named
+        // `doc.md` and carries a self-referential link so hover — a cross-file
+        // preview feature — has an in-index target to resolve.
+        let mut workspaces = rootless_workspaces();
+        let uri = "file:///tmp/lattice-051-features/doc.md";
+        workspaces.sync_document_content(
+            uri,
+            "---\nbacklinks:\n  references:\n    - z.md\n    - a.md\n---\n# Title\n\n## Section\n\n[self](doc.md \"references\")\n",
+        );
+
+        let symbols = document_symbols(&workspaces, uri).expect("rootless document symbols");
+        assert!(
+            !symbols.is_empty(),
+            "rootless document symbols must include the headings, got {symbols:?}"
+        );
+
+        let folds = folding_ranges(&workspaces, uri);
+        assert!(
+            !folds.is_empty(),
+            "rootless folding must fold the frontmatter/heading, got {folds:?}"
+        );
+
+        let links = document_links(&workspaces, uri);
+        assert!(
+            !links.is_empty(),
+            "rootless document links must emit the intra-project link, got {links:?}"
+        );
+
+        let edits = format_document(&workspaces, uri);
+        assert!(
+            edits.is_some(),
+            "rootless formatting must sort the frontmatter backlinks, got {edits:?}"
+        );
+
+        // The self-referential link resolves to the document itself, so the
+        // hover preview has content to show — proving hover runs against the
+        // single-file document rather than short-circuiting at resolution.
+        let hover = hover_preview(&workspaces, &position_params(uri, 10, 0))
+            .expect("rootless hover on the self-link should produce a preview");
+        assert!(
+            hover.contents.value.contains("references"),
+            "rootless hover surfaces the link predicate, got {}",
+            hover.contents.value
+        );
+    }
+
+    #[test]
+    fn single_file_in_rooted_session_serves_document_outside_every_root() {
+        // Case (b): a rooted session where a document is opened from *outside*
+        // every workspace folder degrades the same way rootless does — so it
+        // must be served identically, while an in-root document is unaffected.
+        let dir = workspace_with_files(&[("inside.md", "**inside**\n")]);
+        let mut workspaces = scan_workspaces(&dir);
+
+        let outside_uri = "file:///tmp/lattice-051-outside.md";
+        workspaces.sync_document_content(outside_uri, "**outside**\n");
+
+        let outside = decode_tokens(&semantic_tokens_full(&workspaces, outside_uri));
+        assert!(
+            !outside.is_empty(),
+            "a document opened outside every root must still serve tokens, got {outside:?}"
+        );
+
+        // The in-root document keeps serving through the ordinary workspace path.
+        let inside = tokens_for(&workspaces, &dir, "inside.md");
+        assert!(
+            !inside.is_empty(),
+            "an in-root document is unaffected by the single-file path, got {inside:?}"
+        );
+    }
+
+    #[test]
+    fn single_file_document_stays_diagnostic_quiet() {
+        // Graph/structural diagnostics have nothing to say for a single file:
+        // content that would raise a stale-reference diagnostic inside a
+        // workspace must produce no diagnostics rootless — neither pushed nor
+        // pulled — rather than erroring.
+        let mut workspaces = rootless_workspaces();
+        let uri = "file:///tmp/lattice-051-quiet.md";
+        // A bare path to an absent file — a stale reference in a real workspace.
+        workspaces.sync_document_content(uri, "See docs/page.md for details.\n");
+
+        let report = document_diagnostic(&workspaces, uri);
+        assert!(
+            report.items.is_empty(),
+            "a single-file document pulls no diagnostics, got {:?}",
+            report.items
+        );
+
+        let pushed = diff_diagnostics(&mut workspaces, &one_uri(uri));
+        assert!(
+            pushed.is_empty(),
+            "a single-file document pushes no diagnostics, got {pushed:?}"
+        );
+    }
+
+    #[test]
+    fn single_file_closed_document_is_dropped() {
+        // A `didClose` on a single-file document drops it — there is no disk-
+        // backed workspace to revert to — so a later request no longer resolves.
+        let mut workspaces = rootless_workspaces();
+        let uri = "file:///tmp/lattice-051-close.md";
+        workspaces.sync_document_content(uri, "**live**\n");
+        assert!(
+            !decode_tokens(&semantic_tokens_full(&workspaces, uri)).is_empty(),
+            "the open single-file document serves tokens"
+        );
+
+        workspaces.remove_single_file(uri);
+        assert!(
+            decode_tokens(&semantic_tokens_full(&workspaces, uri)).is_empty(),
+            "the closed single-file document no longer resolves"
+        );
+    }
+
+    /// Drain server messages until a `Response` for `id`, returning its result.
+    fn recv_response_for(client: &Connection, id: i32) -> serde_json::Value {
+        for _ in 0..32 {
+            if let Message::Response(resp) = recv_message(client)
+                && resp.id == RequestId::from(id)
+            {
+                return resp.result.unwrap_or(serde_json::Value::Null);
+            }
+        }
+        panic!("no response for request {id} after 32 messages");
+    }
+
+    #[test]
+    fn rootless_session_serves_semantic_tokens_end_to_end() {
+        // The issue 051 repro end-to-end: a rootless `initialize` (no
+        // workspaceFolders, rootUri null) followed by a `didOpen` and a
+        // `textDocument/semanticTokens/full` request must return non-empty
+        // token data — before the fix it returned `{ "data": [] }`.
+        let (server, client) = Connection::memory();
+        let server_thread = std::thread::spawn(move || serve(&server));
+
+        // Rootless handshake: no folders, no rootUri, no dynamic registration
+        // (so the server originates no registerCapability and the stream stays
+        // clean).
+        let init = Request::new(
+            RequestId::from(1),
+            "initialize".to_string(),
+            serde_json::json!({
+                "capabilities": {},
+                "rootUri": serde_json::Value::Null,
+                "workspaceFolders": serde_json::Value::Null
+            }),
+        );
+        client
+            .sender
+            .send(Message::Request(init))
+            .expect("send initialize");
+        let resp = recv_message(&client);
+        assert!(
+            matches!(resp, Message::Response(_)),
+            "a rootless initialize must be answered with a response, got {resp:?}"
+        );
+        send_notification(&client, "initialized", serde_json::json!({}));
+
+        let doc_uri = "file:///tmp/lattice-051-e2e.md";
+        open_doc(
+            &client,
+            doc_uri,
+            "**bold**, *italic*, and ~~strikethrough~~\n",
+        );
+
+        let tokens_req_id = 42;
+        client
+            .sender
+            .send(Message::Request(Request::new(
+                RequestId::from(tokens_req_id),
+                lsp::method::SEMANTIC_TOKENS_FULL.to_string(),
+                serde_json::json!({ "textDocument": { "uri": doc_uri } }),
+            )))
+            .expect("send semanticTokens/full");
+
+        let result = recv_response_for(&client, tokens_req_id);
+        let data = result
+            .get("data")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            !data.is_empty(),
+            "a rootless session must serve non-empty semantic tokens, got {result:?}"
+        );
+        assert_eq!(
+            data.len() % 5,
+            0,
+            "token data must be a flat 5-tuple stream, got {data:?}"
+        );
+
+        shutdown(&client, server_thread);
     }
 
     // -----------------------------------------------------------------------
@@ -9011,6 +9379,7 @@ mod tests {
             inner: BTreeMap::from([(root.clone(), ws_root), (sub, ws_sub)]),
             published: HashMap::new(),
             open_documents: HashSet::new(),
+            singletons: BTreeMap::new(),
         };
         let doc_uri = path_to_uri(&root.join("sub/doc.md"));
 

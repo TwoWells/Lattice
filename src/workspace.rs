@@ -248,6 +248,47 @@ impl Workspace {
         Ok(workspace)
     }
 
+    /// Build a workspace holding exactly one in-memory document, for a markdown
+    /// file opened outside every workspace folder (issue 051 — single-file
+    /// mode).
+    ///
+    /// No directory is scanned and no `.lattice.toml` is consulted: the root is
+    /// the file's parent directory (or the file itself when it has no parent),
+    /// `has_config` is `false`, and the sole indexed entry is `content` parsed
+    /// under the file's name. Document-scoped features (semantic tokens,
+    /// folding, symbols, hover, formatting, document links, …) resolve against
+    /// it exactly as they do for a scanned workspace, while the graph tier stays
+    /// inert — it is gated on [`Workspace::has_config`] and, with a single
+    /// indexed file under default config, has nothing to say.
+    ///
+    /// The structural cache is intentionally left unpopulated. A single-file
+    /// document carries no workspace-tier diagnostics, so running the bare-path
+    /// existence check against a one-file membership would only manufacture
+    /// misleading verdicts; the server never publishes diagnostics for these
+    /// documents (they are absent from the diagnostic-publish loop, which
+    /// enumerates scanned workspaces only).
+    #[must_use]
+    pub fn single_file(abs_path: &Path, content: &str) -> Self {
+        let (root, rel_path) = match (abs_path.parent(), abs_path.file_name()) {
+            (Some(parent), Some(name)) => (parent.to_path_buf(), PathBuf::from(name)),
+            // A path with no parent or no file name (a root-only or empty path):
+            // index it whole against an empty root so the URI still round-trips
+            // back to this document.
+            _ => (PathBuf::new(), abs_path.to_path_buf()),
+        };
+        let config = Config::default();
+        let data = parse_content(content, &rel_path, &config);
+        let mut files = BTreeMap::new();
+        files.insert(rel_path, data);
+        Self {
+            root,
+            config,
+            config_error: None,
+            has_config: false,
+            files,
+        }
+    }
+
     /// Re-parse a single file and update the workspace index.
     ///
     /// `rel_path` must be relative to the workspace root. If the file no
