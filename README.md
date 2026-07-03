@@ -61,8 +61,50 @@ on restart. Lattice is
 diagnostic-first, but the server is a full markdown LSP: completion
 (paths, headings, predicates, reference labels, footnotes), hover,
 document and workspace symbols, references, rename, folding, document
-links, formatting, and go-to-definition/declaration/type/implementation
-plus call and type hierarchy over the predicate graph.
+links, formatting, semantic tokens (emphasis styling, below), and
+go-to-definition/declaration/type/implementation plus call and type
+hierarchy over the predicate graph.
+
+### Emphasis styling (semantic tokens)
+
+Lattice emits semantic tokens for emphasis runs: one token type,
+`markup`, carrying `bold`, `italic`, and `strikethrough` modifiers.
+Neovim maps each modifier to an `@lsp.mod.<name>` highlight group, and
+neither Neovim core nor common colorschemes define these, so the tokens
+paint nothing until you do — once, after your colorscheme loads (a
+`ColorScheme` autocmd survives reloads):
+
+```lua
+vim.api.nvim_set_hl(0, "@lsp.mod.bold", { bold = true })
+vim.api.nvim_set_hl(0, "@lsp.mod.italic", { italic = true })
+vim.api.nvim_set_hl(0, "@lsp.mod.strikethrough", { strikethrough = true })
+```
+
+Tokens are served only inside a workspace — a directory with a
+`.lattice.toml` or `.git` ancestor. A scratch file outside any root
+(a note in `/tmp`, say) currently gets none; drop an empty
+`.lattice.toml` next to it to opt the directory in.
+
+Treesitter's own markdown emphasis highlighting stays active alongside,
+and extmark attributes merge — so a span the grammar gets wrong stays
+lit no matter what Lattice says (tree-sitter-markdown-inline
+approximates GFM flanking rules and will, for example, pair a
+single-tilde strikethrough across a soft line break). To hand emphasis
+styling to Lattice entirely, blank the language-qualified treesitter
+groups; the qualified name shadows the generic `@markup.*` for markdown
+only, and every other filetype keeps its styling:
+
+```lua
+vim.api.nvim_set_hl(0, "@markup.strong.markdown_inline", {})
+vim.api.nvim_set_hl(0, "@markup.italic.markdown_inline", {})
+vim.api.nvim_set_hl(0, "@markup.strikethrough.markdown_inline", {})
+```
+
+Leave treesitter itself enabled for markdown: it still provides the
+structural highlighting (headings, links, code spans) and the injected
+highlighting inside fenced code blocks; only its emphasis captures go
+quiet. Emphasis styling then updates at semantic-token cadence (on
+server response) rather than per keystroke.
 
 On Neovim older than 0.11, start it per buffer instead:
 
