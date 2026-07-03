@@ -447,12 +447,17 @@ pub enum LinkKind {
     },
     /// Link to a non-markdown file in the project.
     NonMarkdown {
-        /// Resolved path to the target.
+        /// Resolved path to the target: absolute for a document-relative link,
+        /// or the relative remainder for a root-relative (`/x`) one (decision
+        /// 019 clause 8). `WorkspaceLike` maps it onto a stored key / abs path.
         target: PathBuf,
     },
     /// Intra-project link to a markdown file.
     IntraProject {
-        /// Resolved path to the target `.md` file.
+        /// Resolved path to the target `.md` file: absolute for a
+        /// document-relative link, or the relative remainder for a root-relative
+        /// (`/x`) one (decision 019 clause 8), resolved against a root only when
+        /// matched or displayed.
         target: PathBuf,
         /// Fragment (heading anchor), if any.
         fragment: Option<String>,
@@ -4206,24 +4211,34 @@ fn is_external(url: &str) -> bool {
         || url.starts_with("//")
 }
 
-/// Resolve a link target path string to a workspace-relative [`PathBuf`].
+/// Resolve a link target path string against the source document's path.
 ///
-/// A leading single `/` is **root-relative**: GitHub and web renderers
-/// resolve `/foo.md` against the repository (workspace) root, not the
-/// filesystem root, so the leading `/` is stripped and the remainder is taken
-/// verbatim as a workspace-relative path (issue 028). Stripping the `/` also
-/// keeps such a target inside the workspace — it can never escape to an
-/// absolute filesystem path. Every other path is resolved relative to the
-/// source file's parent directory, as before. The result is normalized in
-/// both cases.
-fn resolve_target_path(path_str: &str, file_path: &Path) -> PathBuf {
+/// `doc_path` is the document's **absolute** path in production (its key in the
+/// server's flat store, or `root.join(rel)` for the CLI's owning workspace), so
+/// a document-relative target resolves to an absolute path that encodes *no*
+/// workspace root — the coordinate move of decision 019 clause 8. A root
+/// re-enters only where a target is matched or displayed.
+///
+/// A leading single `/` is **root-relative**: GitHub and web renderers resolve
+/// `/foo.md` against the repository (workspace) root, not the filesystem root
+/// (issue 028). The root is not known at parse time, so such a target keeps its
+/// deferred form — the leading `/` is stripped and the relative remainder is
+/// stored verbatim, to be joined onto whichever root matches it at query time.
+/// Stripping the `/` also keeps it inside the workspace: it can never escape to
+/// an absolute filesystem path. The result is normalized in both cases.
+///
+/// The two forms are self-describing by absoluteness: a document-relative
+/// target is absolute (given an absolute `doc_path`), a root-relative remainder
+/// is relative. `WorkspaceLike` uses exactly this distinction to map a target
+/// back onto its stored key.
+fn resolve_target_path(path_str: &str, doc_path: &Path) -> PathBuf {
     // `//host/...` is handled as external before this point; a single leading
-    // `/` here is unambiguously root-relative — strip it and take the
-    // remainder as a workspace-relative path. Otherwise resolve against the
-    // source file's parent directory.
+    // `/` here is unambiguously root-relative — strip it and keep the relative
+    // remainder for query-time root resolution. Otherwise resolve against the
+    // source document's parent directory (absolute in production).
     path_str.strip_prefix('/').map_or_else(
         || {
-            let parent = file_path.parent().unwrap_or_else(|| Path::new(""));
+            let parent = doc_path.parent().unwrap_or_else(|| Path::new(""));
             normalize_path(&parent.join(path_str))
         },
         |rooted| normalize_path(Path::new(rooted)),
@@ -4270,13 +4285,12 @@ pub fn classify_media(url: String, title: String) -> ElementKind {
 }
 
 /// Classify a raw link URL and title into a [`Link`].
-fn classify_link(
-    url: &str,
-    title: &str,
-    file_path: &Path,
-    line: usize,
-    span: Span,
-) -> Option<Link> {
+///
+/// `doc_path` is the source document's absolute path (see
+/// [`resolve_target_path`]); an [`LinkKind::IntraProject`] / [`LinkKind::NonMarkdown`]
+/// `target` is therefore absolute for a document-relative link and a relative
+/// remainder for a root-relative (`/x`) one.
+fn classify_link(url: &str, title: &str, doc_path: &Path, line: usize, span: Span) -> Option<Link> {
     if url.is_empty() {
         return None;
     }
@@ -4291,7 +4305,7 @@ fn classify_link(
         }
     } else {
         let (path_str, fragment) = split_url_fragment(url);
-        let target = resolve_target_path(path_str, file_path);
+        let target = resolve_target_path(path_str, doc_path);
 
         if is_markdown_ext(&target) {
             let explicit_predicate = !title.is_empty();
@@ -4315,8 +4329,8 @@ fn classify_link(
 }
 
 /// Classify an import directive path into a [`Link`].
-fn classify_import(path: &str, file_path: &Path, line: usize, span: Span) -> Link {
-    let target = resolve_target_path(path, file_path);
+fn classify_import(path: &str, doc_path: &Path, line: usize, span: Span) -> Link {
+    let target = resolve_target_path(path, doc_path);
     let kind = if is_markdown_ext(&target) {
         LinkKind::IntraProject {
             target,
@@ -4724,12 +4738,16 @@ pub fn links_extract_count() -> usize {
 }
 
 impl Tree {
-    /// Extract links from the tree, classified relative to `file_path`.
+    /// Extract links from the tree, resolving targets against `doc_path`.
     ///
-    /// `file_path` is the workspace-relative path of the file, used to
-    /// resolve relative link targets.
+    /// `doc_path` is the source document's **absolute** path in production, so
+    /// an intra-project / non-markdown target is root-free — absolute for a
+    /// document-relative link, a relative remainder for a root-relative (`/x`)
+    /// one (decision 019 clause 8; see [`resolve_target_path`]). Passing a
+    /// relative `doc_path` (as unit tests do) simply yields relative targets;
+    /// the resolution logic is identical either way.
     #[must_use]
-    pub fn links(&self, file_path: &Path) -> Vec<Link> {
+    pub fn links(&self, doc_path: &Path) -> Vec<Link> {
         #[cfg(test)]
         LINKS_EXTRACT_COUNT.with(|count| count.set(count.get() + 1));
 
@@ -4739,13 +4757,13 @@ impl Tree {
             match &node.kind {
                 ElementKind::Link { url, title } => {
                     let line = byte_offset_to_line(&self.source, node.span.start);
-                    if let Some(link) = classify_link(url, title, file_path, line, node.span) {
+                    if let Some(link) = classify_link(url, title, doc_path, line, node.span) {
                         links.push(link);
                     }
                 }
                 ElementKind::Import { path } => {
                     let line = byte_offset_to_line(&self.source, node.span.start);
-                    links.push(classify_import(path, file_path, line, node.span));
+                    links.push(classify_import(path, doc_path, line, node.span));
                 }
                 _ => {}
             }

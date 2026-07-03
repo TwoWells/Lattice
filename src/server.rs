@@ -24,7 +24,9 @@ use crate::line_index::LineIndex;
 use crate::lsp;
 use crate::span::Span;
 use crate::validation::{self, Diagnostic, Severity};
-use crate::workspace::{FileData, Workspace, WorkspaceView, compute_structural, parse_content};
+use crate::workspace::{
+    FileData, Workspace, WorkspaceView, compute_structural, parse_content, target_to_key,
+};
 
 /// What the client currently holds for one document: the Lattice diagnostics
 /// that produced the published set (kept for cheap change-detection) and their
@@ -265,10 +267,12 @@ impl Workspaces {
         let existed = self.documents.contains_key(&abs);
         let primary = self.deepest_root_for(&abs);
         let rooted = primary.is_some();
-        let rel = document_rel(&abs, primary.as_deref());
         let data = {
+            // Links classify against the absolute path (root-free), so the config
+            // affects only the frontmatter predicate check — placement is derived
+            // separately below.
             let config = self.config_for(primary.as_deref());
-            parse_content(content, &rel, config)
+            parse_content(content, &abs, config)
         };
         self.documents.insert(
             abs.clone(),
@@ -313,10 +317,9 @@ impl Workspaces {
             return;
         };
         let primary = self.deepest_root_for(abs);
-        let rel = document_rel(abs, primary.as_deref());
         let data = {
             let config = self.config_for(primary.as_deref());
-            parse_content(&content, &rel, config)
+            parse_content(&content, abs, config)
         };
         self.documents.insert(
             abs.to_path_buf(),
@@ -348,47 +351,50 @@ impl Workspaces {
 
     // --- Placement (primary_root) recomputation ---
 
-    /// Recompute a document's deepest covering root and, if it changed, reparse
-    /// it from its **in-memory buffer** under the new root's config and relative
-    /// path — never re-reading disk, so an open editor buffer is preserved
-    /// across a workspace-folder change (decision 017 §3).
+    /// Recompute a document's deepest covering root and, if it changed, **flip
+    /// its `primary_root` in place** — no reparse (ticket server 11).
+    ///
+    /// Placement is pure metadata now: the parse tree and its cached links are
+    /// root-free (links classify against the absolute path, decision 019
+    /// clause 8), so re-rooting cannot change them. The `FileData` — including
+    /// the in-memory buffer it was parsed from — is preserved untouched, which
+    /// keeps an open editor buffer authoritative across a workspace-folder change
+    /// (decision 017 §3) without re-reading disk *or* re-running the parser. The
+    /// root-dependent derived state — the structural cache (which anchors on the
+    /// root-relative path and reads the new root's membership and config) — is
+    /// refreshed by the caller's `recompute_all_structural` after the placement
+    /// loop settles.
     fn refresh_placement(&mut self, abs: &Path) {
         let new_primary = self.deepest_root_for(abs);
-        let Some(doc) = self.documents.get(abs) else {
+        let Some(doc) = self.documents.get_mut(abs) else {
             return;
         };
         if doc.primary_root == new_primary {
             return;
         }
-        let source = doc.data.tree.source().to_string();
-        let rel = document_rel(abs, new_primary.as_deref());
-        let data = {
-            let config = self.config_for(new_primary.as_deref());
-            parse_content(&source, &rel, config)
-        };
-        self.documents.insert(
-            abs.to_path_buf(),
-            Document {
-                data,
-                primary_root: new_primary,
-            },
-        );
+        doc.primary_root = new_primary;
     }
 
     /// Reparse a document from its in-memory buffer under its current primary
     /// root's config (placement unchanged) — used by a config reload
     /// (ticket server 08), which changes the config every owned document parses
     /// under while preserving membership and unsaved buffers.
+    ///
+    /// The reparse survives ticket server 11's placement/reparse split because
+    /// the config still feeds one *parse-time* derivation: the frontmatter
+    /// backlink-predicate check (`FileData::backlink_diagnostics`), which flags
+    /// an unknown predicate against the config vocabulary and records its line.
+    /// Link classification, by contrast, is config- and root-free, so a mere
+    /// placement change routes through `refresh_placement` instead (no reparse).
     fn reparse_from_buffer(&mut self, abs: &Path) {
         let Some(doc) = self.documents.get(abs) else {
             return;
         };
         let primary = doc.primary_root.clone();
         let source = doc.data.tree.source().to_string();
-        let rel = document_rel(abs, primary.as_deref());
         let data = {
             let config = self.config_for(primary.as_deref());
-            parse_content(&source, &rel, config)
+            parse_content(&source, abs, config)
         };
         if let Some(doc) = self.documents.get_mut(abs) {
             doc.data = data;
@@ -536,10 +542,18 @@ impl Workspaces {
 
     /// Reload one root's `.lattice.toml` and re-parse every document it owns
     /// from its in-memory buffer under the fresh config, then recompute the
-    /// structural caches. A marker change invalidates the whole root — predicate
-    /// vocabulary, artifacts, overrides, and external aliases all feed parse and
-    /// structural analysis (decision 017) — so this is a config-only re-scan
-    /// that preserves membership and unsaved buffers.
+    /// structural caches. Preserves membership and unsaved buffers.
+    ///
+    /// The reparse is justified by exactly one config-sensitive *parse-time*
+    /// derivation that survives ticket server 11's coordinate move:
+    /// `FileData::backlink_diagnostics`, the frontmatter unknown-predicate check,
+    /// which reads the predicate vocabulary and records each offending line at
+    /// parse time. The config's other consumers — artifacts, overrides, external
+    /// aliases (decision 017) — feed the *structural* tier, refreshed below by
+    /// `recompute_all_structural` without a reparse. Link classification is
+    /// config- and root-free, so it is invariant across a reload; a placement
+    /// change, which touches neither the config nor the tree, routes through
+    /// `refresh_placement` and never reaches here.
     fn reload_root_config(&mut self, root: &Path) {
         let Some(meta) = self.roots.get_mut(root) else {
             return;
@@ -1902,17 +1916,19 @@ fn find_references(workspaces: &Workspaces, params: &lsp::ReferenceParams) -> Ve
 
     let mut locations = Vec::new();
 
-    // Scan every rooted document's links for edges to the cursor's document. A
-    // source's targets are classified relative to its own deepest root, so a
-    // link resolves to the cursor `rel_path` only within the same root — cross-
-    // root references were never matched, and are not now (each root is its own
-    // graph).
+    // Scan every rooted document's links for edges to the cursor's document,
+    // matching in absolute space: a source's link target resolved against the
+    // source's own root equals the cursor document's absolute path exactly when
+    // it physically points there — the same file regardless of which root either
+    // side sits under (ticket server 11; this also fixes the ancestor/descendant
+    // divergence, since a descendant's relative link now resolves identically in
+    // either view).
+    let cursor_abs = uri_to_path(&params.text_document.uri);
     for (abs, doc) in &workspaces.documents {
         let Some(root) = doc.primary_root.as_deref() else {
             continue;
         };
-        let src_path = abs.strip_prefix(root).unwrap_or(abs);
-        let links = doc.data.tree.links(src_path);
+        let links = doc.data.tree.links(abs);
         for link in &links {
             let LinkKind::IntraProject {
                 target, fragment, ..
@@ -1920,7 +1936,7 @@ fn find_references(workspaces: &Workspaces, params: &lsp::ReferenceParams) -> Ve
             else {
                 continue;
             };
-            if target != &rel_path {
+            if root.join(target) != cursor_abs {
                 continue;
             }
             // If cursor is on a heading, only match links with a fragment to that heading.
@@ -2059,11 +2075,14 @@ fn go_to_definition(
         return None;
     }
 
-    let link = find_classified_link(&file_data.tree, &rel_path, node.span)?;
+    let root = workspace.root();
+    let link = find_classified_link(&file_data.tree, &root.join(&rel_path), node.span)?;
 
     match &link.kind {
         LinkKind::IntraProject { target, .. } | LinkKind::NonMarkdown { target } => {
-            let root = workspace.root();
+            // `root.join` yields the target's absolute path for either target
+            // form: it replaces on an absolute (document-relative) target and
+            // appends onto a root-relative remainder.
             Some(lsp::Location {
                 uri: path_to_uri(&root.join(target)),
                 range: lsp::Range::default(),
@@ -2113,7 +2132,8 @@ fn go_to_type_definition(
 
     let (_, node) = file_data.tree.find_link_at_offset(offset)?;
 
-    let link = find_classified_link(&file_data.tree, &rel_path, node.span)?;
+    let root = workspace.root();
+    let link = find_classified_link(&file_data.tree, &root.join(&rel_path), node.span)?;
 
     let LinkKind::IntraProject {
         target, fragment, ..
@@ -2127,7 +2147,6 @@ fn go_to_type_definition(
         return go_to_definition(workspaces, params);
     };
 
-    let root = workspace.root();
     let target_data = workspace.file(target)?;
     let target_headings = target_data.tree.headings();
     let heading = target_headings
@@ -2207,7 +2226,8 @@ fn implementation_from_body_link(
     let source = file_data.tree.source();
     let offset = lsp_position_to_byte_offset(source, params.position);
     let (_, node) = file_data.tree.find_link_at_offset(offset)?;
-    let cursor_link = find_classified_link(&file_data.tree, rel_path, node.span)?;
+    let root = workspace.root();
+    let cursor_link = find_classified_link(&file_data.tree, &root.join(rel_path), node.span)?;
 
     let LinkKind::IntraProject {
         target, predicate, ..
@@ -2216,12 +2236,14 @@ fn implementation_from_body_link(
         return None;
     };
 
-    // The counterpart authored on T carries the opposite predicate.
+    // The counterpart authored on T carries the opposite predicate. `target` is
+    // T's absolute path (a document-relative cursor link resolves root-free), so
+    // it doubles as the argument that classifies T's own links root-free.
     let paired = workspace.config().opposite_of(predicate)?;
     let target_data = workspace.file(target)?;
-    let root = workspace.root();
 
-    // Prefer a reciprocal body link T --[opposite_of(P)]--> S.
+    // Prefer a reciprocal body link T --[opposite_of(P)]--> S. T's link target
+    // `t` is root-free; map it onto its stored key and compare to S (`rel_path`).
     let target_links = target_data.tree.links(target);
     let reciprocal = target_links.iter().find(|l| {
         let LinkKind::IntraProject {
@@ -2232,7 +2254,7 @@ fn implementation_from_body_link(
         else {
             return false;
         };
-        t == rel_path && p == paired
+        p == paired && workspace.resolve_key(t).is_some_and(|k| k == rel_path)
     });
     if let Some(recip) = reciprocal {
         let line = recip.line.saturating_sub(1) as u32;
@@ -2241,15 +2263,18 @@ fn implementation_from_body_link(
 
     // Otherwise a frontmatter backlink entry on T keyed by opposite_of(P) and
     // listing S. Backlink paths are file-relative to T, so resolve each against
-    // T's directory (matching validation) before comparing to S.
+    // T's directory (`target` is T's absolute path) and map the result onto its
+    // stored key before comparing to S.
     let lists_source = target_data
         .frontmatter
         .as_ref()
         .and_then(|fm| fm.backlinks.get(paired))
         .is_some_and(|paths| {
-            paths
-                .iter()
-                .any(|p| validation::resolve_backlink_path(target, p).as_path() == rel_path)
+            paths.iter().any(|p| {
+                workspace
+                    .resolve_key(&validation::resolve_backlink_path(target, p))
+                    .is_some_and(|k| k == rel_path)
+            })
         });
     if lists_source {
         let line = backlink_key_line(target_data, paired)?;
@@ -2309,7 +2334,8 @@ fn implementation_from_backlink(
     // before looking S up in the workspace index.
     let source_path = validation::resolve_backlink_path(rel_path, path_text);
     let source_data = workspace.file(&source_path)?;
-    let source_links = source_data.tree.links(&source_path);
+    let source_abs = workspace.root().join(&source_path);
+    let source_links = source_data.tree.links(&source_abs);
 
     let forward_link = source_links.iter().find(|l| {
         let LinkKind::IntraProject {
@@ -2318,7 +2344,10 @@ fn implementation_from_backlink(
         else {
             return false;
         };
-        target == rel_path && predicate == paired_predicate
+        // S's link target is root-free; map it onto its stored key to compare
+        // to T (`rel_path`).
+        predicate == paired_predicate
+            && workspace.resolve_key(target).is_some_and(|k| k == rel_path)
     })?;
 
     let line = forward_link.line.saturating_sub(1) as u32;
@@ -2471,24 +2500,28 @@ fn call_hierarchy_incoming(
     workspaces: &Workspaces,
     item: &lsp::HierarchyItem,
 ) -> Vec<lsp::CallHierarchyIncomingCall> {
-    let Some((_, rel_path)) = workspaces.resolve_document(&item.uri) else {
+    if workspaces.resolve_document(&item.uri).is_none() {
         return Vec::new();
-    };
+    }
 
     let mut calls = Vec::new();
 
+    // Match in absolute space: a source's link target resolved against the
+    // source's own root equals the cursor document's absolute path exactly when
+    // it points there (ticket server 11).
+    let cursor_abs = uri_to_path(&item.uri);
     for (abs, doc) in &workspaces.documents {
         let Some(root) = doc.primary_root.as_deref() else {
             continue;
         };
         let src_path = abs.strip_prefix(root).unwrap_or(abs);
-        let links = doc.data.tree.links(src_path);
+        let links = doc.data.tree.links(abs);
         let headings = doc.data.tree.headings();
         for link in &links {
             let LinkKind::IntraProject { target, .. } = &link.kind else {
                 continue;
             };
-            if target != &rel_path {
+            if root.join(target) != cursor_abs {
                 continue;
             }
             let caller_heading = enclosing_heading(&headings, link.line);
@@ -2528,7 +2561,7 @@ fn call_hierarchy_outgoing(
         return Vec::new();
     };
     let headings = file_data.tree.headings();
-    let links = file_data.tree.links(&rel_path);
+    let links = file_data.tree.links(&workspace.root().join(&rel_path));
 
     let item_line = item.selection_range.start.line;
     let item_level = hierarchy_item_level(item);
@@ -2555,12 +2588,13 @@ fn call_hierarchy_outgoing(
         }
 
         let target_abs = root.join(target);
+        let target_key = target_to_key(root, target);
         let target_headings = workspace.file(target).map(|fd| fd.tree.headings());
         let target_item = target_headings
             .as_ref()
             .and_then(|h| h.first())
             .map_or_else(
-                || file_hierarchy_item(&target_abs, target),
+                || file_hierarchy_item(&target_abs, &target_key),
                 |h| heading_to_hierarchy_item(h, &target_abs),
             );
 
@@ -2598,9 +2632,9 @@ fn document_links(workspaces: &Workspaces, uri: &str) -> Vec<lsp::DocumentLink> 
     let Some(file_data) = workspace.file(&rel_path) else {
         return Vec::new();
     };
-    let file_links = file_data.tree.links(&rel_path);
-
     let root = workspace.root();
+    let file_links = file_data.tree.links(&root.join(&rel_path));
+
     let mut links = Vec::new();
 
     for link in &file_links {
@@ -2777,7 +2811,8 @@ fn hover_preview(
 ) -> Option<lsp::Hover> {
     let (workspace, rel_path) = workspaces.resolve_document(&params.text_document.uri)?;
     let file_data = workspace.file(&rel_path)?;
-    let file_links = file_data.tree.links(&rel_path);
+    let root = workspace.root();
+    let file_links = file_data.tree.links(&root.join(&rel_path));
 
     // Find the link on the cursor's line.
     let cursor_line = params.position.line;
@@ -2813,7 +2848,9 @@ fn hover_preview(
     };
 
     let preview = build_hover_preview(target_data, fragment.as_deref());
-    let target_display = target.display();
+    // Display the root-relative form, not the root-free absolute target.
+    let target_key = target_to_key(root, &target);
+    let target_display = target_key.display();
     let header = opposite.map_or_else(
         || format!("**{predicate}** → `{target_display}`"),
         |opposite| {
@@ -3299,12 +3336,14 @@ fn hierarchy_item_level(item: &lsp::HierarchyItem) -> u8 {
 ///
 /// Bridges the gap between `find_link_at_offset` (which finds the tree node)
 /// and the classified links from `Tree::links` (which resolve targets).
+/// `abs_path` is the document's absolute path, so the classified target is
+/// root-free (ticket server 11).
 fn find_classified_link(
     tree: &crate::block::Tree,
-    rel_path: &Path,
+    abs_path: &Path,
     node_span: Span,
 ) -> Option<crate::block::Link> {
-    tree.links(rel_path)
+    tree.links(abs_path)
         .into_iter()
         .find(|l| l.span == node_span)
 }
@@ -8917,6 +8956,132 @@ mod tests {
             sub.as_path(),
             "the deepest root owns resolution of the shared descendant file"
         );
+    }
+
+    #[test]
+    fn placement_change_flips_primary_root_without_reparsing() {
+        // Acceptance 1 (ticket server 11): a `primary_root` change must be a
+        // metadata flip, never a reparse. With the ancestor and a nested
+        // descendant folder both open, removing the descendant re-roots its
+        // documents onto the ancestor — and, because link classification is
+        // root-free, the parser (`Tree::links`) must not run at all. The old
+        // placement path reparsed from the buffer, which would tick this counter.
+        let dir = workspace_with_files(&[
+            (".lattice.toml", ""),
+            ("sub/.lattice.toml", ""),
+            ("sub/inner.md", "[peer](peer.md \"references\")\n"),
+            ("sub/peer.md", "# Peer\n"),
+        ]);
+        let root = fs::canonicalize(dir.path()).expect("canonicalize temp dir");
+        let sub = root.join("sub");
+        let inner_abs = sub.join("inner.md");
+
+        let mut workspaces = Workspaces::new();
+        workspaces.add_folder(&path_to_uri(&root));
+        workspaces.add_folder(&path_to_uri(&sub));
+
+        assert_eq!(
+            workspaces
+                .documents
+                .get(&inner_abs)
+                .and_then(|d| d.primary_root.as_deref()),
+            Some(sub.as_path()),
+            "the descendant root owns the nested document before removal"
+        );
+
+        // Re-root by removing the descendant folder, counting parser runs.
+        crate::block::reset_extract_counts();
+        workspaces.remove_folder(&path_to_uri(&sub));
+        assert_eq!(
+            crate::block::links_extract_count(),
+            0,
+            "re-rooting must not re-run the parser (links classify root-free)"
+        );
+
+        assert_eq!(
+            workspaces
+                .documents
+                .get(&inner_abs)
+                .and_then(|d| d.primary_root.as_deref()),
+            Some(root.as_path()),
+            "the document re-rooted onto the ancestor without a reparse"
+        );
+
+        // The root-free cached link still resolves in the new (ancestor) view.
+        let ancestor = workspaces.root_view(&root);
+        let diags = collect_all_diagnostics(&ancestor);
+        assert!(
+            !diags.iter().any(|d| d.message.contains("does not exist")),
+            "the re-rooted document's link still resolves after the flip: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn ancestor_and_descendant_views_agree_on_link_targets() {
+        // Acceptance 2 (ticket server 11): a descendant-root document carrying a
+        // document-relative link must read identically from the ancestor's view
+        // and the descendant's own view — the link resolves to the same absolute
+        // document in both. Under the old baked-rel-path model the ancestor view
+        // misread the target (classified under the deepest root), the divergence
+        // ticket 10 flagged in its final report.
+        let dir = workspace_with_files(&[
+            (".lattice.toml", ""),
+            ("sub/.lattice.toml", ""),
+            ("sub/inner.md", "[peer](peer.md \"references\")\n"),
+            ("sub/peer.md", "# Peer\n"),
+        ]);
+        let root = fs::canonicalize(dir.path()).expect("canonicalize temp dir");
+        let sub = root.join("sub");
+        let inner_abs = sub.join("inner.md");
+        let peer_abs = sub.join("peer.md");
+
+        let mut workspaces = Workspaces::new();
+        workspaces.add_folder(&path_to_uri(&root));
+        workspaces.add_folder(&path_to_uri(&sub));
+
+        // The cached link target is root-free: a document-relative link resolves
+        // to an absolute path, independent of which root observes it.
+        let target = match &workspaces
+            .documents
+            .get(&inner_abs)
+            .expect("inner indexed")
+            .data
+            .links[0]
+            .kind
+        {
+            LinkKind::IntraProject { target, .. } => target.clone(),
+            other => panic!("expected an intra-project link, got {other:?}"),
+        };
+
+        let ancestor = workspaces.root_view(&root);
+        let descendant = workspaces.root_view(&sub);
+
+        // Both views map the same link onto the same absolute document.
+        let key_a = ancestor
+            .resolve_key(&target)
+            .expect("ancestor view resolves the target");
+        let key_d = descendant
+            .resolve_key(&target)
+            .expect("descendant view resolves the target");
+        assert_eq!(
+            ancestor.root().join(key_a),
+            peer_abs,
+            "ancestor view resolves the descendant link to sub/peer.md"
+        );
+        assert_eq!(
+            descendant.root().join(key_d),
+            peer_abs,
+            "descendant view resolves the descendant link to sub/peer.md"
+        );
+
+        // ...and neither view reports the link as dangling.
+        for (label, view) in [("ancestor", &ancestor), ("descendant", &descendant)] {
+            let diags = collect_all_diagnostics(view);
+            assert!(
+                !diags.iter().any(|d| d.message.contains("does not exist")),
+                "{label} view must not misread the descendant link as dangling: {diags:?}"
+            );
+        }
     }
 
     #[test]

@@ -7,6 +7,7 @@
 //! an in-memory index backed by the unified parse tree, and supports
 //! incremental updates when individual files change.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -82,13 +83,18 @@ pub struct FileData {
     /// validation reads it instead of re-deriving a linked document's headings
     /// once per `file.md#heading` reference (issue 013 — ticket perf 06).
     pub headings: Vec<block::Heading>,
-    /// Cached extracted links (`Tree::links()` output) for this file, classified
-    /// against its own workspace-relative path.
+    /// Cached extracted links (`Tree::links()` output) for this file, resolved
+    /// against its own **absolute** path (decision 019 clause 8): a
+    /// document-relative target is absolute, a root-relative (`/x`) one the
+    /// relative remainder. Both are root-free, so this cache survives a
+    /// `primary_root` change unchanged — placement becomes a metadata flip, not
+    /// a reparse (ticket server 11).
     ///
     /// Like `headings`, a pure function of this file's tree and path, rebuilt
     /// only on reparse. The forward-link, backlink, connectivity, and
-    /// reciprocal-link validators read it instead of re-walking and
-    /// re-classifying every link on each sync (ticket perf 06).
+    /// reciprocal-link validators read it — mapping each target onto a stored
+    /// key via [`WorkspaceLike`] — instead of re-walking and re-classifying
+    /// every link on each sync (ticket perf 06).
     pub links: Vec<block::Link>,
     /// Cached explicit in-page anchor targets (`Tree::anchors()` output) —
     /// `id`/`name` values harvested from this file's raw-HTML `<a>` tags.
@@ -227,7 +233,7 @@ impl Workspace {
                 .unwrap_or(&abs_path)
                 .to_path_buf();
 
-            match parse_file(&abs_path, &rel_path, &config) {
+            match parse_file(&abs_path, &config) {
                 Ok(data) => {
                     files.insert(rel_path, data);
                 }
@@ -276,7 +282,7 @@ impl Workspace {
         }
 
         let membership_changed = !self.files.contains_key(rel_path);
-        match parse_file(&abs_path, rel_path, &self.config) {
+        match parse_file(&abs_path, &self.config) {
             Ok(data) => {
                 self.files.insert(rel_path.to_path_buf(), data);
                 self.refresh_structural_after_update(rel_path, membership_changed);
@@ -303,7 +309,7 @@ impl Workspace {
     #[cfg(test)]
     pub fn update_content(&mut self, rel_path: &Path, content: &str) {
         let membership_changed = !self.files.contains_key(rel_path);
-        let data = parse_content(content, rel_path, &self.config);
+        let data = parse_content(content, &self.root.join(rel_path), &self.config);
         self.files.insert(rel_path.to_path_buf(), data);
         self.refresh_structural_after_update(rel_path, membership_changed);
     }
@@ -347,7 +353,7 @@ impl Workspace {
                 continue;
             };
             let content = file_data.tree.source().to_string();
-            let data = parse_content(&content, rel_path, &self.config);
+            let data = parse_content(&content, &self.root.join(rel_path), &self.config);
             self.files.insert(rel_path.clone(), data);
         }
 
@@ -435,9 +441,10 @@ impl Workspace {
         &self.files
     }
 
-    /// Get parsed data for a specific file by its workspace-relative path.
-    pub fn file(&self, rel_path: &Path) -> Option<&FileData> {
-        self.files.get(rel_path)
+    /// Get parsed data for a specific file by a link target or a stored key —
+    /// see [`target_to_key`]. A workspace-relative key passes through unchanged.
+    pub fn file(&self, target: &Path) -> Option<&FileData> {
+        self.files.get(&*target_to_key(&self.root, target))
     }
 
     /// Consume this workspace into its scanned parts.
@@ -476,6 +483,28 @@ pub struct WorkspaceParts {
     pub files: BTreeMap<PathBuf, FileData>,
 }
 
+/// Map a link `target` onto the view-relative key its file is stored under.
+///
+/// A document-relative link resolves to an absolute path at parse time
+/// (root-free, decision 019 clause 8); stripping `root` yields its key — and in
+/// a nested view an ancestor and a descendant root strip to *their own*
+/// key, so both agree on the same file (the ticket-10 divergence fix). A
+/// root-relative (`/x`) target is stored as the relative remainder `x`, already
+/// the key. A caller passing a stored key back in (already relative) is returned
+/// unchanged. An absolute target outside `root` fails the strip and is returned
+/// as-is, so the lookup simply misses (it is not a member of this view).
+#[must_use]
+pub fn target_to_key<'a>(root: &Path, target: &'a Path) -> Cow<'a, Path> {
+    if target.is_absolute() {
+        target.strip_prefix(root).map_or_else(
+            |_| Cow::Borrowed(target),
+            |key| Cow::Owned(key.to_path_buf()),
+        )
+    } else {
+        Cow::Borrowed(target)
+    }
+}
+
 /// The read-only surface the graph and structural diagnostic pipeline consumes
 /// from a workspace: its config, membership, and per-file parsed data.
 ///
@@ -491,13 +520,17 @@ pub trait WorkspaceLike {
     fn config(&self) -> &Config;
     /// Whether the graph diagnostic tier is enabled (a `.lattice.toml` exists).
     fn has_config(&self) -> bool;
-    /// Parsed data for one file by its workspace-relative path.
-    fn file(&self, rel_path: &Path) -> Option<&FileData>;
-    /// Iterate every file as `(relative path, parsed data)`.
+    /// Parsed data for one file by a link `target` (absolute for a
+    /// document-relative link, the root-relative remainder otherwise) or by a
+    /// stored key directly — [`target_to_key`] reconciles them.
+    fn file(&self, target: &Path) -> Option<&FileData>;
+    /// Iterate every file as `(view-relative key, parsed data)`.
     fn files_iter(&self) -> impl Iterator<Item = (&PathBuf, &FileData)>;
-    /// Resolve a relative path to the stored key it matches (existence probe
+    /// Resolve a link `target` to the stored key it matches (existence probe
     /// that also yields a borrow living as long as the workspace), or `None`.
-    fn resolve_key(&self, rel_path: &Path) -> Option<&Path>;
+    /// The argument follows the same absolute/relative convention as
+    /// [`WorkspaceLike::file`].
+    fn resolve_key(&self, target: &Path) -> Option<&Path>;
 }
 
 impl WorkspaceLike for Workspace {
@@ -510,14 +543,16 @@ impl WorkspaceLike for Workspace {
     fn has_config(&self) -> bool {
         self.has_config
     }
-    fn file(&self, rel_path: &Path) -> Option<&FileData> {
-        self.files.get(rel_path)
+    fn file(&self, target: &Path) -> Option<&FileData> {
+        self.files.get(&*target_to_key(&self.root, target))
     }
     fn files_iter(&self) -> impl Iterator<Item = (&PathBuf, &FileData)> {
         self.files.iter()
     }
-    fn resolve_key(&self, rel_path: &Path) -> Option<&Path> {
-        self.files.get_key_value(rel_path).map(|(k, _)| k.as_path())
+    fn resolve_key(&self, target: &Path) -> Option<&Path> {
+        self.files
+            .get_key_value(&*target_to_key(&self.root, target))
+            .map(|(k, _)| k.as_path())
     }
 }
 
@@ -576,10 +611,19 @@ impl<'a> WorkspaceView<'a> {
     pub fn files(&self) -> &BTreeMap<PathBuf, &'a FileData> {
         &self.files
     }
-    /// Parsed data for one file by its view-relative path.
+    /// Parsed data for one file by a link target or a view-relative key — see
+    /// [`target_to_key`].
     #[must_use]
-    pub fn file(&self, rel_path: &Path) -> Option<&FileData> {
-        self.files.get(rel_path).copied()
+    pub fn file(&self, target: &Path) -> Option<&FileData> {
+        self.files.get(&*target_to_key(&self.root, target)).copied()
+    }
+    /// Resolve a link target to the view-relative key it matches, or `None`.
+    /// The borrow lives as long as the view (the stored key, not the argument).
+    #[must_use]
+    pub fn resolve_key(&self, target: &Path) -> Option<&Path> {
+        self.files
+            .get_key_value(&*target_to_key(&self.root, target))
+            .map(|(k, _)| k.as_path())
     }
 }
 
@@ -593,14 +637,16 @@ impl WorkspaceLike for WorkspaceView<'_> {
     fn has_config(&self) -> bool {
         self.has_config
     }
-    fn file(&self, rel_path: &Path) -> Option<&FileData> {
-        self.files.get(rel_path).copied()
+    fn file(&self, target: &Path) -> Option<&FileData> {
+        self.files.get(&*target_to_key(&self.root, target)).copied()
     }
     fn files_iter(&self) -> impl Iterator<Item = (&PathBuf, &FileData)> {
         self.files.iter().map(|(path, data)| (path, *data))
     }
-    fn resolve_key(&self, rel_path: &Path) -> Option<&Path> {
-        self.files.get_key_value(rel_path).map(|(k, _)| k.as_path())
+    fn resolve_key(&self, target: &Path) -> Option<&Path> {
+        self.files
+            .get_key_value(&*target_to_key(&self.root, target))
+            .map(|(k, _)| k.as_path())
     }
 }
 
@@ -670,21 +716,23 @@ pub fn compute_structural(
 // --- Internal helpers ---
 
 /// Parse a single markdown file from disk into [`FileData`].
-fn parse_file(
-    abs_path: &Path,
-    rel_path: &Path,
-    config: &Config,
-) -> Result<FileData, std::io::Error> {
+fn parse_file(abs_path: &Path, config: &Config) -> Result<FileData, std::io::Error> {
     let content = std::fs::read_to_string(abs_path)?;
-    Ok(parse_content(&content, rel_path, config))
+    Ok(parse_content(&content, abs_path, config))
 }
 
 /// Parse markdown content into [`FileData`].
 ///
 /// Always succeeds — YAML parse errors become diagnostics instead of
 /// hard failures, enabling partial frontmatter recovery.
+///
+/// `abs_path` is the document's absolute path in production; it is threaded into
+/// link classification only ([`Tree::links`]), so cached link targets are
+/// root-free (decision 019 clause 8). The parse output carries no workspace
+/// root: structural diagnostics (which anchor on the root-relative path) are
+/// filled separately after insertion, once membership is known.
 #[must_use]
-pub fn parse_content(content: &str, rel_path: &Path, config: &Config) -> FileData {
+pub fn parse_content(content: &str, abs_path: &Path, config: &Config) -> FileData {
     // Try YAML (`---`), then TOML (`+++`), then JSON (`{`) frontmatter.
     let (fm_block, fm_syntax) = yaml::parse_frontmatter_block(content).map_or_else(
         || {
@@ -770,7 +818,7 @@ pub fn parse_content(content: &str, rel_path: &Path, config: &Config) -> FileDat
 
     // Collect parse diagnostics from the tree itself.
     for diag in tree.diagnostics() {
-        let _ = &rel_path; // reserved for future per-file filtering
+        let _ = &abs_path; // reserved for future per-file filtering
         let _ = diag;
     }
 
@@ -781,7 +829,7 @@ pub fn parse_content(content: &str, rel_path: &Path, config: &Config) -> FileDat
     // path, so the cache refreshes exactly when the file reparses; no
     // post-insertion workspace step is needed, unlike `structural`.
     let headings = tree.headings();
-    let links = tree.links(rel_path);
+    let links = tree.links(abs_path);
     // Explicit in-page anchors (`<a id>` / `<a name>`) — cached like
     // headings/links so same-document fragment validation resolves `[…](#x)`
     // against explicit anchors as well as heading slugs (issue 025).
@@ -1531,6 +1579,10 @@ mod tests {
     /// must equal a fresh `Tree::headings()`/`Tree::links()` extraction. A drift
     /// here is the "silent stale extraction" failure mode the cache risks — the
     /// stage-2 spirit applied to fragment and forward-link inputs.
+    ///
+    /// Links classify against the document's absolute path (decision 019
+    /// clause 8), so the fresh recompute joins the workspace-relative key onto
+    /// the root — matching how `parse_content` built the cache.
     fn assert_extraction_cache_matches_recompute(ws: &Workspace) {
         for (path, file_data) in ws.files() {
             assert_eq!(
@@ -1541,7 +1593,7 @@ mod tests {
             );
             assert_eq!(
                 file_data.links,
-                file_data.tree.links(path),
+                file_data.tree.links(&ws.root().join(path)),
                 "cached links for {} drifted from a fresh extraction",
                 path.display()
             );

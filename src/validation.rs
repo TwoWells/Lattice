@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use crate::block::{self, HeadingId, LinkKind};
 use crate::config::{Config, ConnectivityPolicy, FragmentAlgorithm, PredicatePolicy};
 use crate::span::Span;
-use crate::workspace::WorkspaceLike;
+use crate::workspace::{WorkspaceLike, target_to_key};
 
 /// Diagnostic severity level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,6 +138,12 @@ pub fn validate_forward_links(workspace: &impl WorkspaceLike) -> Vec<Diagnostic>
 }
 
 /// Check that a link target exists as a file in the workspace or on disk.
+///
+/// `target` is a root-free link target (absolute for a document-relative link,
+/// the root-relative remainder otherwise). Existence is checked in the store's
+/// key space (markdown, via `file`) or on disk (`root.join(target)`, which
+/// yields the target's absolute path for either form). The message displays the
+/// root-relative form, the one edge where the workspace root re-enters.
 fn check_target_exists(
     workspace: &impl WorkspaceLike,
     source: &Path,
@@ -155,11 +161,12 @@ fn check_target_exists(
     };
 
     if !exists {
+        let display = target_to_key(workspace.root(), target);
         diagnostics.push(Diagnostic {
             file: source.to_path_buf(),
             line,
             severity: Severity::Error,
-            message: format!("link target does not exist: {}", target.display()),
+            message: format!("link target does not exist: {}", display.display()),
             span: Some(span),
         });
     }
@@ -276,10 +283,16 @@ fn build_expected_backlinks(workspace: &impl WorkspaceLike) -> ExpectedBacklinks
                 target, predicate, ..
             } = &link.kind
             {
-                // Skip broken targets and unknown predicates — forward validation handles those.
-                if workspace.file(target).is_none() {
+                // Resolve the root-free target onto its stored key, which also
+                // probes existence: a broken target yields `None` and is skipped
+                // (forward validation handles it). Keying the map by the stored
+                // key keeps every path — targets and sources alike — in the
+                // view's coordinate space, so `file_relative` and the frontmatter
+                // comparison below line up.
+                let Some(target_key) = workspace.resolve_key(target) else {
                     continue;
-                }
+                };
+                let target_key = target_key.to_path_buf();
                 // Key by the opposite member of the pair (decision 008): an
                 // inverse-predicate link (`"superseded_by"`) derives the
                 // forward label (`"supersedes"`) on its target.
@@ -288,7 +301,7 @@ fn build_expected_backlinks(workspace: &impl WorkspaceLike) -> ExpectedBacklinks
                 };
 
                 expected
-                    .entry(target.clone())
+                    .entry(target_key)
                     .or_default()
                     .entry(opposite.to_string())
                     .or_default()
@@ -427,11 +440,17 @@ fn has_reciprocal_forward_link(
         return false;
     };
     target_data.links.iter().any(|link| {
-        matches!(
-            &link.kind,
-            LinkKind::IntraProject { target: t, predicate: p, .. }
-                if t == source && p == predicate
-        )
+        let LinkKind::IntraProject {
+            target: t,
+            predicate: p,
+            ..
+        } = &link.kind
+        else {
+            return false;
+        };
+        // `t` is root-free; map it onto its stored key before comparing to
+        // `source` (also a stored key).
+        p == predicate && workspace.resolve_key(t).is_some_and(|k| k == source)
     })
 }
 
@@ -534,6 +553,7 @@ fn check_fragment(
             .any(|anchor| anchor.id == fragment);
 
     if !found {
+        let display = target_to_key(workspace.root(), target);
         diagnostics.push(Diagnostic {
             file: source.to_path_buf(),
             line,
@@ -541,7 +561,7 @@ fn check_fragment(
             message: format!(
                 "fragment `#{}` not found in `{}`",
                 fragment,
-                target.display()
+                display.display()
             ),
             span: Some(span),
         });
