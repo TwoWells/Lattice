@@ -80,10 +80,10 @@ vim.api.nvim_set_hl(0, "@lsp.mod.italic", { italic = true })
 vim.api.nvim_set_hl(0, "@lsp.mod.strikethrough", { strikethrough = true })
 ```
 
-Tokens are served only inside a workspace — a directory with a
-`.lattice.toml` or `.git` ancestor. A scratch file outside any root
-(a note in `/tmp`, say) currently gets none; drop an empty
-`.lattice.toml` next to it to opt the directory in.
+Tokens are served for any opened markdown document, rooted or not: a
+scratch file outside every workspace root (a note in `/tmp`, say) gets
+the same emphasis styling as a project file. Workspace roots gate only
+the graph-linting tier — backlinks, predicates, connectivity.
 
 Treesitter's own markdown emphasis highlighting stays active alongside,
 and extmark attributes merge — so a span the grammar gets wrong stays
