@@ -133,6 +133,11 @@ lattice lint
 Commits with broken links, unknown predicates, or missing backlinks
 will be rejected.
 
+`lattice lint` checks the scope it is invoked in and stops at every
+nested-scope boundary (see [Nested scopes](#nested-scopes)): one
+invocation, one graph. In a repository containing nested scopes, run it
+once from each marker directory.
+
 ## Configuration
 
 An optional `.lattice.toml` at the project root overrides defaults:

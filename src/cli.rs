@@ -347,6 +347,9 @@ containment grants no membership, config, or reference privileges.
   - Entry point is irrelevant. Linting from the outer root, from inside the
     nested scope, or via an editor session rooted at either agrees on where each
     graph begins.
+  - One invocation, one graph. `lattice lint` lints exactly the scope it is
+    invoked in — it stops at every boundary and never recurses into a nested
+    graph. In a multi-scope repository, run it once per marker directory.
 
 override vs. nested scope — the rule of thumb
 ---------------------------------------------
