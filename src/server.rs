@@ -7,7 +7,7 @@
 //! symbols, rename, references, type hierarchy, and call hierarchy for
 //! headings. Supports multiple workspace folders.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -25,7 +25,8 @@ use crate::lsp;
 use crate::span::Span;
 use crate::validation::{self, Diagnostic, Severity};
 use crate::workspace::{
-    FileData, Workspace, WorkspaceView, compute_structural, parse_content, target_to_key,
+    FileData, Workspace, WorkspaceView, compute_structural, discover_scope_boundaries,
+    find_scope_root, parse_content, target_to_key,
 };
 
 /// What the client currently holds for one document: the Lattice diagnostics
@@ -92,8 +93,33 @@ struct RootMeta {
 struct Workspaces {
     /// Every parsed document, keyed by absolute path — the single content owner.
     documents: BTreeMap<PathBuf, Document>,
-    /// Workspace-folder roots, keyed by the client-supplied folder path.
+    /// Every active **scope root**, keyed by the (client-spelling) directory a
+    /// marker declares — a `.lattice.toml` scope or a `.git` non-root
+    /// environment (decision 019). Roots derive from markers, not folders: an
+    /// added folder registers the nearest ancestor marker covering it and every
+    /// strictly-deeper marker beneath it (walk up, then walk down). A document's
+    /// `primary_root` is its deepest covering scope root, and each root's graph
+    /// is the range scan filtered to `primary_root == root` — so a nested scope
+    /// is a disjoint graph, never swallowed by its host.
     roots: BTreeMap<PathBuf, RootMeta>,
+    /// The folders the client actually opened (their client-spelling paths).
+    ///
+    /// Client folders declare *visibility*; markers declare *structure*
+    /// (decision 019 clause 7). A folder is an entry point into whatever scope
+    /// covers it, not a root of its own. The active [`Self::roots`] are derived
+    /// from this set (each folder's covering marker plus its nested markers), so
+    /// removing a folder deregisters exactly the scopes no remaining folder
+    /// keeps visible.
+    client_folders: BTreeSet<PathBuf>,
+    /// Nested `.git` non-root environments (a submodule or vendored repo without
+    /// a `.lattice.toml`), by their client-spelling directory (decision 019
+    /// resolution 2). These are *not* scopes: excluded from every host scope's
+    /// scan and membership, and never eagerly indexed (Lattice does not read a
+    /// foreign repo's graph). A document behind one is rootless — opened directly
+    /// it serves document-scoped features and structural under defaults (051
+    /// semantics) — and a link resolving into one crosses a boundary. Derived
+    /// from the open folders alongside [`Self::roots`].
+    git_boundaries: BTreeSet<PathBuf>,
     /// Diagnostics last published to the client, keyed by document URI.
     ///
     /// Used to suppress redundant `publishDiagnostics` notifications and to
@@ -130,6 +156,8 @@ impl Workspaces {
         Self {
             documents: BTreeMap::new(),
             roots: BTreeMap::new(),
+            client_folders: BTreeSet::new(),
+            git_boundaries: BTreeSet::new(),
             published: HashMap::new(),
             open_documents: HashSet::new(),
             default_config: Config::default(),
@@ -160,10 +188,19 @@ impl Workspaces {
 
     // --- Membership derivation (range scan, no index) ---
 
-    /// The deepest root whose path component-covers `abs`, or `None` when `abs`
-    /// lies outside every folder. Deepest = most path components, which for
+    /// The deepest scope root whose path component-covers `abs`, or `None` when
+    /// `abs` lies outside every scope. Deepest = most path components, which for
     /// nested roots (each a prefix of the other) is the longest, unambiguously.
+    ///
+    /// A document behind a nested `.git` non-root environment
+    /// ([`Self::git_boundaries`]) has no graph of its own (decision 019
+    /// resolution 2): it is rootless — excluded from every host scope, served
+    /// document-scoped under defaults (051 semantics) — so it never resolves to a
+    /// covering root.
     fn deepest_root_for(&self, abs: &Path) -> Option<PathBuf> {
+        if self.git_boundaries.iter().any(|g| abs.starts_with(g)) {
+            return None;
+        }
         self.roots
             .keys()
             .filter(|root| abs.starts_with(root))
@@ -188,9 +225,29 @@ impl Workspaces {
             .map_or(&self.default_config, |meta| &meta.config)
     }
 
+    /// The strictly-deeper scope boundaries nested inside `root`: every
+    /// registered scope root `root` is a proper ancestor of, plus every nested
+    /// `.git` non-root environment beneath it (decision 019). A link resolving
+    /// into one of these has crossed a boundary
+    /// ([`WorkspaceLike::crosses_boundary`]).
+    fn boundaries_under(&self, root: &Path) -> Vec<PathBuf> {
+        self.roots
+            .keys()
+            .filter(|other| other.as_path() != root && other.starts_with(root))
+            .chain(self.git_boundaries.iter().filter(|g| g.starts_with(root)))
+            .cloned()
+            .collect()
+    }
+
     /// Build the per-root view the graph/diagnostic pipeline and cross-file
-    /// document features consume: every document under `root` (range scan),
+    /// document features consume: every document **whose primary root is `root`**,
     /// keyed by path relative to `root`.
+    ///
+    /// Membership is the range scan tightened to `primary_root == root`
+    /// (decision 019, ticket server 10's anticipated filter): a document under a
+    /// strictly-deeper boundary belongs to that nested scope's graph, not this
+    /// one, so the two scopes are disjoint — the host never sees the nested
+    /// scope's files, and vice versa.
     fn root_view(&self, root: &Path) -> WorkspaceView<'_> {
         let mut files = BTreeMap::new();
         for (abs, doc) in self
@@ -198,6 +255,9 @@ impl Workspaces {
             .range(root.to_path_buf()..)
             .take_while(|(abs, _)| abs.starts_with(root))
         {
+            if doc.primary_root.as_deref() != Some(root) {
+                continue;
+            }
             if let Ok(rel) = abs.strip_prefix(root) {
                 files.insert(rel.to_path_buf(), &doc.data);
             }
@@ -206,7 +266,13 @@ impl Workspaces {
             || (&self.default_config, false),
             |meta| (&meta.config, meta.has_config),
         );
-        WorkspaceView::new(root.to_path_buf(), config, has_config, files)
+        WorkspaceView::new(
+            root.to_path_buf(),
+            config,
+            has_config,
+            files,
+            self.boundaries_under(root),
+        )
     }
 
     /// Build a single-file view over one rootless document (issue 051): its
@@ -220,7 +286,7 @@ impl Workspaces {
         };
         let mut files = BTreeMap::new();
         files.insert(document_rel(abs, None), &doc.data);
-        WorkspaceView::new(root, &self.default_config, false, files)
+        WorkspaceView::new(root, &self.default_config, false, files, Vec::new())
     }
 
     // --- Document resolution ---
@@ -352,27 +418,42 @@ impl Workspaces {
     // --- Placement (primary_root) recomputation ---
 
     /// Recompute a document's deepest covering root and, if it changed, **flip
-    /// its `primary_root` in place** — no reparse (ticket server 11).
+    /// its `primary_root` in place** — reparsing from its buffer only when the
+    /// re-root crosses a config boundary (decision 019 clause 6; ticket
+    /// server 11's placement/reparse split, refined by ticket server 12).
     ///
-    /// Placement is pure metadata now: the parse tree and its cached links are
-    /// root-free (links classify against the absolute path, decision 019
-    /// clause 8), so re-rooting cannot change them. The `FileData` — including
-    /// the in-memory buffer it was parsed from — is preserved untouched, which
-    /// keeps an open editor buffer authoritative across a workspace-folder change
-    /// (decision 017 §3) without re-reading disk *or* re-running the parser. The
-    /// root-dependent derived state — the structural cache (which anchors on the
-    /// root-relative path and reads the new root's membership and config) — is
-    /// refreshed by the caller's `recompute_all_structural` after the placement
-    /// loop settles.
+    /// Placement is metadata: the parse tree and its cached links are root-free
+    /// (links classify against the absolute path, decision 019 clause 8), so a
+    /// re-root within one config cannot change them, and the `FileData` — buffer
+    /// included — is preserved untouched, keeping an open editor buffer
+    /// authoritative across the change (decision 017 §3) without touching disk or
+    /// the parser. One parse-time derivation, however, *is* config-sensitive:
+    /// `FileData::backlink_diagnostics`, the frontmatter unknown-predicate check,
+    /// reads the predicate vocabulary. A re-root that crosses a scope boundary
+    /// (a live split/merge, or a folder add/remove over a marker scope) changes
+    /// the effective config, so when the predicate vocabulary actually differs
+    /// this reparses from the buffer to refresh that derivation. The
+    /// root-dependent structural cache is refreshed by the caller's
+    /// `recompute_all_structural` afterward.
     fn refresh_placement(&mut self, abs: &Path) {
         let new_primary = self.deepest_root_for(abs);
-        let Some(doc) = self.documents.get_mut(abs) else {
+        let Some(doc) = self.documents.get(abs) else {
             return;
         };
-        if doc.primary_root == new_primary {
+        let old_primary = doc.primary_root.clone();
+        if old_primary == new_primary {
             return;
         }
-        doc.primary_root = new_primary;
+        // Does the re-root change the predicate vocabulary the parse-time
+        // backlink check reads? Only then must the buffer be reparsed.
+        let reparse = self.config_for(old_primary.as_deref()).predicates
+            != self.config_for(new_primary.as_deref()).predicates;
+        if let Some(doc) = self.documents.get_mut(abs) {
+            doc.primary_root = new_primary;
+        }
+        if reparse {
+            self.reparse_from_buffer(abs);
+        }
     }
 
     /// Reparse a document from its in-memory buffer under its current primary
@@ -423,8 +504,17 @@ impl Workspaces {
             .get(&root)
             .map_or(&self.default_config, |meta| &meta.config);
         // Membership under the primary root, by range scan through the flat
-        // store: a bare-path target `t` exists iff `root/t` is a document.
-        let file_exists = |target: &Path| self.documents.contains_key(&root.join(target));
+        // store: a bare-path target `t` exists iff `root/t` is a document *of
+        // this scope* — `primary_root == root` (decision 019). A document under
+        // a strictly-deeper boundary lives in a nested scope, so it is not a
+        // member here; a mention resolving to it dangles as a stale reference
+        // that steers to the `[external]` alias, exactly as a cross-boundary
+        // link errors in the graph tier.
+        let file_exists = |target: &Path| {
+            self.documents
+                .get(&root.join(target))
+                .is_some_and(|doc| doc.primary_root.as_deref() == Some(root.as_path()))
+        };
         let (diagnostics, suppressions) = compute_structural(&doc.data, &rel, config, &file_exists);
         if let Some(doc) = self.documents.get_mut(abs) {
             doc.data.structural = diagnostics;
@@ -450,21 +540,51 @@ impl Workspaces {
 
     // --- Workspace-folder changes ---
 
-    /// Add a workspace folder: insert its [`RootMeta`], then scan the directory
-    /// *upsert-if-absent*. A document already present (an open buffer, or one a
-    /// shallower root already scanned) keeps its content and only gains a root;
-    /// absent paths parse from disk. Every document under the folder then
-    /// recomputes its deepest primary root — reparsing from its buffer if the
-    /// owner changed — so the editor buffer is never shadowed by disk and no
-    /// orphaned entry remains.
+    /// Add a workspace folder (decision 019 clause 7 — the folder declares
+    /// visibility; markers declare structure).
+    ///
+    /// The folder is rooted at the nearest ancestor marker covering it (or
+    /// itself, a fallback scope, when none exists), and that scope plus every
+    /// strictly-deeper marker beneath it are registered — so opening a
+    /// subdirectory scans the whole scope, and a nested `.lattice.toml` / `.git`
+    /// becomes its own graph rather than being swallowed (resolution 1). Every
+    /// document under the covering scope then recomputes its deepest primary
+    /// root, reparsing across a config boundary and leaving open buffers
+    /// authoritative (decision 017 §3), so the editor buffer is never shadowed by
+    /// disk and no orphaned entry remains.
     fn add_folder(&mut self, uri: &str) {
         let folder = uri_to_path(uri);
-        let Ok(ws) = Workspace::scan(&folder) else {
+        self.client_folders.insert(folder.clone());
+        let covering = find_scope_root(&folder).unwrap_or_else(|| folder.clone());
+        self.register_scope(&covering);
+        self.rebuild_git_boundaries();
+        for key in self.document_keys_under(&covering) {
+            self.refresh_placement(&key);
+        }
+        self.recompute_all_structural();
+    }
+
+    /// Register `scope_root` (a client-spelling marker directory, or a folder
+    /// fallback) as a scope root, then recurse into every strictly-deeper scope
+    /// beneath it (decision 019 clause 1).
+    ///
+    /// Loads the scope's config and folds its boundary-pruned scan into the flat
+    /// store *upsert-if-absent* — an occupied entry (an open buffer, or a
+    /// document a sibling scope already holds) keeps its content and the disk
+    /// parse is dropped; the provisional primary root is corrected by the
+    /// caller's `refresh_placement` loop. Idempotent: an already-registered scope
+    /// returns immediately, so an ancestor folder and one of its nested scopes,
+    /// both opened, register each scope exactly once.
+    fn register_scope(&mut self, scope_root: &Path) {
+        if self.roots.contains_key(scope_root) {
+            return;
+        }
+        let Ok(ws) = Workspace::scan(scope_root) else {
             return;
         };
         let parts = ws.into_parts();
         self.roots.insert(
-            folder.clone(),
+            scope_root.to_path_buf(),
             RootMeta {
                 canonical_root: parts.root,
                 config: parts.config,
@@ -473,40 +593,225 @@ impl Workspaces {
             },
         );
         for (rel, data) in parts.files {
-            let key = folder.join(&rel);
-            // Upsert-if-absent: an occupied entry (an open buffer, or a
-            // pre-existing scan document) keeps its content; the disk parse is
-            // dropped. The provisional primary is corrected below.
+            let key = scope_root.join(&rel);
             self.documents.entry(key).or_insert_with(|| Document {
                 data,
-                primary_root: Some(folder.clone()),
+                primary_root: Some(scope_root.to_path_buf()),
             });
         }
-        for key in self.document_keys_under(&folder) {
+        // Recurse only into nested `.lattice.toml` scopes — those are graphs. A
+        // nested `.git`-only environment is not a scope (decision 019 resolution
+        // 2): it is left unscanned and tracked as a boundary by
+        // `rebuild_git_boundaries`, so a foreign repo is never indexed.
+        for nested in discover_scope_boundaries(scope_root) {
+            if nested.join(".lattice.toml").is_file() {
+                self.register_scope(&nested);
+            }
+        }
+    }
+
+    /// Recompute the nested `.git` non-root environments visible through the open
+    /// client folders (decision 019 resolution 2), walking each folder's scope
+    /// tree without parsing. Rebuilt whenever the folder set or scope structure
+    /// changes, so a `.git` boundary no folder keeps visible drops out.
+    fn rebuild_git_boundaries(&mut self) {
+        let mut git = BTreeSet::new();
+        for folder in &self.client_folders {
+            let covering = find_scope_root(folder).unwrap_or_else(|| folder.clone());
+            Self::collect_git_boundaries(&covering, &mut git);
+        }
+        self.git_boundaries = git;
+    }
+
+    /// Collect the nested `.git`-only boundaries beneath `scope_root` into `out`,
+    /// descending through nested `.lattice.toml` scopes (each of which may hold
+    /// its own `.git` sub-environments) but never into a `.git` boundary itself.
+    fn collect_git_boundaries(scope_root: &Path, out: &mut BTreeSet<PathBuf>) {
+        for boundary in discover_scope_boundaries(scope_root) {
+            if boundary.join(".lattice.toml").is_file() {
+                Self::collect_git_boundaries(&boundary, out);
+            } else {
+                out.insert(boundary);
+            }
+        }
+    }
+
+    /// Remove a workspace folder: recompute which scope roots remain visible
+    /// through the surviving folders, deregister the scopes none keeps visible,
+    /// and re-root or evict the documents that touched.
+    ///
+    /// A scope root persists while any open folder still covers it — a nested
+    /// marker discovered by walk-down survives its own folder's removal, since
+    /// the covering folder keeps it visible (decision 019 clause 7). A scan-only
+    /// document left uncovered is evicted; an open one keeps serving, rootless or
+    /// re-rooted onto the covering scope with no dark window (decision 017 §3),
+    /// reparsing across a config boundary via `refresh_placement`.
+    fn remove_folder(&mut self, uri: &str) {
+        let folder = uri_to_path(uri);
+        if !self.client_folders.remove(&folder) {
+            return;
+        }
+        let active = self.active_scope_roots();
+        let stale: BTreeSet<PathBuf> = self
+            .roots
+            .keys()
+            .filter(|root| !active.contains(*root))
+            .cloned()
+            .collect();
+        for root in &stale {
+            self.roots.remove(root);
+        }
+        self.rebuild_git_boundaries();
+        let affected: Vec<PathBuf> = self
+            .documents
+            .iter()
+            .filter(|(_, doc)| {
+                doc.primary_root
+                    .as_ref()
+                    .is_some_and(|root| stale.contains(root))
+            })
+            .map(|(abs, _)| abs.clone())
+            .collect();
+        for key in affected {
+            let new_primary = self.deepest_root_for(&key);
+            let is_open = self.open_documents.contains(&path_to_uri(&key));
+            if new_primary.is_none() && !is_open {
+                self.documents.remove(&key);
+            } else {
+                self.refresh_placement(&key);
+            }
+        }
+        self.recompute_all_structural();
+    }
+
+    /// The scope roots visible through the currently-open client folders: each
+    /// folder's covering marker plus every strictly-deeper marker beneath it
+    /// (decision 019 clause 7). Recomputed on a folder removal to deregister
+    /// scopes no surviving folder keeps visible.
+    fn active_scope_roots(&self) -> BTreeSet<PathBuf> {
+        let mut active = BTreeSet::new();
+        for folder in &self.client_folders {
+            let covering = find_scope_root(folder).unwrap_or_else(|| folder.clone());
+            Self::collect_scope_tree(&covering, &mut active);
+        }
+        active
+    }
+
+    /// Add `scope_root` and every strictly-deeper marker scope beneath it to
+    /// `out`, walking client-spelling directories on disk.
+    fn collect_scope_tree(scope_root: &Path, out: &mut BTreeSet<PathBuf>) {
+        if !out.insert(scope_root.to_path_buf()) {
+            return;
+        }
+        for nested in discover_scope_boundaries(scope_root) {
+            Self::collect_scope_tree(&nested, out);
+        }
+    }
+
+    // --- Live split / merge (decision 019 clause 6) ---
+
+    /// The client-key of the scope root registered at directory `dir`, matched
+    /// by its own key or its canonical scan path — so a marker reported under a
+    /// symlinked spelling (issue 047) still resolves to the workspace it belongs
+    /// to (issue 050). Unlike a prefix match, this is exact: it names the scope
+    /// *at* `dir`, not a scope that merely contains it.
+    fn registered_root_at(&self, dir: &Path) -> Option<PathBuf> {
+        self.roots.iter().find_map(|(key, meta)| {
+            (key.as_path() == dir || meta.canonical_root == dir).then(|| key.clone())
+        })
+    }
+
+    /// Apply a `.lattice.toml` marker create/change/delete event (decision 019
+    /// clause 6). Returns whether the event matched a workspace and something was
+    /// applied, so the caller knows a re-publish is due.
+    ///
+    /// Four cases, on `(marker present, scope already registered here)`:
+    /// - present + registered → the scope's config changed → hot-reload it
+    ///   (ticket server 08).
+    /// - present + not registered, inside a visible scope → a **split**: the new
+    ///   marker carves its subtree into its own graph.
+    /// - absent + registered, still a visible scope (an open folder, or a `.git`
+    ///   non-root environment) → hot-reload to defaults (`.lattice.toml` gone).
+    /// - absent + registered, a nested `.lattice.toml`-only scope → a **merge**:
+    ///   the subtree fuses back into its host.
+    fn handle_marker_event(&mut self, marker_uri: &str) -> bool {
+        let marker_path = uri_to_path(marker_uri);
+        let Some(marker_dir) = marker_path.parent().map(Path::to_path_buf) else {
+            return false;
+        };
+        let toml_present = marker_path.is_file();
+        let registered = self.registered_root_at(&marker_dir);
+
+        match (toml_present, registered) {
+            (true, Some(root)) => {
+                self.reload_root_config(&root);
+                true
+            }
+            (true, None) => {
+                if self.deepest_root_for(&marker_dir).is_some() {
+                    self.split_scope(&marker_dir);
+                    true
+                } else {
+                    false
+                }
+            }
+            (false, Some(root)) => {
+                if self.client_folders.contains(&root) {
+                    // The client's own folder stays visible as a fallback / `.git`
+                    // scope root; reload to defaults now that `.lattice.toml` is
+                    // gone.
+                    self.reload_root_config(&root);
+                } else {
+                    // A nested scope lost its `.lattice.toml`. Deregister it: if a
+                    // `.git` remains, `rebuild_git_boundaries` (inside
+                    // `merge_scope`) reclassifies it as a non-root environment and
+                    // its documents go rootless (051); otherwise they merge back
+                    // into the host scope.
+                    self.merge_scope(&root);
+                }
+                true
+            }
+            (false, None) => false,
+        }
+    }
+
+    /// Split a newly-created nested marker at `marker_dir` out of its host scope:
+    /// register it (and any scopes beneath it), re-root the captured range, and
+    /// refresh the boundary neighborhood (decision 019 clause 6).
+    ///
+    /// Open buffers are preserved (decision 017 §3); only the re-rooted documents
+    /// reparse, and then only across a config boundary that changes the predicate
+    /// vocabulary — every other document is untouched. The host's now-crossing
+    /// plain links resurface as steering errors, and its mentions into the split
+    /// subtree as stale references, both computed by the next publish's collect
+    /// (no reparse of the host's documents).
+    fn split_scope(&mut self, marker_dir: &Path) {
+        let host = self.deepest_root_for(marker_dir);
+        self.register_scope(marker_dir);
+        self.rebuild_git_boundaries();
+        let scan_from = host.unwrap_or_else(|| marker_dir.to_path_buf());
+        for key in self.document_keys_under(&scan_from) {
             self.refresh_placement(&key);
         }
         self.recompute_all_structural();
     }
 
-    /// Remove a workspace folder: drop its [`RootMeta`], evict scan-only
-    /// documents (not open in the editor), and let open documents recompute
-    /// their primary root (possibly to `None`) and keep serving — no dark
-    /// window.
-    fn remove_folder(&mut self, uri: &str) {
-        let folder = uri_to_path(uri);
-        if self.roots.remove(&folder).is_none() {
+    /// Merge a nested scope whose only marker was deleted back into its host
+    /// (decision 019 clause 6): deregister it and re-root its documents onto the
+    /// covering scope, re-exposing whatever reconciliation debt accrued while the
+    /// scopes were separate. A document whose own deeper marker persists keeps
+    /// that deeper scope (its `deepest_root_for` is unchanged).
+    fn merge_scope(&mut self, scope_root: &Path) {
+        if self.roots.remove(scope_root).is_none() {
             return;
         }
-        for key in self.document_keys_under(&folder) {
+        self.rebuild_git_boundaries();
+        for key in self.document_keys_under(scope_root) {
             let new_primary = self.deepest_root_for(&key);
             let is_open = self.open_documents.contains(&path_to_uri(&key));
             if new_primary.is_none() && !is_open {
-                // A scan-only document of the removed folder, covered by no
-                // remaining root: evict it.
                 self.documents.remove(&key);
             } else {
-                // Still covered by an ancestor root, or an open buffer that
-                // keeps serving rootless — recompute placement (possibly `None`).
                 self.refresh_placement(&key);
             }
         }
@@ -514,31 +819,6 @@ impl Workspaces {
     }
 
     // --- Config reload (ticket server 08) ---
-
-    /// The client-key of the root that owns a `.lattice.toml` marker URI, if
-    /// any. Tries the ordinary folder-key prefix match first (the basis
-    /// documents resolve on); on a miss, retries against each root's canonical
-    /// scan path — the watcher may report the marker under a different spelling
-    /// (a symlink — issue 047), and a dropped config event is the difference
-    /// between config live and silently dead (issue 050). Only the marker's
-    /// directory is canonicalized, so a `deleted` event still resolves.
-    fn root_for_marker(&self, uri: &str) -> Option<PathBuf> {
-        let path = uri_to_path(uri);
-        if let Some(root) = self
-            .roots
-            .keys()
-            .rev()
-            .find(|root| path.strip_prefix(root).is_ok())
-        {
-            return Some(root.clone());
-        }
-        let dir = std::fs::canonicalize(path.parent()?).ok()?;
-        self.roots.iter().rev().find_map(|(root, meta)| {
-            dir.strip_prefix(&meta.canonical_root)
-                .ok()
-                .map(|_| root.clone())
-        })
-    }
 
     /// Reload one root's `.lattice.toml` and re-parse every document it owns
     /// from its in-memory buffer under the fresh config, then recompute the
@@ -1919,15 +2199,26 @@ fn find_references(workspaces: &Workspaces, params: &lsp::ReferenceParams) -> Ve
     // Scan every rooted document's links for edges to the cursor's document,
     // matching in absolute space: a source's link target resolved against the
     // source's own root equals the cursor document's absolute path exactly when
-    // it physically points there — the same file regardless of which root either
-    // side sits under (ticket server 11; this also fixes the ancestor/descendant
-    // divergence, since a descendant's relative link now resolves identically in
-    // either view).
+    // it physically points there (ticket server 11).
+    //
+    // The match is restricted to the cursor's **own scope** (decision 019):
+    // `find_references` is a graph-edge query — "who links here" — and scopes are
+    // disjoint graphs, so a physical `../` reference from a foreign scope is a
+    // clause-3 defect, not an edge, and must not surface as a reference. (Plain
+    // navigation — go-to-definition, outgoing calls — still follows a link
+    // physically; only the reverse graph queries honor the partition.)
     let cursor_abs = uri_to_path(&params.text_document.uri);
+    let cursor_root = workspaces
+        .documents
+        .get(&cursor_abs)
+        .and_then(|doc| doc.primary_root.clone());
     for (abs, doc) in &workspaces.documents {
         let Some(root) = doc.primary_root.as_deref() else {
             continue;
         };
+        if Some(root) != cursor_root.as_deref() {
+            continue;
+        }
         let links = doc.data.tree.links(abs);
         for link in &links {
             let LinkKind::IntraProject {
@@ -2508,12 +2799,22 @@ fn call_hierarchy_incoming(
 
     // Match in absolute space: a source's link target resolved against the
     // source's own root equals the cursor document's absolute path exactly when
-    // it points there (ticket server 11).
+    // it points there (ticket server 11). Restricted to the cursor's own scope
+    // (decision 019): incoming calls are a graph-edge query, and scopes are
+    // disjoint graphs, so a cross-boundary physical reference is a defect, not a
+    // caller.
     let cursor_abs = uri_to_path(&item.uri);
+    let cursor_root = workspaces
+        .documents
+        .get(&cursor_abs)
+        .and_then(|doc| doc.primary_root.clone());
     for (abs, doc) in &workspaces.documents {
         let Some(root) = doc.primary_root.as_deref() else {
             continue;
         };
+        if Some(root) != cursor_root.as_deref() {
+            continue;
+        }
         let src_path = abs.strip_prefix(root).unwrap_or(abs);
         let links = doc.data.tree.links(abs);
         let headings = doc.data.tree.headings();
@@ -4031,10 +4332,11 @@ fn handle_watched_files_change(
     params: &lsp::DidChangeWatchedFilesParams,
 ) -> Result<()> {
     let mut reloaded = false;
-    // Workspace roots already reloaded in this batch: a create+modify pair
-    // coalesced into one notification reloads once, not twice — each reload
-    // is a full reparse of the workspace.
-    let mut reloaded_roots: HashSet<PathBuf> = HashSet::new();
+    // Marker directories already handled in this batch: a create+modify pair
+    // coalesced into one notification is applied once, not twice — each apply
+    // is a full reparse of the affected scope (and, for split/merge, a
+    // re-rooting).
+    let mut handled_markers: HashSet<PathBuf> = HashSet::new();
     for change in &params.changes {
         // The marker watch is config: any event type reloads it. Guard on the
         // suffix so an unrelated future glob can never trigger a config
@@ -4042,16 +4344,20 @@ fn handle_watched_files_change(
         if !change.uri.ends_with(".lattice.toml") {
             continue;
         }
-        if let Some(root) = workspaces.root_for_marker(&change.uri) {
-            if reloaded_roots.insert(root.clone()) {
-                workspaces.reload_root_config(&root);
-                reloaded = true;
-            }
+        let Some(marker_dir) = uri_to_path(&change.uri).parent().map(Path::to_path_buf) else {
+            continue;
+        };
+        if !handled_markers.insert(marker_dir) {
+            continue;
+        }
+        // A marker create/change/delete either reloads a scope's config, splits
+        // a new nested scope out of its host, or merges a vanished one back in
+        // (decision 019 clause 6). A miss leaves the workspace silently on stale
+        // (or default) config until the next marker event — the config-dead
+        // failure shape of issue 050 — so it is worth a trace.
+        if workspaces.handle_marker_event(&change.uri) {
+            reloaded = true;
         } else {
-            // A dropped config event leaves the workspace silently on stale
-            // (or default) config until the next marker event — the
-            // config-dead failure shape of issue 050 — so a miss is worth a
-            // trace even though there is nothing to reload.
             tracing::warn!(
                 uri = %change.uri,
                 "config marker event matches no workspace; reload skipped"
@@ -8917,11 +9223,18 @@ mod tests {
     }
 
     #[test]
-    fn nested_roots_ancestor_graph_sees_descendant_and_deepest_owns_resolution() {
-        // With a nested root, the ancestor's graph must still see descendant-root
-        // files (the range scan includes them), so a forward link from an
-        // ancestor-only file into the nested subtree resolves rather than
-        // dangling — while the deepest root owns resolution of the shared file.
+    fn nested_folder_without_marker_is_entry_point_into_covering_scope() {
+        // Decision 019 clause 7 (ticket server 12): a client folder WITHOUT its
+        // own marker declares visibility, not structure — it is an entry point
+        // into whatever scope covers it, not a root. This retires ticket 10's
+        // config-less deepest-wins quirk: with only the outer `.lattice.toml`, a
+        // nested `sub` folder is part of the outer scope, so `sub/inner.md`
+        // belongs to the outer root, its link resolves in the outer graph, and it
+        // resolves against the outer root — NOT a config-less `sub` root.
+        //
+        // (Previously this test pinned the opposite: `sub` became its own
+        // deepest-wins root and owned resolution. 019 makes markers, not folders,
+        // declare where a graph begins.)
         let dir = workspace_with_files(&[
             (".lattice.toml", ""),
             ("top.md", "[to inner](sub/inner.md \"references\")\n"),
@@ -8929,13 +9242,29 @@ mod tests {
         ]);
         let root = fs::canonicalize(dir.path()).expect("canonicalize temp dir");
         let sub = root.join("sub");
+        let inner_abs = sub.join("inner.md");
 
         let mut workspaces = Workspaces::new();
         workspaces.add_folder(&path_to_uri(&root));
         workspaces.add_folder(&path_to_uri(&sub));
 
-        // The ancestor root (with config) runs its graph over a range scan that
-        // includes `sub/inner.md`, so `top.md`'s link resolves.
+        // `sub` carries no marker, so it is not a registered scope root.
+        assert!(
+            !workspaces.roots.contains_key(&sub),
+            "a folder without its own marker is not a scope root"
+        );
+        // `sub/inner.md` belongs to the covering (outer) scope.
+        assert_eq!(
+            workspaces
+                .documents
+                .get(&inner_abs)
+                .and_then(|d| d.primary_root.as_deref()),
+            Some(root.as_path()),
+            "the nested-folder document belongs to the covering scope, not a config-less sub root"
+        );
+
+        // The outer graph owns `sub/inner.md`, so `top.md`'s link into it
+        // resolves rather than dangling.
         let ancestor = workspaces.root_view(&root);
         let diags = collect_all_diagnostics(&ancestor);
         assert!(
@@ -8943,29 +9272,78 @@ mod tests {
                 .iter()
                 .any(|d| d.file.as_path() == Path::new("top.md")
                     && d.message.contains("does not exist")),
-            "the ancestor graph sees the descendant-root file, so the link resolves: {diags:?}"
+            "the covering scope sees the nested-folder file, so the link resolves: {diags:?}"
         );
 
-        // The shared descendant file resolves against its deepest root.
-        let inner_uri = path_to_uri(&sub.join("inner.md"));
+        // The shared descendant file resolves against the covering root.
+        let inner_uri = path_to_uri(&inner_abs);
         let (inner_view, _) = workspaces
             .resolve(&inner_uri)
             .expect("the descendant file resolves");
         assert_eq!(
             inner_view.root(),
-            sub.as_path(),
-            "the deepest root owns resolution of the shared descendant file"
+            root.as_path(),
+            "the covering scope owns resolution — the deepest-wins quirk is retired"
         );
     }
 
     #[test]
     fn placement_change_flips_primary_root_without_reparsing() {
-        // Acceptance 1 (ticket server 11): a `primary_root` change must be a
-        // metadata flip, never a reparse. With the ancestor and a nested
-        // descendant folder both open, removing the descendant re-roots its
-        // documents onto the ancestor — and, because link classification is
-        // root-free, the parser (`Tree::links`) must not run at all. The old
-        // placement path reparsed from the buffer, which would tick this counter.
+        // Acceptance 1 (ticket server 11), preserved under decision 019: a
+        // `primary_root` change that does not cross a config boundary is a
+        // metadata flip, never a reparse. Removing the sole folder covering an
+        // open document re-roots it to rootless; because link classification is
+        // root-free and the effective config (defaults on both sides) is
+        // unchanged, the parser (`Tree::links`) must not run.
+        //
+        // (Ticket 11 pinned this by re-rooting a nested MARKER scope's document
+        // onto the ancestor on folder removal. Decision 019 makes that marker a
+        // permanent scope that survives its own folder's removal — see
+        // `removing_a_marker_scopes_folder_keeps_the_scope` — so the
+        // config-preserving flip is now the rootless transition.)
+        let dir = workspace_with_files(&[("doc.md", "[peer](peer.md \"references\")\n")]);
+        let root = fs::canonicalize(dir.path()).expect("canonicalize temp dir");
+        let doc_abs = root.join("doc.md");
+        let doc_uri = path_to_uri(&doc_abs);
+
+        let mut workspaces = Workspaces::new();
+        workspaces.add_folder(&path_to_uri(&root));
+        // Open the buffer so it survives the removal (decision 017 §3).
+        workspaces.open_documents.insert(doc_uri.clone());
+        workspaces.sync_document_content(&doc_uri, "[peer](peer.md \"references\")\n");
+        assert_eq!(
+            workspaces
+                .documents
+                .get(&doc_abs)
+                .and_then(|d| d.primary_root.as_deref()),
+            Some(root.as_path()),
+            "the open document belongs to the folder before removal"
+        );
+
+        // Re-root to rootless by removing the folder, counting parser runs.
+        crate::block::reset_extract_counts();
+        workspaces.remove_folder(&path_to_uri(&root));
+        assert_eq!(
+            crate::block::links_extract_count(),
+            0,
+            "a config-preserving re-root must not re-run the parser (links classify root-free)"
+        );
+        assert!(
+            workspaces
+                .documents
+                .get(&doc_abs)
+                .is_some_and(|d| d.primary_root.is_none()),
+            "the open document re-rooted to rootless without a reparse"
+        );
+    }
+
+    #[test]
+    fn removing_a_marker_scopes_folder_keeps_the_scope() {
+        // Decision 019 clause 7 (ticket server 12): markers declare structure,
+        // folders declare visibility. A nested marker scope discovered by
+        // walk-down survives the removal of its own client folder, because the
+        // covering folder keeps it visible — so its documents are not re-rooted,
+        // and nothing reparses.
         let dir = workspace_with_files(&[
             (".lattice.toml", ""),
             ("sub/.lattice.toml", ""),
@@ -8979,51 +9357,63 @@ mod tests {
         let mut workspaces = Workspaces::new();
         workspaces.add_folder(&path_to_uri(&root));
         workspaces.add_folder(&path_to_uri(&sub));
-
         assert_eq!(
             workspaces
                 .documents
                 .get(&inner_abs)
                 .and_then(|d| d.primary_root.as_deref()),
             Some(sub.as_path()),
-            "the descendant root owns the nested document before removal"
+            "the nested marker scope owns its document"
         );
 
-        // Re-root by removing the descendant folder, counting parser runs.
         crate::block::reset_extract_counts();
         workspaces.remove_folder(&path_to_uri(&sub));
         assert_eq!(
             crate::block::links_extract_count(),
             0,
-            "re-rooting must not re-run the parser (links classify root-free)"
+            "removing a still-covered marker scope's folder disturbs nothing — no reparse"
         );
-
+        assert!(
+            workspaces.roots.contains_key(&sub),
+            "the nested marker scope stays registered — the outer folder keeps it visible"
+        );
         assert_eq!(
             workspaces
                 .documents
                 .get(&inner_abs)
                 .and_then(|d| d.primary_root.as_deref()),
-            Some(root.as_path()),
-            "the document re-rooted onto the ancestor without a reparse"
-        );
-
-        // The root-free cached link still resolves in the new (ancestor) view.
-        let ancestor = workspaces.root_view(&root);
-        let diags = collect_all_diagnostics(&ancestor);
-        assert!(
-            !diags.iter().any(|d| d.message.contains("does not exist")),
-            "the re-rooted document's link still resolves after the flip: {diags:?}"
+            Some(sub.as_path()),
+            "the nested document keeps its scope — no re-root"
         );
     }
 
+    /// The cached first-link target of `inner_abs` (a document-relative link,
+    /// resolved to an absolute path — decision 019 clause 8).
+    fn first_link_target(workspaces: &Workspaces, inner_abs: &Path) -> PathBuf {
+        match &workspaces
+            .documents
+            .get(inner_abs)
+            .expect("inner indexed")
+            .data
+            .links[0]
+            .kind
+        {
+            LinkKind::IntraProject { target, .. } => target.clone(),
+            other => panic!("expected an intra-project link, got {other:?}"),
+        }
+    }
+
     #[test]
-    fn ancestor_and_descendant_views_agree_on_link_targets() {
-        // Acceptance 2 (ticket server 11): a descendant-root document carrying a
-        // document-relative link must read identically from the ancestor's view
-        // and the descendant's own view — the link resolves to the same absolute
-        // document in both. Under the old baked-rel-path model the ancestor view
-        // misread the target (classified under the deepest root), the divergence
-        // ticket 10 flagged in its final report.
+    fn nested_scope_is_a_disjoint_graph_regardless_of_entry_point() {
+        // Decision 019 / acceptance 1 (ticket server 12): a nested `.lattice.toml`
+        // partitions the tree into two disjoint graphs, and the partition is the
+        // same whichever entry point observes it. Entering from the outer root
+        // (walk-down) or opening the nested scope directly both give the nested
+        // scope ownership of its documents; the outer scope never sees them.
+        //
+        // (Under ticket 11 the ancestor's range-scan view still saw the
+        // descendant, so the two views "agreed" on the link target. 019 makes the
+        // scopes disjoint — the ancestor no longer sees the descendant at all.)
         let dir = workspace_with_files(&[
             (".lattice.toml", ""),
             ("sub/.lattice.toml", ""),
@@ -9035,53 +9425,325 @@ mod tests {
         let inner_abs = sub.join("inner.md");
         let peer_abs = sub.join("peer.md");
 
+        // Entry point A: open only the outer root. Walk-down registers the
+        // nested scope; `sub/inner.md` belongs to it, not to the outer scope.
+        let mut a = Workspaces::new();
+        a.add_folder(&path_to_uri(&root));
+        assert!(
+            a.roots.contains_key(&sub),
+            "walk-down from the outer root registers the nested scope"
+        );
+        assert_eq!(
+            a.documents
+                .get(&inner_abs)
+                .and_then(|d| d.primary_root.as_deref()),
+            Some(sub.as_path()),
+            "the nested scope owns its document, entered from the outer root"
+        );
+        // The nested scope resolves the intra-scope link to sub/peer.md.
+        let target = first_link_target(&a, &inner_abs);
+        let sub_view = a.root_view(&sub);
+        let key = sub_view
+            .resolve_key(&target)
+            .expect("nested scope resolves its intra-scope link");
+        assert_eq!(
+            sub_view.root().join(key),
+            peer_abs,
+            "the nested scope resolves inner.md's link to sub/peer.md"
+        );
+        // The outer scope is disjoint: its graph contains neither nested file.
+        let root_view = a.root_view(&root);
+        assert!(
+            root_view.file(Path::new("sub/inner.md")).is_none()
+                && root_view.file(Path::new("sub/peer.md")).is_none(),
+            "the outer scope's graph does not see the nested scope's documents"
+        );
+
+        // Entry point B: open the nested scope directly. The same partition — the
+        // nested scope owns its documents and resolves the same link.
+        let mut b = Workspaces::new();
+        b.add_folder(&path_to_uri(&sub));
+        assert_eq!(
+            b.documents
+                .get(&inner_abs)
+                .and_then(|d| d.primary_root.as_deref()),
+            Some(sub.as_path()),
+            "the nested scope owns its document, entered directly"
+        );
+        let target_b = first_link_target(&b, &inner_abs);
+        let sub_view_b = b.root_view(&sub);
+        let key_b = sub_view_b
+            .resolve_key(&target_b)
+            .expect("direct entry resolves the same intra-scope link");
+        assert_eq!(
+            sub_view_b.root().join(key_b),
+            peer_abs,
+            "the same link resolves to sub/peer.md regardless of entry point"
+        );
+    }
+
+    #[test]
+    fn marker_split_reroots_subtree_without_reparsing_host() {
+        // Decision 019 clause 6 (ticket server 12): creating a nested marker
+        // mid-session splits its subtree into its own graph. The host's
+        // now-crossing plain link resurfaces as the steering error, the split
+        // subtree re-roots — and only the split subtree is (re)scanned; the host's
+        // documents are never reparsed.
+        let dir = workspace_with_files(&[
+            (".lattice.toml", ""),
+            ("outer.md", "[down](sub/inner.md \"references\")\n"),
+            ("sub/inner.md", "# Inner\n"),
+        ]);
+        let root = fs::canonicalize(dir.path()).expect("canonicalize temp dir");
+        let sub = root.join("sub");
+        let outer_abs = root.join("outer.md");
+        let inner_abs = sub.join("inner.md");
+
         let mut workspaces = Workspaces::new();
         workspaces.add_folder(&path_to_uri(&root));
-        workspaces.add_folder(&path_to_uri(&sub));
 
-        // The cached link target is root-free: a document-relative link resolves
-        // to an absolute path, independent of which root observes it.
-        let target = match &workspaces
-            .documents
-            .get(&inner_abs)
-            .expect("inner indexed")
-            .data
-            .links[0]
-            .kind
-        {
-            LinkKind::IntraProject { target, .. } => target.clone(),
-            other => panic!("expected an intra-project link, got {other:?}"),
-        };
-
-        let ancestor = workspaces.root_view(&root);
-        let descendant = workspaces.root_view(&sub);
-
-        // Both views map the same link onto the same absolute document.
-        let key_a = ancestor
-            .resolve_key(&target)
-            .expect("ancestor view resolves the target");
-        let key_d = descendant
-            .resolve_key(&target)
-            .expect("descendant view resolves the target");
-        assert_eq!(
-            ancestor.root().join(key_a),
-            peer_abs,
-            "ancestor view resolves the descendant link to sub/peer.md"
+        // Before the split: one scope; the link is in-scope and resolves.
+        let before = collect_all_diagnostics(&workspaces.root_view(&root));
+        assert!(
+            !before
+                .iter()
+                .any(|d| d.message.contains("outside this scope")),
+            "before the split the link is in-scope: {before:?}"
         );
         assert_eq!(
-            descendant.root().join(key_d),
-            peer_abs,
-            "descendant view resolves the descendant link to sub/peer.md"
+            workspaces
+                .documents
+                .get(&inner_abs)
+                .and_then(|d| d.primary_root.as_deref()),
+            Some(root.as_path()),
+            "before the split sub/inner.md belongs to the single scope"
         );
 
-        // ...and neither view reports the link as dangling.
-        for (label, view) in [("ancestor", &ancestor), ("descendant", &descendant)] {
-            let diags = collect_all_diagnostics(view);
-            assert!(
-                !diags.iter().any(|d| d.message.contains("does not exist")),
-                "{label} view must not misread the descendant link as dangling: {diags:?}"
-            );
-        }
+        // Create the nested marker and deliver its watcher event.
+        fs::write(sub.join(".lattice.toml"), "").expect("create nested marker");
+        let marker_uri = path_to_uri(&sub.join(".lattice.toml"));
+        crate::block::reset_extract_counts();
+        assert!(
+            workspaces.handle_marker_event(&marker_uri),
+            "the split is applied"
+        );
+        // Only the split subtree (sub/inner.md) is scanned; the host is untouched.
+        assert_eq!(
+            crate::block::links_extract_count(),
+            1,
+            "only the split subtree is scanned — the host document is not reparsed"
+        );
+
+        assert!(
+            workspaces.roots.contains_key(&sub),
+            "the nested scope is registered"
+        );
+        assert_eq!(
+            workspaces
+                .documents
+                .get(&inner_abs)
+                .and_then(|d| d.primary_root.as_deref()),
+            Some(sub.as_path()),
+            "sub/inner.md re-rooted into the new scope"
+        );
+        assert_eq!(
+            workspaces
+                .documents
+                .get(&outer_abs)
+                .and_then(|d| d.primary_root.as_deref()),
+            Some(root.as_path()),
+            "outer.md stays in the host scope"
+        );
+        // The host's link now crosses the boundary → steering error.
+        let after = collect_all_diagnostics(&workspaces.root_view(&root));
+        assert!(
+            after
+                .iter()
+                .any(|d| d.file.as_path() == Path::new("outer.md")
+                    && d.message.contains("outside this scope")),
+            "the now-crossing link steers to the alias: {after:?}"
+        );
+    }
+
+    #[test]
+    fn marker_merge_fuses_scopes_and_resurfaces_debt() {
+        // Decision 019 clause 6: deleting a nested marker merges its subtree back
+        // into the host — the scopes fuse (a config-preserving metadata flip, no
+        // reparse), the boundary-crossing steering error clears, and the
+        // reconciliation debt suppressed while the scopes were separate (the
+        // missing backlink for the now-in-scope edge) re-surfaces.
+        let dir = workspace_with_files(&[
+            (".lattice.toml", ""),
+            ("sub/.lattice.toml", ""),
+            ("outer.md", "[down](sub/inner.md \"references\")\n"),
+            ("sub/inner.md", "# Inner\n"),
+        ]);
+        let root = fs::canonicalize(dir.path()).expect("canonicalize temp dir");
+        let sub = root.join("sub");
+        let inner_abs = sub.join("inner.md");
+
+        let mut workspaces = Workspaces::new();
+        workspaces.add_folder(&path_to_uri(&root));
+        let before = collect_all_diagnostics(&workspaces.root_view(&root));
+        assert!(
+            before
+                .iter()
+                .any(|d| d.message.contains("outside this scope")),
+            "the cross-boundary link steers before the merge: {before:?}"
+        );
+
+        // Delete the nested marker and deliver its watcher event.
+        fs::remove_file(sub.join(".lattice.toml")).expect("delete nested marker");
+        let marker_uri = path_to_uri(&sub.join(".lattice.toml"));
+        crate::block::reset_extract_counts();
+        assert!(
+            workspaces.handle_marker_event(&marker_uri),
+            "the merge is applied"
+        );
+        assert_eq!(
+            crate::block::links_extract_count(),
+            0,
+            "the merge re-roots without a reparse (config unchanged)"
+        );
+
+        assert!(
+            !workspaces.roots.contains_key(&sub),
+            "the nested scope deregisters"
+        );
+        assert_eq!(
+            workspaces
+                .documents
+                .get(&inner_abs)
+                .and_then(|d| d.primary_root.as_deref()),
+            Some(root.as_path()),
+            "sub/inner.md re-roots into the host scope"
+        );
+
+        let after = collect_all_diagnostics(&workspaces.root_view(&root));
+        assert!(
+            !after
+                .iter()
+                .any(|d| d.message.contains("outside this scope")),
+            "the steering error clears on fusion: {after:?}"
+        );
+        assert!(
+            after
+                .iter()
+                .any(|d| d.message.contains("expected backlink")),
+            "the suppressed reconciliation debt (a missing backlink) re-surfaces: {after:?}"
+        );
+    }
+
+    #[test]
+    fn nested_git_excluded_from_host_and_served_rootless_under_defaults() {
+        // Decision 019 resolution 2 (ticket server 12): a nested `.git` (no
+        // marker) is a non-root environment — excluded from the host graph and
+        // never eagerly indexed. Opened directly, its document is rootless and
+        // serves document-scoped features under defaults (051 semantics).
+        let dir = workspace_with_files(&[
+            (".lattice.toml", ""),
+            (
+                "outer.md",
+                "[into vendor](vendor/inner.md \"references\")\n",
+            ),
+        ]);
+        let root = fs::canonicalize(dir.path()).expect("canonicalize temp dir");
+        fs::create_dir_all(root.join("vendor")).expect("create vendor dir");
+        fs::create_dir(root.join("vendor/.git")).expect("create nested .git");
+        fs::write(root.join("vendor/inner.md"), "# Vendored\n\n## Section\n")
+            .expect("write vendored file");
+        let inner_abs = root.join("vendor/inner.md");
+        let inner_uri = path_to_uri(&inner_abs);
+
+        let mut workspaces = Workspaces::new();
+        workspaces.add_folder(&path_to_uri(&root));
+
+        // The nested `.git` is never eagerly indexed: its file is not in the store.
+        assert!(
+            !workspaces.documents.contains_key(&inner_abs),
+            "a nested `.git` repo is not eagerly scanned"
+        );
+        // The host's link into it crosses the boundary → steering error.
+        let host = collect_all_diagnostics(&workspaces.root_view(&root));
+        assert!(
+            host.iter()
+                .any(|d| d.file.as_path() == Path::new("outer.md")
+                    && d.message.contains("outside this scope")),
+            "the link into the nested `.git` steers to an alias: {host:?}"
+        );
+
+        // Opened directly, the document is rootless (excluded from the host graph)
+        // and serves document-scoped features (symbols) under defaults.
+        workspaces.open_documents.insert(inner_uri.clone());
+        workspaces.sync_document_content(&inner_uri, "# Vendored\n\n## Section\n");
+        assert!(
+            workspaces
+                .documents
+                .get(&inner_abs)
+                .is_some_and(|d| d.primary_root.is_none()),
+            "a document behind a nested `.git` is rootless, not a host member"
+        );
+        assert!(
+            document_symbols(&workspaces, &inner_uri).is_some_and(|s| !s.is_empty()),
+            "the nested `.git` document serves document-scoped features under defaults"
+        );
+        // It is still excluded from the host graph after opening.
+        assert!(
+            workspaces
+                .root_view(&root)
+                .file(Path::new("vendor/inner.md"))
+                .is_none(),
+            "the nested `.git` document never joins the host graph"
+        );
+    }
+
+    #[test]
+    fn cross_boundary_physical_reference_is_not_a_reference() {
+        // Navigation decision (ticket server 12): `find_references` is a
+        // graph-edge query, and scopes are disjoint graphs (decision 019). A
+        // physical `../` reference from a foreign scope is a clause-3 defect, not
+        // an edge — so it must NOT surface as a reference to the target.
+        let dir = workspace_with_files(&[
+            (".lattice.toml", ""),
+            ("sub/.lattice.toml", ""),
+            // The nested scope physically points up-and-over at the host's target.
+            ("sub/inner.md", "[cross](../target.md \"references\")\n"),
+            ("target.md", "# Target\n\nbody\n"),
+            // A same-scope reference to the target, which MUST surface.
+            ("peer.md", "[peer](target.md \"references\")\n"),
+        ]);
+        let root = fs::canonicalize(dir.path()).expect("canonicalize temp dir");
+        let sub = root.join("sub");
+        let target_uri = path_to_uri(&root.join("target.md"));
+
+        let mut workspaces = Workspaces::new();
+        workspaces.add_folder(&path_to_uri(&root));
+        assert!(
+            workspaces.roots.contains_key(&sub),
+            "the nested scope is registered"
+        );
+
+        let refs = find_references(
+            &workspaces,
+            &lsp::ReferenceParams {
+                text_document: lsp::TextDocumentIdentifier { uri: target_uri },
+                // A non-heading line, so all links to the file match (not just
+                // fragment-links to a heading).
+                position: lsp::Position {
+                    line: 2,
+                    character: 0,
+                },
+            },
+        );
+        let ref_uris: Vec<&str> = refs.iter().map(|loc| loc.uri.as_str()).collect();
+        assert!(
+            ref_uris.iter().any(|u| u.ends_with("/peer.md")),
+            "a same-scope reference to the target surfaces: {ref_uris:?}"
+        );
+        assert!(
+            !ref_uris.iter().any(|u| u.ends_with("/inner.md")),
+            "a cross-boundary physical reference from the nested scope is not a reference: {ref_uris:?}"
+        );
     }
 
     #[test]
@@ -9368,6 +10030,113 @@ mod tests {
         assert!(
             after.is_empty(),
             "the reloaded [graph] artifacts entry clears doc.md, got {after:?}"
+        );
+
+        shutdown(&client, server_thread);
+    }
+
+    #[test]
+    fn wire_marker_create_splits_scope_preserving_buffers() {
+        // Wire-level split (decision 019 clause 6, ticket server 12 acceptance):
+        // creating a nested marker mid-session re-roots its subtree into a new
+        // graph. The host's now-crossing plain link surfaces the steering error,
+        // and a re-rooted OPEN document keeps its unsaved buffer (decision 017 §3)
+        // — served, not clobbered by disk.
+        let dir = workspace_with_files(&[
+            (".lattice.toml", ""),
+            ("outer.md", "[down](sub/inner.md \"references\")\n"),
+            ("sub/inner.md", "# Inner\n"),
+        ]);
+        let root = fs::canonicalize(dir.path()).expect("canonicalize temp dir");
+        let root_uri = path_to_uri(&root);
+        let outer_uri = path_to_uri(&root.join("outer.md"));
+        let inner_uri = path_to_uri(&root.join("sub/inner.md"));
+
+        let (server, client) = Connection::memory();
+        let server_thread = std::thread::spawn(move || serve(&server));
+        handshake(&client, &root_uri, true);
+        let _reg = recv_message(&client); // client/registerCapability
+
+        // Open sub/inner.md with an unsaved buffer that differs from disk: a link
+        // that resolves in the single scope but escapes once the scope splits.
+        open_doc(
+            &client,
+            &inner_uri,
+            "# Inner\n\n[up](../outer.md \"references\")\n",
+        );
+        let inner_before = recv_publish_for(&client, &inner_uri);
+        assert!(
+            !any_message_contains(&inner_before, "outside this scope"),
+            "before the split the buffer's `../outer.md` link is in-scope: {inner_before:?}"
+        );
+
+        // Create the nested marker on disk and deliver the watcher event.
+        fs::write(root.join("sub/.lattice.toml"), "").expect("create nested marker");
+        let marker_uri = path_to_uri(&root.join("sub/.lattice.toml"));
+        send_watched_change(&client, &marker_uri, lsp::file_change_type::CREATED);
+
+        // The host's link now crosses the boundary → steering error.
+        let outer_after = recv_publish_for(&client, &outer_uri);
+        assert!(
+            any_message_contains(&outer_after, "outside this scope"),
+            "the split surfaces the steering error on the host's link: {outer_after:?}"
+        );
+        // The re-rooted OPEN document served its preserved buffer: the buffer-only
+        // `../outer.md` link now escapes the nested scope and steers.
+        let inner_after = recv_publish_for(&client, &inner_uri);
+        assert!(
+            any_message_contains(&inner_after, "outside this scope"),
+            "the re-rooted document kept its buffer (its escaping link now steers): {inner_after:?}"
+        );
+
+        shutdown(&client, server_thread);
+    }
+
+    #[test]
+    fn wire_marker_delete_merges_scopes_and_resurfaces_debt() {
+        // Wire-level merge (decision 019 clause 6, ticket server 12 acceptance):
+        // deleting a nested marker fuses the scopes. The boundary-crossing
+        // steering error clears, and the reconciliation debt suppressed while the
+        // scopes were separate — the missing backlink for the now-live edge —
+        // re-surfaces.
+        let dir = workspace_with_files(&[
+            (".lattice.toml", ""),
+            ("sub/.lattice.toml", ""),
+            ("outer.md", "[down](sub/inner.md \"references\")\n"),
+            ("sub/inner.md", "# Inner\n"),
+        ]);
+        let root = fs::canonicalize(dir.path()).expect("canonicalize temp dir");
+        let root_uri = path_to_uri(&root);
+        let outer_uri = path_to_uri(&root.join("outer.md"));
+
+        let (server, client) = Connection::memory();
+        let server_thread = std::thread::spawn(move || serve(&server));
+        handshake(&client, &root_uri, true);
+        let _reg = recv_message(&client); // client/registerCapability
+
+        // The link into the nested scope steers (two disjoint graphs).
+        open_doc(&client, &outer_uri, "[down](sub/inner.md \"references\")\n");
+        let before = recv_publish_for(&client, &outer_uri);
+        assert!(
+            any_message_contains(&before, "outside this scope"),
+            "the cross-boundary link steers before the merge: {before:?}"
+        );
+
+        // Delete the nested marker and deliver the watcher event.
+        fs::remove_file(root.join("sub/.lattice.toml")).expect("delete nested marker");
+        let marker_uri = path_to_uri(&root.join("sub/.lattice.toml"));
+        send_watched_change(&client, &marker_uri, lsp::file_change_type::DELETED);
+
+        // The scopes fuse: the steering error clears (the link is now in-scope),
+        // and the missing-backlink debt for the now-live edge re-surfaces.
+        let after = recv_publish_for(&client, &outer_uri);
+        assert!(
+            !any_message_contains(&after, "outside this scope"),
+            "the merge clears the steering error: {after:?}"
+        );
+        assert!(
+            any_message_contains(&after, "expected backlink"),
+            "the fused scope re-surfaces the missing-backlink debt: {after:?}"
         );
 
         shutdown(&client, server_thread);

@@ -83,14 +83,20 @@ pub fn validate_forward_links(workspace: &impl WorkspaceLike) -> Vec<Diagnostic>
                 }
 
                 LinkKind::NonMarkdown { target } => {
-                    check_target_exists(
-                        workspace,
-                        file_path,
-                        link.line,
-                        link.span,
-                        target,
-                        &mut diagnostics,
-                    );
+                    if workspace.crosses_boundary(target) {
+                        diagnostics.push(cross_boundary_diagnostic(
+                            workspace, file_path, link.line, link.span, target,
+                        ));
+                    } else {
+                        check_target_exists(
+                            workspace,
+                            file_path,
+                            link.line,
+                            link.span,
+                            target,
+                            &mut diagnostics,
+                        );
+                    }
                 }
 
                 LinkKind::IntraProject {
@@ -99,6 +105,18 @@ pub fn validate_forward_links(workspace: &impl WorkspaceLike) -> Vec<Diagnostic>
                     predicate,
                     explicit_predicate,
                 } => {
+                    // A link whose target resolves across a scope boundary is a
+                    // defect steering to the alias (decision 019 clause 3): it
+                    // encodes the host layout and fails the move rule, so the
+                    // existence / predicate / fragment checks below (all of which
+                    // assume an in-scope target) are moot — the fix is to write
+                    // it as an `[external]` alias.
+                    if workspace.crosses_boundary(target) {
+                        diagnostics.push(cross_boundary_diagnostic(
+                            workspace, file_path, link.line, link.span, target,
+                        ));
+                        continue;
+                    }
                     check_target_exists(
                         workspace,
                         file_path,
@@ -135,6 +153,37 @@ pub fn validate_forward_links(workspace: &impl WorkspaceLike) -> Vec<Diagnostic>
 
     diagnostics.sort_by(|a, b| a.file.cmp(&b.file).then(a.line.cmp(&b.line)));
     diagnostics
+}
+
+/// Build the alias-steering error for a link whose target crosses a scope
+/// boundary (decision 019 clause 3, ticket server 12).
+///
+/// A boundary-crossing link — into a strictly-deeper nested scope, or above this
+/// scope's root — encodes the host's layout in every referring document and
+/// fails the move rule wholesale, so it is a defect, not a demoted reference.
+/// The message names the fix: reference the target through an `[external]`
+/// alias, the sole sanctioned cross-boundary form (decisions 010 / 016). The
+/// displayed target is the root-relative form where one exists (a crossing into
+/// a nested scope), or the absolute path where the target climbed out of the
+/// scope entirely (no meaningful rel-path in this root's coordinates).
+fn cross_boundary_diagnostic(
+    workspace: &impl WorkspaceLike,
+    source: &Path,
+    line: usize,
+    span: Span,
+    target: &Path,
+) -> Diagnostic {
+    let display = target_to_key(workspace.root(), target);
+    Diagnostic {
+        file: source.to_path_buf(),
+        line,
+        severity: Severity::Error,
+        message: format!(
+            "link target `{}` is outside this scope — reference it through an `[external]` alias (see `lattice help config`)",
+            display.display()
+        ),
+        span: Some(span),
+    }
 }
 
 /// Check that a link target exists as a file in the workspace or on disk.

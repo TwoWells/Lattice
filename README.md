@@ -170,6 +170,34 @@ stale_references = "warn"  # or "hint", "deny", "disabled" — dangling `.md` re
 # Catenary = "../Catenary"
 ```
 
+### Nested scopes
+
+A `.lattice.toml` marks the root of a graph. A **nested** `.lattice.toml` (or a
+nested `.git` — a submodule or vendored repo) marks the root of a *different,
+smaller* graph: the marker partitions the tree into disjoint scopes, each
+self-describing under its own marker (never the outer vocabulary), and each
+behaving exactly as if it were a sibling. Membership stops at every
+strictly-deeper marker, so no backlink expectation crosses a boundary in either
+direction. Discovery is entry-point independent — linting from the outer root,
+from inside the nested scope, or via an editor session rooted at either agrees
+on where each graph begins. A nested `.git` without its own `.lattice.toml` is a
+non-root environment: excluded from the host graph and never indexed.
+
+A plain relative link (or a `../` escape) whose target lands in another scope is
+a defect, not a reference — it errors with `link target … is outside this scope
+— reference it through an [external] alias` (a boundary-crossing path-shaped
+*mention* is its warn-tier sibling). Rewrite it as a `{Name}/path` citation and
+alias `Name` in the referrer's own `[external]` table. Reach for a nested marker
+when a subtree is a **separable unit** (its own graph); reach for an
+`[[override]]` when a subtree just wants different **strictness** within one
+graph.
+
+> **Migration.** Before this release a nested `.lattice.toml` was inert — its
+> subtree was swallowed into the outer graph. It now splits into its own graph:
+> cross-boundary plain links surface as steering errors, and stale backlink
+> entries across the boundary become removable. This is a one-time,
+> diagnostic-guided cleanup; stage large ones with `[[override]]` count-keys.
+
 ### Per-reference exceptions
 
 A path-shaped string that is deliberately not a live reference (a worked

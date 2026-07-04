@@ -178,6 +178,13 @@ pub struct Workspace {
     has_config: bool,
     /// Parsed file data, keyed by workspace-relative path.
     files: BTreeMap<PathBuf, FileData>,
+    /// Absolute paths of strictly-deeper scope boundaries pruned from this
+    /// scope's scan (decision 019 clause 1): each is a nested `.lattice.toml`
+    /// (another scope) or a nested `.git` (a non-root environment). A link or
+    /// path-shaped mention resolving into any of these — or escaping above
+    /// `root` — crosses a scope boundary and steers to an `[external]` alias
+    /// ([`WorkspaceLike::crosses_boundary`], decision 019 clause 3).
+    boundaries: Vec<PathBuf>,
 }
 
 impl Workspace {
@@ -223,7 +230,11 @@ impl Workspace {
             }
         };
 
-        let md_paths = discover_markdown_files(&root);
+        // Scan the scope, pruning at every strictly-deeper boundary (a nested
+        // `.lattice.toml` or `.git`): those subtrees belong to their own graph
+        // (decision 019 clause 1). The pruned boundary directories are captured
+        // so cross-boundary references can steer to an alias rather than dangle.
+        let (md_paths, boundaries) = discover_markdown_files_and_boundaries(&root);
 
         let mut files = BTreeMap::new();
 
@@ -249,6 +260,7 @@ impl Workspace {
             config_error,
             has_config,
             files,
+            boundaries,
         };
         // Membership is final after the scan loop, so structural caches can be
         // computed for every file now (bare-path existence sees the full set).
@@ -531,6 +543,37 @@ pub trait WorkspaceLike {
     /// The argument follows the same absolute/relative convention as
     /// [`WorkspaceLike::file`].
     fn resolve_key(&self, target: &Path) -> Option<&Path>;
+
+    /// The absolute paths of the strictly-deeper scope boundaries inside this
+    /// scope (nested `.lattice.toml` / `.git` directories — decision 019). Used
+    /// by [`crosses_boundary`](WorkspaceLike::crosses_boundary).
+    fn boundaries(&self) -> &[PathBuf];
+
+    /// Whether a link `target` resolves *across* a scope boundary — into a
+    /// strictly-deeper nested scope, or above this scope's root (decision 019
+    /// clause 3). Such a target encodes the host layout in every referring
+    /// document and fails the move rule wholesale: it is a defect that must be
+    /// written as an `[external]` alias, not a plain relative path.
+    ///
+    /// `target` is the root-free link target: absolute for a document-relative
+    /// link (decision 019 clause 8), the root-relative remainder otherwise. It
+    /// is absolutized against the root, then tested against the two boundary
+    /// directions — a target not under the root has climbed out of the scope; a
+    /// target under one of the pruned nested boundaries has crossed into a
+    /// deeper one. A plain (non-crossing) miss is an ordinary broken link, not a
+    /// boundary crossing, so this returns `false` for it.
+    fn crosses_boundary(&self, target: &Path) -> bool {
+        let target_abs = if target.is_absolute() {
+            target.to_path_buf()
+        } else {
+            self.root().join(target)
+        };
+        !target_abs.starts_with(self.root())
+            || self
+                .boundaries()
+                .iter()
+                .any(|boundary| target_abs.starts_with(boundary))
+    }
 }
 
 impl WorkspaceLike for Workspace {
@@ -554,6 +597,9 @@ impl WorkspaceLike for Workspace {
             .get_key_value(&*target_to_key(&self.root, target))
             .map(|(k, _)| k.as_path())
     }
+    fn boundaries(&self) -> &[PathBuf] {
+        &self.boundaries
+    }
 }
 
 /// A borrowed, per-root view over a set of parsed documents.
@@ -571,23 +617,28 @@ pub struct WorkspaceView<'a> {
     config: &'a Config,
     has_config: bool,
     files: BTreeMap<PathBuf, &'a FileData>,
+    boundaries: Vec<PathBuf>,
 }
 
 impl<'a> WorkspaceView<'a> {
     /// Construct a view from its parts. `files` maps each document's
-    /// view-relative path to its parsed data.
+    /// view-relative path to its parsed data; `boundaries` names the
+    /// strictly-deeper scope roots inside this one (the server derives them from
+    /// its registered roots — decision 019).
     #[must_use]
     pub fn new(
         root: PathBuf,
         config: &'a Config,
         has_config: bool,
         files: BTreeMap<PathBuf, &'a FileData>,
+        boundaries: Vec<PathBuf>,
     ) -> Self {
         Self {
             root,
             config,
             has_config,
             files,
+            boundaries,
         }
     }
 
@@ -647,6 +698,9 @@ impl WorkspaceLike for WorkspaceView<'_> {
         self.files
             .get_key_value(&*target_to_key(&self.root, target))
             .map(|(k, _)| k.as_path())
+    }
+    fn boundaries(&self) -> &[PathBuf] {
+        &self.boundaries
     }
 }
 
@@ -865,6 +919,20 @@ fn byte_offset_to_line(content: &str, offset: usize) -> usize {
     fm::byte_offset_to_line(content, offset)
 }
 
+/// Discover the scope root covering `start`: the nearest ancestor `.lattice.toml`
+/// or `.git`, or the starting directory itself when none is found (decision 019
+/// clause 7 — markers declare structure, so a folder without an ancestor marker
+/// is its own fallback scope).
+///
+/// Client-spelling: `start` is walked (and markers are `stat`ed) as given, so
+/// the returned root is in the same spelling the caller's document keys use. The
+/// flat document store (ticket server 10) roots each opened folder at the scope
+/// this discovers.
+#[must_use]
+pub fn find_scope_root(start: &Path) -> Option<PathBuf> {
+    find_workspace_root(start)
+}
+
 /// Walk up from `start` looking for `.lattice.toml` or `.git`.
 ///
 /// Returns the directory containing the first marker found. Falls back to the
@@ -893,14 +961,48 @@ fn find_workspace_root(start: &Path) -> Option<PathBuf> {
     Some(dir)
 }
 
-/// Discover all `.md` files under `root`, respecting `.gitignore`.
-fn discover_markdown_files(root: &Path) -> Vec<PathBuf> {
-    let mut paths = Vec::new();
+/// Discover all `.md` files under `root`, respecting `.gitignore`, together with
+/// the strictly-deeper scope boundaries pruned from the walk (decision 019).
+///
+/// Descent stops at any directory (other than `root`) that carries its own
+/// marker — a nested `.lattice.toml` (another scope) or a nested `.git` (a
+/// non-root environment: a submodule or vendored repo). That subtree belongs to
+/// its own graph, so neither its `.md` files (they are not members of this
+/// scope) nor its contents are scanned here; the boundary directory itself is
+/// recorded so a link resolving into it can steer to an `[external]` alias
+/// instead of dangling. Returns `(markdown files, boundary directories)`, both
+/// absolute.
+fn discover_markdown_files_and_boundaries(root: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    use std::sync::{Arc, Mutex};
+
+    // Captured in the walker's `filter_entry` closure, which prunes each nested
+    // boundary from the traversal and records it here. `Arc<Mutex<…>>` satisfies
+    // the closure's `Send + Sync + 'static` bound (a `RefCell` would not).
+    let boundaries: Arc<Mutex<Vec<PathBuf>>> = Arc::new(Mutex::new(Vec::new()));
+    let boundaries_sink = Arc::clone(&boundaries);
+    let root_owned = root.to_path_buf();
 
     let walker = ignore::WalkBuilder::new(root)
         .standard_filters(true)
+        .filter_entry(move |entry| {
+            let path = entry.path();
+            // The root itself is never a boundary of its own scan.
+            if path == root_owned {
+                return true;
+            }
+            let is_dir = entry.file_type().is_some_and(|ft| ft.is_dir());
+            if is_dir && is_scope_boundary(path) {
+                if let Ok(mut sink) = boundaries_sink.lock() {
+                    sink.push(path.to_path_buf());
+                }
+                // Prune the boundary directory and everything beneath it.
+                return false;
+            }
+            true
+        })
         .build();
 
+    let mut paths = Vec::new();
     for entry in walker {
         let Ok(entry) = entry else { continue };
         let path = entry.path();
@@ -913,7 +1015,34 @@ fn discover_markdown_files(root: &Path) -> Vec<PathBuf> {
         }
     }
 
-    paths
+    let mut boundaries = Arc::try_unwrap(boundaries)
+        .ok()
+        .and_then(|mutex| mutex.into_inner().ok())
+        .unwrap_or_default();
+    boundaries.sort();
+    boundaries.dedup();
+    (paths, boundaries)
+}
+
+/// Whether `dir` is a strictly-deeper scope boundary: it carries its own
+/// `.lattice.toml` (a nested scope) or `.git` (a non-root environment — a
+/// submodule or vendored repo). Decision 019 resolution 2.
+fn is_scope_boundary(dir: &Path) -> bool {
+    dir.join(".lattice.toml").is_file() || dir.join(".git").exists()
+}
+
+/// The strictly-deeper scope boundaries directly inside `root` (client-spelling,
+/// gitignore-aware), not descending into any of them — decision 019.
+///
+/// The flat document store (ticket server 10) uses this to register each nested
+/// marker as its own scope root, and to recompute the active scope set when a
+/// folder is removed. Only the shallowest boundary in each branch is returned;
+/// a scope nested inside a nested scope is that scope's own boundary, not this
+/// root's.
+#[must_use]
+pub fn discover_scope_boundaries(root: &Path) -> Vec<PathBuf> {
+    let (_, boundaries) = discover_markdown_files_and_boundaries(root);
+    boundaries
 }
 
 #[cfg(test)]

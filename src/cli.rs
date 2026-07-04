@@ -318,6 +318,48 @@ A `[[override]]` array-of-tables sets the 028-family policy
     of the unused-exception, catching a stale override after a tree was renamed.
 
 
+nested scopes — a marker partitions the tree
+--------------------------------------------
+
+A `.lattice.toml` marks the root of a graph. A NESTED `.lattice.toml` (or a
+nested `.git` — a submodule or vendored repo) marks the root of a DIFFERENT,
+smaller graph: the marker cuts the tree into disjoint scopes, each
+self-describing (its own defaults plus its own marker, never the outer
+vocabulary). A nested scope behaves exactly as if it were a sibling — physical
+containment grants no membership, config, or reference privileges.
+
+  - Boundary. A scan stops at every strictly-deeper marker. The outer graph
+    never sees the nested scope's files, and vice versa; no backlink expectation
+    crosses the boundary in either direction. A nested `.git` without its own
+    `.lattice.toml` is a non-root environment: excluded from the host graph and
+    never indexed (opened directly, its documents serve document-scoped features
+    under defaults).
+  - Cross-boundary references are `[external]` aliases — nothing new. A plain
+    relative link (or a `../` escape) whose target lands in another scope encodes
+    the host layout and fails the move test wholesale, so it is a DEFECT, not a
+    reference. Lattice names the fix:
+        error: link target `X` is outside this scope -- reference it through an
+        `[external]` alias
+    A boundary-crossing path-shaped MENTION is its warn-tier sibling (a stale
+    reference carrying the same alias suggestion). Rewrite the reference as
+    `{Name}/path` and alias `Name` in the referrer's own `[external]` table
+    (existence-only, edge-free -- see the [external] section above).
+  - Entry point is irrelevant. Linting from the outer root, from inside the
+    nested scope, or via an editor session rooted at either agrees on where each
+    graph begins.
+
+override vs. nested scope — the rule of thumb
+---------------------------------------------
+
+Reach for an `[[override]]` (above) when a SUBTREE wants different STRICTNESS
+within ONE graph — same vocabulary, same backlink universe, just stricter or
+frozen. Reach for a nested `.lattice.toml` when a subtree is a SEPARABLE UNIT —
+its own graph, relocatable to its own repository by construction. The common
+error is reaching for a marker when an override was meant: a marker splits the
+backlink universe (and steers every cross-boundary reference to an alias); an
+override leaves one graph intact.
+
+
 suppression ledger (lattice lint)
 ---------------------------------
 
@@ -539,6 +581,36 @@ mod tests {
         assert!(
             CONFIG_REFERENCE.contains("Ledger-visible"),
             "the reference notes the ledger visibility"
+        );
+    }
+
+    #[test]
+    fn reference_documents_nested_scopes_and_steering_diagnostic() {
+        // Decision 019 / ticket server 12: the reference states the boundary /
+        // alias model and NAMES the steering diagnostic, so an agent can fix a
+        // cross-boundary reference without reading the decision.
+        assert!(
+            CONFIG_REFERENCE.contains("nested scopes")
+                && CONFIG_REFERENCE.contains("partitions the tree"),
+            "the reference documents the nested-scope partition as a named section"
+        );
+        assert!(
+            CONFIG_REFERENCE.contains("outside this scope")
+                && CONFIG_REFERENCE.contains("reference it through an")
+                && CONFIG_REFERENCE.contains("`[external]` alias"),
+            "the reference names the steering diagnostic"
+        );
+        // The override-vs-scope rule of thumb (decision 019 clause 5).
+        assert!(
+            CONFIG_REFERENCE.contains("override vs. nested scope")
+                && CONFIG_REFERENCE.contains("SEPARABLE UNIT")
+                && CONFIG_REFERENCE.contains("different STRICTNESS"),
+            "the reference states the override-vs-scope rule of thumb"
+        );
+        // The nested `.git` non-root environment.
+        assert!(
+            CONFIG_REFERENCE.contains("non-root environment"),
+            "the reference notes the nested `.git` non-root environment"
         );
     }
 

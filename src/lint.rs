@@ -1706,4 +1706,174 @@ mod tests {
             "the drift flag is present: {output}"
         );
     }
+
+    // -- Nested scope partition (decision 019, ticket server 12) --
+
+    #[test]
+    fn cross_boundary_link_errors_with_alias_steering() {
+        // A plain relative link whose target resolves into a nested scope is a
+        // defect steering to the alias (decision 019 clause 3): the outer scan
+        // prunes the nested marker, so the link crosses a boundary and errors
+        // with the alias-steering message rather than dangling or resolving.
+        let dir = setup(&[
+            (".lattice.toml", ""),
+            ("outer.md", "[into sub](sub/inner.md \"references\")\n"),
+            ("sub/.lattice.toml", ""),
+            ("sub/inner.md", "# Inner\n"),
+        ]);
+        let (failed, output) = run_lint(&dir);
+        assert!(failed, "a boundary-crossing link is an error: {output}");
+        assert!(
+            output.contains("outer.md:")
+                && output.contains("outside this scope")
+                && output.contains("[external]` alias"),
+            "the steering error is anchored on the source and names the alias fix: {output}"
+        );
+    }
+
+    #[test]
+    fn inner_to_outer_escape_errors_with_alias_steering() {
+        // Decision 019 resolution 4: a `../…` reference climbing out of its scope
+        // is the same clause-3 defect with the same alias steering — entering
+        // from inside the nested scope, the escape crosses the boundary upward.
+        let dir = setup(&[
+            (".lattice.toml", ""),
+            ("outer.md", "# Outer\n"),
+            ("sub/.lattice.toml", ""),
+            ("sub/inner.md", "[up](../outer.md \"references\")\n"),
+        ]);
+        let (failed, output) = run_lint_start(&dir.path().join("sub"));
+        assert!(failed, "an inner→outer escape is an error: {output}");
+        assert!(
+            output.contains("inner.md:") && output.contains("outside this scope"),
+            "the escaping link steers to the alias: {output}"
+        );
+    }
+
+    #[test]
+    fn entry_point_independence_two_disjoint_graphs() {
+        // Acceptance 1 (ticket server 12) at the CLI layer: linting from the
+        // outer root and from inside the nested scope produce the SAME two
+        // graphs. Each run lints only its own scope — the outer run steers its
+        // link into the nested scope and never touches the nested files; the
+        // nested run steers its escaping link and never touches the outer files.
+        let dir = setup(&[
+            (".lattice.toml", ""),
+            ("outer.md", "[down](sub/inner.md \"references\")\n"),
+            ("sub/.lattice.toml", ""),
+            ("sub/inner.md", "[up](../outer.md \"references\")\n"),
+        ]);
+
+        let (outer_failed, outer_out) = run_lint(&dir);
+        assert!(
+            outer_failed
+                && outer_out.contains("outer.md:")
+                && outer_out.contains("outside this scope"),
+            "the outer run steers its boundary-crossing link: {outer_out}"
+        );
+        assert!(
+            !outer_out.contains("sub/inner.md:"),
+            "the outer run does not lint the nested scope's files: {outer_out}"
+        );
+
+        let (inner_failed, inner_out) = run_lint_start(&dir.path().join("sub"));
+        assert!(
+            inner_failed
+                && inner_out.contains("inner.md:")
+                && inner_out.contains("outside this scope"),
+            "the nested run steers its escaping link: {inner_out}"
+        );
+        assert!(
+            !inner_out.contains("outer.md:"),
+            "the nested run does not lint the outer scope's files: {inner_out}"
+        );
+    }
+
+    #[test]
+    fn cross_boundary_mention_is_a_stale_reference() {
+        // Decision 019 clause 3: a boundary-crossing path-shaped MENTION joins the
+        // 028-family warn tier with the alias suggestion. The nested scope's file
+        // is not a member here, so a bare/backticked mention of it dangles as a
+        // stale reference (the warn-tier sibling of the link error).
+        let dir = setup(&[
+            (".lattice.toml", ""),
+            ("outer.md", "See `sub/inner.md` for the details.\n"),
+            ("sub/.lattice.toml", ""),
+            ("sub/inner.md", "# Inner\n"),
+        ]);
+        let (failed, output) = run_lint(&dir);
+        assert!(
+            output.contains("stale reference") && output.contains("sub/inner.md"),
+            "the cross-boundary mention is a stale reference: {output}"
+        );
+        assert!(
+            !failed,
+            "a warn-tier stale reference does not gate the default exit: {output}"
+        );
+    }
+
+    #[test]
+    fn alias_reference_into_nested_scope_is_quiet() {
+        // The same reference through a configured `[external]` alias validates
+        // through the unchanged 010/016 path — existence-checked and quiet.
+        let dir = setup(&[
+            (".lattice.toml", "[external]\nSub = \"sub\"\n"),
+            ("outer.md", "See `{Sub}/inner.md` for the details.\n"),
+            ("sub/.lattice.toml", ""),
+            ("sub/inner.md", "# Inner\n"),
+        ]);
+        let (failed, output) = run_lint(&dir);
+        assert!(
+            !failed
+                && !output.contains("outside this scope")
+                && !output.contains("stale reference"),
+            "an alias reference into the present nested scope is existence-checked and quiet: {output}"
+        );
+    }
+
+    #[test]
+    fn alias_directory_absent_degrades_to_exempt() {
+        // With the alias directory absent, the reference degrades to 010's exempt
+        // tier — external, unverified, never a false break.
+        let dir = setup(&[
+            (
+                ".lattice.toml",
+                "[external]\nGone = \"nonexistent-sibling\"\n",
+            ),
+            ("outer.md", "See `{Gone}/whatever.md` here.\n"),
+        ]);
+        let (failed, output) = run_lint(&dir);
+        assert!(
+            !failed && !output.contains("stale reference"),
+            "an absent alias directory degrades to exempt: {output}"
+        );
+    }
+
+    #[test]
+    fn nested_git_without_marker_is_excluded_from_host_graph() {
+        // Decision 019 resolution 2: a nested `.git` (a submodule / vendored repo,
+        // no marker of its own) is a non-root environment — excluded from the
+        // host scope's scan and membership, so a plain link into it crosses the
+        // boundary and steers to an alias.
+        let dir = setup(&[
+            (".lattice.toml", ""),
+            (
+                "outer.md",
+                "[into vendor](vendor/inner.md \"references\")\n",
+            ),
+        ]);
+        fs::create_dir_all(dir.path().join("vendor")).expect("create vendor dir");
+        fs::create_dir(dir.path().join("vendor/.git")).expect("create nested .git");
+        fs::write(dir.path().join("vendor/inner.md"), "# Vendored\n").expect("write vendored file");
+
+        let (failed, output) = run_lint(&dir);
+        assert!(
+            failed && output.contains("outside this scope"),
+            "a link into a nested `.git` environment steers to an alias: {output}"
+        );
+        assert!(
+            !output.contains("vendor/inner.md:"),
+            "the nested `.git`'s files are not in the host graph: {output}"
+        );
+    }
 }
