@@ -134,12 +134,27 @@ impl<'a> Parser<'a> {
         });
     }
 
-    /// A one-byte span at the current position, clamped to the source end so an
-    /// at-EOF "expected X" diagnostic collapses to an empty span instead of
-    /// pointing one byte past the input.
+    /// A span covering the single character at the current position, clamped
+    /// to the source end so an at-EOF "expected X" diagnostic collapses to an
+    /// empty span instead of pointing one byte past the input.
+    ///
+    /// The span covers the character's full UTF-8 encoding: a fixed one-byte
+    /// span would end mid-character when the unexpected character is
+    /// multi-byte, violating the char-boundary invariant every diagnostic
+    /// span must satisfy (`fuzz_structural` soak finding). The source is valid
+    /// UTF-8 and the parser stops at character starts, so the lead byte
+    /// determines the length; a continuation byte (impossible at a character
+    /// start) degrades to an empty span rather than risk a mid-character end.
     fn here_span(&self) -> Span {
+        let len = self.src.get(self.pos).map_or(0, |&b| match b {
+            0x00..=0x7F => 1,
+            0x80..=0xBF => 0,
+            0xC0..=0xDF => 2,
+            0xE0..=0xEF => 3,
+            0xF0..=0xFF => 4,
+        });
         let start = self.abs();
-        Span::new(start, (start + 1).min(self.base + self.src.len()))
+        Span::new(start, (start + len).min(self.base + self.src.len()))
     }
 
     fn skip_whitespace(&mut self) {

@@ -1296,6 +1296,13 @@ fn structural_diagnostics_valid_on_known_inputs() {
         "```yaml lattice\nbacklinks:\n  referenced_by:\n    - a.md\n```\n\n```yaml lattice\nbacklinks:\n  referenced_by:\n    - b.md\n```\n",
         "```yaml lattice\nbacklinks:\n      bad_indent\n```\n",
         "````markdown\n```yaml lattice\nbacklinks:\n  referenced_by:\n    - a.md\n```\n````\n",
+        // An "expected X" diagnostic at a multi-byte character, per
+        // frontmatter syntax: `here_span` must cover the character's full
+        // UTF-8 encoding, not a fixed single byte (fuzz_structural soak
+        // finding — U+A28A3 is four bytes).
+        "---\n\"k\" \u{a28a3}x\n---\nbody\n",
+        "+++\nk \u{a28a3}\n+++\nbody\n",
+        "{\n\"k\" \u{a28a3}\n}\nbody\n",
     ];
     for case in cases {
         assert_structural_invariants(case);
@@ -1312,6 +1319,19 @@ fn structural_invariants_hold_on_close_tag_trailing_multibyte() {
     // unexpected_close_tag_span_with_trailing_multibyte`.
     assert_structural_invariants(include_str!(
         "../fuzz/corpus/fuzz_structural/close_tag_trailing_multibyte.md"
+    ));
+}
+
+#[test]
+fn structural_invariants_hold_on_carrier_expected_colon_multibyte() {
+    // Second fuzz_structural soak finding (pre-0.4.0): the frontmatter
+    // parsers' `here_span` was a fixed one-byte span, so an "expected ':'"
+    // diagnostic at a multi-byte character (a 4-byte supplementary-plane
+    // char in a quoted key context) ended mid-character. Pinned byte-exact
+    // from the corpus seed; the minimal per-syntax cases live in
+    // `structural_diagnostics_valid_on_known_inputs`.
+    assert_structural_invariants(include_str!(
+        "../fuzz/corpus/fuzz_structural/carrier_expected_colon_multibyte.md"
     ));
 }
 
