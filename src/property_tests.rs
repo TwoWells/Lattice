@@ -1303,6 +1303,19 @@ fn structural_diagnostics_valid_on_known_inputs() {
 }
 
 #[test]
+fn structural_invariants_hold_on_close_tag_trailing_multibyte() {
+    // fuzz_structural soak finding (2026-07-03 pre-0.4.0): an unexpected
+    // close tag followed by trailing multi-byte content (`</div>Dark-m` +
+    // U+FEFF) got its diagnostic span back-computed from the end-of-line
+    // offset, splitting a UTF-8 character. Pinned byte-exact from the
+    // corpus seed; the precise span shape is asserted in `block::tests::
+    // unexpected_close_tag_span_with_trailing_multibyte`.
+    assert_structural_invariants(include_str!(
+        "../fuzz/corpus/fuzz_structural/close_tag_trailing_multibyte.md"
+    ));
+}
+
+#[test]
 fn carrier_fidelity_holds_on_known_inputs() {
     // Live carriers — naked, `<details>`-wrapped, with exceptions, multi-byte,
     // and under CRLF — must all source faithful metadata that agrees with the

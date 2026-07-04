@@ -2445,10 +2445,37 @@ impl<'a> TreeBuilder<'a> {
         let pos = self.html_stack.iter().rposition(|s| s.tag == tag);
 
         let Some(idx) = pos else {
-            // No match — unexpected close tag.
+            // No match — unexpected close tag. `span_end` is an end-of-line
+            // position, and the close tag may be followed by trailing content
+            // (possibly multi-byte) on the same line, so back-computing the
+            // span from `span_end` by tag length can split a UTF-8 character
+            // (fuzz_structural soak finding). Locate the tag's actual bytes
+            // instead: an ASCII-case-insensitive backward search for `</tag`,
+            // extended through an adjacent `>`. Tag names are ASCII, so the
+            // resulting span always lands on char boundaries.
+            let bytes = &self.source.as_bytes()[..span_end.min(self.source.len())];
+            let needle = tag.as_bytes();
+            let span = bytes
+                .windows(needle.len() + 2)
+                .rposition(|w| w[0] == b'<' && w[1] == b'/' && w[2..].eq_ignore_ascii_case(needle))
+                .map_or_else(
+                    // Not found (defensive): an empty span at the end-of-line
+                    // offset, which is a char boundary by construction.
+                    || Span::new(span_end, span_end),
+                    |start| {
+                        let after_name = start + needle.len() + 2;
+                        let end = bytes[after_name..]
+                            .iter()
+                            .position(|b| !b.is_ascii_whitespace())
+                            .map(|i| after_name + i)
+                            .filter(|&i| bytes[i] == b'>')
+                            .map_or(after_name, |i| i + 1);
+                        Span::new(start, end)
+                    },
+                );
             self.diagnostics.push(Diagnostic {
                 level: DiagnosticLevel::Error,
-                span: Span::new(span_end.saturating_sub(tag.len() + 3), span_end),
+                span,
                 message: format!("unexpected closing tag `</{tag}>`"),
             });
             return false;
@@ -7573,6 +7600,32 @@ mod tests {
                 .iter()
                 .any(|d| d.message.contains("unexpected closing tag")),
             "should have unexpected close tag diagnostic: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn unexpected_close_tag_span_with_trailing_multibyte() {
+        // A nested close tag with no matching open, followed by trailing
+        // content containing multi-byte characters, used to get its span
+        // back-computed from the end-of-line offset — splitting a UTF-8
+        // character (fuzz_structural soak finding). The span must land on
+        // char boundaries and cover the close tag's own bytes.
+        let src = "<details>\n</div>x\u{feff}\u{feff}\n";
+        let tree = parse(src);
+        let diag = tree
+            .diagnostics()
+            .iter()
+            .find(|d| d.message.contains("unexpected closing tag"))
+            .expect("unexpected-close diagnostic emitted");
+        assert!(
+            src.is_char_boundary(diag.span.start) && src.is_char_boundary(diag.span.end),
+            "span must land on char boundaries: {:?}",
+            diag.span
+        );
+        assert_eq!(
+            &src[diag.span.start..diag.span.end],
+            "</div>",
+            "span must cover the close tag itself"
         );
     }
 
