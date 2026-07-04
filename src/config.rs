@@ -450,21 +450,25 @@ impl Config {
     }
 
     /// Returns `true` if `predicate` is a known forward predicate.
+    #[must_use]
     pub fn is_known_forward(&self, predicate: &str) -> bool {
         self.predicates.contains_key(predicate)
     }
 
     /// Returns `true` if `predicate` is a known inverse predicate.
+    #[must_use]
     pub fn is_known_inverse(&self, predicate: &str) -> bool {
         self.predicates.values().any(|v| v == predicate)
     }
 
     /// Returns the inverse for a forward predicate.
+    #[must_use]
     pub fn inverse_of(&self, forward: &str) -> Option<&str> {
         self.predicates.get(forward).map(String::as_str)
     }
 
     /// Returns the forward predicate for an inverse predicate.
+    #[must_use]
     pub fn forward_of(&self, inverse: &str) -> Option<&str> {
         self.predicates
             .iter()
@@ -477,6 +481,7 @@ impl Config {
     /// Decision 008 lifts the direction restriction: a link or backlink may
     /// name either member of a vocabulary pair. The closed vocabulary remains
     /// the floor — a string in neither direction is still unknown.
+    #[must_use]
     pub fn is_known_predicate(&self, predicate: &str) -> bool {
         self.is_known_forward(predicate) || self.is_known_inverse(predicate)
     }
@@ -491,6 +496,7 @@ impl Config {
     ///
     /// Assumes forward keys and inverse values are disjoint (sane configs);
     /// on the unlikely overlap the inverse reading wins.
+    #[must_use]
     pub fn opposite_of(&self, predicate: &str) -> Option<&str> {
         self.inverse_of(predicate)
             .or_else(|| self.forward_of(predicate))

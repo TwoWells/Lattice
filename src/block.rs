@@ -1890,12 +1890,14 @@ fn fm_leaf_count(value: &crate::fm::FmValue) -> usize {
 /// each top-level key (and nested maps) so that symbol emission can
 /// expose frontmatter structure.
 #[allow(dead_code, reason = "public API used by tests in other modules")]
+#[must_use]
 pub fn parse_tree(source: &str, frontmatter_span: Option<Span>) -> Tree {
     parse_tree_with_entries(source, frontmatter_span, Syntax::Yaml, None)
 }
 
 /// Extended variant of [`parse_tree`] that accepts parsed frontmatter entries
 /// for child expansion.
+#[must_use]
 pub fn parse_tree_with_entries(
     source: &str,
     frontmatter_span: Option<Span>,
@@ -4900,6 +4902,7 @@ impl Tree {
     }
 
     /// Extract heading display text, optional explicit ID, and text byte span.
+    #[must_use]
     pub fn heading_content(&self, node_id: NodeId) -> (String, Option<String>, Span) {
         let node = &self.nodes[node_id];
         let raw = &self.source[node.span.start..node.span.end];

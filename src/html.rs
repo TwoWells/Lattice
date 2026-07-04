@@ -110,6 +110,7 @@ pub struct Attribute {
 /// `base` is the byte offset of `text[0]` in the full source, used for
 /// span computation. Returns `None` if the text does not start with a
 /// valid HTML tag.
+#[must_use]
 pub fn tokenize_tag(text: &str, base: usize) -> Option<HtmlTag> {
     let bytes = text.as_bytes();
     if bytes.first() != Some(&b'<') {
