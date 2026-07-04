@@ -3,9 +3,12 @@
 
 //! Workspace scanning and file indexing.
 //!
-//! Discovers all markdown files under the workspace root, parses them into
-//! an in-memory index backed by the unified parse tree, and supports
-//! incremental updates when individual files change.
+//! Discovers all markdown files under a scope root — stopping at every
+//! strictly-deeper scope boundary (decision 019) — and parses them into an
+//! in-memory index backed by the unified parse tree. The owning [`Workspace`]
+//! is the CLI's single-scan engine; the LSP server drives incremental sync
+//! through its own flat document store (ticket server 10) and consumes the
+//! shared pipeline through [`WorkspaceLike`] views.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
