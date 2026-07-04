@@ -118,7 +118,7 @@ mutants:
 #   make fuzz T=fuzz_yaml      # a single target
 #   make fuzz FUZZ_TIME=600    # longer per-target run (10 min)
 #   make soak FUZZ_TIME=3600   # all targets IN PARALLEL, 1 h each (~1 h wall)
-FUZZ_TARGETS := fuzz_parse_tree fuzz_yaml fuzz_toml fuzz_json fuzz_full fuzz_tokenize_tag fuzz_inlines fuzz_edits
+FUZZ_TARGETS := fuzz_parse_tree fuzz_yaml fuzz_toml fuzz_json fuzz_full fuzz_tokenize_tag fuzz_inlines fuzz_edits fuzz_structural
 FUZZ_TIME ?= 60
 
 # A prebuilt (musl) cargo-fuzz binary defaults `--target` to its own musl
