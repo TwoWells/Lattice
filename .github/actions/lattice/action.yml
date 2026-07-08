@@ -1,0 +1,70 @@
+# Reusable composite action: install Lattice and gate a project's markdown
+# graph in CI (ticket integration 03).
+#
+# Consumers reference this action from their own workflow, e.g.
+#
+#     - uses: TwoWells/Lattice/.github/actions/lattice@v1
+#
+# It installs a pinned `lattice` binary (via `cargo install`), then runs
+# `lattice lint` and — unless disabled — `lattice format --check`. Both share
+# the same exit-code contract: 0 = clean, 1 = errors (lint) or drift
+# (format --check). Warnings do NOT fail the build; only error-level
+# diagnostics do (pass `strict: "true"` to also gate on warnings).
+name: Lattice
+description: Lint the markdown predicate graph and check backlink-frontmatter formatting.
+
+inputs:
+  version:
+    description: >-
+      The Lattice version to install (a crates.io version, e.g. "0.4.1").
+      Defaults to the latest published release.
+    required: false
+    default: ""
+  path:
+    description: Directory or file to check. Defaults to the repository root.
+    required: false
+    default: "."
+  strict:
+    description: >-
+      Pass --strict to `lattice lint`, gating the build on warnings (missing
+      backlinks, bare paths) as well as errors. "true" to enable.
+    required: false
+    default: "false"
+  format-check:
+    description: >-
+      Run `lattice format --check` after linting, failing the build when any
+      file's backlink frontmatter is not formatted. "true" to enable.
+    required: false
+    default: "true"
+
+runs:
+  using: composite
+  steps:
+    # Install the pinned toolchain's `cargo` if the runner lacks it, then build
+    # the `lattice` binary. `cargo install` is version-pinnable and works on
+    # every hosted runner; a consumer wanting speed can swap in a prebuilt
+    # binary in their own workflow.
+    - name: Install Lattice
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [ -n "${{ inputs.version }}" ]; then
+          cargo install lattice --version "${{ inputs.version }}" --locked
+        else
+          cargo install lattice --locked
+        fi
+
+    - name: lattice lint
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [ "${{ inputs.strict }}" = "true" ]; then
+          lattice lint --strict "${{ inputs.path }}"
+        else
+          lattice lint "${{ inputs.path }}"
+        fi
+
+    - name: lattice format --check
+      if: ${{ inputs.format-check == 'true' }}
+      shell: bash
+      run: lattice format --check "${{ inputs.path }}"
