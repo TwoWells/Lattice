@@ -131,6 +131,40 @@ pub enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Format backlink frontmatter across the workspace.
+    ///
+    /// Discovers the workspace root, loads configuration, scans all markdown
+    /// files, and applies the formatting engine to each in-scope file: backlink
+    /// predicates are sorted alphabetically, paths within each predicate are
+    /// sorted, frontmatter whitespace is normalized, and — when a `[format]`
+    /// command is configured — the whole document is piped through it. Path
+    /// resolution and workspace scoping match `lattice lint` (issue 024): every
+    /// spelling of a directory or single-file scope normalizes identically.
+    ///
+    /// By default changed files are rewritten in place and each changed path is
+    /// reported. Formatting is a graph no-op: it only touches the bytes of the
+    /// frontmatter Lattice owns (and delegates the body to the external
+    /// formatter), so `lattice lint` produces the same diagnostics before and
+    /// after.
+    ///
+    /// Exit code is 0 when nothing changed. With `--check`, nothing is written
+    /// and the exit code is 1 when any file's formatted form differs (listing
+    /// those paths) — the same exit-code contract as `lattice lint`, so it slots
+    /// into CI alongside it.
+    Format {
+        /// Directory or file to format (defaults to the current working
+        /// directory).
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Report files that would change without writing anything.
+        ///
+        /// Writes nothing and exits non-zero, listing each file whose formatted
+        /// form differs from its current bytes; exits 0 when every in-scope file
+        /// is already formatted. Suitable for a CI gate alongside `lattice
+        /// lint`.
+        #[arg(long)]
+        check: bool,
+    },
     /// Start the LSP server on stdio.
     ///
     /// Publishes diagnostics on file open, save, and change.
@@ -476,7 +510,11 @@ Example `[policy]` block:
 ";
 
 #[cfg(test)]
-#[allow(clippy::expect_used, reason = "tests use expect for clarity")]
+#[allow(
+    clippy::expect_used,
+    clippy::panic,
+    reason = "tests use expect and panic for clarity"
+)]
 mod tests {
     use clap::CommandFactory;
 
@@ -581,6 +619,17 @@ mod tests {
     }
 
     #[test]
+    fn format_is_listed_and_not_hidden() {
+        // The `lattice format` subcommand (ticket integration 17) must be
+        // discoverable in the top-level Commands block alongside its siblings.
+        let help = top_level_help();
+        assert!(
+            help.contains("format"),
+            "format is listed in the top-level Commands block: {help}"
+        );
+    }
+
+    #[test]
     fn mv_help_documents_dry_run_and_the_rename_ordering() {
         // `lattice mv --help` must surface the two things an agent needs at the
         // point of friction: the `--dry-run` inspection flag and the
@@ -622,6 +671,42 @@ mod tests {
             CONFIG_REFERENCE.contains("Refusals name the fix"),
             "the reference notes that refusals name the fix and touch nothing"
         );
+    }
+
+    #[test]
+    fn format_parses_path_and_check_flag() {
+        use clap::Parser as _;
+
+        use super::Command;
+
+        // Bare `lattice format` defaults the path to `.` and check to false.
+        let bare = Cli::try_parse_from(["lattice", "format"]).expect("bare format parses");
+        match bare.command {
+            Command::Format { path, check } => {
+                assert_eq!(
+                    path,
+                    std::path::PathBuf::from("."),
+                    "format defaults its path to the current directory"
+                );
+                assert!(!check, "format defaults --check off");
+            }
+            other => panic!("expected Format, got {other:?}"),
+        }
+
+        // An explicit path and `--check` both parse.
+        let checked = Cli::try_parse_from(["lattice", "format", "docs", "--check"])
+            .expect("format with path and --check parses");
+        match checked.command {
+            Command::Format { path, check } => {
+                assert_eq!(
+                    path,
+                    std::path::PathBuf::from("docs"),
+                    "the explicit path is captured"
+                );
+                assert!(check, "--check is captured");
+            }
+            other => panic!("expected Format, got {other:?}"),
+        }
     }
 
     #[test]

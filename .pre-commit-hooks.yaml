@@ -1,0 +1,35 @@
+# Hook definitions Lattice provides to pre-commit consumers (ticket
+# integration 03). A downstream project references these from its own
+# `.pre-commit-config.yaml`:
+#
+#     repos:
+#       - repo: https://github.com/TwoWells/Lattice
+#         rev: v0.4.1
+#         hooks:
+#           - id: lattice-lint
+#           - id: lattice-format-check
+#
+# `language: rust` lets pre-commit build the `lattice` binary from this repo in
+# an isolated environment, so consumers need nothing installed globally. Both
+# hooks are `pass_filenames: false` — Lattice discovers the workspace and its
+# scope itself (one invocation, one graph), so pre-commit's changed-file list
+# must not be appended as path arguments.
+- id: lattice-lint
+  name: lattice lint
+  description: Lint the markdown predicate graph (broken links, unknown predicates, missing backlinks).
+  entry: lattice lint
+  language: rust
+  types: [markdown]
+  pass_filenames: false
+  # Runs even when no markdown file changed, since a config edit can change the
+  # whole graph's verdict.
+  always_run: true
+
+- id: lattice-format-check
+  name: lattice format --check
+  description: Fail if any file's backlink frontmatter is not formatted.
+  entry: lattice format --check
+  language: rust
+  types: [markdown]
+  pass_filenames: false
+  always_run: true

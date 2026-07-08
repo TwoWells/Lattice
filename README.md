@@ -121,22 +121,80 @@ vim.api.nvim_create_autocmd("FileType", {
 })
 ```
 
-## Git hook
+## Continuous integration and hooks
 
-Add to `.githooks/pre-commit` or `.git/hooks/pre-commit`:
+Both `lattice lint` and `lattice format --check` share one exit-code
+contract, so they slot into any gate: **exit 0 = clean, exit 1 = errors**
+(a broken link, unknown predicate, or unformatted frontmatter). Warnings
+— missing backlinks, bare paths — do **not** fail the build; pass
+`--strict` to `lattice lint` to gate on those too. So a PR with a broken
+link fails, a warnings-only PR passes, and a clean project passes
+silently.
+
+`lattice format --check` writes nothing: it exits 1 and lists any file
+whose backlink frontmatter is not sorted/normalized, and exits 0 when
+every file is already formatted. Run `lattice format` (no `--check`) to
+rewrite them in place — this is a graph no-op, changing only frontmatter
+bytes, never the diagnostics `lattice lint` produces.
+
+Both commands check the scope they are invoked in and stop at every
+nested-scope boundary (see [Nested scopes](#nested-scopes)): one
+invocation, one graph. In a repository containing nested scopes, run each
+once from every marker directory.
+
+### GitHub Actions
+
+Reference the bundled composite action from a workflow. It installs
+`lattice`, runs `lattice lint`, then `lattice format --check`:
+
+```yaml
+# .github/workflows/lattice.yml
+name: Lattice
+on: [push, pull_request]
+jobs:
+  lattice:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: TwoWells/Lattice/.github/actions/lattice@v1
+        # with:
+        #   version: "0.4.1"    # pin a crates.io version (default: latest)
+        #   path: "docs"        # scope to a subtree (default: repo root)
+        #   strict: "true"      # also fail on warnings (default: false)
+        #   format-check: "false" # skip the format gate (default: true)
+```
+
+### Pre-commit
+
+For projects using [pre-commit](https://pre-commit.com), add Lattice as a
+hook repo in `.pre-commit-config.yaml`:
+
+```yaml
+repos:
+  - repo: https://github.com/TwoWells/Lattice
+    rev: v0.4.1
+    hooks:
+      - id: lattice-lint
+      - id: lattice-format-check
+```
+
+`lattice-format-check` fails the commit on unformatted frontmatter; run
+`lattice format` to fix it. Drop the `lattice-format-check` entry if you
+only want the graph lint.
+
+### Plain git hook
+
+Without pre-commit, add to `.githooks/pre-commit` or
+`.git/hooks/pre-commit`:
 
 ```sh
 #!/bin/sh
-lattice lint
+lattice lint && lattice format --check
 ```
 
-Commits with broken links, unknown predicates, or missing backlinks
-will be rejected.
-
-`lattice lint` checks the scope it is invoked in and stops at every
-nested-scope boundary (see [Nested scopes](#nested-scopes)): one
-invocation, one graph. In a repository containing nested scopes, run it
-once from each marker directory.
+Commits with broken links, unknown predicates, missing backlinks, or
+unformatted frontmatter will be rejected.
 
 ## Configuration
 
