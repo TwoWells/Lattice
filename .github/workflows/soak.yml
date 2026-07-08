@@ -1,0 +1,172 @@
+name: fuzz-soak
+
+# Coverage-guided fuzz soak on a schedule (see AGENTS.md "Fuzzing"). Each
+# cargo-fuzz target runs as its own job, so a single-threaded target gets a
+# whole runner — the >=9-core requirement of the local `make soak` (which packs
+# every target onto one box) does not apply here. Standard GitHub-hosted runners
+# are free with unlimited minutes on public repositories, so this costs nothing:
+# keep every job on `ubuntu-latest` (larger runners bill even on public repos).
+#
+# Silent on green. On a finding a job uploads the minimized input, opens or
+# updates a deduplicated tracking issue, and opens a PR adding the shrunk input
+# to the seed corpus — turning AGENTS.md's "add the reproducing input" step into
+# a ready artifact. PR CI stays as `make check` (it already replays
+# proptest-regressions and the committed corpus seeds); this job only hunts for
+# *new* bugs.
+
+on:
+  schedule:
+    - cron: "0 3 * * *"   # nightly 03:00 UTC — moderate (900s/target)
+    - cron: "0 2 * * 0"   # weekly Sun 02:00 UTC — long (5400s/target)
+  workflow_dispatch:
+    inputs:
+      fuzz_time:
+        description: Seconds to fuzz each target
+        default: "900"
+        required: false
+
+# One soak at a time; let an in-flight run finish rather than cancel it.
+concurrency:
+  group: fuzz-soak
+  cancel-in-progress: false
+
+# Least privilege for the default token. The reproducer PR additionally requires
+# the repo setting "Allow GitHub Actions to create and approve pull requests"
+# (Settings -> Actions -> General -> Workflow permissions).
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  # Read FUZZ_TARGETS from the Makefile so the matrix never drifts from the
+  # single source of truth: a target added there is soaked automatically.
+  targets:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.list.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: list
+        run: |
+          json="$(make -s print-fuzz-targets | jq -R . | jq -cs .)"
+          echo "matrix=$json" >> "$GITHUB_OUTPUT"
+
+  soak:
+    needs: targets
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJson(needs.targets.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Choose fuzz duration
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "FUZZ_TIME=${{ github.event.inputs.fuzz_time }}" >> "$GITHUB_ENV"
+          elif [ "${{ github.event.schedule }}" = "0 2 * * 0" ]; then
+            echo "FUZZ_TIME=5400" >> "$GITHUB_ENV"
+          else
+            echo "FUZZ_TIME=900" >> "$GITHUB_ENV"
+          fi
+
+      # cargo-fuzz needs the nightly toolchain (libFuzzer/ASAN instrumentation).
+      # Consider pinning these actions to commit SHAs to harden the supply chain.
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: fuzz-${{ matrix.target }}
+
+      - name: Soak ${{ matrix.target }}
+        id: fuzz
+        continue-on-error: true
+        run: make fuzz T=${{ matrix.target }} FUZZ_TIME="$FUZZ_TIME"
+
+      - name: Upload crash input
+        if: steps.fuzz.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: crash-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}/
+          if-no-files-found: warn
+
+      - name: File finding — dedup issue + reproducer PR
+        if: steps.fuzz.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET: ${{ matrix.target }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          crash=""
+          for f in fuzz/artifacts/"$TARGET"/crash-*; do
+            [ -e "$f" ] || continue
+            crash="$f"
+            break
+          done
+          if [ -z "$crash" ]; then
+            echo "::error::$TARGET failed with no crash artifact — a build/setup break, not a finding."
+            exit 1
+          fi
+          short="$(basename "$crash" | sed 's/^crash-//' | cut -c1-12)"
+          echo "::notice::soak found a crash in $TARGET ($short)"
+
+          gh label create fuzz-finding --color B60205 \
+            --description "Reproducible crash from the scheduled fuzz soak" 2>/dev/null || true
+
+          # Reproducer PR on a deterministic branch: the same crash reuses the
+          # branch, so re-finding it does not open a duplicate PR.
+          branch="soak/$TARGET-$short"
+          if git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
+            echo "branch $branch already exists — reproducer already filed"
+          else
+            git config user.name  "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git switch -c "$branch"
+            mkdir -p "fuzz/corpus/$TARGET"
+            cp "$crash" "fuzz/corpus/$TARGET/soak-$short"
+            git add -f "fuzz/corpus/$TARGET/soak-$short"
+            git commit -m "test(fuzz): add $TARGET soak reproducer $short"
+            git push -u origin "$branch"
+            {
+              printf 'Crash found by the scheduled soak: %s\n\n' "$RUN_URL"
+              printf 'The minimized input was added to the seed corpus at:\n\n'
+              printf '    fuzz/corpus/%s/soak-%s\n\n' "$TARGET" "$short"
+              printf '(rename to the target input extension per the seed convention).\n\n'
+              printf 'Reproduce locally:\n\n'
+              printf '    cargo fuzz run %s fuzz/corpus/%s/soak-%s\n\n' \
+                "$TARGET" "$TARGET" "$short"
+              printf 'Per AGENTS.md a finding is a real, reproducible bug: fix the\n'
+              printf 'parser (or the over-strict invariant), then keep this seed and\n'
+              printf 'add a deterministic #[cfg(test)] regression so the fix is\n'
+              printf 'permanent.\n'
+            } > /tmp/pr-body.md
+            gh pr create --title "fuzz: $TARGET soak reproducer $short" \
+              --label fuzz-finding --body-file /tmp/pr-body.md \
+              || echo "pr create failed (PR may already exist)"
+          fi
+
+          # Deduplicated tracking issue, keyed by target.
+          existing="$(gh issue list --state open --label fuzz-finding \
+            --search "soak crash $TARGET in:title" --json number --jq '.[0].number // empty' || true)"
+          note="New soak crash \`$short\` on \`$TARGET\`: $RUN_URL (input artifact: \`crash-$TARGET\`)."
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$note"
+          else
+            {
+              printf '%s\n\n' "$note"
+              printf 'The scheduled fuzz soak found a reproducible crash. A reproducer\n'
+              printf 'PR adds the shrunk input under fuzz/corpus/%s/. Per AGENTS.md:\n' "$TARGET"
+              printf 'fix the parser (or refine the over-strict invariant), then add a\n'
+              printf 'deterministic #[cfg(test)] regression so the fix survives without\n'
+              printf 'the fuzzer.\n'
+            } > /tmp/issue-body.md
+            gh issue create --title "soak crash: $TARGET" --label fuzz-finding \
+              --body-file /tmp/issue-body.md
+          fi

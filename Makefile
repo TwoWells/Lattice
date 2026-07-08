@@ -7,7 +7,7 @@
 #   make release-major   # 0.1.0 -> 1.0.0
 #   make release V=0.2.0 # explicit version
 
-.PHONY: build-release check deny fuzz soak machete metadata mutants setup setup-hooks setup-tools test release release-patch release-minor release-major publish tag-current
+.PHONY: build-release check deny fuzz print-fuzz-targets soak machete metadata mutants setup setup-hooks setup-tools test release release-patch release-minor release-major publish tag-current
 
 # Get current version from Cargo.toml
 CURRENT_VERSION := $(shell grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
@@ -125,6 +125,14 @@ FUZZ_TIME ?= 60
 # platform, which has no installed std and is ASAN-incompatible. Pin the host
 # gnu target instead; override FUZZ_TRIPLE if your host differs.
 FUZZ_TRIPLE ?= x86_64-unknown-linux-gnu
+
+# Print the fuzz target list, one per line. The scheduled CI soak reads this to
+# build its per-target job matrix, so the workflow and the Makefile share one
+# source of truth: a target added to FUZZ_TARGETS above is soaked automatically
+# (cf. issue 053, where a target omitted from the list went unfuzzed for a
+# release).
+print-fuzz-targets:
+	@printf '%s\n' $(FUZZ_TARGETS)
 
 fuzz:
 	@command -v cargo-fuzz >/dev/null 2>&1 || { \
