@@ -81,6 +81,18 @@ impl InitializeParams {
             .did_change_watched_files
             .dynamic_registration
     }
+
+    /// Whether the client advertises support for the `workspace/willRenameFiles`
+    /// file-operation request (decision 020 clause 2).
+    ///
+    /// The move surface is advertised only when this is `true`: a client without
+    /// it never sends the request, so the server degrades to nothing — an
+    /// editor rename behaves exactly as before, moving the file blind
+    /// (`no_will_rename_capability_degrades_to_nothing`).
+    #[must_use]
+    pub const fn supports_will_rename_files(&self) -> bool {
+        self.capabilities.workspace.file_operations.will_rename
+    }
 }
 
 /// A workspace folder.
@@ -105,6 +117,9 @@ pub struct WorkspaceClientCapabilities {
     /// The client's `didChangeWatchedFiles` capability.
     #[serde(default)]
     pub did_change_watched_files: DidChangeWatchedFilesClientCapabilities,
+    /// The client's `fileOperations` capability (decision 020 clause 2).
+    #[serde(default)]
+    pub file_operations: FileOperationsClientCapabilities,
 }
 
 /// Subset of the client's `workspace/didChangeWatchedFiles` capability.
@@ -114,6 +129,16 @@ pub struct DidChangeWatchedFilesClientCapabilities {
     /// Whether the client supports dynamic registration for file watching.
     #[serde(default)]
     pub dynamic_registration: bool,
+}
+
+/// Subset of the client's `workspace.fileOperations` capability — only the
+/// `willRename` flag Lattice gates the move surface on (decision 020 clause 2).
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileOperationsClientCapabilities {
+    /// Whether the client sends `workspace/willRenameFiles` before a rename.
+    #[serde(default)]
+    pub will_rename: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -239,6 +264,27 @@ pub struct FileEvent {
     /// The change kind: see [`file_change_type`].
     #[serde(rename = "type")]
     pub change_type: u8,
+}
+
+/// `workspace/willRenameFiles` request params and `workspace/didRenameFiles`
+/// notification params — both carry the same `files` array of renames
+/// (decision 020 clause 2). `willRename` arrives *before* the rename (the
+/// server answers with the edit set); `didRename` arrives *after* it (the
+/// re-keying confirmation).
+#[derive(Debug, Deserialize)]
+pub struct RenameFilesParams {
+    /// The renames the client is about to perform, or has just performed.
+    pub files: Vec<FileRename>,
+}
+
+/// A single file (or folder) rename: its old and new URIs.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileRename {
+    /// The URI the file or folder currently lives at.
+    pub old_uri: String,
+    /// The URI it is being renamed to.
+    pub new_uri: String,
 }
 
 /// `FileChangeType` values carried by a [`FileEvent`]'s `type` field
@@ -603,6 +649,9 @@ pub mod method {
     pub const DID_CHANGE_WORKSPACE_FOLDERS: &str = "workspace/didChangeWorkspaceFolders";
     /// `workspace/didChangeWatchedFiles`.
     pub const DID_CHANGE_WATCHED_FILES: &str = "workspace/didChangeWatchedFiles";
+    /// `workspace/didRenameFiles` — the client's post-rename confirmation
+    /// (decision 020 clause 2). Re-keys the document store without a rescan.
+    pub const DID_RENAME_FILES: &str = "workspace/didRenameFiles";
     /// `textDocument/publishDiagnostics`.
     pub const PUBLISH_DIAGNOSTICS: &str = "textDocument/publishDiagnostics";
 
@@ -617,6 +666,10 @@ pub mod method {
     pub const PREPARE_RENAME: &str = "textDocument/prepareRename";
     /// `textDocument/rename`.
     pub const RENAME: &str = "textDocument/rename";
+    /// `workspace/willRenameFiles` — the editor move surface (decision 020
+    /// clause 2). The client sends the intent before the rename; the server
+    /// answers with the forced edit set.
+    pub const WILL_RENAME_FILES: &str = "workspace/willRenameFiles";
     /// `textDocument/references`.
     pub const REFERENCES: &str = "textDocument/references";
     /// `textDocument/declaration`.

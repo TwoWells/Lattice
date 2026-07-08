@@ -415,6 +415,80 @@ impl Workspaces {
         }
     }
 
+    /// Re-key the document store for one `oldUri -> newUri` rename the client
+    /// has just performed (`workspace/didRenameFiles` — decision 020 clause 2),
+    /// **without a rescan**.
+    ///
+    /// The move engine's text edits were already applied to buffers by the
+    /// client before it renamed on disk (decision 017 §3), so the content at the
+    /// new key is authoritative and correct — re-keying just moves the parsed
+    /// entries from the old absolute path to the new one and reparses each under
+    /// its (possibly changed) primary root, rather than re-reading a whole
+    /// scope. A file rename moves the single entry; a directory rename moves
+    /// every document under the old prefix. The `open_documents` set and the
+    /// per-URI `published` cache are re-keyed alongside so buffer authority and
+    /// publication diffing follow the file. Returns whether anything moved.
+    ///
+    /// Reparsing (not a bare key swap) is required because a document parses
+    /// relative to its root, and the link classification / structural existence
+    /// checks read the new coordinate; the buffer text is preserved verbatim.
+    ///
+    /// Returns the old URIs that held a published diagnostic set, so the caller
+    /// can send each an explicit empty publish — the re-publish diff iterates
+    /// the *current* store and never revisits a vanished key.
+    fn rekey_rename(&mut self, old_abs: &Path, new_abs: &Path) -> Vec<String> {
+        // Every stored document at, or under, the old path (a file is its own
+        // sole member; a directory prefixes several).
+        let moved: Vec<PathBuf> = self
+            .documents
+            .range(old_abs.to_path_buf()..)
+            .take_while(|(abs, _)| abs.starts_with(old_abs))
+            .map(|(abs, _)| abs.clone())
+            .collect();
+        let mut cleared = Vec::new();
+        for old_key in moved {
+            let Some(doc) = self.documents.remove(&old_key) else {
+                continue;
+            };
+            // Translate the key under the rename: the source maps to the
+            // destination, a contained member keeps its suffix.
+            let new_key = if old_key == old_abs {
+                new_abs.to_path_buf()
+            } else {
+                old_key
+                    .strip_prefix(old_abs)
+                    .map_or_else(|_| old_key.clone(), |suffix| new_abs.join(suffix))
+            };
+            // Follow the buffer-authority and publication-diff state to the new
+            // key so an open renamed file stays editor-authoritative and its
+            // stale publication under the old URI is cleared.
+            let old_uri = path_to_uri(&old_key);
+            let new_uri = path_to_uri(&new_key);
+            if self.open_documents.remove(&old_uri) {
+                self.open_documents.insert(new_uri);
+            }
+            if self.published.remove(&old_uri).is_some() {
+                cleared.push(old_uri);
+            }
+            // Reparse from the preserved buffer under the destination's primary
+            // root — placement and coordinate change, content does not.
+            let primary = self.deepest_root_for(&new_key);
+            let source = doc.data.tree.source().to_string();
+            let data = {
+                let config = self.config_for(primary.as_deref());
+                parse_content(&source, &new_key, config)
+            };
+            self.documents.insert(
+                new_key,
+                Document {
+                    data,
+                    primary_root: primary,
+                },
+            );
+        }
+        cleared
+    }
+
     // --- Placement (primary_root) recomputation ---
 
     /// Recompute a document's deepest covering root and, if it changed, **flip
@@ -949,7 +1023,43 @@ pub fn run() -> Result<()> {
 ///
 /// Returns an error if initialization or the message loop fails.
 fn serve(connection: &Connection) -> Result<()> {
-    let capabilities = serde_json::json!({
+    // Two-phase init so the capabilities we advertise can depend on the client's
+    // own capabilities: `workspace/willRenameFiles` is advertised only to a
+    // client that sends it (decision 020 clause 2). `initialize_start` returns
+    // the client params before we must send our own, so we parse them first,
+    // build the capabilities conditionally, then finish the handshake.
+    let (init_id, init_value) = connection.initialize_start()?;
+    let params: lsp::InitializeParams =
+        serde_json::from_value(init_value).context("failed to parse InitializeParams")?;
+
+    let capabilities = server_capabilities(&params);
+    connection.initialize_finish(init_id, serde_json::json!({ "capabilities": capabilities }))?;
+
+    let workspaces = Workspaces::from_params(&params);
+
+    // File watchers are dynamic-registration only, so register the
+    // `.lattice.toml` watcher now — after `initialized` — when the client
+    // advertises support. A client without it degrades to startup-only config
+    // (decision 017); Lattice never runs its own watcher.
+    if params.supports_watched_files_dynamic_registration() {
+        register_watched_files(connection)?;
+    }
+
+    main_loop(connection, workspaces)?;
+
+    Ok(())
+}
+
+/// Build the server capabilities to advertise, gating client-dependent surfaces.
+///
+/// Every static capability is unconditional; `workspace.fileOperations.willRename`
+/// is advertised only when the client sends `workspace/willRenameFiles`
+/// (decision 020 clause 2), with registration filters that scope the request to
+/// markdown files and folders so the client never sends it for an unrelated
+/// asset. A client without the capability gets no `fileOperations` block, so an
+/// editor rename behaves exactly as before.
+fn server_capabilities(params: &lsp::InitializeParams) -> serde_json::Value {
+    let mut capabilities = serde_json::json!({
         "textDocumentSync": {
             "openClose": true,
             "change": 1,
@@ -1016,23 +1126,31 @@ fn serve(connection: &Connection) -> Result<()> {
         }
     });
 
-    let init_params = connection.initialize(capabilities)?;
-    let params: lsp::InitializeParams =
-        serde_json::from_value(init_params).context("failed to parse InitializeParams")?;
-
-    let workspaces = Workspaces::from_params(&params);
-
-    // File watchers are dynamic-registration only, so register the
-    // `.lattice.toml` watcher now — after `initialized` — when the client
-    // advertises support. A client without it degrades to startup-only config
-    // (decision 017); Lattice never runs its own watcher.
-    if params.supports_watched_files_dynamic_registration() {
-        register_watched_files(connection)?;
+    // The move surface (decision 020 clause 2) is advertised only to a client
+    // that sends `workspace/willRenameFiles`. Its registration filters scope the
+    // request to markdown files and folders, matching the engine's move domain
+    // — an asset rename never trips the client into asking. A client without the
+    // capability sees no `fileOperations` block, so it moves files blind, exactly
+    // as before this ticket.
+    if params.supports_will_rename_files()
+        && let Some(workspace) = capabilities
+            .get_mut("workspace")
+            .and_then(serde_json::Value::as_object_mut)
+    {
+        workspace.insert(
+            "fileOperations".to_string(),
+            serde_json::json!({
+                "willRename": {
+                    "filters": [
+                        { "scheme": "file", "pattern": { "glob": MD_WATCH_GLOB, "matches": "file" } },
+                        { "scheme": "file", "pattern": { "glob": "**/*", "matches": "folder" } }
+                    ]
+                }
+            }),
+        );
     }
 
-    main_loop(connection, workspaces)?;
-
-    Ok(())
+    capabilities
 }
 
 /// Register the watched-file globs with the client.
@@ -1149,6 +1267,20 @@ fn handle_request(
             let params: lsp::RenameParams = serde_json::from_value(req.params)?;
             let edit = do_rename(workspaces, &params);
             Response::new_ok(req.id, edit)
+        }
+        lsp::method::WILL_RENAME_FILES => {
+            let params: lsp::RenameFilesParams = serde_json::from_value(req.params)?;
+            match will_rename_files(workspaces, &params) {
+                // The forced edit set: the client applies it, then performs the
+                // rename (decision 020 clause 2).
+                Ok(edit) => Response::new_ok(req.id, edit),
+                // A refused move (decision 020 clause 6). The message names the
+                // fix; the JSON-RPC error aborts the rename client-side, so the
+                // file does not move.
+                Err(message) => {
+                    Response::new_err(req.id, lsp_server::ErrorCode::RequestFailed as i32, message)
+                }
+            }
         }
         lsp::method::REFERENCES => {
             let params: lsp::ReferenceParams = serde_json::from_value(req.params)?;
@@ -2152,6 +2284,96 @@ fn do_rename(workspaces: &Workspaces, params: &lsp::RenameParams) -> Option<lsp:
     Some(lsp::WorkspaceEdit {
         changes: Some(changes),
     })
+}
+
+// ---------------------------------------------------------------------------
+// Editor move surface — workspace/willRenameFiles (ticket mv/02, decision 020)
+// ---------------------------------------------------------------------------
+
+/// Answer a `workspace/willRenameFiles` request with the move engine's forced
+/// edit set (decision 020 clause 2).
+///
+/// Each `(oldUri, newUri)` is translated into a [`crate::mv::compute_move_edits`]
+/// call over the source's covering scope; every file's edits are converted to
+/// LSP ranges (through that file's cached [`LineIndex`]) and merged into one
+/// [`lsp::WorkspaceEdit`]. The client applies it to buffers, then performs the
+/// rename — so the buffer-wins rule (decision 017) holds with no new machinery,
+/// and the post-rename re-keying rides `workspace/didRenameFiles` plus the
+/// watched-file create/delete channel.
+///
+/// A source outside every scope contributes no edits (there is no edit set to
+/// compute — a plain rename already does everything Lattice could; decision 020
+/// clause 6), so the rename proceeds unimpeded. Any other refusal
+/// (cross-marker, existing destination, markdown-ness flip, …) short-circuits
+/// the whole batch: `Err(message)` carries the alias-steering / fix-naming
+/// text, which the caller returns as a JSON-RPC error so the client aborts the
+/// rename and no file moves.
+///
+/// # Errors
+///
+/// Returns the refusal message (a [`crate::mv::MoveError`] `Display`) for the
+/// first rename the engine refuses.
+fn will_rename_files(
+    workspaces: &Workspaces,
+    params: &lsp::RenameFilesParams,
+) -> Result<lsp::WorkspaceEdit, String> {
+    let mut changes: HashMap<String, Vec<lsp::TextEdit>> = HashMap::new();
+
+    for rename in &params.files {
+        let old_abs = uri_to_path(&rename.old_uri);
+        let new_abs = uri_to_path(&rename.new_uri);
+
+        // Without a covering scope there is no keyspace to compute an edit set
+        // over — the source is outside every graph. Contribute nothing and let
+        // the client's rename proceed (decision 020 clause 6); refusing here
+        // would block a legitimate rename of a file Lattice does not manage.
+        let Some(root) = workspaces.deepest_root_for(&old_abs) else {
+            continue;
+        };
+
+        let view = workspaces.root_view(&root);
+        let fs_exists = |p: &Path| p.is_file() || p.is_dir();
+        let edits = crate::mv::compute_move_edits(&view, &old_abs, &new_abs, &fs_exists)
+            .map_err(|e| e.to_string())?;
+
+        merge_move_edits(workspaces, &edits, &mut changes);
+    }
+
+    Ok(lsp::WorkspaceEdit {
+        changes: Some(changes),
+    })
+}
+
+/// Convert one move's per-file byte-span edits into LSP `TextEdit`s and merge
+/// them into `changes` (keyed by document URI).
+///
+/// Each edited file's source and cached [`LineIndex`] come from the flat
+/// document store, so the byte→UTF-16 conversion matches every other publish.
+/// A file the store does not hold is skipped — the engine only enumerates files
+/// in the view, so this is defensive.
+fn merge_move_edits(
+    workspaces: &Workspaces,
+    edits: &crate::mv::MoveEdits,
+    changes: &mut HashMap<String, Vec<lsp::TextEdit>>,
+) {
+    for (abs_path, file_edits) in &edits.edits {
+        let Some(doc) = workspaces.documents.get(abs_path) else {
+            continue;
+        };
+        let source = doc.data.tree.source();
+        let index = &doc.data.line_index;
+        let uri = path_to_uri(abs_path);
+        let entry = changes.entry(uri).or_default();
+        for edit in file_edits {
+            entry.push(lsp::TextEdit {
+                range: span_to_lsp_range(source, index, &edit.span),
+                new_text: edit.new_text.clone(),
+            });
+        }
+        // A file touched by more than one rename in the batch accumulates edits
+        // out of order; sort so the client applies them deterministically.
+        entry.sort_by_key(|e| (e.range.start.line, e.range.start.character));
+    }
 }
 
 /// Find the heading whose line matches the cursor's 0-based line number.
@@ -4253,6 +4475,10 @@ fn handle_notification(
             let params: lsp::DidChangeWatchedFilesParams = serde_json::from_value(notif.params)?;
             handle_watched_files_change(connection, workspaces, &params)?;
         }
+        lsp::method::DID_RENAME_FILES => {
+            let params: lsp::RenameFilesParams = serde_json::from_value(notif.params)?;
+            handle_did_rename_files(connection, workspaces, &params)?;
+        }
         _ => {}
     }
     Ok(())
@@ -4364,6 +4590,57 @@ fn handle_watched_files_change(
     if !changed_docs.is_empty() {
         publish_all_diagnostics(connection, workspaces, &changed_docs)?;
     }
+    Ok(())
+}
+
+/// Apply a `workspace/didRenameFiles` confirmation (decision 020 clause 2):
+/// re-key the store for every rename the client just performed, then re-publish.
+///
+/// The `willRenameFiles` handler already returned the forced edits, and the
+/// client applied them to buffers and renamed on disk — so the content now
+/// living at each new path is correct. This re-keys the parsed entries onto the
+/// new coordinates **without a rescan** ([`Workspaces::rekey_rename`]),
+/// preserving open buffers (decision 017 §3). Each moved document's old URI gets
+/// an explicit empty publish to clear the client's stale diagnostics under the
+/// old name; then one graph-aware re-publish names the new URIs so their
+/// diagnostics (and any referrer whose edge the coordinate change moved) land at
+/// the renamed positions — the engine's isomorphism, observed end-to-end.
+///
+/// The watched-file create/delete channel (decision 017) delivers the same
+/// membership change independently; this confirmation is idempotent with it —
+/// a re-key of an already-moved key finds nothing and no-ops.
+fn handle_did_rename_files(
+    connection: &Connection,
+    workspaces: &mut Workspaces,
+    params: &lsp::RenameFilesParams,
+) -> Result<()> {
+    let mut cleared_uris: Vec<String> = Vec::new();
+    let mut renamed_uris: HashSet<String> = HashSet::new();
+    for rename in &params.files {
+        let old_abs = uri_to_path(&rename.old_uri);
+        let new_abs = uri_to_path(&rename.new_uri);
+        let cleared = workspaces.rekey_rename(&old_abs, &new_abs);
+        if !cleared.is_empty() || workspaces.deepest_root_for(&new_abs).is_some() {
+            renamed_uris.insert(path_to_uri(&new_abs));
+        }
+        cleared_uris.extend(cleared);
+    }
+    // A membership change: any file's bare-path or backlink edge may have moved.
+    workspaces.recompute_all_structural();
+
+    // Clear the client's stale diagnostics under each vanished old URI.
+    for uri in cleared_uris {
+        let params = lsp::PublishDiagnosticsParams {
+            uri,
+            diagnostics: Vec::new(),
+        };
+        let notif = Notification::new(lsp::method::PUBLISH_DIAGNOSTICS.to_string(), params);
+        connection.sender.send(Message::Notification(notif))?;
+    }
+
+    // Re-publish the whole graph in one pass, forcing the renamed documents to
+    // re-materialize at their new coordinates.
+    publish_all_diagnostics(connection, workspaces, &renamed_uris)?;
     Ok(())
 }
 
@@ -10987,5 +11264,520 @@ mod tests {
             idle.is_empty(),
             "an idle pass publishes nothing — no alternation: {idle:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Editor move surface — workspace/willRenameFiles (ticket mv/02,
+    // decision 020 clause 2)
+    // -----------------------------------------------------------------------
+
+    /// Build the `InitializeParams` a client sends, optionally advertising the
+    /// `workspace.fileOperations.willRename` capability.
+    fn init_params_with_will_rename(will_rename: bool) -> lsp::InitializeParams {
+        serde_json::from_value(serde_json::json!({
+            "capabilities": {
+                "workspace": {
+                    "fileOperations": { "willRename": will_rename }
+                }
+            },
+            "workspaceFolders": []
+        }))
+        .expect("deserialize InitializeParams")
+    }
+
+    /// Send a `workspace/willRenameFiles` request for one `old -> new` rename and
+    /// return the raw response (result or error) for `id`.
+    fn will_rename_request(
+        client: &Connection,
+        id: i32,
+        old_uri: &str,
+        new_uri: &str,
+    ) -> lsp_server::Response {
+        client
+            .sender
+            .send(Message::Request(Request::new(
+                RequestId::from(id),
+                lsp::method::WILL_RENAME_FILES.to_string(),
+                serde_json::json!({
+                    "files": [ { "oldUri": old_uri, "newUri": new_uri } ]
+                }),
+            )))
+            .expect("send willRenameFiles");
+        for _ in 0..32 {
+            if let Message::Response(resp) = recv_message(client)
+                && resp.id == RequestId::from(id)
+            {
+                return resp;
+            }
+        }
+        panic!("no response for willRenameFiles request {id}");
+    }
+
+    /// The `WorkspaceEdit.changes` map keyed by URI, as `Vec<lsp::TextEdit>`,
+    /// extracted from a successful willRename response.
+    fn changes_of(resp: &lsp_server::Response) -> HashMap<String, Vec<lsp::TextEdit>> {
+        let result = resp
+            .result
+            .as_ref()
+            .expect("a successful willRename carries a WorkspaceEdit result");
+        let changes = result
+            .get("changes")
+            .expect("the WorkspaceEdit has a changes map");
+        serde_json::from_value(changes.clone()).expect("deserialize the changes map")
+    }
+
+    #[test]
+    fn will_rename_capability_gated_on_client() {
+        // Advertised only to a client that sends the request; absent otherwise —
+        // a client without it moves files blind, exactly as before (decision 020
+        // clause 2, the graceful-degradation half of the acceptance).
+        let with = server_capabilities(&init_params_with_will_rename(true));
+        let file_ops = with.get("workspace").and_then(|w| w.get("fileOperations"));
+        assert!(
+            file_ops.is_some(),
+            "a willRename-capable client is offered the fileOperations surface: {with}"
+        );
+        let filters = file_ops
+            .and_then(|f| f.get("willRename"))
+            .and_then(|w| w.get("filters"))
+            .and_then(serde_json::Value::as_array)
+            .expect("willRename carries registration filters");
+        let filters_json = serde_json::to_string(filters).expect("serialize filters");
+        assert!(
+            filters_json.contains("file") && filters_json.contains("folder"),
+            "the filters scope the request to markdown files and folders: {filters_json}"
+        );
+
+        let without = server_capabilities(&init_params_with_will_rename(false));
+        assert!(
+            without
+                .get("workspace")
+                .and_then(|w| w.get("fileOperations"))
+                .is_none(),
+            "a client without the capability sees no fileOperations block: {without}"
+        );
+    }
+
+    #[test]
+    fn will_rename_updates_referrer_and_moved_file() {
+        // A clean two-file graph — a forward link and its reciprocal backlink.
+        // Moving the target to a deeper directory must retarget the referrer's
+        // forward link AND re-relativize the moved file's own backlink entry (its
+        // depth to hub.md changed), in one merged WorkspaceEdit (decision 020
+        // clause 4).
+        let dir = workspace_with_files(&[
+            (".lattice.toml", ""),
+            (
+                "hub.md",
+                "# Hub\n\n[to target](docs/target.md \"references\")\n",
+            ),
+            (
+                "docs/target.md",
+                "---\nbacklinks:\n  referenced_by:\n    - ../hub.md\n---\n# Target\n",
+            ),
+        ]);
+        let workspaces = scan_workspaces(&dir);
+        let old_uri = file_uri(&dir, "docs/target.md");
+        let new_uri = file_uri(&dir, "archive/deep/target.md");
+
+        let edit = will_rename_files(
+            &workspaces,
+            &lsp::RenameFilesParams {
+                files: vec![lsp::FileRename { old_uri, new_uri }],
+            },
+        );
+        let edit = edit.expect("a valid in-scope move computes an edit set");
+        let changes = edit.changes.expect("the workspace edit carries changes");
+
+        let hub_uri = file_uri(&dir, "hub.md");
+        let target_uri = file_uri(&dir, "docs/target.md");
+        let hub_edits = changes
+            .get(&hub_uri)
+            .expect("the referrer's forward link is edited");
+        assert_eq!(
+            hub_edits.len(),
+            1,
+            "exactly the one forward link is retargeted: {hub_edits:?}"
+        );
+        assert_eq!(
+            hub_edits[0].new_text, "archive/deep/target.md",
+            "the referrer's link points at the new location"
+        );
+        let target_edits = changes
+            .get(&target_uri)
+            .expect("the moved file's own backlink entry is re-relativized");
+        assert_eq!(
+            target_edits.len(),
+            1,
+            "exactly the one backlink entry is re-rendered: {target_edits:?}"
+        );
+        assert_eq!(
+            target_edits[0].new_text, "../../hub.md",
+            "the moved file's backlink re-relativizes to hub.md from its deeper location"
+        );
+    }
+
+    #[test]
+    fn will_rename_cross_marker_is_refused() {
+        // A move whose destination lands inside a nested scope crosses a marker
+        // boundary: it is an extraction, not a rename (decision 020 clause 6).
+        // The engine refuses with the alias-steering message, and the handler
+        // computes no edits — so the client aborts and the file does not move.
+        let dir = workspace_with_files(&[
+            (".lattice.toml", ""),
+            ("a.md", "# A\n"),
+            ("nested/.lattice.toml", ""),
+            ("nested/keep.md", "# Keep\n"),
+        ]);
+        let workspaces = scan_workspaces(&dir);
+        let old_uri = file_uri(&dir, "a.md");
+        let new_uri = file_uri(&dir, "nested/a.md");
+
+        let result = will_rename_files(
+            &workspaces,
+            &lsp::RenameFilesParams {
+                files: vec![lsp::FileRename { old_uri, new_uri }],
+            },
+        );
+        let message = result.expect_err("a cross-marker move is refused");
+        assert!(
+            message.contains("external"),
+            "the refusal steers to the `[external]` alias: {message}"
+        );
+    }
+
+    #[test]
+    fn wire_will_rename_cross_marker_answers_error_and_file_stays() {
+        // Over the wire (decision 020 clause 2 + clause 6): a cross-marker move
+        // is answered with a JSON-RPC error carrying the alias-steering message,
+        // not a WorkspaceEdit — so the client aborts and the file does not move.
+        let dir = workspace_with_files(&[
+            (".lattice.toml", ""),
+            ("a.md", "# A\n"),
+            ("nested/.lattice.toml", ""),
+            ("nested/keep.md", "# Keep\n"),
+        ]);
+        let root = fs::canonicalize(dir.path()).expect("canonicalize temp dir");
+        let root_uri = path_to_uri(&root);
+        let old_uri = path_to_uri(&root.join("a.md"));
+        let new_uri = path_to_uri(&root.join("nested/a.md"));
+
+        let (server, client) = Connection::memory();
+        let server_thread = std::thread::spawn(move || serve(&server));
+        handshake(&client, &root_uri, false);
+
+        let resp = will_rename_request(&client, 77, &old_uri, &new_uri);
+        assert!(
+            resp.result.is_none(),
+            "a refused move carries no WorkspaceEdit result: {resp:?}"
+        );
+        let error = resp.error.expect("a refused move answers with an error");
+        assert_eq!(
+            error.code,
+            lsp_server::ErrorCode::RequestFailed as i32,
+            "the refusal is a RequestFailed error, got code {}",
+            error.code
+        );
+        assert!(
+            error.message.contains("external"),
+            "the error names the fix (the `[external]` alias): {}",
+            error.message
+        );
+        // The server computed no edit and left the source in place; the client,
+        // seeing the error, aborts — the file is still at its old path.
+        assert!(
+            root.join("a.md").is_file() && !root.join("nested/a.md").exists(),
+            "the refused move left the file at its old path"
+        );
+
+        shutdown(&client, server_thread);
+    }
+
+    /// Splice an `lsp::TextEdit` list into `source` back-to-front (so earlier
+    /// byte offsets stay valid), converting each LSP range to a byte range.
+    fn apply_text_edits(source: &str, edits: &[lsp::TextEdit]) -> String {
+        let mut byte_edits: Vec<(usize, usize, &str)> = edits
+            .iter()
+            .map(|e| {
+                let start = lsp_position_to_byte_offset(source, e.range.start);
+                let end = lsp_position_to_byte_offset(source, e.range.end);
+                (start, end, e.new_text.as_str())
+            })
+            .collect();
+        byte_edits.sort_by_key(|(start, _, _)| *start);
+        let mut text = source.to_string();
+        for (start, end, new_text) in byte_edits.iter().rev() {
+            text.replace_range(*start..*end, new_text);
+        }
+        text
+    }
+
+    #[test]
+    fn will_rename_isomorphism_end_to_end() {
+        // The governing property observed over the LSP surface: apply the edit
+        // set the willRename handler returns, perform the rename, and the graph
+        // is unchanged up to the coordinate move. Clean stays clean; the moved
+        // file's own drift (a broken forward link) transports verbatim.
+        let dir = workspace_with_files(&[
+            (".lattice.toml", ""),
+            (
+                "hub.md",
+                "# Hub\n\n[to target](docs/target.md \"references\")\n",
+            ),
+            (
+                "docs/target.md",
+                // A reciprocal backlink (clean edge) plus a deliberately broken
+                // forward link that must survive the move at new coordinates.
+                "---\nbacklinks:\n  referenced_by:\n    - ../hub.md\n---\n# Target\n\n[gone](ghost.md \"references\")\n",
+            ),
+        ]);
+        let root = dir.path().to_path_buf();
+
+        // Pre-move: exactly the one broken-link error on target.md.
+        let pre = crate::validation::collect_all(&Workspace::scan(&root).expect("scan pre"));
+        assert_eq!(
+            pre.len(),
+            1,
+            "one pre-move drift (the broken link): {pre:#?}"
+        );
+
+        let workspaces = scan_workspaces(&dir);
+        let old_uri = file_uri(&dir, "docs/target.md");
+        let new_uri = file_uri(&dir, "archive/target.md");
+        let edit = will_rename_files(
+            &workspaces,
+            &lsp::RenameFilesParams {
+                files: vec![lsp::FileRename { old_uri, new_uri }],
+            },
+        )
+        .expect("the move computes an edit set");
+        let changes = edit.changes.expect("changes present");
+
+        // Apply every returned text edit to disk (the client applies to buffers;
+        // on save/rename the bytes land on disk identically).
+        for (uri, text_edits) in &changes {
+            let path = uri_to_path(uri);
+            let source = fs::read_to_string(&path).expect("read edited file");
+            let edited = apply_text_edits(&source, text_edits);
+            fs::write(&path, edited).expect("write edited file");
+        }
+        // Perform the rename on disk (the client's job after applying edits).
+        fs::create_dir_all(root.join("archive")).expect("create archive dir");
+        fs::rename(root.join("docs/target.md"), root.join("archive/target.md"))
+            .expect("perform the rename");
+
+        // Post-move: the same single drift, now anchored at the renamed file.
+        let post = crate::validation::collect_all(&Workspace::scan(&root).expect("scan post"));
+        assert_eq!(
+            post.len(),
+            1,
+            "the diagnostic count is preserved by the coordinate move: {post:#?}"
+        );
+        assert_eq!(
+            post[0].file,
+            PathBuf::from("archive/target.md"),
+            "the surviving drift transported to the renamed coordinate: {post:#?}"
+        );
+        // The clean forward-link/backlink edge stayed clean: the only diagnostic
+        // is the pre-existing broken link, not a freshly-broken referrer.
+        assert!(
+            post[0].message.contains("ghost.md"),
+            "the transported drift is the same broken link, not a new break: {post:#?}"
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one linear wire-level lifecycle: init, open, willRename, apply, rename, didRename, assert"
+    )]
+    fn did_rename_files_rekeys_without_rescan_and_republishes() {
+        // Wire-level end-to-end (decision 020 clause 2): after the client applies
+        // the edits and renames, `workspace/didRenameFiles` re-keys the store
+        // without a rescan. The moved file's own drift (a broken forward link)
+        // transports to its NEW URI, its OLD URI is cleared, and the referrer's
+        // retargeted link resolves again.
+        let dir = workspace_with_files(&[
+            (".lattice.toml", ""),
+            (
+                "hub.md",
+                "# Hub\n\n[to target](docs/target.md \"references\")\n",
+            ),
+            (
+                "docs/target.md",
+                "---\nbacklinks:\n  referenced_by:\n    - ../hub.md\n---\n# Target\n\n[gone](ghost.md \"references\")\n",
+            ),
+        ]);
+        let root = fs::canonicalize(dir.path()).expect("canonicalize temp dir");
+        let root_uri = path_to_uri(&root);
+        let hub_uri = path_to_uri(&root.join("hub.md"));
+        let old_uri = path_to_uri(&root.join("docs/target.md"));
+        let new_uri = path_to_uri(&root.join("archive/target.md"));
+
+        let (server, client) = Connection::memory();
+        let server_thread = std::thread::spawn(move || serve(&server));
+
+        // Advertise both dynamic registration and willRename so the full lifecycle
+        // is exercised.
+        let init = Request::new(
+            RequestId::from(1),
+            "initialize".to_string(),
+            serde_json::json!({
+                "capabilities": {
+                    "workspace": {
+                        "didChangeWatchedFiles": { "dynamicRegistration": true },
+                        "fileOperations": { "willRename": true }
+                    }
+                },
+                "workspaceFolders": [ { "uri": root_uri } ]
+            }),
+        );
+        client
+            .sender
+            .send(Message::Request(init))
+            .expect("send initialize");
+        // The initialize response advertises the willRename surface.
+        let init_resp = loop {
+            if let Message::Response(resp) = recv_message(&client) {
+                break resp;
+            }
+        };
+        let caps = init_resp
+            .result
+            .expect("initialize result")
+            .get("capabilities")
+            .expect("capabilities present")
+            .clone();
+        assert!(
+            caps.get("workspace")
+                .and_then(|w| w.get("fileOperations"))
+                .is_some(),
+            "the initialize result advertises the willRename surface: {caps}"
+        );
+        send_notification(&client, "initialized", serde_json::json!({}));
+        let _reg = recv_message(&client); // client/registerCapability
+
+        // Open both documents; the clean graph publishes empty sets.
+        open_doc(
+            &client,
+            &hub_uri,
+            "# Hub\n\n[to target](docs/target.md \"references\")\n",
+        );
+        assert!(
+            recv_publish_for(&client, &hub_uri).is_empty(),
+            "hub.md is clean before the move"
+        );
+        open_doc(
+            &client,
+            &old_uri,
+            "---\nbacklinks:\n  referenced_by:\n    - ../hub.md\n---\n# Target\n\n[gone](ghost.md \"references\")\n",
+        );
+        assert!(
+            any_message_contains(&recv_publish_for(&client, &old_uri), "ghost.md"),
+            "target.md carries its broken-link drift before the move"
+        );
+
+        // Ask for the move; apply the returned edits to the open buffers via
+        // didChange (buffer-wins), and to disk, then rename on disk.
+        let resp = will_rename_request(&client, 42, &old_uri, &new_uri);
+        let changes = changes_of(&resp);
+        for (uri, text_edits) in &changes {
+            let path = uri_to_path(uri);
+            let source = fs::read_to_string(&path).expect("read edited file");
+            let edited = apply_text_edits(&source, text_edits);
+            // The client applies the edit to its live buffer first.
+            send_change(&client, uri, &edited);
+            fs::write(&path, edited).expect("write edited file");
+        }
+        // Drain any republishes the buffer edits triggered.
+        for uri in changes.keys() {
+            let _ = recv_publish_for(&client, uri);
+        }
+        fs::create_dir_all(root.join("archive")).expect("create archive dir");
+        fs::rename(root.join("docs/target.md"), root.join("archive/target.md"))
+            .expect("perform the rename");
+
+        // Confirm the rename: didRenameFiles re-keys the store without a rescan.
+        send_notification(
+            &client,
+            lsp::method::DID_RENAME_FILES,
+            serde_json::json!({
+                "files": [ { "oldUri": old_uri, "newUri": new_uri } ]
+            }),
+        );
+
+        // The old URI is cleared, and the moved file's drift transports to its
+        // new URI — the isomorphism preserved end-to-end over the LSP surface.
+        let cleared = recv_publish_for(&client, &old_uri);
+        assert!(
+            cleared.is_empty(),
+            "the vanished old URI is cleared: {cleared:?}"
+        );
+        let moved = recv_publish_for(&client, &new_uri);
+        assert!(
+            any_message_contains(&moved, "ghost.md"),
+            "the renamed file's broken-link drift transported to its new coordinate: {moved:?}"
+        );
+
+        shutdown(&client, server_thread);
+    }
+
+    #[test]
+    fn no_will_rename_capability_degrades_to_nothing() {
+        // A client that does not advertise willRename receives no fileOperations
+        // block and the server behaves exactly as before — an editor rename is
+        // performed blind. The server still serves everything else.
+        let dir = workspace_with_files(&[
+            (".lattice.toml", ""),
+            ("doc.md", "# Doc\n\n[x](gone.md \"references\")\n"),
+        ]);
+        let root = fs::canonicalize(dir.path()).expect("canonicalize temp dir");
+        let root_uri = path_to_uri(&root);
+        let doc_uri = path_to_uri(&root.join("doc.md"));
+
+        let (server, client) = Connection::memory();
+        let server_thread = std::thread::spawn(move || serve(&server));
+
+        // Handshake WITHOUT the willRename capability, capturing the result.
+        let init = Request::new(
+            RequestId::from(1),
+            "initialize".to_string(),
+            serde_json::json!({
+                "capabilities": { "workspace": {} },
+                "workspaceFolders": [ { "uri": root_uri } ]
+            }),
+        );
+        client
+            .sender
+            .send(Message::Request(init))
+            .expect("send initialize");
+        let init_resp = loop {
+            if let Message::Response(resp) = recv_message(&client) {
+                break resp;
+            }
+        };
+        let caps = init_resp
+            .result
+            .expect("initialize result")
+            .get("capabilities")
+            .expect("capabilities present")
+            .clone();
+        assert!(
+            caps.get("workspace")
+                .and_then(|w| w.get("fileOperations"))
+                .is_none(),
+            "no fileOperations surface is advertised without the client capability: {caps}"
+        );
+        send_notification(&client, "initialized", serde_json::json!({}));
+
+        // The server still publishes diagnostics as before.
+        open_doc(&client, &doc_uri, "# Doc\n\n[x](gone.md \"references\")\n");
+        let publish = recv_publish_for(&client, &doc_uri);
+        assert!(
+            !publish.is_empty(),
+            "the server still serves diagnostics without the move surface: {publish:?}"
+        );
+
+        shutdown(&client, server_thread);
     }
 }
