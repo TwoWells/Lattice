@@ -392,8 +392,11 @@ pub fn resolve_backlink_path(containing_file: &Path, backlink_path: &str) -> Pat
 ///
 /// Both paths must be workspace-relative. Returns the path you would write
 /// in `from`'s frontmatter to reference `to` — relative to `from`'s
-/// parent directory.
-fn file_relative(from: &Path, to: &Path) -> PathBuf {
+/// parent directory. Shared with the move engine (`crate::mv`), which re-renders
+/// a backlink entry or a plain relative link target through the same renderer
+/// backlink reconciliation expects, so a moved edge's new spelling matches what
+/// the graph tier would predict.
+pub fn file_relative(from: &Path, to: &Path) -> PathBuf {
     let from_dir = from.parent().unwrap_or_else(|| Path::new(""));
     let from_parts: Vec<_> = from_dir.components().collect();
     let to_parts: Vec<_> = to.components().collect();

@@ -27,6 +27,7 @@ mod line_index;
 mod lint;
 mod lsp;
 mod metadata;
+mod mv;
 mod server;
 mod span;
 mod structural;

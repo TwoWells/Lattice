@@ -779,6 +779,202 @@ fn scan_title(s: &str, start: usize) -> Option<(String, usize)> {
     None
 }
 
+/// Locate the byte span of a link's *destination* — the path-denoting text a
+/// move must re-render — within the full document `source`, given the link
+/// node's full span (as carried by [`Link::span`]).
+///
+/// The returned span covers only the path portion of the destination, up to but
+/// never including a `#` fragment (fragment bytes ride along verbatim in a file
+/// rename — decision 020 clause 4) or a title. The move engine (`crate::mv`)
+/// splices the new spelling into exactly this range, leaving the surrounding
+/// `[text]`, delimiters, title, and fragment byte-identical.
+///
+/// Handles the destination-bearing link syntaxes:
+/// - inline `[text](dest "title")` — the bare `dest` run;
+/// - angle-bracketed inline `[text](<dest> "title")` — the run *inside* the
+///   angle brackets, so the edit stays between `<` and `>`;
+/// - an `@dest` import directive — the path after the `@`;
+/// - a raw-HTML `<a href="dest">…</a>` anchor — the `href` attribute value.
+///
+/// Returns `None` for a reference-style link (`[text][label]`, `[text][]`,
+/// `[label]`), whose destination lives in a separate `ReferenceDef` node, not in
+/// the link span — the caller edits the definition's URL via
+/// [`Tree::find_ref_def`] instead. Also `None` for an autolink or any link whose
+/// span does not carry an editable inline destination.
+#[must_use]
+pub fn link_destination_span(source: &str, link_span: Span) -> Option<Span> {
+    let start = link_span.start;
+    let end = link_span.end.min(source.len());
+    if start >= end {
+        return None;
+    }
+    let slice = &source[start..end];
+    let bytes = slice.as_bytes();
+
+    match bytes[0] {
+        b'@' => import_destination_span(slice, start),
+        b'<' => html_anchor_href_span(slice, start),
+        b'[' => inline_link_destination_span(slice, start),
+        _ => None,
+    }
+}
+
+/// Destination span of an `@dest` import directive (the path after the `@`),
+/// trimmed of any `#` fragment. `base` is the byte offset of the slice's first
+/// byte in the full source.
+fn import_destination_span(slice: &str, base: usize) -> Option<Span> {
+    // The import path is the whole slice after the leading `@` (the node span
+    // ends exactly at the path's end — `try_parse_import` sets it there).
+    let path = &slice[1..];
+    if path.is_empty() {
+        return None;
+    }
+    let dest_start = base + 1;
+    let path_len = path.split('#').next().unwrap_or(path).len();
+    Some(Span::new(dest_start, dest_start + path_len))
+}
+
+/// Destination span of a raw-HTML `<a href="dest">` anchor — the `href`
+/// attribute value, trimmed of any `#` fragment. `base` is the byte offset of
+/// the slice's first byte in the full source.
+fn html_anchor_href_span(slice: &str, base: usize) -> Option<Span> {
+    // Locate `href`, then its quoted value. Case-insensitive attribute name,
+    // matching the tokenizer; the value delimiter is `"` or `'`.
+    let lower = slice.to_ascii_lowercase();
+    let mut search = 0;
+    while let Some(rel) = lower[search..].find("href") {
+        let name_at = search + rel;
+        let after = name_at + "href".len();
+        // Skip optional whitespace, require `=`.
+        let sbytes = slice.as_bytes();
+        let mut i = after;
+        while i < sbytes.len() && matches!(sbytes[i], b' ' | b'\t' | b'\n' | b'\r') {
+            i += 1;
+        }
+        if i >= sbytes.len() || sbytes[i] != b'=' {
+            search = after;
+            continue;
+        }
+        i += 1;
+        while i < sbytes.len() && matches!(sbytes[i], b' ' | b'\t' | b'\n' | b'\r') {
+            i += 1;
+        }
+        if i >= sbytes.len() {
+            return None;
+        }
+        let quote = sbytes[i];
+        if quote != b'"' && quote != b'\'' {
+            search = after;
+            continue;
+        }
+        let value_start = i + 1;
+        let mut j = value_start;
+        while j < sbytes.len() && sbytes[j] != quote {
+            j += 1;
+        }
+        if j >= sbytes.len() {
+            return None;
+        }
+        let value = &slice[value_start..j];
+        let path_len = value.split('#').next().unwrap_or(value).len();
+        if path_len == 0 {
+            return None;
+        }
+        return Some(Span::new(base + value_start, base + value_start + path_len));
+    }
+    None
+}
+
+/// Destination span of an inline `[text](dest …)` link — the bare or
+/// angle-bracketed `dest` run, trimmed of any `#` fragment. Returns `None` for a
+/// reference-style link (no inline `(dest)`). `base` is the byte offset of the
+/// slice's first byte in the full source.
+fn inline_link_destination_span(slice: &str, base: usize) -> Option<Span> {
+    let bytes = slice.as_bytes();
+    // Find the `]` closing the link text, then require `(` immediately after —
+    // otherwise this is a reference-style link with no inline destination.
+    let close = matching_link_text_close(bytes)?;
+    let paren = close + 1;
+    if paren >= bytes.len() || bytes[paren] != b'(' {
+        return None;
+    }
+    let mut i = paren + 1;
+    while i < bytes.len() && matches!(bytes[i], b' ' | b'\t') {
+        i += 1;
+    }
+    if i >= bytes.len() {
+        return None;
+    }
+    if bytes[i] == b'<' {
+        // Angle-bracketed: edit inside the brackets.
+        let inner_start = i + 1;
+        let mut j = inner_start;
+        while j < bytes.len() && bytes[j] != b'>' && bytes[j] != b'\n' {
+            j += 1;
+        }
+        if j >= bytes.len() || bytes[j] != b'>' {
+            return None;
+        }
+        let value = &slice[inner_start..j];
+        let path_len = value.split('#').next().unwrap_or(value).len();
+        return Some(Span::new(base + inner_start, base + inner_start + path_len));
+    }
+    // Bare destination: scan to whitespace or the closing `)`, honoring nested
+    // parens, mirroring `parse_dest_url`.
+    let dest_start = i;
+    let mut paren_depth: i32 = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\n' | b'\r' => break,
+            b' ' | b'\t' | b')' if paren_depth == 0 => break,
+            b'(' => {
+                paren_depth += 1;
+                i += 1;
+            }
+            b')' => {
+                paren_depth -= 1;
+                i += 1;
+            }
+            b'\\' if i + 1 < bytes.len() => i += 2,
+            _ => i += 1,
+        }
+    }
+    if i == dest_start {
+        return None;
+    }
+    let value = &slice[dest_start..i];
+    let path_len = value.split('#').next().unwrap_or(value).len();
+    if path_len == 0 {
+        return None;
+    }
+    Some(Span::new(base + dest_start, base + dest_start + path_len))
+}
+
+/// Index of the `]` that closes the leading `[` of a link's text, honoring
+/// backslash escapes and nested balanced brackets. `bytes[0]` must be `[`.
+fn matching_link_text_close(bytes: &[u8]) -> Option<usize> {
+    let mut depth: i32 = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' if i + 1 < bytes.len() => i += 2,
+            b'[' => {
+                depth += 1;
+                i += 1;
+            }
+            b']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    None
+}
+
 /// Recognize the opener of a reference-definition label: up to three spaces of
 /// indentation, then a `[` that is not a footnote marker (`[^`). Returns the
 /// byte index just past the `[`, or `None`. Shared by the cheap gate and the
@@ -7310,6 +7506,121 @@ mod tests {
             }
             other => panic!("expected a strict intra-project markdown link, got {other:?}"),
         }
+    }
+
+    // --- link_destination_span (the move-engine edit primitive, ticket mv/01) ---
+
+    /// Resolve the single link's destination span and return the slice it
+    /// covers, asserting exactly one link is present.
+    fn only_link_dest_slice(source: &str) -> (Span, String) {
+        let tree = parse(source);
+        let links = tree.links(Path::new("doc.md"));
+        assert_eq!(links.len(), 1, "expected exactly one link: {links:?}");
+        let span = link_destination_span(source, links[0].span)
+            .expect("link should carry an editable inline destination");
+        (span, source[span.start..span.end].to_string())
+    }
+
+    #[test]
+    fn dest_span_inline_bare() {
+        let (_span, slice) = only_link_dest_slice("see [x](sub/other.md) here\n");
+        assert_eq!(
+            slice, "sub/other.md",
+            "the bare inline destination is the path run"
+        );
+    }
+
+    #[test]
+    fn dest_span_inline_with_title() {
+        let (_span, slice) = only_link_dest_slice("[x](other.md \"references\")\n");
+        assert_eq!(
+            slice, "other.md",
+            "the title is excluded from the destination span"
+        );
+    }
+
+    #[test]
+    fn dest_span_inline_fragment_excluded() {
+        let source = "[x](guide.md#heading)\n";
+        let (span, slice) = only_link_dest_slice(source);
+        assert_eq!(slice, "guide.md", "the `#fragment` is never in the span");
+        assert_eq!(
+            &source[span.end..span.end + 8],
+            "#heading",
+            "the span ends exactly before the `#`"
+        );
+    }
+
+    #[test]
+    fn dest_span_angle_bracket_inside_brackets() {
+        let source = "[x](<a b.md> \"references\")\n";
+        let (span, slice) = only_link_dest_slice(source);
+        assert_eq!(
+            slice, "a b.md",
+            "the angle-bracketed destination is the run inside `<>`"
+        );
+        assert_eq!(
+            source.as_bytes()[span.start - 1],
+            b'<',
+            "the edit range starts after the `<`"
+        );
+        assert_eq!(
+            source.as_bytes()[span.end],
+            b'>',
+            "the edit range ends before the `>`"
+        );
+    }
+
+    #[test]
+    fn dest_span_import() {
+        let (_span, slice) = only_link_dest_slice("@sub/partial.md\n");
+        assert_eq!(
+            slice, "sub/partial.md",
+            "the import destination is the path after `@`"
+        );
+    }
+
+    #[test]
+    fn dest_span_html_anchor_href() {
+        let (_span, slice) = only_link_dest_slice("<a href=\"other.md\">x</a>\n");
+        assert_eq!(
+            slice, "other.md",
+            "the HTML anchor destination is the `href` value"
+        );
+    }
+
+    #[test]
+    fn dest_span_html_anchor_href_fragment_excluded() {
+        let (_span, slice) = only_link_dest_slice("<a href=\"g.md#h\">x</a>\n");
+        assert_eq!(
+            slice, "g.md",
+            "the HTML anchor `#fragment` is excluded from the span"
+        );
+    }
+
+    #[test]
+    fn dest_span_reference_style_is_none() {
+        // A reference-style link's destination lives in a separate ReferenceDef
+        // node, not the link span, so the primitive declines it.
+        let source = "[x][ref]\n\n[ref]: other.md\n";
+        let tree = parse(source);
+        let links = tree.links(Path::new("doc.md"));
+        assert_eq!(
+            links.len(),
+            1,
+            "reference link resolves to one link: {links:?}"
+        );
+        assert!(
+            link_destination_span(source, links[0].span).is_none(),
+            "a reference-style link carries no inline destination span"
+        );
+        // The definition's URL is what the move engine edits instead.
+        let (_id, node) = tree.find_ref_def("ref").expect("ref def resolves");
+        assert!(
+            matches!(&node.kind, ElementKind::ReferenceDef { url, .. } if url == "other.md"),
+            "the ReferenceDef carries the destination: {:?}",
+            node.kind
+        );
     }
 
     // --- Tables: edge cases ---
