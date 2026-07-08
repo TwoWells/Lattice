@@ -442,46 +442,11 @@ pub struct MarkupContent {
     pub value: String,
 }
 
-/// Full document diagnostic report.
-#[derive(Debug, Clone, Serialize)]
-pub struct FullDocumentDiagnosticReport {
-    /// Report kind — always "full".
-    pub kind: String,
-    /// Diagnostics.
-    pub items: Vec<Diagnostic>,
-}
-
-/// A single workspace document diagnostic report.
-#[derive(Debug, Clone, Serialize)]
-pub struct WorkspaceDocumentDiagnosticReport {
-    /// Report kind — always "full".
-    pub kind: String,
-    /// Document URI.
-    pub uri: String,
-    /// Diagnostics.
-    pub items: Vec<Diagnostic>,
-}
-
-/// Workspace diagnostic report.
-#[derive(Debug, Clone, Serialize)]
-pub struct WorkspaceDiagnosticReport {
-    /// Per-document reports.
-    pub items: Vec<WorkspaceDocumentDiagnosticReport>,
-}
-
 /// `textDocument/formatting` params.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DocumentFormattingParams {
     /// The document to format.
-    pub text_document: TextDocumentIdentifier,
-}
-
-/// `textDocument/diagnostic` params.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DocumentDiagnosticParams {
-    /// The document to get diagnostics for.
     pub text_document: TextDocumentIdentifier,
 }
 
@@ -680,10 +645,6 @@ pub mod method {
     pub const FOLDING_RANGE: &str = "textDocument/foldingRange";
     /// `textDocument/hover`.
     pub const HOVER: &str = "textDocument/hover";
-    /// `textDocument/diagnostic`.
-    pub const DOCUMENT_DIAGNOSTIC: &str = "textDocument/diagnostic";
-    /// `workspace/diagnostic`.
-    pub const WORKSPACE_DIAGNOSTIC: &str = "workspace/diagnostic";
     /// `textDocument/formatting`.
     pub const FORMATTING: &str = "textDocument/formatting";
     /// `textDocument/completion`.

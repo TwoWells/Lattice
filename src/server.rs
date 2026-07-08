@@ -968,10 +968,18 @@ fn serve(connection: &Connection) -> Result<()> {
         "documentLinkProvider": {},
         "foldingRangeProvider": true,
         "hoverProvider": true,
-        // Diagnostics are push-only. A server that advertises pull
-        // (`diagnosticProvider`) *and* pushes `publishDiagnostics` makes
+        // Diagnostics are push-only by design (decision 022), not by revert.
+        // Push (`publishDiagnostics`) is the only transport that proactively
+        // covers the *closed* target file — where a backlink diagnostic lands
+        // when its source is edited — so it is the right transport for a graph
+        // linter, not a fallback. `didOpen` resets the per-URI publish diff
+        // because a client's memory of a reopened document is unknowable
+        // (`republish_on_open`), which closes the only gap pull papered over.
+        // Advertising pull (`diagnosticProvider`) *and* pushing makes
         // spec-compliant clients (e.g. Neovim 0.11) render every diagnostic
-        // twice, so pull is intentionally not advertised here.
+        // twice, so pull is not advertised — and any future pull support must
+        // be capability-negotiated per session with disjoint open/closed
+        // transports, never merely "don't advertise both".
         "documentFormattingProvider": true,
         "completionProvider": {
             // Destination open, path separator, fragment, title quote, and
@@ -1211,15 +1219,6 @@ fn handle_request(
             let params: lsp::TextDocumentPositionParams = serde_json::from_value(req.params)?;
             let hover = hover_preview(workspaces, &params);
             Response::new_ok(req.id, hover)
-        }
-        lsp::method::DOCUMENT_DIAGNOSTIC => {
-            let params: lsp::DocumentDiagnosticParams = serde_json::from_value(req.params)?;
-            let report = document_diagnostic(workspaces, &params.text_document.uri);
-            Response::new_ok(req.id, report)
-        }
-        lsp::method::WORKSPACE_DIAGNOSTIC => {
-            let report = workspace_diagnostic(workspaces);
-            Response::new_ok(req.id, report)
         }
         lsp::method::FORMATTING => {
             let params: lsp::DocumentFormattingParams = serde_json::from_value(req.params)?;
@@ -2969,7 +2968,7 @@ fn document_links(workspaces: &Workspaces, uri: &str) -> Vec<lsp::DocumentLink> 
 }
 
 // ---------------------------------------------------------------------------
-// Pull diagnostics (ticket 09)
+// Diagnostic collection (shared by the push path and `lattice lint`)
 // ---------------------------------------------------------------------------
 
 /// Collect all diagnostics for a workspace: structural (unconditional) +
@@ -3041,60 +3040,6 @@ fn file_desired(
         .map(|d| to_lsp_diagnostic(d, source, index))
         .collect();
     (lattice, lsp)
-}
-
-/// Return diagnostics for a single document.
-fn document_diagnostic(workspaces: &Workspaces, uri: &str) -> lsp::FullDocumentDiagnosticReport {
-    let items = if let Some((workspace, rel_path)) = workspaces.resolve(uri) {
-        let all = collect_all_diagnostics(&workspace);
-        let fd = workspace.file(&rel_path);
-        let source = fd.map_or("", |fd| fd.tree.source());
-        let empty = LineIndex::default();
-        let index = fd.map_or(&empty, |fd| &fd.line_index);
-        all.iter()
-            .filter(|d| d.file == rel_path)
-            .map(|d| to_lsp_diagnostic(d, source, index))
-            .collect()
-    } else {
-        Vec::new()
-    };
-
-    lsp::FullDocumentDiagnosticReport {
-        kind: "full".to_string(),
-        items,
-    }
-}
-
-/// Return diagnostics for all files across all workspaces.
-fn workspace_diagnostic(workspaces: &Workspaces) -> lsp::WorkspaceDiagnosticReport {
-    let mut reports = Vec::new();
-
-    let empty = LineIndex::default();
-    for root in workspaces.roots.keys() {
-        let workspace = workspaces.root_view(root);
-        let all = collect_all_diagnostics(&workspace);
-        let mut by_file: BTreeMap<PathBuf, Vec<lsp::Diagnostic>> = BTreeMap::new();
-
-        for diag in &all {
-            let fd = workspace.file(&diag.file);
-            let source = fd.map_or("", |fd| fd.tree.source());
-            let index = fd.map_or(&empty, |fd| &fd.line_index);
-            by_file
-                .entry(diag.file.clone())
-                .or_default()
-                .push(to_lsp_diagnostic(diag, source, index));
-        }
-
-        for (rel_path, items) in by_file {
-            reports.push(lsp::WorkspaceDocumentDiagnosticReport {
-                kind: "full".to_string(),
-                uri: path_to_uri(&root.join(rel_path)),
-                items,
-            });
-        }
-    }
-
-    lsp::WorkspaceDiagnosticReport { items: reports }
 }
 
 // ---------------------------------------------------------------------------
@@ -4215,10 +4160,10 @@ fn handle_notification(
             // workspace folder updates that workspace; one opened outside every
             // folder becomes a single-file document (issue 051) so its
             // document-scoped features are served without a workspace. The
-            // publish below enumerates scanned workspaces only, so a single-file
+            // republish below enumerates scanned workspaces only, so a single-file
             // document emits no diagnostics — the graph tier has nothing to say.
             workspaces.sync_document_content(&params.text_document.uri, &params.text_document.text);
-            publish_all_diagnostics(connection, workspaces, &one_uri(&params.text_document.uri))?;
+            republish_on_open(connection, workspaces, &params.text_document.uri)?;
         }
         lsp::method::DID_CLOSE => {
             let params: lsp::DidCloseTextDocumentParams = serde_json::from_value(notif.params)?;
@@ -4471,6 +4416,61 @@ fn one_uri(uri: &str) -> HashSet<String> {
     let mut set = HashSet::with_capacity(1);
     set.insert(uri.to_string());
     set
+}
+
+/// Republish a just-opened document's current diagnostics unconditionally.
+///
+/// `didOpen` is a client-state boundary (decision 022): the server cannot know
+/// what a client remembers about a document it just opened, so the per-URI
+/// last-published record is invalidated before the sync's publish pass. That
+/// forces the diff to re-send a document carrying diagnostics even when its
+/// content is unchanged — closing the false-clean gap a client that drops its
+/// per-URI record on reopen would otherwise hit.
+///
+/// A clean indexed file needs one extra step: its desired set is empty and it
+/// holds no cache entry, so the diff suppresses it (an unchanged empty is not a
+/// change). Push-only owes it an *explicit* empty publish there, not a skip — so
+/// when the pass leaves this document with no cache entry (i.e. it is clean), an
+/// empty `publishDiagnostics` is sent for it. A rootless or unindexed open
+/// (issue 051) resolves to no workspace and publishes nothing, as before.
+///
+/// No diagnostics are recomputed beyond the ordinary publish pass.
+fn republish_on_open(
+    connection: &Connection,
+    workspaces: &mut Workspaces,
+    uri: &str,
+) -> Result<()> {
+    // The publish/cache key for this document when it is indexed under a root
+    // (the same base `diff_diagnostics` keys the cache by). `None` for a
+    // rootless or unindexed open, which publishes nothing.
+    let canonical = workspaces
+        .resolve(uri)
+        .map(|(workspace, rel_path)| path_to_uri(&workspace.root().join(rel_path)));
+
+    // Invalidate the last-published record so the diff re-sends the current set
+    // even when the content is unchanged.
+    if let Some(canonical) = &canonical {
+        workspaces.published.remove(canonical);
+    }
+
+    publish_all_diagnostics(connection, workspaces, &one_uri(uri))?;
+
+    // After the pass, a document that carries diagnostics has its cache entry
+    // repopulated; a clean one has none (only non-empty entries are cached). The
+    // clean file was suppressed by the diff, so send it the explicit empty
+    // publish push-only owes it.
+    if let Some(canonical) = canonical
+        && !workspaces.published.contains_key(&canonical)
+    {
+        let params = lsp::PublishDiagnosticsParams {
+            uri: canonical,
+            diagnostics: Vec::new(),
+        };
+        let notif = Notification::new(lsp::method::PUBLISH_DIAGNOSTICS.to_string(), params);
+        connection.sender.send(Message::Notification(notif))?;
+    }
+
+    Ok(())
 }
 
 /// Publish diagnostics for the files whose diagnostics changed.
@@ -5888,60 +5888,6 @@ mod tests {
         let links = document_links(&workspaces, &file_uri(&dir, "a.md"));
         // Only the intra-project link to b.md, not the https link.
         assert_eq!(links.len(), 1, "should skip external links");
-    }
-
-    // -----------------------------------------------------------------------
-    // Pull diagnostics (ticket 09)
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn document_diagnostic_returns_file_errors() {
-        let dir = workspace_with_files(&[
-            (".lattice.toml", ""),
-            ("a.md", "# A\n\n[broken](nonexistent.md \"references\")\n"),
-        ]);
-        let workspaces = scan_workspaces(&dir);
-
-        let report = document_diagnostic(&workspaces, &file_uri(&dir, "a.md"));
-        assert_eq!(report.kind, "full", "report kind should be full");
-        assert!(
-            !report.items.is_empty(),
-            "should have diagnostics for broken link"
-        );
-    }
-
-    #[test]
-    fn document_diagnostic_clean_file_returns_empty() {
-        let dir = workspace_with_files(&[
-            (".lattice.toml", ""),
-            ("a.md", "# A\n\n[see B](b.md \"references\")\n"),
-            (
-                "b.md",
-                "---\nbacklinks:\n  referenced_by:\n    - a.md\n---\n\n# B\n",
-            ),
-        ]);
-        let workspaces = scan_workspaces(&dir);
-
-        let report = document_diagnostic(&workspaces, &file_uri(&dir, "b.md"));
-        assert!(
-            report.items.is_empty(),
-            "clean file should have no diagnostics"
-        );
-    }
-
-    #[test]
-    fn workspace_diagnostic_covers_all_files() {
-        let dir = workspace_with_files(&[
-            (".lattice.toml", ""),
-            ("a.md", "# A\n\n[broken](nonexistent.md \"references\")\n"),
-        ]);
-        let workspaces = scan_workspaces(&dir);
-
-        let report = workspace_diagnostic(&workspaces);
-        assert!(
-            !report.items.is_empty(),
-            "workspace diagnostic should include reports"
-        );
     }
 
     // -----------------------------------------------------------------------
@@ -9049,19 +8995,12 @@ mod tests {
     fn single_file_document_stays_diagnostic_quiet() {
         // Graph/structural diagnostics have nothing to say for a single file:
         // content that would raise a stale-reference diagnostic inside a
-        // workspace must produce no diagnostics rootless — neither pushed nor
-        // pulled — rather than erroring.
+        // workspace must produce no pushed diagnostics rootless rather than
+        // erroring.
         let mut workspaces = rootless_workspaces();
         let uri = "file:///tmp/lattice-051-quiet.md";
         // A bare path to an absent file — a stale reference in a real workspace.
         workspaces.sync_document_content(uri, "See docs/page.md for details.\n");
-
-        let report = document_diagnostic(&workspaces, uri);
-        assert!(
-            report.items.is_empty(),
-            "a single-file document pulls no diagnostics, got {:?}",
-            report.items
-        );
 
         let pushed = diff_diagnostics(&mut workspaces, &one_uri(uri));
         assert!(
@@ -9183,8 +9122,8 @@ mod tests {
             "document-scoped features keep serving with no dark window"
         );
         assert!(
-            document_diagnostic(&workspaces, &uri).items.is_empty(),
-            "a rootless document pulls no diagnostics"
+            diff_diagnostics(&mut workspaces, &one_uri(&uri)).is_empty(),
+            "a rootless document publishes no diagnostics"
         );
     }
 
@@ -9960,6 +9899,133 @@ mod tests {
             .expect("server returned an error");
     }
 
+    /// Drain server messages until a `Response` for `id`, returning its error
+    /// code — the response must be an error, not a result.
+    fn recv_error_code_for(client: &Connection, id: i32) -> i32 {
+        for _ in 0..32 {
+            if let Message::Response(resp) = recv_message(client)
+                && resp.id == RequestId::from(id)
+            {
+                return resp
+                    .error
+                    .expect("an unadvertised method is answered with an error response")
+                    .code;
+            }
+        }
+        panic!("no response for request {id} after 32 messages");
+    }
+
+    // -----------------------------------------------------------------------
+    // Push-only diagnostics (decision 022, ticket integration 16)
+    //
+    // Wire-level: `didOpen` is a client-state boundary, so reopening an
+    // unchanged document re-publishes its current set — the client's memory is
+    // unknowable — and an unadvertised pull request is answered MethodNotFound.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn reopen_republishes_unchanged_document() {
+        // Close then reopen with identical text: the server cannot know the
+        // client still holds the document's diagnostics, so it re-sends the
+        // current set — the non-empty set for a file carrying diagnostics, and an
+        // explicit empty set for a clean file (a publish, never a skip).
+        let dir = workspace_with_files(&[
+            (".lattice.toml", ""),
+            ("a.md", "# A\n\n[broken](nonexistent.md \"references\")\n"),
+            ("clean.md", "# Clean\n"),
+        ]);
+        let root = fs::canonicalize(dir.path()).expect("canonicalize temp dir");
+        let root_uri = path_to_uri(&root);
+        let dirty_uri = path_to_uri(&root.join("a.md"));
+        let clean_uri = path_to_uri(&root.join("clean.md"));
+
+        let (server, client) = Connection::memory();
+        let server_thread = std::thread::spawn(move || serve(&server));
+
+        // No dynamic registration, so the server originates no registerCapability
+        // and the stream carries only publishDiagnostics.
+        handshake(&client, &root_uri, false);
+
+        // First open establishes each document's published record: a.md carries
+        // its broken-reference diagnostic, clean.md gets an explicit empty set.
+        open_doc(
+            &client,
+            &dirty_uri,
+            "# A\n\n[broken](nonexistent.md \"references\")\n",
+        );
+        assert!(
+            !recv_publish_for(&client, &dirty_uri).is_empty(),
+            "opening a.md publishes its broken-reference diagnostic"
+        );
+        open_doc(&client, &clean_uri, "# Clean\n");
+        assert!(
+            recv_publish_for(&client, &clean_uri).is_empty(),
+            "opening the clean clean.md publishes an explicit empty set"
+        );
+
+        // Close both. Disk matches the buffer, so neither close moves a publish.
+        send_close(&client, &dirty_uri);
+        send_close(&client, &clean_uri);
+
+        // Reopen with identical text. Even though nothing changed, each document
+        // is re-published: the diff record was invalidated on open.
+        open_doc(
+            &client,
+            &dirty_uri,
+            "# A\n\n[broken](nonexistent.md \"references\")\n",
+        );
+        assert!(
+            !recv_publish_for(&client, &dirty_uri).is_empty(),
+            "reopening the unchanged a.md re-publishes its current (non-empty) set"
+        );
+
+        open_doc(&client, &clean_uri, "# Clean\n");
+        assert!(
+            recv_publish_for(&client, &clean_uri).is_empty(),
+            "reopening the unchanged clean.md re-publishes an explicit empty set"
+        );
+
+        shutdown(&client, server_thread);
+    }
+
+    #[test]
+    fn pull_diagnostic_request_is_method_not_found() {
+        // Pull is unadvertised and, by design, unimplemented (decision 022): a
+        // `textDocument/diagnostic` request over the wire falls to the default
+        // dispatch arm and is answered with a MethodNotFound error, not a report.
+        let dir = workspace_with_files(&[
+            (".lattice.toml", ""),
+            ("a.md", "# A\n\n[broken](nonexistent.md \"references\")\n"),
+        ]);
+        let root = fs::canonicalize(dir.path()).expect("canonicalize temp dir");
+        let root_uri = path_to_uri(&root);
+        let doc_uri = path_to_uri(&root.join("a.md"));
+
+        let (server, client) = Connection::memory();
+        let server_thread = std::thread::spawn(move || serve(&server));
+
+        handshake(&client, &root_uri, false);
+
+        let req_id = 7;
+        client
+            .sender
+            .send(Message::Request(Request::new(
+                RequestId::from(req_id),
+                "textDocument/diagnostic".to_string(),
+                serde_json::json!({ "textDocument": { "uri": doc_uri } }),
+            )))
+            .expect("send textDocument/diagnostic");
+
+        let code = recv_error_code_for(&client, req_id);
+        assert_eq!(
+            code,
+            lsp_server::ErrorCode::MethodNotFound as i32,
+            "an unadvertised pull request is answered MethodNotFound, got code {code}"
+        );
+
+        shutdown(&client, server_thread);
+    }
+
     #[test]
     fn watched_files_registration_and_reload() {
         // Full acceptance loop (ticket server 08): a client advertising
@@ -10446,8 +10512,10 @@ mod tests {
         handshake(&client, &root_uri, false);
 
         // Open with a buffer heading that differs from disk, then close without
-        // saving. The clean buffer publishes nothing, and closing the equally
-        // clean disk content publishes nothing, so there is no publish to drain.
+        // saving. The clean open re-publishes an explicit empty set (decision
+        // 022: didOpen is a client-state boundary) and the equally clean disk
+        // content publishes nothing on close; `request_response` below skips the
+        // empty publish notification while scanning for its response.
         open_doc(&client, &doc_uri, "# In Buffer\n");
         send_close(&client, &doc_uri);
 
@@ -10486,9 +10554,15 @@ mod tests {
 
         handshake(&client, &root_uri, false);
 
-        // Open matching the clean disk content (no publish), then edit the
-        // buffer to add a stale reference. The didChange publishes it.
+        // Open matching the clean disk content. `didOpen` is a client-state
+        // boundary (decision 022), so it re-publishes an explicit empty set even
+        // for a clean file; drain it before the edit. Then edit the buffer to add
+        // a stale reference — the didChange publishes it.
         open_doc(&client, &doc_uri, "# Clean\n");
+        assert!(
+            recv_publish_for(&client, &doc_uri).is_empty(),
+            "opening the clean buffer re-publishes an explicit empty set"
+        );
         send_change(&client, &doc_uri, "See `gone.md` here.\n");
         let dirty = recv_publish_for(&client, &doc_uri);
         assert!(
@@ -10526,7 +10600,9 @@ mod tests {
 
         // Open matching disk, edit the heading in the buffer, then save that
         // edit to disk and deliver didSave with the saved text. All three steps
-        // keep the file clean, so none publishes a diagnostic.
+        // keep the file clean, so none publishes a diagnostic (the clean open
+        // re-publishes only an explicit empty set, which `request_response`
+        // skips below).
         open_doc(&client, &doc_uri, "# Original\n");
         send_change(&client, &doc_uri, "# Edited\n");
         fs::write(root.join("doc.md"), "# Edited\n").expect("save doc.md to disk");
