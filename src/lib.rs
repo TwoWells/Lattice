@@ -19,6 +19,7 @@ mod cli;
 mod completion;
 mod config;
 mod fm;
+mod format;
 mod html;
 mod inline;
 mod json;
@@ -53,10 +54,11 @@ pub mod invariants;
 #[cfg(feature = "fuzzing")]
 pub mod fuzz_api;
 
-/// Run the Lattice CLI: parse arguments and dispatch to `lint` or `serve`.
+/// Run the Lattice CLI: parse arguments and dispatch to `lint`, `format`,
+/// `serve`, or `config`.
 ///
 /// Returns the process exit code — `0` on success, `1` when linting finds
-/// errors or a subcommand fails.
+/// errors, `format --check` finds drift, or a subcommand fails.
 #[must_use]
 pub fn run() -> ExitCode {
     let args = cli::Cli::parse();
@@ -71,6 +73,25 @@ pub fn run() -> ExitCode {
             match lint::run(&path, strict, quiet, &mut stderr) {
                 Ok(has_errors) => {
                     if has_errors {
+                        ExitCode::from(1)
+                    } else {
+                        ExitCode::from(0)
+                    }
+                }
+                Err(e) => {
+                    let _ = writeln!(stderr, "error: {e:#}");
+                    ExitCode::from(1)
+                }
+            }
+        }
+        cli::Command::Format { path, check } => {
+            let mut stderr = io::stderr().lock();
+            match format::run(&path, check, &mut stderr) {
+                // In `--check` mode a change means "drift found" → exit 1,
+                // mirroring the lint exit-code contract. In write mode a rewrite
+                // is a success, so the flag never fails the exit code.
+                Ok(changed) => {
+                    if check && changed {
                         ExitCode::from(1)
                     } else {
                         ExitCode::from(0)

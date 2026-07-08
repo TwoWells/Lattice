@@ -8,7 +8,6 @@
 //! headings. Supports multiple workspace folders.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -3414,9 +3413,12 @@ fn semantic_tokens_range(
 
 /// Format a document's backlink frontmatter.
 ///
-/// Sorts predicate keys alphabetically, sorts paths within each predicate,
-/// and normalizes whitespace. If the config specifies an external formatter,
-/// pipes the full document through it after frontmatter sorting.
+/// Delegates to the shared [`crate::format::format_source`] engine (the single
+/// source of formatting semantics, shared with the `lattice format` CLI): it
+/// sorts predicate keys alphabetically, sorts paths within each predicate,
+/// normalizes whitespace, and — if the config specifies an external formatter —
+/// pipes the full document through it after frontmatter sorting. The formatted
+/// document is returned as a single whole-document [`lsp::TextEdit`].
 #[allow(
     clippy::cast_possible_truncation,
     reason = "line numbers in markdown files won't exceed u32::MAX"
@@ -3425,51 +3427,14 @@ fn format_document(workspaces: &Workspaces, uri: &str) -> Option<Vec<lsp::TextEd
     let (workspace, rel_path) = workspaces.resolve_document(uri)?;
     let file_data = workspace.file(&rel_path)?;
 
-    let has_backlinks = file_data
-        .frontmatter
-        .as_ref()
-        .is_some_and(|fm| !fm.backlinks.is_empty());
-
-    let format_command = workspace.config().format_command.as_deref();
-
-    // Nothing to do if there are no backlinks to sort and no external formatter.
-    if !has_backlinks && format_command.is_none() {
-        return None;
-    }
-
-    // Step 1: Sort frontmatter backlinks.
-    let mut document = file_data.tree.source().to_string();
-    if let Some(fm) = &file_data.frontmatter
-        && !fm.backlinks.is_empty()
-    {
-        let mut sorted: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
-        for (pred, paths) in &fm.backlinks {
-            let mut path_refs: Vec<&str> = paths.iter().map(String::as_str).collect();
-            path_refs.sort_unstable();
-            sorted.insert(pred.as_str(), path_refs);
-        }
-
-        let mut yaml = String::from("---\nbacklinks:\n");
-        for (pred, paths) in &sorted {
-            let _ = writeln!(yaml, "  {pred}:");
-            for path in paths {
-                let _ = writeln!(yaml, "    - {path}");
-            }
-        }
-        yaml.push_str("---");
-
-        document.replace_range(fm.byte_range.clone(), &yaml);
-    }
-
-    // Step 2: Pipe through external formatter if configured.
-    if let Some(cmd) = format_command
-        && let Some(formatted) = run_formatter(cmd, &document)
-    {
-        document = formatted;
-    }
+    let source = file_data.tree.source();
+    let document = crate::format::format_source(
+        source,
+        file_data.frontmatter.as_ref(),
+        workspace.config().format_command.as_deref(),
+    )?;
 
     // Replace the entire document.
-    let source = file_data.tree.source();
     let total_lines = source.lines().count() as u32;
     let last_line_len = source.lines().last().map_or(0, str::len) as u32;
 
@@ -3488,39 +3453,6 @@ fn format_document(workspaces: &Workspaces, uri: &str) -> Option<Vec<lsp::TextEd
         range,
         new_text: document,
     }])
-}
-
-/// Run an external formatter command, piping content through stdin/stdout.
-///
-/// The command is passed to `sh -c` so shell features (pipes, quoted args,
-/// environment variables) work as expected.
-fn run_formatter(command: &str, content: &str) -> Option<String> {
-    use std::io::Write as _;
-    use std::process::{Command, Stdio};
-
-    let mut child = Command::new("sh")
-        .args(["-c", command])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(content.as_bytes());
-    }
-
-    let output = child.wait_with_output().ok()?;
-    if output.status.success() {
-        String::from_utf8(output.stdout).ok()
-    } else {
-        tracing::warn!(
-            "formatter exited with status {}: {}",
-            output.status,
-            command
-        );
-        None
-    }
 }
 
 // ---------------------------------------------------------------------------
