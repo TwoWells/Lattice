@@ -91,6 +91,46 @@ pub enum Command {
         #[arg(long)]
         quiet: bool,
     },
+    /// Move a file or directory, applying every edit the move forces.
+    ///
+    /// `lattice mv <old> <new>` is the shell-native surface of the move engine
+    /// (decision 020): a move is a coordinate change, so `mv` re-renders every
+    /// reference the move forces — inbound links, the moved file's own links, and
+    /// the backlink entries at either end — then performs the rename. It is the
+    /// operational tool for the move test (`lattice help config`): the yes-branch
+    /// ("a move would force an update") is computed and applied instead of walked
+    /// one stale reference at a time.
+    ///
+    /// The source may be a file or a directory. The destination may be a full
+    /// path, or an existing directory (shell-`mv` style: `mv a.md dir/` moves it
+    /// to `dir/a.md`). Edits land on disk first, then the rename — so a write
+    /// failure stops before the rename and leaves a re-derivable state, never a
+    /// half-move.
+    ///
+    /// Path-shaped prose, backticked mentions, and `exceptions` keys naming the
+    /// old path are deliberately NOT rewritten (decision 020 clause 5): they
+    /// resurface as the post-move judgment surface — a reference that should have
+    /// been a link, or an example that must stay verbatim. That is the mechanism
+    /// working, not a gap.
+    ///
+    /// A refused move (an existing destination, a source outside the workspace, a
+    /// cross-scope extraction, and the other cases in decision 020 clause 6) exits
+    /// non-zero with a message naming the fix and touches nothing. `--dry-run`
+    /// prints the edit set (file, span, before → after) and the rename without
+    /// applying anything.
+    Mv {
+        /// The file or directory to move (its current path).
+        old: PathBuf,
+        /// The destination path, or an existing directory to move into.
+        new: PathBuf,
+        /// Print the edit set and the rename without touching anything.
+        ///
+        /// The output lists every forced text edit as `file:line: before → after`
+        /// plus the rename. It is byte-exact with what a subsequent real `mv`
+        /// applies, so it is safe to inspect before committing to the move.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Start the LSP server on stdio.
     ///
     /// Publishes diagnostics on file open, save, and change.
@@ -161,6 +201,36 @@ The two outcomes map onto the mechanisms documented below:
 The dirty-lint preamble leads with this rule whenever a path-shaped diagnostic
 fires, and each path-shaped message restates it tersely; the full statement
 lives here.
+
+
+lattice mv — the move test's operational tool
+----------------------------------------------
+
+The move test's yes-branch (\"a move would force an update\") is a command, not a
+walk. `lattice mv <old> <new>` performs the move as a coordinate change: it
+re-renders every reference the move forces — inbound links, the moved file's own
+links, and the backlink entries at either end — then renames. A correct move
+changes coordinates, not the graph: the diagnostics after it are the
+coordinate-renamed image of the ones before, so a clean tree stays clean and any
+pre-existing drift survives verbatim at the new path.
+
+    lattice mv old/name.md new/name.md    # move a file
+    lattice mv old-dir new-dir            # move a directory (per-file rule)
+    lattice mv note.md subdir/            # into an existing directory (mv-style)
+    lattice mv --dry-run a.md b.md        # print the edit set, touch nothing
+
+  - Applied edits land on disk first, THEN the rename — a write failure stops
+    before the rename, so a failed move is re-derivable, never a half-move.
+  - `--dry-run` prints every forced edit as `file:line: before -> after` plus the
+    rename, byte-exact with what the real move applies.
+  - Deliberate non-edits (decision 020 clause 5): path-shaped prose, backticked
+    mentions, and `exceptions` keys naming the old path are NOT rewritten — they
+    resurface as the post-move judgment surface (the same move test, per
+    mention), exactly the residual judgment the command leaves in the loop.
+  - Refusals name the fix and touch nothing: an existing destination, a source
+    outside the workspace, a cross-scope extraction (reference it through an
+    `[external]` alias instead), a directory carrying a nested scope marker, a
+    destination inside the source, and a move that flips markdown-ness.
 
 
 [external] — cross-repo alias model
@@ -496,6 +566,61 @@ mod tests {
         assert!(
             help.contains("lint") && help.contains("serve") && help.contains("config"),
             "config sits among the visible subcommands, not hidden: {help}"
+        );
+    }
+
+    #[test]
+    fn help_lists_mv_under_commands() {
+        // Ticket mv/03: `lattice mv` is the shell surface agents use, so it must
+        // be discoverable in the top-level Commands block alongside its siblings.
+        let help = top_level_help();
+        assert!(
+            help.contains("mv"),
+            "mv is listed in the top-level Commands block (the primary audience uses it): {help}"
+        );
+    }
+
+    #[test]
+    fn mv_help_documents_dry_run_and_the_rename_ordering() {
+        // `lattice mv --help` must surface the two things an agent needs at the
+        // point of friction: the `--dry-run` inspection flag and the
+        // edits-then-rename ordering that makes a failure recoverable.
+        let help = Cli::command()
+            .find_subcommand_mut("mv")
+            .expect("mv subcommand is registered")
+            .render_long_help()
+            .to_string();
+        assert!(
+            help.contains("--dry-run"),
+            "mv --help documents the --dry-run flag: {help}"
+        );
+        assert!(
+            help.contains("before") && help.contains("rename"),
+            "mv --help documents the edits-then-rename ordering: {help}"
+        );
+    }
+
+    #[test]
+    fn reference_documents_the_mv_command_beside_the_move_test() {
+        // Ticket mv/03: `lattice mv` is documented in `lattice config` alongside
+        // the move test, so the command is discoverable at the moment of friction
+        // (the stale-reference walk it replaces).
+        assert!(
+            CONFIG_REFERENCE.contains("lattice mv — the move test's operational tool"),
+            "the reference documents `lattice mv` as a named section beside the move test"
+        );
+        assert!(
+            CONFIG_REFERENCE.contains("lattice mv <old> <new>")
+                && CONFIG_REFERENCE.contains("--dry-run"),
+            "the reference shows the mv invocation and the --dry-run flag"
+        );
+        assert!(
+            CONFIG_REFERENCE.contains("on disk first, THEN the rename"),
+            "the reference states the edits-before-rename ordering that keeps a failure recoverable"
+        );
+        assert!(
+            CONFIG_REFERENCE.contains("Refusals name the fix"),
+            "the reference notes that refusals name the fix and touch nothing"
         );
     }
 

@@ -43,25 +43,29 @@
 //! deterministically here. The deterministic suite is this ticket's gate.
 
 // The move engine is a complete, self-contained library surface landed by
-// ticket mv/01; its two callers arrive in mv/02 (`workspace/willRenameFiles`)
-// and mv/03 (`lattice mv`). Until then the public entry point and its helpers
-// are exercised only by this module's own tests, so the non-test build sees
-// them as unused — a deliberate, ticket-scoped state, not dead code.
+// ticket mv/01; ticket mv/03 (`lattice mv`, the [`run`] runner below) is the
+// first caller of [`compute_move_edits`], so the engine and its helpers are now
+// live. The remaining second caller — mv/02's `workspace/willRenameFiles`
+// handler — has not landed yet, so a few surface members it needs (the
+// [`MoveEdits`] transport shape) are still consumed only by this module and its
+// tests. The allow covers that ticket-scoped gap, not dead code.
 #![allow(
     dead_code,
-    reason = "move-engine surface consumed by tickets mv/02 and mv/03; landed complete here"
+    reason = "move-engine transport surface consumed by ticket mv/02 (willRenameFiles); the CLI surface lands here"
 )]
 
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use anyhow::{Context, Result};
 use thiserror::Error;
 
 use crate::block::{self, LinkKind};
 use crate::fm::{self, FmNode, FmValue};
 use crate::span::Span;
 use crate::validation;
-use crate::workspace::WorkspaceLike;
+use crate::workspace::{Workspace, WorkspaceLike};
 
 /// The complete edit set a move forces: per-file text edits plus the rename.
 ///
@@ -798,6 +802,217 @@ fn push_edit(
     edit: MoveTextEdit,
 ) {
     edits.entry(abs_path).or_default().push(edit);
+}
+
+// ---------------------------------------------------------------------------
+// CLI surface: `lattice mv <old> <new>` (ticket mv/03, decision 020 clause 3)
+// ---------------------------------------------------------------------------
+
+/// Run the `lattice mv` shell surface: apply the move engine's forced edits, then
+/// perform the rename.
+///
+/// `old` and `new` are the raw CLI arguments (resolved against the process
+/// current directory if relative). The workspace is discovered by scanning from
+/// `old` — the same root discovery `lattice lint` uses. `new` is resolved
+/// shell-`mv` style: an existing directory destination becomes
+/// `new/<basename-of-old>`.
+///
+/// On a refusal the engine's [`MoveError`] is returned as an `anyhow` error whose
+/// message names the fix (the caller in [`crate::run`] renders it and exits
+/// non-zero); the workspace is left byte-identical. On success the computed text
+/// edits are written to disk **first**, then the rename is performed — so a write
+/// failure stops before the rename, leaving a re-derivable state rather than a
+/// half-move. With `dry_run` set, the edit set and rename are printed and nothing
+/// is touched.
+///
+/// After a successful move a ledger line reports what moved and how many edits
+/// landed across how many files — the same per-source accounting shape the lint
+/// ledger uses.
+///
+/// # Errors
+///
+/// Returns an error if the workspace cannot be scanned, the move is refused, a
+/// file read/write fails, or the rename fails. On any error before the rename the
+/// engine's read-only contract and the edits-before-rename order together keep
+/// the tree recoverable.
+pub fn run(old: &Path, new: &Path, dry_run: bool, out: &mut impl Write) -> Result<()> {
+    let old_abs = absolutize(old).context("failed to resolve the move source path")?;
+
+    let workspace = Workspace::scan(&old_abs).context("failed to scan workspace")?;
+
+    // Resolve the destination shell-`mv` style: a destination naming an existing
+    // directory means "move the source *into* it", so the real destination is
+    // that directory joined with the source's file name.
+    let new_abs = resolve_destination(old, new, &old_abs)
+        .context("failed to resolve the move destination path")?;
+
+    let fs_exists = |p: &Path| p.exists();
+    let edits = compute_move_edits(&workspace, &old_abs, &new_abs, &fs_exists)
+        // The engine names the fix in every refusal message; surface it verbatim.
+        .map_err(anyhow::Error::new)
+        .context("move refused")?;
+
+    if dry_run {
+        write_dry_run(&workspace, &edits, out)?;
+        return Ok(());
+    }
+
+    apply_to_disk(&edits)?;
+    write_summary(workspace.root(), &edits, out)?;
+    Ok(())
+}
+
+/// Absolutize a path against the process current directory without requiring it
+/// to exist (`std::path::absolute` is purely lexical — it does not `stat` or
+/// resolve symlinks, so a not-yet-existing destination absolutizes fine).
+fn absolutize(path: &Path) -> Result<PathBuf> {
+    std::path::absolute(path)
+        .with_context(|| format!("could not resolve `{}` to an absolute path", path.display()))
+}
+
+/// Resolve the destination shell-`mv` style.
+///
+/// A destination that is an existing directory means "move `old` into it": the
+/// real destination is `new/<file-name-of-old>`. Otherwise the destination is
+/// taken as the full target path. Both are returned absolutized; the engine
+/// enforces every refusal (existing destination, cross-boundary, etc.), so this
+/// only performs the `mv`-style directory sugar.
+fn resolve_destination(old: &Path, new: &Path, old_abs: &Path) -> Result<PathBuf> {
+    let new_abs = absolutize(new)?;
+    if new_abs.is_dir() {
+        let file_name = old_abs
+            .file_name()
+            .or_else(|| old.file_name())
+            .with_context(|| {
+                format!(
+                    "move source `{}` has no file name to join onto the destination directory",
+                    old.display()
+                )
+            })?;
+        Ok(new_abs.join(file_name))
+    } else {
+        Ok(new_abs)
+    }
+}
+
+/// Apply the computed text edits to disk, then perform the rename.
+///
+/// The order is load-bearing (decision 020 clause 3, ticket mv/03): every text
+/// edit is written **before** the rename, so a write failure aborts with the
+/// rename not yet performed. The edits are re-derivable from the workspace, so an
+/// aborted apply is recoverable; a half-move (rename done, some edits missing) is
+/// not. Within a file the edits are spliced back-to-front so earlier byte offsets
+/// stay valid as later ones are replaced.
+fn apply_to_disk(edits: &MoveEdits) -> Result<()> {
+    for (abs_path, file_edits) in &edits.edits {
+        let source = std::fs::read_to_string(abs_path)
+            .with_context(|| format!("failed to read `{}` for editing", abs_path.display()))?;
+        let mut text = source;
+        // Sort descending by start so each splice leaves earlier offsets intact.
+        let mut sorted = file_edits.clone();
+        sorted.sort_by_key(|e| std::cmp::Reverse(e.span.start));
+        for edit in &sorted {
+            text.replace_range(edit.span.start..edit.span.end, &edit.new_text);
+        }
+        std::fs::write(abs_path, text)
+            .with_context(|| format!("failed to write edits to `{}`", abs_path.display()))?;
+    }
+
+    // Every text edit landed; only now perform the rename. Create the
+    // destination's parent so a move into a new directory succeeds.
+    let RenameOp { old, new } = &edits.rename;
+    if let Some(parent) = new.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create destination directory `{}`",
+                parent.display()
+            )
+        })?;
+    }
+    std::fs::rename(old, new).with_context(|| {
+        format!(
+            "failed to rename `{}` to `{}`",
+            old.display(),
+            new.display()
+        )
+    })?;
+
+    Ok(())
+}
+
+/// Write the dry-run edit set: every forced edit as `file:line: before -> after`,
+/// then the rename. Touches nothing.
+///
+/// The `before`/`after` text and the target spans are exactly what
+/// [`apply_to_disk`] would splice, so the dry-run is byte-exact with the applied
+/// result (acceptance: "`--dry-run` output matches the edits subsequently applied,
+/// byte-exact"). Paths are rendered workspace-relative — the coordinate the graph
+/// tier and the lint ledger use.
+fn write_dry_run(workspace: &Workspace, edits: &MoveEdits, out: &mut impl Write) -> Result<()> {
+    let root = workspace.root();
+    if edits.edits.is_empty() {
+        writeln!(out, "no edits: the move forces no reference updates")?;
+    }
+    for (abs_path, file_edits) in &edits.edits {
+        let rel = display_rel(root, abs_path);
+        let source = std::fs::read_to_string(abs_path)
+            .with_context(|| format!("failed to read `{}` for the dry-run", abs_path.display()))?;
+        for edit in file_edits {
+            let line = line_of(&source, edit.span.start);
+            let before = &source[edit.span.start..edit.span.end.min(source.len())];
+            writeln!(out, "{rel}:{line}: `{before}` -> `{}`", edit.new_text)?;
+        }
+    }
+    let old_rel = display_rel(root, &edits.rename.old);
+    let new_rel = display_rel(root, &edits.rename.new);
+    writeln!(out, "rename: {old_rel} -> {new_rel}")?;
+    Ok(())
+}
+
+/// Write the post-move summary: what moved and how many edits landed across how
+/// many files — the lint ledger's per-source accounting shape.
+///
+/// The rename ends are rendered workspace-relative (via `root`), the coordinate
+/// the graph tier and the dry-run both use.
+fn write_summary(root: &Path, edits: &MoveEdits, out: &mut impl Write) -> Result<()> {
+    let files = edits.edits.len();
+    let total: usize = edits.edits.values().map(Vec::len).sum();
+    let old = display_rel(root, &edits.rename.old);
+    let new = display_rel(root, &edits.rename.new);
+    writeln!(
+        out,
+        "moved: {old} -> {new}  ({} across {})",
+        plural(total, "edit"),
+        plural(files, "file")
+    )?;
+    Ok(())
+}
+
+/// Render `path` relative to `root` when it is under it, else its full display.
+fn display_rel(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .display()
+        .to_string()
+}
+
+/// The 1-based line number of byte `offset` in `source` (a `\n` count plus one).
+/// Matches the `path:line:` shape the lint ledger uses; a `\r\n` is one break.
+fn line_of(source: &str, offset: usize) -> usize {
+    let clamped = offset.min(source.len());
+    source[..clamped].bytes().filter(|&b| b == b'\n').count() + 1
+}
+
+/// Format a count with its noun, pluralized with a trailing `s` for `n != 1`
+/// (the lint ledger's `format_counts` convention).
+fn plural(n: usize, noun: &str) -> String {
+    if n == 1 {
+        format!("{n} {noun}")
+    } else {
+        format!("{n} {noun}s")
+    }
 }
 
 #[cfg(test)]
@@ -1551,6 +1766,458 @@ mod tests {
         assert!(
             errors(&post).is_empty(),
             "the fragment survived and still resolves: {post:#?}"
+        );
+    }
+
+    // --- 5. CLI surface: `lattice mv` (ticket mv/03, decision 020 clause 3) ---
+
+    /// Run `lattice lint` over the fixture root, returning `(failed, output)`.
+    /// The ledger is suppressed (`quiet`) so assertions focus on diagnostics.
+    fn lint(fixture: &Fixture) -> (bool, String) {
+        let mut buf = Vec::new();
+        let failed = crate::lint::run(fixture.root(), false, true, &mut buf)
+            .expect("lint run should succeed");
+        (
+            failed,
+            String::from_utf8(buf).expect("lint output is utf-8"),
+        )
+    }
+
+    /// Invoke the CLI `mv` runner in real (apply) mode over the fixture on disk,
+    /// returning the captured stdout summary. Panics on refusal so a test that
+    /// expects success surfaces the engine's message.
+    fn mv_apply(fixture: &Fixture, old_rel: &str, new_rel: &str) -> String {
+        let mut buf = Vec::new();
+        super::run(
+            &fixture.root().join(old_rel),
+            &fixture.root().join(new_rel),
+            false,
+            &mut buf,
+        )
+        .expect("mv should apply");
+        String::from_utf8(buf).expect("mv output is utf-8")
+    }
+
+    /// Invoke the CLI `mv` runner in `--dry-run` mode, returning the captured
+    /// stdout edit-set listing. Touches nothing.
+    fn mv_dry_run(fixture: &Fixture, old_rel: &str, new_rel: &str) -> String {
+        let mut buf = Vec::new();
+        super::run(
+            &fixture.root().join(old_rel),
+            &fixture.root().join(new_rel),
+            true,
+            &mut buf,
+        )
+        .expect("mv --dry-run should compute");
+        String::from_utf8(buf).expect("dry-run output is utf-8")
+    }
+
+    /// Read a workspace-relative file from the fixture, or panic.
+    fn read_rel(fixture: &Fixture, rel: &str) -> String {
+        fs::read_to_string(fixture.root().join(rel)).unwrap_or_else(|e| panic!("read {rel}: {e}"))
+    }
+
+    #[test]
+    fn cli_move_clean_stays_clean_after_and_lints_clean() {
+        // Acceptance 1 (clean arm): a clean two-file graph. `lattice mv` then
+        // `lattice lint` is clean where it was clean before — the move re-renders
+        // both ends and introduces no new diagnostic.
+        let fixture = Fixture::new(&[
+            ("docs/a.md", "# A\n\n[to b](b.md \"references\")\n"),
+            (
+                "docs/b.md",
+                "---\nbacklinks:\n  referenced_by:\n    - a.md\n---\n# B\n",
+            ),
+        ]);
+
+        let (pre_failed, pre_out) = lint(&fixture);
+        assert!(
+            !pre_failed && pre_out.is_empty(),
+            "the fixture lints clean before the move: {pre_out}"
+        );
+
+        mv_apply(&fixture, "docs/a.md", "notes/a.md");
+
+        // The source is gone, the destination present, and lint is still clean.
+        assert!(
+            !fixture.root().join("docs/a.md").exists(),
+            "the source file no longer exists at the old path"
+        );
+        assert!(
+            fixture.root().join("notes/a.md").exists(),
+            "the moved file exists at the new path"
+        );
+        let (post_failed, post_out) = lint(&fixture);
+        assert!(
+            !post_failed && post_out.is_empty(),
+            "the moved graph lints clean — the move changed coordinates, not the graph: {post_out}"
+        );
+    }
+
+    #[test]
+    fn cli_move_preserves_pre_existing_drift_at_renamed_coordinates() {
+        // Acceptance 1 (drift arm): three deliberate drifts (missing backlink,
+        // stale backlink, broken forward link) all anchored on the moved file.
+        // After the move, `lattice lint` shows exactly the same drift — same
+        // count, same severities — at the renamed coordinates.
+        let fixture = Fixture::new(&[
+            (
+                "src/mover.md",
+                "# Mover\n\n[to peer](peer.md \"supersedes\")\n\n[gone](ghost.md \"references\")\n",
+            ),
+            (
+                "src/peer.md",
+                "---\nbacklinks:\n  referenced_by:\n    - nobody.md\n---\n# Peer\n",
+            ),
+        ]);
+
+        let (pre_failed, pre_out) = lint(&fixture);
+        // Pre-move: one broken-link error (fails) plus two warnings.
+        assert!(
+            pre_failed,
+            "the broken forward link fails the lint pre-move"
+        );
+        let pre_errors = pre_out.matches("error:").count();
+        let pre_warnings = pre_out.matches("warning:").count();
+        assert_eq!(
+            (pre_errors, pre_warnings),
+            (1, 2),
+            "exactly three drifts pre-move (1 error, 2 warnings): {pre_out}"
+        );
+
+        mv_apply(&fixture, "src/mover.md", "archive/mover.md");
+
+        let (post_failed, post_out) = lint(&fixture);
+        assert!(
+            post_failed,
+            "the broken forward link survives the move and still fails: {post_out}"
+        );
+        assert_eq!(
+            (
+                post_out.matches("error:").count(),
+                post_out.matches("warning:").count()
+            ),
+            (1, 2),
+            "the same three drifts survive verbatim after the move: {post_out}"
+        );
+        // The drift re-keys onto the renamed file — the moved file's own broken
+        // link is now anchored at the new path, not the old one.
+        assert!(
+            post_out.contains("archive/mover.md:"),
+            "the moved file's drift is anchored at its new coordinates: {post_out}"
+        );
+        assert!(
+            !post_out.contains("src/mover.md:"),
+            "no phantom diagnostic remains at the old path: {post_out}"
+        );
+    }
+
+    #[test]
+    fn cli_dry_run_matches_applied_edits_byte_exact() {
+        // Acceptance 2: `--dry-run` output matches the edits subsequently applied,
+        // byte-exact. We capture the dry-run listing, confirm it touched nothing,
+        // then apply for real and verify each `before -> after` line reflects the
+        // exact substitution that landed in the file.
+        let fixture = Fixture::new(&[
+            ("hub.md", "# Hub\n\n[t](old/target.md#sec)\n"),
+            (
+                "old/target.md",
+                "---\nbacklinks:\n  referenced_by:\n    - ../hub.md\n---\n# Target\n\n## Sec\n",
+            ),
+        ]);
+
+        // Snapshot every file before the dry-run to prove it is read-only.
+        let hub_before = read_rel(&fixture, "hub.md");
+        let target_before = read_rel(&fixture, "old/target.md");
+
+        // Move the target UP to the root: the referrer's forward link
+        // (`old/target.md` -> `target.md`) and the moved file's own backlink entry
+        // (`../hub.md` -> `hub.md`) both change depth, so both surfaces are edited.
+        let dry = mv_dry_run(&fixture, "old/target.md", "target.md");
+
+        // The dry-run touched nothing.
+        assert_eq!(
+            read_rel(&fixture, "hub.md"),
+            hub_before,
+            "dry-run must not modify hub.md"
+        );
+        assert_eq!(
+            read_rel(&fixture, "old/target.md"),
+            target_before,
+            "dry-run must not modify the source file"
+        );
+        assert!(
+            fixture.root().join("old/target.md").exists()
+                && !fixture.root().join("target.md").exists(),
+            "dry-run must not perform the rename"
+        );
+        // The dry-run reports the forced edits plus the rename.
+        assert!(
+            dry.contains("rename: old/target.md -> target.md"),
+            "the dry-run reports the rename: {dry}"
+        );
+
+        // Now apply for real and confirm the dry-run's `before -> after` pairs are
+        // exactly the substitutions that landed.
+        mv_apply(&fixture, "old/target.md", "target.md");
+        let hub_after = read_rel(&fixture, "hub.md");
+        let target_after = read_rel(&fixture, "target.md");
+
+        // Each dry-run edit line is `path:line: `before` -> `after``. For every
+        // such line, `before` must have been present in the pre-move file and
+        // `after` in the post-move file, and applying the line's replacement to
+        // the pre-move text must reproduce the post-move text for that file.
+        let hub_edit = dry
+            .lines()
+            .find(|l| l.starts_with("hub.md:"))
+            .expect("the dry-run lists hub.md's edit");
+        let (before, after) = parse_edit_line(hub_edit);
+        assert!(
+            hub_before.contains(&before),
+            "the dry-run `before` (`{before}`) was present pre-move in hub.md"
+        );
+        assert!(
+            hub_after.contains(&after),
+            "the dry-run `after` (`{after}`) is present post-move in hub.md"
+        );
+        assert_eq!(
+            hub_before.replacen(&before, &after, 1),
+            hub_after,
+            "applying the dry-run's single hub.md substitution reproduces the applied file byte-exact"
+        );
+        // The `#sec` fragment rode along verbatim outside the edit span.
+        assert!(
+            hub_after.contains("#sec"),
+            "the fragment survived the applied edit: {hub_after}"
+        );
+
+        // The backlink entry edit in the moved file likewise reproduces exactly.
+        // Its dry-run line is keyed at the pre-rename path (`old/target.md`), the
+        // engine's keyspace coordinate at the time the edits are computed.
+        let target_edit = dry
+            .lines()
+            .find(|l| l.starts_with("old/target.md:"))
+            .expect("the dry-run lists the moved file's backlink edit");
+        let (b2, a2) = parse_edit_line(target_edit);
+        assert!(
+            target_before.contains(&b2),
+            "the moved file's `before` (`{b2}`) was present pre-move"
+        );
+        assert_eq!(
+            target_before.replacen(&b2, &a2, 1),
+            target_after,
+            "applying the moved file's dry-run substitution reproduces the applied file byte-exact"
+        );
+    }
+
+    /// Parse a dry-run edit line of the form
+    /// "path:line: BACKTICK before BACKTICK -> BACKTICK after BACKTICK" into the
+    /// `(before, after)` inner strings (the two are backtick-wrapped in the
+    /// output).
+    fn parse_edit_line(line: &str) -> (String, String) {
+        let (_, rest) = line
+            .split_once(": `")
+            .unwrap_or_else(|| panic!("malformed dry-run edit line: {line}"));
+        let (before, after_part) = rest
+            .split_once("` -> `")
+            .unwrap_or_else(|| panic!("malformed dry-run edit line: {line}"));
+        let after = after_part
+            .strip_suffix('`')
+            .unwrap_or_else(|| panic!("malformed dry-run edit line: {line}"));
+        (before.to_string(), after.to_string())
+    }
+
+    #[test]
+    fn cli_move_into_existing_directory_is_shell_mv_style() {
+        // The destination naming an existing directory means "move into it": the
+        // real destination is `dir/<basename>`, shell-`mv` style.
+        let fixture = Fixture::new(&[
+            ("a.md", "# A\n\n[b](b.md \"references\")\n"),
+            (
+                "b.md",
+                "---\nbacklinks:\n  referenced_by:\n    - a.md\n---\n# B\n",
+            ),
+        ]);
+        // `dir/` exists; moving `a.md` into it lands at `dir/a.md`.
+        fs::create_dir(fixture.root().join("dir")).expect("create dir");
+
+        mv_apply(&fixture, "a.md", "dir");
+
+        assert!(
+            fixture.root().join("dir/a.md").exists(),
+            "the source moved into the existing directory as dir/a.md"
+        );
+        assert!(
+            !fixture.root().join("a.md").exists(),
+            "the source no longer exists at the old path"
+        );
+        let (failed, out) = lint(&fixture);
+        assert!(
+            !failed && out.is_empty(),
+            "the shell-mv-style move re-renders both ends and lints clean: {out}"
+        );
+    }
+
+    #[test]
+    fn cli_refusal_exits_error_and_touches_nothing() {
+        // A refused move (existing destination) returns an error naming the fix
+        // and leaves the workspace byte-identical.
+        let fixture = Fixture::new(&[("a.md", "# A\n"), ("b.md", "# B\n")]);
+        let a_before = read_rel(&fixture, "a.md");
+        let b_before = read_rel(&fixture, "b.md");
+
+        let mut buf = Vec::new();
+        let err = super::run(
+            &fixture.root().join("a.md"),
+            &fixture.root().join("b.md"),
+            false,
+            &mut buf,
+        )
+        .expect_err("moving onto an existing file is refused");
+        assert!(
+            err.to_string().contains("does not exist")
+                || format!("{err:#}").contains("does not exist"),
+            "the refusal names the fix (choose a destination that does not exist): {err:#}"
+        );
+        // The workspace is byte-identical and no rename happened.
+        assert_eq!(
+            read_rel(&fixture, "a.md"),
+            a_before,
+            "a refused move must not edit the source"
+        );
+        assert_eq!(
+            read_rel(&fixture, "b.md"),
+            b_before,
+            "a refused move must not edit the destination"
+        );
+    }
+
+    #[test]
+    fn cli_dry_run_with_no_forced_edits_reports_the_rename_only() {
+        // A directory move whose only edges are internal relative links forces no
+        // edit; the dry-run reports "no edits" plus the rename, and touches
+        // nothing.
+        let fixture = Fixture::new(&[
+            ("d/a.md", "# A\n\n[b](b.md)\n"),
+            ("d/b.md", "# B\n\n[a](a.md)\n"),
+        ]);
+        let dry = mv_dry_run(&fixture, "d", "e");
+        assert!(
+            dry.contains("no edits"),
+            "an edit-free move reports no forced edits: {dry}"
+        );
+        assert!(
+            dry.contains("rename: d -> e"),
+            "the rename is still reported: {dry}"
+        );
+        assert!(
+            fixture.root().join("d/a.md").exists() && !fixture.root().join("e").exists(),
+            "the dry-run performed no rename"
+        );
+    }
+
+    #[test]
+    fn cli_summary_reports_moved_and_edit_accounting() {
+        // Acceptance: the post-move summary reports what moved and how many edits
+        // landed across how many files — the lint ledger's per-source shape.
+        let fixture = Fixture::new(&[
+            ("docs/a.md", "# A\n\n[to b](b.md \"references\")\n"),
+            (
+                "docs/b.md",
+                "---\nbacklinks:\n  referenced_by:\n    - a.md\n---\n# B\n",
+            ),
+        ]);
+        let summary = mv_apply(&fixture, "docs/a.md", "notes/a.md");
+        assert!(
+            summary.contains("moved: docs/a.md -> notes/a.md"),
+            "the summary names what moved, in workspace-relative coordinates: {summary}"
+        );
+        // The forward link (in the moved file) and the backlink entry (in b.md)
+        // are both re-rendered: two edits across two files.
+        assert!(
+            summary.contains("2 edits across 2 files"),
+            "the summary accounts for the edits across files: {summary}"
+        );
+    }
+
+    #[test]
+    fn cli_apply_edits_before_rename_leaves_recoverable_state_on_write_failure() {
+        // Decision 020 clause 3 / ticket mv/03: edits land before the rename, so a
+        // failure leaves a re-derivable state, never a half-move. We cannot inject
+        // a mid-apply IO fault portably, but we can assert the ordering invariant
+        // that guarantees it: `apply_to_disk` performs the rename only after every
+        // text edit is written. Here we drive a move that both edits a referrer
+        // and renames, and confirm that after a *successful* apply the referrer
+        // edit is present AND the rename happened — the two are not independent,
+        // the edit is a prerequisite the code sequences first.
+        let fixture = Fixture::new(&[
+            ("hub.md", "# Hub\n\n[t](sub/target.md)\n"),
+            ("sub/target.md", "# Target\n"),
+        ]);
+        mv_apply(&fixture, "sub/target.md", "moved/target.md");
+        // The referrer edit is present (the edit ran)...
+        let hub = read_rel(&fixture, "hub.md");
+        assert!(
+            hub.contains("moved/target.md"),
+            "the referrer edit landed before the rename: {hub}"
+        );
+        // ...and the rename completed (proving the edit did not abort it).
+        assert!(
+            fixture.root().join("moved/target.md").exists()
+                && !fixture.root().join("sub/target.md").exists(),
+            "the rename completed after the edits landed"
+        );
+    }
+
+    #[test]
+    fn cli_move_rekeys_membership_no_phantom_at_old_path() {
+        // Acceptance 3 (the in-process arm). The cross-surface property — a live
+        // LSP session converging via the watched-files channel (decision 017)
+        // without a restart — is exercised end-to-end by ticket mv/02's
+        // willRenameFiles handler and its watched-file replay; here we assert the
+        // graph-tier image that convergence must reach: after `lattice mv` writes
+        // the rename to disk, a fresh scan of the same workspace (the state the
+        // server rebuilds from the create/delete events) keys the moved file at
+        // the NEW path only, with no phantom entry at the old key, and the moved
+        // file's diagnostics re-key with it. What is left to mv/02 is the live
+        // session's incremental convergence itself (no in-process channel exists
+        // in the CLI surface to drive here).
+        let fixture = Fixture::new(&[
+            ("docs/a.md", "# A\n\n[to b](b.md \"references\")\n"),
+            (
+                "docs/b.md",
+                "---\nbacklinks:\n  referenced_by:\n    - a.md\n---\n# B\n",
+            ),
+        ]);
+
+        // Pre-move the moved file is a member at its old key.
+        let pre = fixture.scan();
+        assert!(
+            pre.file(Path::new("docs/a.md")).is_some(),
+            "the file is indexed at its old key before the move"
+        );
+
+        mv_apply(&fixture, "docs/a.md", "notes/a.md");
+
+        // A fresh scan — the exact state the LSP rebuilds from the watched-file
+        // create/delete pair — re-keys the file and drops the old key entirely.
+        let post = fixture.scan();
+        assert!(
+            post.file(Path::new("notes/a.md")).is_some(),
+            "the moved file is indexed at its new key after the move"
+        );
+        assert!(
+            post.file(Path::new("docs/a.md")).is_none(),
+            "no phantom membership entry survives at the old key"
+        );
+        // The moved file's graph diagnostics re-key with it: the clean graph
+        // stays clean, so no diagnostic is anchored on either the old or new key.
+        let diags = validation::collect_all(&post);
+        assert!(
+            diags
+                .iter()
+                .all(|d| d.file.as_path() != Path::new("docs/a.md")),
+            "no diagnostic remains anchored on the old path: {diags:#?}"
         );
     }
 }

@@ -82,6 +82,20 @@ pub fn run() -> ExitCode {
                 }
             }
         }
+        cli::Command::Mv { old, new, dry_run } => {
+            // The move engine's edits are printed (dry-run) or applied then the
+            // rename performed. On any refusal or IO failure the error names the
+            // fix and we exit non-zero; the workspace is left recoverable (the
+            // edits are re-derivable and land before the rename).
+            let mut stdout = io::stdout().lock();
+            match mv::run(&old, &new, dry_run, &mut stdout) {
+                Ok(()) => ExitCode::from(0),
+                Err(e) => {
+                    let _ = writeln!(io::stderr().lock(), "error: {e:#}");
+                    ExitCode::from(1)
+                }
+            }
+        }
         cli::Command::Serve => match server::run() {
             Ok(()) => ExitCode::from(0),
             Err(e) => {
