@@ -68,9 +68,10 @@ pub fn run() -> ExitCode {
             path,
             strict,
             quiet,
+            verbose,
         } => {
             let mut stderr = io::stderr().lock();
-            match lint::run(&path, strict, quiet, &mut stderr) {
+            match lint::run(&path, strict, quiet, verbose, &mut stderr) {
                 Ok(has_errors) => {
                     if has_errors {
                         ExitCode::from(1)

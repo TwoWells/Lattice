@@ -81,15 +81,24 @@ pub enum Command {
         /// diagnostics never affect the exit code.
         #[arg(long, alias = "deny-warnings")]
         strict: bool,
-        /// Suppress the trailing suppression ledger summary.
+        /// Suppress the suppression ledger entirely.
         ///
-        /// By default `lattice lint` prints, after the diagnostics, a ledger of
-        /// what was suppressed — by source (frontmatter exceptions, count-keys)
-        /// and severity — so a turned-off blanket is never silent (decision
-        /// 012). `--quiet` drops the ledger, leaving only the diagnostics, for
-        /// machine-readable CI output.
+        /// By default `lattice lint` prints, after the diagnostics, the ledger
+        /// header — the suppressed totals and per-source-kind counts — so a
+        /// turned-off blanket is never silent (decision 012). `--quiet` drops
+        /// even the header, leaving only the diagnostics, for machine-readable
+        /// CI output.
         #[arg(long)]
         quiet: bool,
+        /// Expand the suppression ledger with per-source detail rows.
+        ///
+        /// The default ledger prints only its header. `--verbose` adds one row
+        /// per suppression source — each frontmatter exception, count-key,
+        /// artifact, and subtree override — with its label, per-severity counts,
+        /// and source detail: the exhaustive breakdown. Conflicts with
+        /// `--quiet`.
+        #[arg(long, conflicts_with = "quiet")]
+        verbose: bool,
     },
     /// Move a file or directory, applying every edit the move forces.
     ///
@@ -707,6 +716,30 @@ mod tests {
             }
             other => panic!("expected Format, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn lint_verbose_parses_and_conflicts_with_quiet() {
+        use clap::Parser as _;
+
+        use super::Command;
+
+        // `lattice lint --verbose` parses with verbose set and quiet defaulted off.
+        let verbose =
+            Cli::try_parse_from(["lattice", "lint", "--verbose"]).expect("lint --verbose parses");
+        match verbose.command {
+            Command::Lint { verbose, quiet, .. } => {
+                assert!(verbose, "--verbose is captured");
+                assert!(!quiet, "--quiet defaults off");
+            }
+            other => panic!("expected Lint, got {other:?}"),
+        }
+
+        // The ledger cannot be both dropped and expanded — the flags conflict.
+        assert!(
+            Cli::try_parse_from(["lattice", "lint", "--quiet", "--verbose"]).is_err(),
+            "--quiet and --verbose are mutually exclusive"
+        );
     }
 
     #[test]

@@ -1775,7 +1775,7 @@ mod tests {
     /// The ledger is suppressed (`quiet`) so assertions focus on diagnostics.
     fn lint(fixture: &Fixture) -> (bool, String) {
         let mut buf = Vec::new();
-        let failed = crate::lint::run(fixture.root(), false, true, &mut buf)
+        let failed = crate::lint::run(fixture.root(), false, true, false, &mut buf)
             .expect("lint run should succeed");
         (
             failed,

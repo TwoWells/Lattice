@@ -299,7 +299,7 @@ mod tests {
     /// the diagnostic output — the graph observable a format pass must not move.
     fn lint_output(dir: &TempDir) -> String {
         let mut buf = Vec::new();
-        lint::run(dir.path(), false, true, &mut buf).expect("lint run should succeed");
+        lint::run(dir.path(), false, true, false, &mut buf).expect("lint run should succeed");
         String::from_utf8(buf).expect("lint output should be utf-8")
     }
 
