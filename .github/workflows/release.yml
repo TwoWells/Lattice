@@ -206,10 +206,20 @@ jobs:
           path: dist
           merge-multiple: true
 
+      # Publish a sha256 sidecar next to each archive ("<hash>  <filename>",
+      # sha256sum format). The Homebrew tap's and Scoop bucket's bump automation
+      # read these to pin per-platform hashes without downloading the archives.
+      - name: Generate sha256 sidecars
+        working-directory: dist
+        run: |
+          for f in lattice-*.tar.gz lattice-*.zip; do
+            sha256sum "$f" > "$f.sha256"
+          done
+
       # Sign a build-provenance attestation for every release archive, linking
       # each binary back to this workflow run. The globs cover the Linux/macOS
-      # tar.gz and the Windows zip; Lattice ships no .sha256 sidecars, so these
-      # match exactly the archives and nothing else.
+      # tar.gz and the Windows zip and nothing else — the .sha256 sidecars
+      # don't match the anchored extensions, so only the archives are attested.
       - uses: actions/attest-build-provenance@v4
         with:
           subject-path: |
