@@ -43,7 +43,7 @@ jobs:
     outputs:
       version: ${{ steps.v.outputs.version }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - id: v
         name: Tag must match Cargo.toml version
         run: |
@@ -71,7 +71,7 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Materialize pinned Rust toolchain
         run: |
@@ -112,7 +112,7 @@ jobs:
     # on windows-latest / macos-14, which carry their own MSVC / Xcode toolchains.
     container: ${{ matrix.container }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Materialize Rust toolchain
         run: |
@@ -165,7 +165,7 @@ jobs:
     # GitHub auto-creates it (unprotected) on first run.
     environment: release
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Materialize Rust toolchain
         run: rustup show

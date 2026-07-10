@@ -46,7 +46,7 @@ jobs:
     outputs:
       matrix: ${{ steps.list.outputs.matrix }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - id: list
         run: |
           json="$(make -s print-fuzz-targets | jq -R . | jq -cs .)"
@@ -60,7 +60,7 @@ jobs:
       matrix:
         target: ${{ fromJson(needs.targets.outputs.matrix) }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Choose fuzz duration
         run: |
