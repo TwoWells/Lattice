@@ -137,12 +137,28 @@ struct Workspaces {
     /// buffer with stale bytes — and an open file edited in the editor already
     /// reaches the server through `didChange`, so the watcher event would be a
     /// second source of truth (the issue 009 duplication class). A `changed`
-    /// event is therefore dropped while its URI is in this set; create/delete
-    /// membership events are honored regardless (ticket server 09). It also
-    /// pins buffer authority across a workspace-folder change: a folder added
-    /// over an open document keeps the buffer, and a folder removed under one
-    /// keeps it serving rootless.
+    /// event is therefore dropped while its URI is in this set **and** the
+    /// buffer holds state disk doesn't ([`Self::dirty_documents`], issue 061);
+    /// create/delete membership events are honored regardless (ticket
+    /// server 09). It also pins buffer authority across a workspace-folder
+    /// change: a folder added over an open document keeps the buffer, and a
+    /// folder removed under one keeps it serving rootless.
     open_documents: HashSet<String>,
+    /// Open documents whose buffer may hold state that is not on disk: opened
+    /// with text diverging from the file's bytes, or edited (`didChange`)
+    /// since the last save.
+    ///
+    /// This is the strict buffer-wins set — decision 017 §3 as narrowed by
+    /// issue 061. A watched `changed` event is dropped only for these URIs,
+    /// because their buffer is the sole copy of unsaved state. An open
+    /// document *not* in this set holds a mere snapshot of its last save: an
+    /// external process rewriting the file makes disk strictly newer, so the
+    /// watched event reconciles it from disk exactly like a closed file.
+    /// Without the narrowing, a long-open saved document pins the index to
+    /// pre-rewrite content indefinitely, and every cross-file predicate judged
+    /// against it is a phantom — issue 061's mass-`lattice mv` shape, where
+    /// the in-place link rewrites of open counterpart files never landed.
+    dirty_documents: HashSet<String>,
     /// A borrowable default configuration for rootless single-file views
     /// (issue 051): a document outside every root parses and serves its
     /// document-scoped features under defaults, with the graph tier inert.
@@ -178,6 +194,7 @@ impl Workspaces {
             git_boundaries: BTreeSet::new(),
             published: HashMap::new(),
             open_documents: HashSet::new(),
+            dirty_documents: HashSet::new(),
             default_config: Config::default(),
         }
     }
@@ -504,12 +521,16 @@ impl Workspaces {
                     .map_or_else(|_| old_key.clone(), |suffix| new_abs.join(suffix))
             };
             // Follow the buffer-authority and publication-diff state to the new
-            // key so an open renamed file stays editor-authoritative and its
-            // stale publication under the old URI is cleared.
+            // key so an open renamed file stays editor-authoritative (its
+            // divergence state included) and its stale publication under the
+            // old URI is cleared.
             let old_uri = path_to_uri(&old_key);
             let new_uri = path_to_uri(&new_key);
             if self.open_documents.remove(&old_uri) {
-                self.open_documents.insert(new_uri);
+                self.open_documents.insert(new_uri.clone());
+            }
+            if self.dirty_documents.remove(&old_uri) {
+                self.dirty_documents.insert(new_uri);
             }
             if self.published.remove(&old_uri).is_some() {
                 cleared.push(old_uri);
@@ -4357,6 +4378,21 @@ fn handle_notification(
             workspaces
                 .open_documents
                 .insert(params.text_document.uri.clone());
+            // Divergence at the open boundary (issue 061): a buffer opened
+            // with the file's current bytes is a snapshot disk may later
+            // refresh; one opened divergent (an editor attaching with
+            // unflushed modifications, or no file on disk yet) carries state
+            // that exists nowhere else and keeps strict buffer authority.
+            let abs = uri_to_path(&params.text_document.uri);
+            let matches_disk =
+                std::fs::read_to_string(&abs).is_ok_and(|disk| disk == params.text_document.text);
+            if matches_disk {
+                workspaces.dirty_documents.remove(&params.text_document.uri);
+            } else {
+                workspaces
+                    .dirty_documents
+                    .insert(params.text_document.uri.clone());
+            }
             // Index the buffer wherever it belongs: a document inside a scanned
             // workspace folder updates that workspace; one opened outside every
             // folder becomes a single-file document (issue 051) so its
@@ -4373,10 +4409,14 @@ fn handle_notification(
             // 017 §3), and per the LSP spec content authority reverts to the
             // filesystem — reconcile the index to disk (issue 046).
             workspaces.open_documents.remove(&params.text_document.uri);
+            workspaces.dirty_documents.remove(&params.text_document.uri);
             reconcile_closed_document(connection, workspaces, &params.text_document.uri)?;
         }
         lsp::method::DID_SAVE => {
             let params: lsp::DidSaveTextDocumentParams = serde_json::from_value(notif.params)?;
+            // The buffer was flushed: it no longer holds state disk doesn't,
+            // so a later watched change may reconcile it (issue 061).
+            workspaces.dirty_documents.remove(&params.text_document.uri);
             if let Some(text) = &params.text {
                 // The save payload carries the text: upsert it by path.
                 workspaces.sync_document_content(&params.text_document.uri, text);
@@ -4393,6 +4433,11 @@ fn handle_notification(
         lsp::method::DID_CHANGE => {
             let params: lsp::DidChangeTextDocumentParams = serde_json::from_value(notif.params)?;
             if let Some(change) = params.content_changes.into_iter().last() {
+                // The buffer now holds unsaved edits: strict buffer authority
+                // until the next save (issue 061).
+                workspaces
+                    .dirty_documents
+                    .insert(params.text_document.uri.clone());
                 // A didChange targets an already-open (already-indexed) document,
                 // so it never changes membership. Upsert the buffer, then choose
                 // the publish path from the document's placement:
@@ -4537,12 +4582,24 @@ fn handle_watched_files_change(
             continue;
         }
         match change.change_type {
-            // `changed` carries disk content; for a file open in the editor
-            // the synced buffer wins, so the event is dropped (decision 017
-            // §3). The open file already reaches the server through
-            // `didChange`, so honoring the watcher too would also
-            // double-deliver (the issue 009 class).
-            lsp::file_change_type::CHANGED if workspaces.open_documents.contains(&change.uri) => {}
+            // `changed` carries disk content. It is dropped only while the
+            // open buffer holds state disk doesn't — unsaved edits, or a
+            // divergent open (decision 017 §3, narrowed by issue 061): that
+            // buffer is the sole copy, and its own edits already reach the
+            // server through `didChange`, so honoring the watcher too would
+            // double-deliver (the issue 009 class). An open buffer matching
+            // its last save is a snapshot an external writer has just
+            // superseded — disk is strictly newer — so it falls through and
+            // reconciles from disk exactly like a closed file.
+            lsp::file_change_type::CHANGED
+                if workspaces.open_documents.contains(&change.uri)
+                    && workspaces.dirty_documents.contains(&change.uri) =>
+            {
+                tracing::warn!(
+                    uri = %change.uri,
+                    "watched change dropped: open buffer holds unsaved or divergent state (buffer wins)"
+                );
+            }
             // created / deleted are membership changes honored regardless of
             // open state; a non-open `changed` re-reads disk. All three route
             // through `apply_from_disk`, which re-reads disk — reparsing a
@@ -10772,6 +10829,140 @@ mod tests {
         assert!(
             any_message_contains(&after, "disk-only.md"),
             "after didClose the watcher re-reads disk: the diagnostic now reflects disk, got {after:?}"
+        );
+
+        shutdown(&client, server_thread);
+    }
+
+    #[test]
+    fn watched_change_reconciles_open_saved_buffer() {
+        // Issue 061: buffer-wins is narrowed to buffers holding state disk
+        // doesn't. While the open buffer has unsaved edits the watched
+        // `changed` event is still dropped; once the buffer is saved it is a
+        // mere snapshot, so an external rewrite's watched event reconciles
+        // the index from disk instead of pinning it to the stale buffer.
+        let dir = workspace_with_files(&[("doc.md", "See `disk-a.md` here.\n")]);
+        let root = fs::canonicalize(dir.path()).expect("canonicalize temp dir");
+        let root_uri = path_to_uri(&root);
+        let doc_uri = path_to_uri(&root.join("doc.md"));
+
+        let (server, client) = Connection::memory();
+        let server_thread = std::thread::spawn(move || serve(&server));
+
+        handshake(&client, &root_uri, true);
+        let reg = recv_message(&client);
+        assert!(
+            matches!(reg, Message::Request(_)),
+            "the registration request precedes the document sync, got {reg:?}"
+        );
+
+        // Open with the file's current bytes: a snapshot, not a divergence.
+        open_doc(&client, &doc_uri, "See `disk-a.md` here.\n");
+        let opened = recv_publish_for(&client, &doc_uri);
+        assert!(
+            any_message_contains(&opened, "disk-a.md"),
+            "the open publish reflects the synced content, got {opened:?}"
+        );
+
+        // Edit the buffer: it now holds unsaved state.
+        send_change(&client, &doc_uri, "See `buffer-b.md` here.\n");
+        let changed = recv_publish_for(&client, &doc_uri);
+        assert!(
+            any_message_contains(&changed, "buffer-b.md"),
+            "the didChange publish reflects the edited buffer, got {changed:?}"
+        );
+
+        // An external process rewrites disk. While the buffer is dirty the
+        // watched event is dropped — the unsaved edits are the sole copy.
+        fs::write(root.join("doc.md"), "See `disk-c.md` here.\n").expect("rewrite doc.md on disk");
+        send_watched_change(&client, &doc_uri, lsp::file_change_type::CHANGED);
+        assert!(
+            client
+                .receiver
+                .recv_timeout(std::time::Duration::from_millis(300))
+                .is_err(),
+            "a dirty open buffer keeps strict buffer authority — the watched change is dropped"
+        );
+
+        // Save the buffer: it no longer holds state disk doesn't. The save is
+        // answered unconditionally (issue 062).
+        send_notification(
+            &client,
+            lsp::method::DID_SAVE,
+            serde_json::json!({
+                "textDocument": { "uri": doc_uri },
+                "text": "See `buffer-b.md` here.\n"
+            }),
+        );
+        let saved = recv_publish_for(&client, &doc_uri);
+        assert!(
+            any_message_contains(&saved, "buffer-b.md"),
+            "the save answer reflects the saved buffer, got {saved:?}"
+        );
+
+        // The same watched event now reconciles from disk: the saved buffer is
+        // a stale snapshot of a file an external writer has superseded.
+        send_watched_change(&client, &doc_uri, lsp::file_change_type::CHANGED);
+        let reconciled = recv_publish_for(&client, &doc_uri);
+        assert!(
+            any_message_contains(&reconciled, "disk-c.md"),
+            "a saved open buffer reconciles from disk on a watched change, got {reconciled:?}"
+        );
+
+        shutdown(&client, server_thread);
+    }
+
+    #[test]
+    fn watched_change_of_open_counterpart_updates_cross_file_edges() {
+        // Issue 061 at the cross-file predicate, the phantom shape itself:
+        // a.md forward-links b.md and b.md carries the backlink — symmetric,
+        // both clean. a.md sits open (and saved) in the editor while an
+        // external process rewrites it on disk to drop the link. The watched
+        // `changed` event must reconcile the open-but-undiverged a.md from
+        // disk so b.md's backlink is judged against disk truth — under the
+        // unconditional drop, a.md stayed pinned and every backlink judged
+        // against it was a phantom.
+        let dir = workspace_with_files(&[
+            (".lattice.toml", ""),
+            ("a.md", "[b](./b.md \"references\")\n"),
+            (
+                "b.md",
+                "---\nbacklinks:\n  referenced_by:\n    - a.md\n---\n# B\n",
+            ),
+        ]);
+        let root = fs::canonicalize(dir.path()).expect("canonicalize temp dir");
+        let root_uri = path_to_uri(&root);
+        let a_uri = path_to_uri(&root.join("a.md"));
+        let b_uri = path_to_uri(&root.join("b.md"));
+
+        let (server, client) = Connection::memory();
+        let server_thread = std::thread::spawn(move || serve(&server));
+
+        handshake(&client, &root_uri, true);
+        let reg = recv_message(&client);
+        assert!(
+            matches!(reg, Message::Request(_)),
+            "the registration request precedes the document sync, got {reg:?}"
+        );
+
+        // Open a.md with its current bytes and leave it open: the lingering
+        // saved-buffer state of issue 061's counterpart files.
+        open_doc(&client, &a_uri, "[b](./b.md \"references\")\n");
+        let opened = recv_publish_for(&client, &a_uri);
+        assert!(
+            opened.is_empty(),
+            "the symmetric graph opens clean, got {opened:?}"
+        );
+
+        // An external rewrite drops a.md's forward link; the watcher relays it.
+        fs::write(root.join("a.md"), "# A\n\nThe link is gone.\n").expect("rewrite a.md on disk");
+        send_watched_change(&client, &a_uri, lsp::file_change_type::CHANGED);
+
+        // b.md's backlink is now judged against disk truth: stale.
+        let b_diags = recv_publish_for(&client, &b_uri);
+        assert!(
+            any_message_contains(&b_diags, "no corresponding forward link"),
+            "the counterpart's backlink is judged against the reconciled disk state, got {b_diags:?}"
         );
 
         shutdown(&client, server_thread);
