@@ -149,6 +149,25 @@ struct Workspaces {
     default_config: Config,
 }
 
+/// The structural-cache debt one disk reconciliation leaves its caller.
+///
+/// [`Workspaces::apply_from_disk`] mutates the store without paying any
+/// structural recompute, so the watched-files batch handler can fold N debts
+/// into one sweep (issue 063); [`Workspaces::update_from_disk`] settles the
+/// debt immediately for single-file callers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiskUpdate {
+    /// The store did not change: the path is neither on disk nor indexed, or
+    /// the on-disk bytes already match the indexed content.
+    Untouched,
+    /// An existing document's content was re-read in place. Only its own
+    /// structural cache is owed — no membership changed.
+    Content,
+    /// A document joined or left the store. Any sibling's bare-path existence
+    /// answer may have flipped, so a full-workspace sweep is owed.
+    Membership,
+}
+
 impl Workspaces {
     /// An empty store with no roots and no documents.
     fn new() -> Self {
@@ -363,23 +382,49 @@ impl Workspaces {
 
     /// Reconcile a document to disk: re-read and re-parse it, or drop it if it
     /// is gone (issue 046 didClose semantics; watched create/change/delete).
-    /// Its `primary_root` is recomputed at insert.
+    /// Its `primary_root` is recomputed at insert. Settles the structural debt
+    /// immediately; the watched-files batch handler calls
+    /// [`Self::apply_from_disk`] directly to pay one sweep for a whole batch.
     fn update_from_disk(&mut self, abs: &Path) {
-        let existed = self.documents.contains_key(abs);
+        match self.apply_from_disk(abs) {
+            DiskUpdate::Membership => self.recompute_all_structural(),
+            DiskUpdate::Content => self.recompute_structural(abs),
+            DiskUpdate::Untouched => {}
+        }
+    }
+
+    /// Reconcile a document to disk without recomputing any structural cache,
+    /// returning the debt the caller owes ([`DiskUpdate`]).
+    ///
+    /// Folding the recompute out of the per-file apply is what keeps a bulk
+    /// `didChangeWatchedFiles` batch `O(batch + workspace)` instead of
+    /// `O(batch × workspace)`: a directory move delivered as hundreds of
+    /// created/deleted events must not pay a full-workspace sweep per event
+    /// (issue 063). Re-reading bytes identical to the indexed content reports
+    /// [`DiskUpdate::Untouched`] — nothing reparsed, nothing owed — so a
+    /// watcher echo of content the server already holds costs one read.
+    fn apply_from_disk(&mut self, abs: &Path) -> DiskUpdate {
         if !abs.is_file() {
-            if self.documents.remove(abs).is_some() {
-                self.recompute_all_structural();
-            }
-            return;
+            return if self.documents.remove(abs).is_some() {
+                DiskUpdate::Membership
+            } else {
+                DiskUpdate::Untouched
+            };
         }
         let Ok(content) = std::fs::read_to_string(abs) else {
             // Exists but unreadable: drop it so no stale content lingers —
             // stricter than the test-only incremental `Workspace::update`,
             // which keeps the stale entry and surfaces the read error.
-            if self.documents.remove(abs).is_some() {
-                self.recompute_all_structural();
-            }
-            return;
+            return if self.documents.remove(abs).is_some() {
+                DiskUpdate::Membership
+            } else {
+                DiskUpdate::Untouched
+            };
+        };
+        let existed = match self.documents.get(abs) {
+            Some(doc) if doc.data.tree.source() == content => return DiskUpdate::Untouched,
+            Some(_) => true,
+            None => false,
         };
         let primary = self.deepest_root_for(abs);
         let data = {
@@ -394,9 +439,9 @@ impl Workspaces {
             },
         );
         if existed {
-            self.recompute_structural(abs);
+            DiskUpdate::Content
         } else {
-            self.recompute_all_structural();
+            DiskUpdate::Membership
         }
     }
 
@@ -4474,6 +4519,14 @@ fn handle_watched_files_change(
     // `publish_all_diagnostics`, but folds N changed files into one
     // O(workspace) recompute instead of N (ticket perf 07).
     let mut changed_docs: HashSet<String> = HashSet::new();
+    // The structural debt the batch accrues (issue 063). Membership changes
+    // owe one full sweep, paid once after every change is applied — a bulk
+    // create/delete storm (a directory move) is O(batch + workspace), not
+    // O(batch × workspace) — and the deferred sweep runs against the batch's
+    // *final* membership, so it also covers every content change. Only when
+    // no membership moved do content changes pay their own per-file caches.
+    let mut membership_changed = false;
+    let mut content_changed: Vec<PathBuf> = Vec::new();
     for change in &params.changes {
         if !is_markdown_uri(&change.uri) {
             continue;
@@ -4487,21 +4540,36 @@ fn handle_watched_files_change(
             lsp::file_change_type::CHANGED if workspaces.open_documents.contains(&change.uri) => {}
             // created / deleted are membership changes honored regardless of
             // open state; a non-open `changed` re-reads disk. All three route
-            // through `update_from_disk`, which re-reads disk — reparsing a
-            // created/changed file and dropping a deleted one — and refreshes
-            // the structural caches. Only files under a folder are tracked (the
-            // watcher glob is folder-scoped), so an event outside every root is
-            // ignored.
+            // through `apply_from_disk`, which re-reads disk — reparsing a
+            // created/changed file and dropping a deleted one — and leaves the
+            // structural recompute to the batch settlement below. Only files
+            // under a folder are tracked (the watcher glob is folder-scoped),
+            // so an event outside every root is ignored.
             lsp::file_change_type::CREATED
             | lsp::file_change_type::CHANGED
             | lsp::file_change_type::DELETED => {
                 let abs = uri_to_path(&change.uri);
                 if workspaces.deepest_root_for(&abs).is_some() {
-                    workspaces.update_from_disk(&abs);
+                    match workspaces.apply_from_disk(&abs) {
+                        DiskUpdate::Membership => membership_changed = true,
+                        DiskUpdate::Content => content_changed.push(abs),
+                        // Nothing indexed moved (e.g. a delete echo for a file
+                        // never indexed, or bytes the server already holds):
+                        // no debt, and no re-materialization to force.
+                        DiskUpdate::Untouched => continue,
+                    }
                     changed_docs.insert(change.uri.clone());
                 }
             }
             _ => {}
+        }
+    }
+    // Settle the batch's structural debt in one payment (issue 063).
+    if membership_changed {
+        workspaces.recompute_all_structural();
+    } else {
+        for abs in &content_changed {
+            workspaces.recompute_structural(abs);
         }
     }
     // A marker change invalidates the whole workspace (predicates, artifacts,
@@ -11022,6 +11090,63 @@ mod tests {
         assert!(
             any_message_contains(diags, "stale reference"),
             "the single closed file's on-disk change re-materialized, got {diags:?}"
+        );
+    }
+
+    #[test]
+    fn watched_batch_pays_one_structural_sweep() {
+        // Issue 063: a single `didChangeWatchedFiles` batch mixing membership
+        // changes (created + deleted) with in-place content changes pays
+        // exactly ONE full-workspace structural sweep — not one per membership
+        // event. This is the mv-storm shape at miniature: a directory move
+        // arrives as hundreds of created/deleted pairs, and a per-event sweep
+        // makes the batch O(batch × workspace) — a wedge of tens of minutes at
+        // real scale, during which every queued didSave times out client-side.
+        let dir = workspace_with_files(&[
+            (".lattice.toml", ""),
+            ("a.md", "# A\n"),
+            ("b.md", "# B\n"),
+            ("c.md", "# C\n"),
+        ]);
+        let mut workspaces = scan_workspaces(&dir);
+        let initial = diff_diagnostics(&mut workspaces, &HashSet::new());
+        assert!(
+            initial.is_empty(),
+            "clean files publish nothing initially: {initial:?}"
+        );
+
+        // One file created, one deleted, one rewritten in place.
+        fs::write(dir.path().join("d.md"), "# D\n").expect("create d.md");
+        fs::remove_file(dir.path().join("b.md")).expect("delete b.md");
+        fs::write(dir.path().join("c.md"), "See `gone.md` here.\n").expect("rewrite c.md");
+        let notif = Notification::new(
+            lsp::method::DID_CHANGE_WATCHED_FILES.to_string(),
+            serde_json::json!({ "changes": [
+                { "uri": file_uri(&dir, "d.md"), "type": lsp::file_change_type::CREATED },
+                { "uri": file_uri(&dir, "b.md"), "type": lsp::file_change_type::DELETED },
+                { "uri": file_uri(&dir, "c.md"), "type": lsp::file_change_type::CHANGED },
+            ] }),
+        );
+
+        let (server, client) = Connection::memory();
+        let (sweeps, result) =
+            count_structural_sweeps(|| handle_notification(&server, &mut workspaces, notif));
+        result.expect("handle the batched watched-file notification");
+        assert_eq!(
+            sweeps, 1,
+            "a mixed created/deleted/changed batch pays one structural sweep, not one per membership event"
+        );
+
+        // The one deferred sweep ran against the batch's final membership: the
+        // in-place rewrite's diagnostics landed in the same pass.
+        let published = drain_publishes(&client);
+        let c_uri = file_uri(&dir, "c.md");
+        let diags = published
+            .get(&c_uri)
+            .expect("c.md was published in the batch pass");
+        assert!(
+            any_message_contains(diags, "stale reference"),
+            "the in-place rewrite re-materialized under the batch's single sweep, got {diags:?}"
         );
     }
 
