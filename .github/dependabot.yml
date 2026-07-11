@@ -8,5 +8,10 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    # One PR per week covering every actions bump, not one PR per action.
+    groups:
+      github-actions:
+        patterns:
+          - "*"
     commit-message:
       prefix: "ci"
