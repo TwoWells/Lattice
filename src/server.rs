@@ -1127,8 +1127,10 @@ fn server_capabilities(params: &lsp::InitializeParams) -> serde_json::Value {
         // covers the *closed* target file — where a backlink diagnostic lands
         // when its source is edited — so it is the right transport for a graph
         // linter, not a fallback. `didOpen` resets the per-URI publish diff
-        // because a client's memory of a reopened document is unknowable
-        // (`republish_on_open`), which closes the only gap pull papered over.
+        // because a client's memory of a reopened document is unknowable, and
+        // `didSave` is answered unconditionally because push-only silence is
+        // indistinguishable from no answer (`force_republish`, issue 062) —
+        // which closes the only gaps pull papered over.
         // Advertising pull (`diagnosticProvider`) *and* pushing makes
         // spec-compliant clients (e.g. Neovim 0.11) render every diagnostic
         // twice, so pull is not advertised — and any future pull support must
@@ -4362,7 +4364,7 @@ fn handle_notification(
             // republish below enumerates scanned workspaces only, so a single-file
             // document emits no diagnostics — the graph tier has nothing to say.
             workspaces.sync_document_content(&params.text_document.uri, &params.text_document.text);
-            republish_on_open(connection, workspaces, &params.text_document.uri)?;
+            force_republish(connection, workspaces, &params.text_document.uri)?;
         }
         lsp::method::DID_CLOSE => {
             let params: lsp::DidCloseTextDocumentParams = serde_json::from_value(notif.params)?;
@@ -4383,7 +4385,10 @@ fn handle_notification(
                 let abs = uri_to_path(&params.text_document.uri);
                 workspaces.update_from_disk(&abs);
             }
-            publish_all_diagnostics(connection, workspaces, &one_uri(&params.text_document.uri))?;
+            // A save is answered unconditionally (issue 062): the delta diff
+            // reads an unchanged set as silence, which a push-only client
+            // cannot tell from no answer.
+            force_republish(connection, workspaces, &params.text_document.uri)?;
         }
         lsp::method::DID_CHANGE => {
             let params: lsp::DidChangeTextDocumentParams = serde_json::from_value(notif.params)?;
@@ -4695,28 +4700,30 @@ fn one_uri(uri: &str) -> HashSet<String> {
     set
 }
 
-/// Republish a just-opened document's current diagnostics unconditionally.
+/// Republish a document's current diagnostics unconditionally.
 ///
-/// `didOpen` is a client-state boundary (decision 022): the server cannot know
-/// what a client remembers about a document it just opened, so the per-URI
-/// last-published record is invalidated before the sync's publish pass. That
-/// forces the diff to re-send a document carrying diagnostics even when its
-/// content is unchanged — closing the false-clean gap a client that drops its
-/// per-URI record on reopen would otherwise hit.
+/// Two notification boundaries force a publish even when nothing changed:
+///
+/// - `didOpen` is a client-state boundary (decision 022): the server cannot
+///   know what a client remembers about a document it just opened, so the
+///   per-URI last-published record is invalidated before the sync's publish
+///   pass — closing the false-clean gap a client that drops its per-URI
+///   record on reopen would otherwise hit.
+/// - `didSave` is a client-expectation boundary (issue 062): on a push-only
+///   server (decision 022 removed the pull surface) a client that hears
+///   nothing for a document it just saved cannot distinguish "no findings"
+///   from "no answer" except by timeout. The delta diff reads an unchanged
+///   set as nothing-to-send, so the save's answer is forced the same way.
 ///
 /// A clean indexed file needs one extra step: its desired set is empty and it
 /// holds no cache entry, so the diff suppresses it (an unchanged empty is not a
 /// change). Push-only owes it an *explicit* empty publish there, not a skip — so
 /// when the pass leaves this document with no cache entry (i.e. it is clean), an
-/// empty `publishDiagnostics` is sent for it. A rootless or unindexed open
+/// empty `publishDiagnostics` is sent for it. A rootless or unindexed document
 /// (issue 051) resolves to no workspace and publishes nothing, as before.
 ///
 /// No diagnostics are recomputed beyond the ordinary publish pass.
-fn republish_on_open(
-    connection: &Connection,
-    workspaces: &mut Workspaces,
-    uri: &str,
-) -> Result<()> {
+fn force_republish(connection: &Connection, workspaces: &mut Workspaces, uri: &str) -> Result<()> {
     // The publish/cache key for this document when it is indexed under a root
     // (the same base `diff_diagnostics` keys the cache by). `None` for a
     // rootless or unindexed open, which publishes nothing.
@@ -11148,6 +11155,83 @@ mod tests {
             any_message_contains(diags, "stale reference"),
             "the in-place rewrite re-materialized under the batch's single sweep, got {diags:?}"
         );
+    }
+
+    #[test]
+    fn did_save_republishes_clean_document() {
+        // Issue 062: a `didSave` whose recompute leaves the diagnostic set
+        // unchanged must still be answered. A clean document is the strongest
+        // case — it holds no publish-cache entry, so the delta diff reads
+        // empty-to-empty as nothing-to-send, and a push-only client (decision
+        // 022) cannot tell that silence from no answer. The save's publish is
+        // forced like `didOpen`'s, including the explicit empty.
+        let dir = workspace_with_files(&[("doc.md", "# Clean\n")]);
+        let root = fs::canonicalize(dir.path()).expect("canonicalize temp dir");
+        let root_uri = path_to_uri(&root);
+        let doc_uri = path_to_uri(&root.join("doc.md"));
+
+        let (server, client) = Connection::memory();
+        let server_thread = std::thread::spawn(move || serve(&server));
+        handshake(&client, &root_uri, false);
+
+        // The open boundary already forces its explicit empty publish.
+        open_doc(&client, &doc_uri, "# Clean\n");
+        let opened = recv_publish_for(&client, &doc_uri);
+        assert!(
+            opened.is_empty(),
+            "the clean open is answered with an explicit empty publish, got {opened:?}"
+        );
+
+        // Save it unchanged: the recompute yields the same (empty) set, and
+        // the answer must still arrive.
+        send_notification(
+            &client,
+            lsp::method::DID_SAVE,
+            serde_json::json!({ "textDocument": { "uri": doc_uri }, "text": "# Clean\n" }),
+        );
+        let saved = recv_publish_for(&client, &doc_uri);
+        assert!(
+            saved.is_empty(),
+            "an unchanged clean save is answered with an explicit empty publish, got {saved:?}"
+        );
+
+        shutdown(&client, server_thread);
+    }
+
+    #[test]
+    fn did_save_republishes_unchanged_findings() {
+        // Issue 062, the cached arm: a document whose findings did not move
+        // across a save has a publish-cache entry equal to the fresh set, so
+        // the delta diff would suppress the send. The forced save answer
+        // re-sends the identical findings instead.
+        let dir = workspace_with_files(&[("doc.md", "See `gone.md` here.\n")]);
+        let root = fs::canonicalize(dir.path()).expect("canonicalize temp dir");
+        let root_uri = path_to_uri(&root);
+        let doc_uri = path_to_uri(&root.join("doc.md"));
+
+        let (server, client) = Connection::memory();
+        let server_thread = std::thread::spawn(move || serve(&server));
+        handshake(&client, &root_uri, false);
+
+        open_doc(&client, &doc_uri, "See `gone.md` here.\n");
+        let opened = recv_publish_for(&client, &doc_uri);
+        assert!(
+            any_message_contains(&opened, "stale reference"),
+            "the open publish carries the finding, got {opened:?}"
+        );
+
+        send_notification(
+            &client,
+            lsp::method::DID_SAVE,
+            serde_json::json!({ "textDocument": { "uri": doc_uri }, "text": "See `gone.md` here.\n" }),
+        );
+        let saved = recv_publish_for(&client, &doc_uri);
+        assert!(
+            any_message_contains(&saved, "stale reference"),
+            "the unchanged save re-sends the identical findings, got {saved:?}"
+        );
+
+        shutdown(&client, server_thread);
     }
 
     // -----------------------------------------------------------------------
