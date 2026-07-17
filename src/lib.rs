@@ -85,7 +85,7 @@ pub fn run() -> ExitCode {
                 }
                 Err(e) => {
                     let _ = writeln!(stderr, "error: {e:#}");
-                    ExitCode::from(failure_exit_code(&e))
+                    ExitCode::from(EXIT_COULD_NOT_EVALUATE)
                 }
             }
         }
@@ -99,7 +99,7 @@ pub fn run() -> ExitCode {
                 Ok(()) => ExitCode::from(0),
                 Err(e) => {
                     let _ = writeln!(io::stderr().lock(), "error: {e:#}");
-                    ExitCode::from(failure_exit_code(&e))
+                    ExitCode::from(EXIT_COULD_NOT_EVALUATE)
                 }
             }
         }
@@ -118,7 +118,7 @@ pub fn run() -> ExitCode {
                 }
                 Err(e) => {
                     let _ = writeln!(stderr, "error: {e:#}");
-                    ExitCode::from(failure_exit_code(&e))
+                    ExitCode::from(EXIT_COULD_NOT_EVALUATE)
                 }
             }
         }
@@ -146,59 +146,15 @@ pub fn run() -> ExitCode {
     }
 }
 
-/// Map a failed evaluating subcommand (`lint` / `mv` / `format`) to its exit
+/// Exit code for an evaluating subcommand (`lint` / `mv` / `format`) that
+/// could not complete its evaluation — the grep/diff convention's "trouble"
 /// code (decision 023, issue 065).
 ///
-/// A refusal to evaluate — a present-but-unreadable `.lattice.toml` anywhere
-/// in the error chain — exits **2**, the grep/diff convention's "could not
-/// evaluate", distinct from `1` ("evaluated and found defects" — or any other
-/// failure). The refusal itself lands once, in `Workspace::scan`; this only
-/// translates it to the process boundary.
-pub(crate) fn failure_exit_code(error: &anyhow::Error) -> u8 {
-    let refused = error.chain().any(|cause| {
-        matches!(
-            cause.downcast_ref::<workspace::WorkspaceError>(),
-            Some(workspace::WorkspaceError::Config { .. })
-        )
-    });
-    if refused { 2 } else { 1 }
-}
-
-#[cfg(test)]
-#[allow(
-    clippy::expect_used,
-    clippy::panic,
-    reason = "tests use expect and panic for clarity"
-)]
-mod exit_code_tests {
-    use super::failure_exit_code;
-    use crate::config::ConfigError;
-    use crate::workspace::WorkspaceError;
-
-    #[test]
-    fn refused_config_maps_to_exit_2() {
-        // The refusal survives `.context()` wrapping: the chain walk finds the
-        // `WorkspaceError::Config` link however the subcommand dressed it.
-        let source = ConfigError::Invalid {
-            path: std::path::PathBuf::from("x/.lattice.toml"),
-            message: "boom".to_string(),
-        };
-        let err = anyhow::Error::from(WorkspaceError::Config { source })
-            .context("failed to scan workspace");
-        assert_eq!(
-            failure_exit_code(&err),
-            2,
-            "a broken-config refusal is exit 2 (could not evaluate)"
-        );
-    }
-
-    #[test]
-    fn ordinary_failure_maps_to_exit_1() {
-        let err = anyhow::anyhow!("some io failure");
-        assert_eq!(
-            failure_exit_code(&err),
-            1,
-            "a non-refusal failure keeps exit 1"
-        );
-    }
-}
+/// Every `Err` from these subcommands is a could-not-evaluate: a
+/// present-but-unreadable `.lattice.toml` (refused at the loading layer so
+/// nothing runs under a fabricated default), a missing workspace root, an IO
+/// failure mid-run. It is **2**, held distinct from `1` — which is reserved
+/// for a *completed* evaluation that found defects (the `Ok(true)` arms: lint
+/// error diagnostics, `format --check` drift). Bad arguments already exit 2 via
+/// clap, so usage, setup, and environment failures all agree on 2.
+const EXIT_COULD_NOT_EVALUATE: u8 = 2;

@@ -65,12 +65,13 @@ pub enum Command {
     /// files, and runs every validation check. Diagnostics are printed to
     /// stderr in `path:line: severity: message` format.
     ///
-    /// Exit code is 0 when no errors are found (warnings are allowed), 1
-    /// when any error-level diagnostic is present (pass `--strict` to also
-    /// fail on warnings), and 2 when the workspace could not be evaluated
-    /// at all: a present-but-unreadable `.lattice.toml` refuses the run
-    /// instead of linting under defaults — defaults are the semantics of an
-    /// absent config only.
+    /// Exit code follows the grep/diff convention: 0 when no errors are found
+    /// (warnings are allowed), 1 when the run completed and found defects — any
+    /// error-level diagnostic (pass `--strict` to also fail on warnings) — and
+    /// 2 when the workspace could not be evaluated at all: no workspace root, a
+    /// present-but-unreadable `.lattice.toml` (refused rather than linted under
+    /// defaults — defaults are the semantics of an absent config only), or an
+    /// IO failure. Bad arguments also exit 2 (via clap).
     Lint {
         /// Directory to lint (defaults to the current working directory).
         #[arg(default_value = ".")]

@@ -17,7 +17,13 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum ConfigError {
     /// Failed to read the config file from disk.
-    #[error("failed to read {path}: {source}")]
+    ///
+    /// The `{source}` is deliberately NOT interpolated into the message: the
+    /// field is a `.source()`, so both consumers render it from the chain (the
+    /// CLI via anyhow's `{:#}`, the LSP via [`crate::server`]'s chain walk).
+    /// Interpolating it here too would double it under a chain walk (issue 064
+    /// follow-up).
+    #[error("failed to read {path}")]
     Read {
         /// Path that could not be read.
         path: PathBuf,
@@ -26,7 +32,10 @@ pub enum ConfigError {
     },
 
     /// Config file is not valid TOML.
-    #[error("failed to parse {path}: {source}")]
+    ///
+    /// The `{source}` is rendered from the chain, not interpolated — see
+    /// [`Self::Read`].
+    #[error("failed to parse {path}")]
     Parse {
         /// Path that could not be parsed.
         path: PathBuf,

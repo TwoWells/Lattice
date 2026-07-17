@@ -8,6 +8,7 @@
 //! headings. Supports multiple workspace folders.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -5286,6 +5287,21 @@ fn adjudicated_root_diagnostics(
 /// from the same verdicts the publish pass filters through; a fabricated
 /// default (broken at startup, no last-good) governs nothing and contributes
 /// only its load error.
+/// Render a [`ConfigError`] and its source chain as a single diagnostic
+/// message. The error variants deliberately omit `{source}` from their Display
+/// (it is a `.source()`), so the detail — the toml parse location, the io
+/// cause — lives only in the chain; this walks it, mirroring what anyhow's
+/// `{:#}` gives the CLI so both surfaces read identically.
+fn config_error_message(error: &ConfigError) -> String {
+    let mut message = error.to_string();
+    let mut source = std::error::Error::source(error);
+    while let Some(cause) = source {
+        let _ = write!(message, ": {cause}");
+        source = cause.source();
+    }
+    message
+}
+
 fn config_channel_diagnostics(meta: &RootMeta, verdicts: &OverrideVerdicts) -> Vec<Diagnostic> {
     let file = PathBuf::from(".lattice.toml");
     let mut diagnostics = Vec::new();
@@ -5294,7 +5310,7 @@ fn config_channel_diagnostics(meta: &RootMeta, verdicts: &OverrideVerdicts) -> V
             file: file.clone(),
             line: 1,
             severity: Severity::Error,
-            message: error.to_string(),
+            message: config_error_message(error),
             span: None,
         });
     }
@@ -12707,14 +12723,24 @@ mod tests {
             "the server's analogue of the refusal is the error diagnostic: {config:?}"
         );
 
-        // Every CLI subcommand refuses the same state with exit 2.
+        // Every CLI subcommand refuses the same state. The refusal is a
+        // `WorkspaceError::Config` in the chain — the could-not-evaluate signal
+        // the CLI boundary maps to exit 2 (issue 065; every evaluating-subcommand
+        // Err is exit 2, so this asserts the refusal is *that* Err, not the code).
+        let is_config_refusal = |err: &anyhow::Error| {
+            err.chain().any(|cause| {
+                matches!(
+                    cause.downcast_ref::<crate::workspace::WorkspaceError>(),
+                    Some(crate::workspace::WorkspaceError::Config { .. })
+                )
+            })
+        };
         let mut lint_buf = Vec::new();
         let lint_err = crate::lint::run(dir.path(), false, true, false, &mut lint_buf)
             .expect_err("lint refuses the broken config");
-        assert_eq!(
-            crate::failure_exit_code(&lint_err),
-            2,
-            "lint maps the refusal to exit 2: {lint_err:#}"
+        assert!(
+            is_config_refusal(&lint_err),
+            "lint refuses with a config error (exit 2): {lint_err:#}"
         );
         let mut mv_buf = Vec::new();
         let mv_err = crate::mv::run(
@@ -12724,18 +12750,16 @@ mod tests {
             &mut mv_buf,
         )
         .expect_err("mv refuses the broken config");
-        assert_eq!(
-            crate::failure_exit_code(&mv_err),
-            2,
-            "mv maps the refusal to exit 2: {mv_err:#}"
+        assert!(
+            is_config_refusal(&mv_err),
+            "mv refuses with a config error (exit 2): {mv_err:#}"
         );
         let mut format_buf = Vec::new();
         let format_err = crate::format::run(dir.path(), true, &mut format_buf)
             .expect_err("format refuses the broken config");
-        assert_eq!(
-            crate::failure_exit_code(&format_err),
-            2,
-            "format maps the refusal to exit 2: {format_err:#}"
+        assert!(
+            is_config_refusal(&format_err),
+            "format refuses with a config error (exit 2): {format_err:#}"
         );
     }
 
