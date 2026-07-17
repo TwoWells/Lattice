@@ -59,7 +59,10 @@ pub mod fuzz_api;
 /// `serve`, or `config`.
 ///
 /// Returns the process exit code — `0` on success, `1` when linting finds
-/// errors, `format --check` finds drift, or a subcommand fails.
+/// errors, `format --check` finds drift, or a subcommand fails, and `2` when
+/// the workspace could not be evaluated at all: a present-but-unreadable
+/// `.lattice.toml` refuses every evaluating subcommand rather than running
+/// under fabricated defaults (decision 023, issue 065).
 #[must_use]
 pub fn run() -> ExitCode {
     let args = cli::Cli::parse();
@@ -82,7 +85,7 @@ pub fn run() -> ExitCode {
                 }
                 Err(e) => {
                     let _ = writeln!(stderr, "error: {e:#}");
-                    ExitCode::from(1)
+                    ExitCode::from(failure_exit_code(&e))
                 }
             }
         }
@@ -96,7 +99,7 @@ pub fn run() -> ExitCode {
                 Ok(()) => ExitCode::from(0),
                 Err(e) => {
                     let _ = writeln!(io::stderr().lock(), "error: {e:#}");
-                    ExitCode::from(1)
+                    ExitCode::from(failure_exit_code(&e))
                 }
             }
         }
@@ -115,7 +118,7 @@ pub fn run() -> ExitCode {
                 }
                 Err(e) => {
                     let _ = writeln!(stderr, "error: {e:#}");
-                    ExitCode::from(1)
+                    ExitCode::from(failure_exit_code(&e))
                 }
             }
         }
@@ -140,5 +143,62 @@ pub fn run() -> ExitCode {
                 }
             }
         }
+    }
+}
+
+/// Map a failed evaluating subcommand (`lint` / `mv` / `format`) to its exit
+/// code (decision 023, issue 065).
+///
+/// A refusal to evaluate — a present-but-unreadable `.lattice.toml` anywhere
+/// in the error chain — exits **2**, the grep/diff convention's "could not
+/// evaluate", distinct from `1` ("evaluated and found defects" — or any other
+/// failure). The refusal itself lands once, in `Workspace::scan`; this only
+/// translates it to the process boundary.
+pub(crate) fn failure_exit_code(error: &anyhow::Error) -> u8 {
+    let refused = error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<workspace::WorkspaceError>(),
+            Some(workspace::WorkspaceError::Config { .. })
+        )
+    });
+    if refused { 2 } else { 1 }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::panic,
+    reason = "tests use expect and panic for clarity"
+)]
+mod exit_code_tests {
+    use super::failure_exit_code;
+    use crate::config::ConfigError;
+    use crate::workspace::WorkspaceError;
+
+    #[test]
+    fn refused_config_maps_to_exit_2() {
+        // The refusal survives `.context()` wrapping: the chain walk finds the
+        // `WorkspaceError::Config` link however the subcommand dressed it.
+        let source = ConfigError::Invalid {
+            path: std::path::PathBuf::from("x/.lattice.toml"),
+            message: "boom".to_string(),
+        };
+        let err = anyhow::Error::from(WorkspaceError::Config { source })
+            .context("failed to scan workspace");
+        assert_eq!(
+            failure_exit_code(&err),
+            2,
+            "a broken-config refusal is exit 2 (could not evaluate)"
+        );
+    }
+
+    #[test]
+    fn ordinary_failure_maps_to_exit_1() {
+        let err = anyhow::anyhow!("some io failure");
+        assert_eq!(
+            failure_exit_code(&err),
+            1,
+            "a non-refusal failure keeps exit 1"
+        );
     }
 }

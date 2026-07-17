@@ -68,7 +68,10 @@ const MOVE_TEST_NOTE: &str = "note: a path is a link if moving the target would 
 /// # Errors
 ///
 /// Returns an error if the workspace cannot be scanned or output cannot
-/// be written.
+/// be written. A present-but-unreadable `.lattice.toml` is a refusal at the
+/// scan layer (decision 023, issue 065): the run computes nothing under
+/// fabricated defaults, and the CLI maps the error to exit 2 ("could not
+/// evaluate", distinct from 1, "evaluated and found defects").
 pub fn run(
     start: &Path,
     strict: bool,
@@ -109,13 +112,11 @@ pub fn run(
         }
     }
 
-    // Graph diagnostics: gated by .lattice.toml.
+    // Graph diagnostics: gated by .lattice.toml. A present-but-unreadable
+    // config never reaches here — `Workspace::scan` refused the run above
+    // (decision 023, issue 065): defaults are the semantics of an *absent*
+    // config, so nothing below ever evaluates under a fabricated one.
     if workspace.has_config() {
-        // Config errors are hard failures in CLI mode.
-        if let Some(config_err) = workspace.config_error() {
-            let _ = writeln!(out, ".lattice.toml: error: {config_err}");
-            failed = true;
-        }
         diagnostics.extend(validation::collect_all(&workspace));
     } else {
         writeln!(
@@ -412,13 +413,13 @@ fn apply_subtree_overrides(
     );
 
     // Unused-override flags: the config analogue of the unused-exception
-    // (decision 012), rendered before the per-lint messages as always.
+    // (decision 012), rendered before the per-lint messages as always. The
+    // wording is shared with the server's config-URI publish (decision 023
+    // clause 4) so the two carriers cannot drift.
     for &idx in &verdicts.unused {
-        outcome.messages.push(format!(
-            "unused override: `{}` matches no files — remove it, or restore the path if the tree moved (see `lattice help config`){}",
-            overrides[idx].label(),
-            overrides[idx].hint_suffix()
-        ));
+        outcome
+            .messages
+            .push(overrides::unused_message(&overrides[idx]));
     }
 
     // Apply the one suppression decision (shared with the server's publish
@@ -457,14 +458,12 @@ fn apply_subtree_overrides(
                     detail: format!("override (expect={expect}){}", ov.hint_suffix()),
                 });
             }
-            // Drift: the override is inert (diagnostics stay), plus one flag.
+            // Drift: the override is inert (diagnostics stay), plus one flag —
+            // worded once for both carriers (decision 023 clause 4).
             VerdictKind::Drifted { expect, found } => {
-                outcome.messages.push(format!(
-                    "override `{}` expects {expect} {} but found {found} — update the count or fix the drift (see `lattice help config`){}",
-                    ov.label(),
-                    verdict.lint.noun(),
-                    ov.hint_suffix()
-                ));
+                outcome
+                    .messages
+                    .push(overrides::drift_message(ov, verdict.lint, expect, found));
             }
         }
     }
@@ -801,16 +800,28 @@ mod tests {
     }
 
     #[test]
-    fn invalid_config_reports_error() {
+    fn broken_config_refuses_the_run() {
+        // Decision 023, issue 065: a present-but-unreadable config is a
+        // failed commitment — the run refuses at the scan layer instead of
+        // printing the error and then linting under defaults anyway.
         let dir = setup(&[
             (".lattice.toml", "[policy]\npredicates = \"bogus\"\n"),
             ("index.md", "# Hello\n"),
         ]);
-        let (has_errors, output) = run_lint(&dir);
-        assert!(has_errors, "invalid config should produce errors");
+        let mut buf = Vec::new();
+        let err = run(dir.path(), false, true, false, &mut buf)
+            .expect_err("a broken config refuses the run");
         assert!(
-            output.contains(".lattice.toml: error:"),
-            "output should reference the config file: {output}"
+            err.chain().any(|cause| matches!(
+                cause.downcast_ref::<crate::workspace::WorkspaceError>(),
+                Some(crate::workspace::WorkspaceError::Config { .. })
+            )),
+            "the refusal carries the config error for the exit-2 mapping: {err:#}"
+        );
+        let output = String::from_utf8(buf).expect("output should be utf-8");
+        assert!(
+            output.is_empty(),
+            "nothing is computed under fabricated defaults: {output}"
         );
     }
 

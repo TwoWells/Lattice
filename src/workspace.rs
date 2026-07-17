@@ -48,6 +48,17 @@ pub enum WorkspaceError {
         /// The starting path used for the search.
         start: PathBuf,
     },
+
+    /// `.lattice.toml` is present but unreadable — a **failed commitment**,
+    /// not an absent config (decision 023, issue 065). Refused at the loading
+    /// layer so no one-shot subcommand evaluates under a fabricated default
+    /// config: defaults are the semantics of a repo that declared nothing.
+    /// The CLI maps this to exit 2 ("could not evaluate").
+    #[error(transparent)]
+    Config {
+        /// The load failure, naming the config path.
+        source: ConfigError,
+    },
 }
 
 /// Parsed data for a single markdown file.
@@ -201,9 +212,34 @@ impl Workspace {
     /// # Errors
     ///
     /// Returns [`WorkspaceError::NoRoot`] if the starting path cannot be
-    /// resolved to a directory. Individual file read errors are collected
-    /// but do not abort the scan.
+    /// resolved to a directory, and [`WorkspaceError::Config`] when a
+    /// `.lattice.toml` is present but unreadable — the refusal at the loading
+    /// layer (decision 023, issue 065): defaults are the semantics of an
+    /// *absent* config, never a substitute for a broken one, so no one-shot
+    /// surface may evaluate under them. Individual file read errors are
+    /// collected but do not abort the scan.
     pub fn scan(start: &Path) -> Result<Self, WorkspaceError> {
+        let mut workspace = Self::scan_recording_config_error(start)?;
+        if let Some(source) = workspace.config_error.take() {
+            return Err(WorkspaceError::Config { source });
+        }
+        Ok(workspace)
+    }
+
+    /// Scan like [`Workspace::scan`], but **hold** a broken `.lattice.toml`
+    /// instead of refusing: the index is built under default config with the
+    /// load error recorded in `config_error`, for the one caller that can
+    /// express "a failed commitment changes nothing" in a running process —
+    /// the LSP server, which serves config-independent features and publishes
+    /// the error on the config's URI rather than gating (decision 023
+    /// addendum). Every one-shot surface goes through [`Workspace::scan`] and
+    /// refuses.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkspaceError::NoRoot`] if the starting path cannot be
+    /// resolved to a directory.
+    pub fn scan_recording_config_error(start: &Path) -> Result<Self, WorkspaceError> {
         // Absolutize `start` before root discovery. A bare single-component
         // relative path (`archive`) has `Path::parent() == Some("")` — an empty
         // path — so the walk-up loop in `find_workspace_root` would step to `""`,
@@ -228,7 +264,7 @@ impl Workspace {
         let (config, config_error) = match Config::load(&root) {
             Ok(c) => (c, None),
             Err(e) => {
-                tracing::warn!(root = %root.display(), "config error, using defaults: {e}");
+                tracing::warn!(root = %root.display(), "config error recorded, index built under defaults: {e}");
                 (Config::default(), Some(e))
             }
         };
@@ -344,20 +380,23 @@ impl Workspace {
     /// Mirrors the hot-reload the LSP server now performs per root over its
     /// flat document store (issue 044, ticket server 08 / 10); retained as a
     /// regression test of the shared config-reload semantics, so test-only. A
-    /// parse/read error leaves the workspace on default config with the error
-    /// recorded, matching [`Workspace::scan`].
+    /// parse/read error is a failed commitment (decision 023, issue 065): the
+    /// previous valid config is held with the error recorded — never a swap
+    /// to fabricated defaults.
     #[cfg(test)]
     pub fn reload_config(&mut self) {
-        let (config, config_error) = match Config::load(&self.root) {
-            Ok(c) => (c, None),
-            Err(e) => {
-                tracing::warn!(root = %self.root.display(), "config reload error, using defaults: {e}");
-                (Config::default(), Some(e))
-            }
-        };
         self.has_config = self.root.join(".lattice.toml").is_file();
-        self.config = config;
-        self.config_error = config_error;
+        match Config::load(&self.root) {
+            Ok(config) => {
+                self.config = config;
+                self.config_error = None;
+            }
+            Err(e) => {
+                tracing::warn!(root = %self.root.display(), "config reload error, holding last-good: {e}");
+                self.config_error = Some(e);
+                return;
+            }
+        }
 
         // Re-parse every file from its cached source so config-dependent parse
         // output (backlink-predicate diagnostics) is refreshed. The source is
@@ -428,15 +467,6 @@ impl Workspace {
     /// The workspace configuration.
     pub fn config(&self) -> &Config {
         &self.config
-    }
-
-    /// Error from loading `.lattice.toml`, if any.
-    ///
-    /// When this is `Some`, the workspace is using default configuration.
-    /// The LSP should publish this as a diagnostic on the config file;
-    /// the CLI should treat it as a hard error.
-    pub fn config_error(&self) -> Option<&ConfigError> {
-        self.config_error.as_ref()
     }
 
     /// Whether a `.lattice.toml` file was found in the workspace root.
@@ -1118,6 +1148,39 @@ mod tests {
     }
 
     #[test]
+    fn scan_refuses_a_present_but_unreadable_config() {
+        // Decision 023, issue 065: a broken `.lattice.toml` is a failed
+        // commitment, not an absent config — the one-shot scan refuses
+        // instead of building an index under fabricated defaults.
+        let dir =
+            workspace_with_files(&[(".lattice.toml", "[[override\n"), ("README.md", "# Root")]);
+        let err = Workspace::scan(dir.path()).expect_err("a broken config refuses the scan");
+        assert!(
+            matches!(err, WorkspaceError::Config { .. }),
+            "the refusal names the config, not a generic failure: {err}"
+        );
+    }
+
+    #[test]
+    fn scan_recording_config_error_holds_the_error_for_the_server() {
+        // The server's holding path (decision 023 addendum): the index is
+        // built (config-independent features have data to serve) with the
+        // load error recorded for the config channel to publish.
+        let dir =
+            workspace_with_files(&[(".lattice.toml", "[[override\n"), ("README.md", "# Root")]);
+        let ws = Workspace::scan_recording_config_error(dir.path())
+            .expect("the holding scan builds the index");
+        assert!(
+            ws.config_error.is_some(),
+            "the load error is recorded, not dropped"
+        );
+        assert!(
+            ws.file(Path::new("README.md")).is_some(),
+            "documents index despite the broken config"
+        );
+    }
+
+    #[test]
     fn workspace_root_from_git() {
         let dir = workspace_with_files(&[("README.md", "# Root")]);
 
@@ -1436,24 +1499,6 @@ mod tests {
     }
 
     #[test]
-    fn broken_config_surfaces_error() {
-        let dir = workspace_with_files(&[
-            (".lattice.toml", "not valid toml {{{}}}"),
-            ("README.md", "# Root"),
-        ]);
-
-        let ws = Workspace::scan(dir.path()).expect("scan should still succeed");
-        assert!(
-            ws.config_error().is_some(),
-            "broken config should be surfaced"
-        );
-        assert!(
-            ws.file(Path::new("README.md")).is_some(),
-            "files should still be parsed with defaults"
-        );
-    }
-
-    #[test]
     fn has_config_true_when_lattice_toml_present() {
         let dir = workspace_with_files(&[(".lattice.toml", ""), ("README.md", "# Root")]);
 
@@ -1471,12 +1516,15 @@ mod tests {
 
     #[test]
     fn has_config_true_when_config_is_broken() {
+        // The one-shot `scan` refuses a broken config (decision 023); the
+        // server's holding scan still records that the user opted in.
         let dir = workspace_with_files(&[
             (".lattice.toml", "not valid toml {{{}}}"),
             ("README.md", "# Root"),
         ]);
 
-        let ws = Workspace::scan(dir.path()).expect("scan should succeed");
+        let ws = Workspace::scan_recording_config_error(dir.path())
+            .expect("the holding scan should succeed");
         assert!(ws.has_config(), "broken config still means user opted in");
     }
 
@@ -1675,6 +1723,31 @@ mod tests {
                 .backlink_diagnostics
                 .is_empty(),
             "defining the predicate clears the unknown-predicate diagnostic after reload"
+        );
+    }
+
+    #[test]
+    fn reload_config_holds_last_good_on_a_broken_rewrite() {
+        // Decision 023 addendum, issue 065: a reload hitting an unreadable
+        // config is a failed commitment — the previous valid config keeps
+        // governing, with the error recorded, never a swap to defaults.
+        let dir = workspace_with_files(&[
+            (".lattice.toml", "[graph]\nartifacts = [\"artifact.md\"]\n"),
+            ("doc.md", "# Doc\n"),
+        ]);
+        let mut ws = Workspace::scan(dir.path()).expect("scan should succeed");
+
+        fs::write(dir.path().join(".lattice.toml"), "[[override\n")
+            .expect("break .lattice.toml on disk");
+        ws.reload_config();
+
+        assert!(
+            ws.config().artifacts.contains("artifact.md"),
+            "the last valid config keeps governing after the failed reload"
+        );
+        assert!(
+            ws.config_error.is_some(),
+            "the failed commitment's error is recorded"
         );
     }
 

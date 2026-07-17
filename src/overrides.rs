@@ -209,6 +209,37 @@ pub fn suppress_matched(
     tallies
 }
 
+/// Render the unused-override flag for one entry — the config analogue of the
+/// unused exception (decision 012).
+///
+/// One wording, two carriers (decision 023 clause 4): the CLI prints it as a
+/// `.lattice.toml: warning:` line and the server publishes it as a warning
+/// diagnostic on the config's URI, both through this function so the surfaces
+/// cannot drift.
+#[must_use]
+pub fn unused_message(ov: &Override) -> String {
+    format!(
+        "unused override: `{}` matches no files — remove it, or restore the path if the tree moved (see `lattice help config`){}",
+        ov.label(),
+        ov.hint_suffix()
+    )
+}
+
+/// Render the expect-drift flag for one entry and lint.
+///
+/// One wording, two carriers (decision 023 clause 4): the CLI's
+/// `.lattice.toml: warning:` line and the server's config-URI warning
+/// diagnostic both come from here, hint suffix included.
+#[must_use]
+pub fn drift_message(ov: &Override, lint: ExceptionLint, expect: usize, found: usize) -> String {
+    format!(
+        "override `{}` expects {expect} {} but found {found} — update the count or fix the drift (see `lattice help config`){}",
+        ov.label(),
+        lint.noun(),
+        ov.hint_suffix()
+    )
+}
+
 /// The resolution of a single 028-family `lint` for one file under the
 /// overrides.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

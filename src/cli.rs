@@ -65,9 +65,12 @@ pub enum Command {
     /// files, and runs every validation check. Diagnostics are printed to
     /// stderr in `path:line: severity: message` format.
     ///
-    /// Exit code is 0 when no errors are found (warnings are allowed),
-    /// and 1 when any error-level diagnostic is present. Pass `--strict` to
-    /// also fail on warnings.
+    /// Exit code is 0 when no errors are found (warnings are allowed), 1
+    /// when any error-level diagnostic is present (pass `--strict` to also
+    /// fail on warnings), and 2 when the workspace could not be evaluated
+    /// at all: a present-but-unreadable `.lattice.toml` refuses the run
+    /// instead of linting under defaults — defaults are the semantics of an
+    /// absent config only.
     Lint {
         /// Directory to lint (defaults to the current working directory).
         #[arg(default_value = ".")]
@@ -126,7 +129,9 @@ pub enum Command {
     /// cross-scope extraction, and the other cases in decision 020 clause 6) exits
     /// non-zero with a message naming the fix and touches nothing. `--dry-run`
     /// prints the edit set (file, span, before → after) and the rename without
-    /// applying anything.
+    /// applying anything. A present-but-unreadable `.lattice.toml` refuses with
+    /// exit 2 before any evaluation: a mutating command must never compute edits
+    /// under fabricated default aliases.
     Mv {
         /// The file or directory to move (its current path).
         old: PathBuf,
@@ -159,7 +164,9 @@ pub enum Command {
     /// Exit code is 0 when nothing changed. With `--check`, nothing is written
     /// and the exit code is 1 when any file's formatted form differs (listing
     /// those paths) — the same exit-code contract as `lattice lint`, so it slots
-    /// into CI alongside it.
+    /// into CI alongside it. A present-but-unreadable `.lattice.toml` refuses
+    /// with exit 2: formatting must not run with its `[format]` table silently
+    /// gone.
     Format {
         /// Directory or file to format (defaults to the current working
         /// directory).

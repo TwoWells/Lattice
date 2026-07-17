@@ -2093,6 +2093,41 @@ mod tests {
     }
 
     #[test]
+    fn broken_config_refuses_the_move_and_touches_nothing() {
+        // Decision 023, issue 065: a mutating command must never compute move
+        // edits under fabricated default aliases — a present-but-unreadable
+        // `.lattice.toml` refuses at the scan layer (exit 2 via the CLI's
+        // chain mapping) before any evaluation.
+        let fixture = Fixture::new(&[("a.md", "# A\n"), ("b.md", "[a](a.md \"references\")\n")]);
+        fs::write(fixture.root().join(".lattice.toml"), "[[override\n")
+            .expect("break .lattice.toml on disk");
+
+        let mut buf = Vec::new();
+        let err = super::run(
+            &fixture.root().join("a.md"),
+            &fixture.root().join("moved.md"),
+            false,
+            &mut buf,
+        )
+        .expect_err("a broken config refuses the move");
+        assert!(
+            err.chain().any(|cause| matches!(
+                cause.downcast_ref::<crate::workspace::WorkspaceError>(),
+                Some(crate::workspace::WorkspaceError::Config { .. })
+            )),
+            "the refusal carries the config error for the exit-2 mapping: {err:#}"
+        );
+        assert!(
+            fixture.root().join("a.md").exists() && !fixture.root().join("moved.md").exists(),
+            "the refused move renames nothing"
+        );
+        assert!(
+            read_rel(&fixture, "b.md").contains("a.md"),
+            "the refused move rewrites no links"
+        );
+    }
+
+    #[test]
     fn cli_dry_run_with_no_forced_edits_reports_the_rename_only() {
         // A directory move whose only edges are internal relative links forces no
         // edit; the dry-run reports "no edits" plus the rename, and touches

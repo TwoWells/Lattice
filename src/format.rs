@@ -354,6 +354,31 @@ mod tests {
     }
 
     #[test]
+    fn broken_config_refuses_the_format_run() {
+        // Decision 023, issue 065: `format` must not run with its `[format]`
+        // table silently gone — a present-but-unreadable `.lattice.toml`
+        // refuses at the scan layer (exit 2 via the CLI's chain mapping),
+        // writing nothing.
+        let original = "---\nbacklinks:\n  referenced_by:\n    - z.md\n    - a.md\n---\n\n# A\n";
+        let dir = setup(&[(".lattice.toml", "[[override\n"), ("a.md", original)]);
+
+        let mut buf = Vec::new();
+        let err = run(dir.path(), false, &mut buf).expect_err("a broken config refuses the run");
+        assert!(
+            err.chain().any(|cause| matches!(
+                cause.downcast_ref::<crate::workspace::WorkspaceError>(),
+                Some(crate::workspace::WorkspaceError::Config { .. })
+            )),
+            "the refusal carries the config error for the exit-2 mapping: {err:#}"
+        );
+        assert_eq!(
+            read(&dir, "a.md"),
+            original,
+            "the refused run rewrites nothing, not even sortable backlinks"
+        );
+    }
+
+    #[test]
     fn no_backlinks_no_config_is_byte_identical_and_check_passes() {
         // Acceptance: with no backlinks and no `[format]` config, files are
         // byte-identical and `--check` passes with exit 0.

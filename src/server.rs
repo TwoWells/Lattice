@@ -21,7 +21,7 @@ use crate::completion::Context as CompletionContext;
 use crate::config::{Config, ConfigError, FragmentAlgorithm};
 use crate::line_index::LineIndex;
 use crate::lsp;
-use crate::overrides::{self, OverrideVerdicts};
+use crate::overrides::{self, OverrideVerdicts, VerdictKind};
 use crate::span::Span;
 use crate::validation::{self, Diagnostic, Severity};
 use crate::workspace::{
@@ -78,8 +78,19 @@ struct RootMeta {
     canonical_root: PathBuf,
     /// Configuration loaded from the root.
     config: Config,
-    /// Error from loading `.lattice.toml`, if any.
+    /// Error from loading `.lattice.toml`, if any — published on the config's
+    /// URI at commitment points (decision 023 clause 4).
     config_error: Option<ConfigError>,
+    /// Whether `config` is a genuine commitment: a successfully loaded
+    /// `.lattice.toml`, or genuine absence (defaults are the semantics of a
+    /// repo that declared nothing). `false` only when the config was broken
+    /// at scope registration with no last-good to hold (decision 023
+    /// addendum, issue 065): the `Config::default()` in `config` is then a
+    /// fabrication nobody wrote, so the root publishes nothing computed under
+    /// it — only the load error, on the config URI — until the next valid
+    /// commitment. A *reload* failure never clears this: the previous valid
+    /// config is held and keeps governing.
+    config_committed: bool,
     /// Whether a `.lattice.toml` was found at the root.
     has_config: bool,
     /// The `[[override]]` expect-aggregate verdicts held from the last
@@ -136,6 +147,11 @@ struct Workspaces {
     /// vector changes (issue 013 — publication diffing, then ticket perf 02's
     /// materialization cache). Only non-empty entries are stored, so an absent
     /// entry means the client currently holds no diagnostics for that URI.
+    /// Besides the indexed markdown set, the cache admits one per-root
+    /// `.lattice.toml` URI — the config channel (decision 023 clause 4) —
+    /// cleared like any absent file on config delete or root deregistration,
+    /// and force-invalidated on every marker event (the config is unsynced,
+    /// so no `didOpen` boundary ever resets its record).
     published: HashMap<String, PublishedDiagnostics>,
     /// URIs of documents currently open in the editor — live between
     /// `textDocument/didOpen` and `textDocument/didClose`.
@@ -727,7 +743,11 @@ impl Workspaces {
         if self.roots.contains_key(scope_root) {
             return;
         }
-        let Ok(ws) = Workspace::scan(scope_root) else {
+        // The holding scan (decision 023 addendum): a broken config refuses
+        // the one-shot CLI, but the server registers the scope anyway —
+        // config-independent features serve, and the load error is published
+        // on the config URI instead of gating the whole root.
+        let Ok(ws) = Workspace::scan_recording_config_error(scope_root) else {
             return;
         };
         let parts = ws.into_parts();
@@ -736,6 +756,10 @@ impl Workspaces {
             RootMeta {
                 canonical_root: parts.root,
                 config: parts.config,
+                // With no last-good to hold, a config broken at registration
+                // leaves `config` a fabricated default: nothing computed
+                // under it may publish (issue 065).
+                config_committed: parts.config_error.is_none(),
                 config_error: parts.config_error,
                 has_config: parts.has_config,
                 verdicts: OverrideVerdicts::default(),
@@ -988,16 +1012,25 @@ impl Workspaces {
             return;
         };
         let canonical = meta.canonical_root.clone();
-        let (config, config_error) = match Config::load(&canonical) {
-            Ok(c) => (c, None),
-            Err(e) => {
-                tracing::warn!(root = %canonical.display(), "config reload error, using defaults: {e}");
-                (Config::default(), Some(e))
-            }
-        };
         meta.has_config = canonical.join(".lattice.toml").is_file();
-        meta.config = config;
-        meta.config_error = config_error;
+        match Config::load(&canonical) {
+            Ok(config) => {
+                meta.config = config;
+                meta.config_error = None;
+                meta.config_committed = true;
+            }
+            Err(e) => {
+                // A failed commitment changes nothing (decision 023 addendum,
+                // issue 065): the previous valid config keeps governing
+                // adjudication — or, with no last-good, the root stays
+                // serving config-independent features only. The error is
+                // recorded for the config channel to publish; the held
+                // config did not change, so no reparse is owed.
+                tracing::warn!(root = %canonical.display(), "config reload error, holding last-good: {e}");
+                meta.config_error = Some(e);
+                return;
+            }
+        }
 
         let owned: Vec<PathBuf> = self
             .documents
@@ -1282,6 +1315,14 @@ fn is_markdown_uri(uri: &str) -> bool {
     Path::new(uri)
         .extension()
         .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
+}
+
+/// Whether a URI names a `.lattice.toml` marker — the config channel's URI
+/// space (decision 023 clause 4). Routes both the watched-marker pass and the
+/// accepted-never-required document-sync events for the config: a config
+/// URI is a diagnosed document, never an indexed or buffer-authoritative one.
+fn is_config_uri(uri: &str) -> bool {
+    uri.ends_with(".lattice.toml")
 }
 
 /// Main message loop.
@@ -4372,12 +4413,62 @@ fn complete_footnote(
 // Notifications
 // ---------------------------------------------------------------------------
 
+/// The `.lattice.toml` URI a document-sync notification names, if any — the
+/// routing probe for [`handle_config_sync`]. Every `textDocument/*` sync
+/// notification carries its URI at `textDocument.uri`; notifications without
+/// one (watched files, folder changes, renames) probe `None` and dispatch
+/// normally.
+fn config_sync_uri(notif: &Notification) -> Option<String> {
+    let uri = notif.params.get("textDocument")?.get("uri")?.as_str()?;
+    is_config_uri(uri).then(|| uri.to_string())
+}
+
+/// Handle a document-sync notification aimed at a `.lattice.toml` URI — the
+/// accepted, never required config sync, save-anchored (decision 023
+/// addendum):
+///
+/// - `didOpen` is decision 022's client-state boundary: reset the config
+///   URI's publish record and re-answer. The TOML is never indexed as a
+///   markdown document and its buffer gets no authority — 017 §3's
+///   buffer-wins rule is markdown-only.
+/// - `didSave` is a commitment: the same signal of intent as the watcher
+///   event for the same write, honored (in a client that syncs the config
+///   but does not watch files it is the only courier) and deduped against
+///   it — the reload is idempotent, the publish diff swallows the echo's
+///   no-op, and the config URI itself is always re-answered.
+/// - `didChange` (and everything else, e.g. `didClose`) adjudicates nothing:
+///   the draft lives in the editor and recommits over disk on save. It is
+///   deliberately never tracked as dirty, so the config watcher event keeps
+///   applying under an open config buffer.
+fn handle_config_sync(
+    connection: &Connection,
+    workspaces: &mut Workspaces,
+    method: &str,
+    uri: &str,
+) -> Result<()> {
+    match method {
+        lsp::method::DID_OPEN => force_republish_config(connection, workspaces, uri),
+        lsp::method::DID_SAVE => {
+            workspaces.handle_marker_event(uri);
+            force_republish_config(connection, workspaces, uri)
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Dispatch a notification.
 fn handle_notification(
     connection: &Connection,
     workspaces: &mut Workspaces,
     notif: Notification,
 ) -> Result<()> {
+    // A client may route `.lattice.toml` to us (a broad document selector);
+    // its document sync is accepted, never required, and save-anchored
+    // (decision 023 addendum) — dispatched separately so the config never
+    // enters the markdown sync path below.
+    if let Some(uri) = config_sync_uri(&notif) {
+        return handle_config_sync(connection, workspaces, &notif.method, &uri);
+    }
     match notif.method.as_str() {
         lsp::method::DID_OPEN => {
             let params: lsp::DidOpenTextDocumentParams = serde_json::from_value(notif.params)?;
@@ -4544,6 +4635,11 @@ fn handle_watched_files_change(
     params: &lsp::DidChangeWatchedFilesParams,
 ) -> Result<()> {
     let mut reloaded = false;
+    // Config URIs owed a forced republish by this batch (decision 023
+    // addendum): the config is unsynced by default, so no `didOpen` boundary
+    // ever resets its publish record — every marker event re-answers the
+    // config URI instead, diff or no diff.
+    let mut forced_config_uris: Vec<String> = Vec::new();
     // Marker directories already handled in this batch: a create+modify pair
     // coalesced into one notification is applied once, not twice — each apply
     // is a full reparse of the affected scope (and, for split/merge, a
@@ -4553,13 +4649,13 @@ fn handle_watched_files_change(
         // The marker watch is config: any event type reloads it. Guard on the
         // suffix so an unrelated future glob can never trigger a config
         // reload.
-        if !change.uri.ends_with(".lattice.toml") {
+        if !is_config_uri(&change.uri) {
             continue;
         }
         let Some(marker_dir) = uri_to_path(&change.uri).parent().map(Path::to_path_buf) else {
             continue;
         };
-        if !handled_markers.insert(marker_dir) {
+        if !handled_markers.insert(marker_dir.clone()) {
             continue;
         }
         // A marker create/change/delete either reloads a scope's config, splits
@@ -4569,6 +4665,17 @@ fn handle_watched_files_change(
         // failure shape of issue 050 — so it is worth a trace.
         if workspaces.handle_marker_event(&change.uri) {
             reloaded = true;
+            // Invalidate the config URI's publish record now — the batch
+            // publish below then re-sends the channel's current set even
+            // when unchanged — and remember it so a clean channel still
+            // gets its explicit answer after the pass. A merged-away scope
+            // resolves no root here; its cached entry (if any) is cleared
+            // by the publish diff's absent-file pass instead.
+            if let Some(root) = workspaces.registered_root_at(&marker_dir) {
+                let config_uri = path_to_uri(&root.join(".lattice.toml"));
+                workspaces.published.remove(&config_uri);
+                forced_config_uris.push(config_uri);
+            }
         } else {
             tracing::warn!(
                 uri = %change.uri,
@@ -4665,6 +4772,20 @@ fn handle_watched_files_change(
     // recompute for the batch, not one per file (ticket perf 07).
     if !changed_docs.is_empty() {
         publish_all_diagnostics(connection, workspaces, &changed_docs)?;
+    }
+    // The forced config republish, second half (decision 023 addendum): a
+    // channel the pass left uncached is clean, and push-only owes it the
+    // explicit empty a synced document would get from `force_republish` —
+    // so every marker event answers on its config URI, unconditionally.
+    for config_uri in forced_config_uris {
+        if !workspaces.published.contains_key(&config_uri) {
+            let params = lsp::PublishDiagnosticsParams {
+                uri: config_uri,
+                diagnostics: Vec::new(),
+            };
+            let notif = Notification::new(lsp::method::PUBLISH_DIAGNOSTICS.to_string(), params);
+            connection.sender.send(Message::Notification(notif))?;
+        }
     }
     Ok(())
 }
@@ -4828,6 +4949,44 @@ fn force_republish(connection: &Connection, workspaces: &mut Workspaces, uri: &s
     Ok(())
 }
 
+/// Force-republish one root's `.lattice.toml` channel (decision 023
+/// addendum), given any URI spelling of the marker.
+///
+/// The config is unsynced by default, so no `didOpen` boundary ever resets
+/// its publish record client-side — the record is invalidated here so the
+/// publish pass re-sends the current set even when unchanged, and a clean
+/// channel (no cache entry after the pass) is still answered with the
+/// explicit empty push-only owes it. Serves both accepted-sync couriers
+/// (`didOpen` as the client-state boundary, `didSave` as the commitment);
+/// the watched-marker batch path performs the same invalidation inline so
+/// one batch pays one publish pass.
+fn force_republish_config(
+    connection: &Connection,
+    workspaces: &mut Workspaces,
+    marker_uri: &str,
+) -> Result<()> {
+    let marker_path = uri_to_path(marker_uri);
+    let Some(root) = marker_path
+        .parent()
+        .and_then(|dir| workspaces.registered_root_at(dir))
+    else {
+        // A config outside every registered scope publishes nothing.
+        return Ok(());
+    };
+    let config_uri = path_to_uri(&root.join(".lattice.toml"));
+    workspaces.published.remove(&config_uri);
+    publish_all_diagnostics(connection, workspaces, &HashSet::new())?;
+    if !workspaces.published.contains_key(&config_uri) {
+        let params = lsp::PublishDiagnosticsParams {
+            uri: config_uri,
+            diagnostics: Vec::new(),
+        };
+        let notif = Notification::new(lsp::method::PUBLISH_DIAGNOSTICS.to_string(), params);
+        connection.sender.send(Message::Notification(notif))?;
+    }
+    Ok(())
+}
+
 /// Whether a publish pass is a save-point commitment or a mid-edit draft
 /// (decision 023): a commitment re-adjudicates each root's `[[override]]`
 /// expect verdicts from the freshly computed live set and holds them; a draft
@@ -4984,27 +5143,27 @@ fn desired_diagnostics(workspaces: &Workspaces) -> BTreeMap<String, Vec<lsp::Dia
     // workspace's set wins the shared URI (matching `diff_diagnostics`).
     for (root, meta) in &workspaces.roots {
         let workspace = workspaces.root_view(root);
-        let mut all_diagnostics = collect_all_diagnostics(&workspace);
         // The desired set is post-adjudication: filtered through the root's
         // held override verdicts, exactly as production publishes (decision
         // 023). The oracle never re-adjudicates — it asks what the client
-        // should currently hold, and that is the held verdict's answer.
-        overrides::suppress_matched(&meta.verdicts, &mut all_diagnostics);
+        // should currently hold, and that is the held verdict's answer
+        // ([`Adjudication::Held`]) — and it carries the config channel and
+        // the fabricated-config guard through the same shared collection.
+        let (mut by_file, _) = adjudicated_root_diagnostics(&workspace, meta, Adjudication::Held);
 
-        let mut by_file: BTreeMap<PathBuf, Vec<lsp::Diagnostic>> = BTreeMap::new();
-        for diag in &all_diagnostics {
-            let fd = workspace.file(&diag.file);
+        let config_rel = PathBuf::from(".lattice.toml");
+        let config_channel =
+            (meta.has_config || meta.config_error.is_some()).then_some(&config_rel);
+        for rel_path in workspace.files().keys().chain(config_channel) {
+            let uri = path_to_uri(&root.join(rel_path));
+            let lattice = by_file.remove(rel_path).unwrap_or_default();
+            let fd = workspace.file(rel_path);
             let source = fd.map_or("", |fd| fd.tree.source());
             let index = fd.map_or(&empty, |fd| &fd.line_index);
-            by_file
-                .entry(diag.file.clone())
-                .or_default()
-                .push(to_lsp_diagnostic(diag, source, index));
-        }
-
-        for rel_path in workspace.files().keys() {
-            let uri = path_to_uri(&root.join(rel_path));
-            let diagnostics = by_file.remove(rel_path).unwrap_or_default();
+            let diagnostics = lattice
+                .iter()
+                .map(|d| to_lsp_diagnostic(d, source, index))
+                .collect();
             desired.insert(uri, diagnostics);
         }
     }
@@ -5070,6 +5229,23 @@ fn adjudicated_root_diagnostics(
     meta: &RootMeta,
     adjudication: Adjudication,
 ) -> (BTreeMap<PathBuf, Vec<Diagnostic>>, Option<OverrideVerdicts>) {
+    // A root holding a fabricated config — broken at scope registration with
+    // no last-good (decision 023 addendum, issue 065) — publishes nothing
+    // computed under it: defaults are the semantics of an absent config, not
+    // a broken one. Only the load error reaches the wire, on the config
+    // channel; the next valid commitment restores the full surface.
+    if !meta.config_committed {
+        let mut by_file: BTreeMap<PathBuf, Vec<Diagnostic>> = BTreeMap::new();
+        let channel = config_channel_diagnostics(meta, &meta.verdicts);
+        if !channel.is_empty() {
+            by_file.insert(PathBuf::from(".lattice.toml"), channel);
+        }
+        let committed = match adjudication {
+            Adjudication::Commit => Some(OverrideVerdicts::default()),
+            Adjudication::Held => None,
+        };
+        return (by_file, committed);
+    }
     let mut live = collect_all_diagnostics(workspace);
     let committed = match adjudication {
         Adjudication::Commit => Some(overrides::adjudicate(
@@ -5085,7 +5261,72 @@ fn adjudicated_root_diagnostics(
     for diag in live {
         by_file.entry(diag.file.clone()).or_default().push(diag);
     }
+    // The config channel (decision 023 clause 4) rides the same per-root map
+    // under the marker's pseudo-path, so the publish diff treats the config
+    // URI exactly like a document's: sent when it changes, cleared when it
+    // empties.
+    let channel = config_channel_diagnostics(meta, verdicts);
+    if !channel.is_empty() {
+        by_file.insert(PathBuf::from(".lattice.toml"), channel);
+    }
     (by_file, committed)
+}
+
+/// The `.lattice.toml` channel's desired diagnostic set for one root
+/// (decision 023 clause 4): the config load error (severity error) and the
+/// expect-drift / unused-override flags (severity warning, the CLI's exact
+/// wording via the shared [`overrides`] renderers, hint suffix included).
+///
+/// All entries are file-level — no span, line 1 — and the config is never
+/// indexed, so materialization takes the unindexed-file fallback (empty
+/// source) and anchors every range at position 0,0. Stanza spans via
+/// `toml::Spanned` are a possible refinement, not scope.
+///
+/// The flags describe the config that governs adjudication, so they render
+/// from the same verdicts the publish pass filters through; a fabricated
+/// default (broken at startup, no last-good) governs nothing and contributes
+/// only its load error.
+fn config_channel_diagnostics(meta: &RootMeta, verdicts: &OverrideVerdicts) -> Vec<Diagnostic> {
+    let file = PathBuf::from(".lattice.toml");
+    let mut diagnostics = Vec::new();
+    if let Some(error) = &meta.config_error {
+        diagnostics.push(Diagnostic {
+            file: file.clone(),
+            line: 1,
+            severity: Severity::Error,
+            message: error.to_string(),
+            span: None,
+        });
+    }
+    if !meta.config_committed {
+        return diagnostics;
+    }
+    for &idx in &verdicts.unused {
+        diagnostics.push(Diagnostic {
+            file: file.clone(),
+            line: 1,
+            severity: Severity::Warning,
+            message: overrides::unused_message(&meta.config.overrides[idx]),
+            span: None,
+        });
+    }
+    for verdict in &verdicts.entries {
+        if let VerdictKind::Drifted { expect, found } = verdict.kind {
+            diagnostics.push(Diagnostic {
+                file: file.clone(),
+                line: 1,
+                severity: Severity::Warning,
+                message: overrides::drift_message(
+                    &meta.config.overrides[verdict.entry],
+                    verdict.lint,
+                    expect,
+                    found,
+                ),
+                span: None,
+            });
+        }
+    }
+    diagnostics
 }
 
 /// Canonicalize each changed URI to the form the publish cache is keyed by, so
@@ -5175,7 +5416,17 @@ fn diff_diagnostics_with(
             // canonical root so a moved diagnostic is not skipped (issue 047).
             let root_is_canonical = root.as_path() == meta.canonical_root.as_path();
 
-            for rel_path in workspace.files().keys() {
+            // The config channel: one per-root URI outside the indexed
+            // markdown set (decision 023 clause 4), admitted to the
+            // publish-diff cache only while the root has a config state to
+            // report on — a marker on disk, or a recorded load error. On a
+            // config delete or root deregistration it drops out of `present`,
+            // so the phase-3 clear empties the client's copy.
+            let config_rel = PathBuf::from(".lattice.toml");
+            let config_channel =
+                (meta.has_config || meta.config_error.is_some()).then_some(&config_rel);
+
+            for rel_path in workspace.files().keys().chain(config_channel) {
                 let uri = path_to_uri(&root.join(rel_path));
                 if !present.insert(uri.clone()) {
                     // Already claimed by a deeper root in this pass.
@@ -11933,6 +12184,558 @@ mod tests {
         assert!(
             lint_sets.is_empty(),
             "lint reported findings on files the differential did not visit: {lint_sets:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // The config channel (decision 023 clauses 3–4 + addendum, issue 065,
+    // ticket server 14)
+    //
+    // `.lattice.toml` is a diagnosed document: load errors and drift/unused
+    // flags publish on its URI at commitment points; a failed reload holds
+    // last-good; a config broken at startup publishes only its error; the
+    // watcher event always applies (buffer-wins is markdown-only); and
+    // accepted document sync for the config is save-anchored.
+    // -----------------------------------------------------------------------
+
+    /// `didChangeWatchedFiles` params carrying one change for `uri`.
+    fn watched_params(uri: &str, change_type: u8) -> serde_json::Value {
+        serde_json::json!({ "changes": [ { "uri": uri, "type": change_type } ] })
+    }
+
+    #[test]
+    fn mid_session_config_typo_holds_last_good_and_flags_the_config_uri() {
+        // Acceptance: save a config with a TOML typo mid-session —
+        // adjudication and every published set hold steady (last-good), the
+        // config URI gains an error diagnostic anchored at 0,0, and fixing
+        // the typo clears it and commits the new config.
+        let valid_config =
+            "[[override]]\npaths = [\"report.md\"]\nstale_references = { expect = 2 }\n";
+        let report_text = "See `gone-a.md` and `gone-b.md` here.\n";
+        let dir =
+            workspace_with_files(&[(".lattice.toml", valid_config), ("report.md", report_text)]);
+        let mut workspaces = scan_workspaces(&dir);
+        let report_uri = file_uri(&dir, "report.md");
+        let config_uri = file_uri(&dir, ".lattice.toml");
+        let (server, client) = Connection::memory();
+
+        // Commit the valid config's adjudication: the matched expect
+        // suppresses the member findings.
+        drive(
+            &server,
+            &mut workspaces,
+            lsp::method::DID_OPEN,
+            open_params(&report_uri, report_text),
+        );
+        let opened = drain_publishes(&client);
+        assert!(
+            opened.get(&report_uri).is_none_or(Vec::is_empty),
+            "the valid commitment suppresses the matched members: {opened:?}"
+        );
+
+        // Save a typo into the config: a failed commitment.
+        fs::write(dir.path().join(".lattice.toml"), "[[override\n")
+            .expect("break the config on disk");
+        drive(
+            &server,
+            &mut workspaces,
+            lsp::method::DID_CHANGE_WATCHED_FILES,
+            watched_params(&config_uri, lsp::file_change_type::CHANGED),
+        );
+        let published = drain_publishes(&client);
+        assert!(
+            published.get(&report_uri).is_none_or(Vec::is_empty),
+            "the failed commitment changes nothing — last-good keeps suppressing: {published:?}"
+        );
+        let config = published
+            .get(&config_uri)
+            .expect("the failed commitment publishes the load error on the config URI");
+        assert_eq!(
+            config.len(),
+            1,
+            "the config channel carries exactly the load error: {config:?}"
+        );
+        assert_eq!(
+            config[0]["severity"], 1,
+            "a config load error publishes at severity error: {config:?}"
+        );
+        assert_eq!(
+            (
+                config[0]["range"]["start"]["line"].as_u64(),
+                config[0]["range"]["start"]["character"].as_u64()
+            ),
+            (Some(0), Some(0)),
+            "the file-level error anchors at 0,0: {config:?}"
+        );
+
+        // Fix the typo: the next valid save commits normally and clears it.
+        fs::write(dir.path().join(".lattice.toml"), valid_config)
+            .expect("restore the valid config on disk");
+        drive(
+            &server,
+            &mut workspaces,
+            lsp::method::DID_CHANGE_WATCHED_FILES,
+            watched_params(&config_uri, lsp::file_change_type::CHANGED),
+        );
+        let published = drain_publishes(&client);
+        let config = published
+            .get(&config_uri)
+            .expect("the recovery answers the config URI");
+        assert!(
+            config.is_empty(),
+            "a valid commitment clears the error diagnostic: {config:?}"
+        );
+        assert!(
+            published.get(&report_uri).is_none_or(Vec::is_empty),
+            "the recommitted config keeps the suppression: {published:?}"
+        );
+    }
+
+    #[test]
+    fn broken_config_at_startup_publishes_only_the_error() {
+        // Acceptance: start on a broken config — the error publishes on the
+        // config URI, config-independent features serve, and no
+        // defaults-computed diagnostics publish (never fabricate a config
+        // nobody wrote — issue 065).
+        let dir = workspace_with_files(&[
+            (".lattice.toml", "[[override\n"),
+            ("doc.md", "See `gone.md` here.\n"),
+        ]);
+        let mut workspaces = scan_workspaces(&dir);
+        let config_uri = file_uri(&dir, ".lattice.toml");
+        let doc_uri = file_uri(&dir, "doc.md");
+
+        let sets = diff_diagnostics(&mut workspaces, &HashSet::new());
+        let config = sets
+            .iter()
+            .find(|(uri, _)| uri == &config_uri)
+            .map(|(_, diagnostics)| diagnostics)
+            .expect("the startup pass publishes the config URI");
+        assert_eq!(
+            config.len(),
+            1,
+            "only the load error publishes on the config URI: {config:?}"
+        );
+        assert_eq!(
+            config[0].severity,
+            Some(lsp::diagnostic_severity::ERROR),
+            "the load error is severity error: {config:?}"
+        );
+        assert!(
+            !sets.iter().any(|(uri, _)| uri == &doc_uri),
+            "no defaults-computed diagnostics publish for the fabricated root: {sets:?}"
+        );
+
+        // A didOpen in the fabricated root is answered with the explicit
+        // empty — served, but never with defaults-computed findings.
+        let (server, client) = Connection::memory();
+        drive(
+            &server,
+            &mut workspaces,
+            lsp::method::DID_OPEN,
+            open_params(&doc_uri, "See `gone.md` here.\n"),
+        );
+        let published = drain_publishes(&client);
+        assert!(
+            published.get(&doc_uri).is_some_and(Vec::is_empty),
+            "the open is answered empty, not with fabricated findings: {published:?}"
+        );
+
+        // The first valid commitment restores the full surface.
+        fs::write(dir.path().join(".lattice.toml"), "").expect("fix the config on disk");
+        drive(
+            &server,
+            &mut workspaces,
+            lsp::method::DID_CHANGE_WATCHED_FILES,
+            watched_params(&config_uri, lsp::file_change_type::CHANGED),
+        );
+        let published = drain_publishes(&client);
+        assert!(
+            published.get(&config_uri).is_some_and(Vec::is_empty),
+            "the valid commitment clears the config URI: {published:?}"
+        );
+        let doc = published
+            .get(&doc_uri)
+            .expect("the valid commitment publishes the document's real findings");
+        assert!(
+            any_message_contains(doc, "stale reference"),
+            "the genuinely-committed config computes the finding: {doc:?}"
+        );
+    }
+
+    #[test]
+    fn drift_and_unused_override_warnings_publish_on_the_config_uri() {
+        // Acceptance: a drifted tripwire resurfaces its members (ticket 13)
+        // AND flags the drift on the config URI, hint included; a glob
+        // matching zero files flags an unused-override warning there. The
+        // wording is the CLI's own — asserted differentially against
+        // `lint::run` on the same disk state.
+        let dir = workspace_with_files(&[
+            (
+                ".lattice.toml",
+                concat!(
+                    "[[override]]\npaths = [\"sweep/**\"]\nstale_references = { expect = 5 }\nhint = \"the absorption sweep\"\n\n",
+                    "[[override]]\npaths = [\"phantom/**\"]\nbare_paths = \"disabled\"\n",
+                ),
+            ),
+            ("sweep/a.md", "See `gone-a.md` and `gone-b.md` here.\n"),
+        ]);
+        let mut workspaces = scan_workspaces(&dir);
+        let config_uri = file_uri(&dir, ".lattice.toml");
+        let member_uri = file_uri(&dir, "sweep/a.md");
+
+        let sets = diff_diagnostics(&mut workspaces, &HashSet::new());
+        let member = sets
+            .iter()
+            .find(|(uri, _)| uri == &member_uri)
+            .map(|(_, diagnostics)| diagnostics)
+            .expect("the drifted override is inert, so members publish raw");
+        assert_eq!(
+            member.len(),
+            2,
+            "every member finding resurfaces on drift: {member:?}"
+        );
+        let config = sets
+            .iter()
+            .find(|(uri, _)| uri == &config_uri)
+            .map(|(_, diagnostics)| diagnostics)
+            .expect("the workspace-health flags publish on the config URI");
+        for diagnostic in config {
+            assert_eq!(
+                diagnostic.severity,
+                Some(lsp::diagnostic_severity::WARNING),
+                "drift and unused flags are warnings: {diagnostic:?}"
+            );
+            assert_eq!(
+                (
+                    diagnostic.range.start.line,
+                    diagnostic.range.start.character
+                ),
+                (0, 0),
+                "file-level flags anchor at 0,0: {diagnostic:?}"
+            );
+        }
+        let mut server_messages: Vec<String> = config.iter().map(|d| d.message.clone()).collect();
+        server_messages.sort();
+        assert!(
+            server_messages
+                .iter()
+                .any(|m| m.contains("— the absorption sweep")),
+            "the drift flag carries the stanza's hint: {server_messages:?}"
+        );
+
+        // The CLI renders the same flags as `.lattice.toml: warning:` lines
+        // on the same disk state — one wording, two carriers.
+        let mut buf = Vec::new();
+        let _failed =
+            crate::lint::run(dir.path(), false, true, false, &mut buf).expect("lint runs");
+        let lint_out = String::from_utf8(buf).expect("lint output is utf-8");
+        let mut cli_messages: Vec<String> = lint_out
+            .lines()
+            .filter_map(|line| line.strip_prefix(".lattice.toml: warning: "))
+            .map(str::to_string)
+            .collect();
+        cli_messages.sort();
+        assert_eq!(
+            server_messages, cli_messages,
+            "the config-URI warnings match the CLI's wording exactly"
+        );
+    }
+
+    #[test]
+    fn config_delete_clears_the_config_uri_and_reloads_to_defaults() {
+        // Acceptance: deleting `.lattice.toml` clears the config-URI
+        // diagnostics and reloads the root to defaults — genuine absence,
+        // unlike breakage.
+        let dir = workspace_with_files(&[
+            (
+                ".lattice.toml",
+                "[[override]]\npaths = [\"doc.md\"]\nstale_references = { expect = 5 }\n",
+            ),
+            ("doc.md", "See `gone.md` here.\n"),
+        ]);
+        let mut workspaces = scan_workspaces(&dir);
+        let config_uri = file_uri(&dir, ".lattice.toml");
+
+        let sets = diff_diagnostics(&mut workspaces, &HashSet::new());
+        assert!(
+            sets.iter().any(|(uri, diagnostics)| uri == &config_uri
+                && diagnostics.iter().any(|d| d.message.contains("expects 5"))),
+            "the drifted config publishes its flag before the delete: {sets:?}"
+        );
+
+        fs::remove_file(dir.path().join(".lattice.toml")).expect("delete the config");
+        let (server, client) = Connection::memory();
+        drive(
+            &server,
+            &mut workspaces,
+            lsp::method::DID_CHANGE_WATCHED_FILES,
+            watched_params(&config_uri, lsp::file_change_type::DELETED),
+        );
+        let published = drain_publishes(&client);
+        assert!(
+            published.get(&config_uri).is_some_and(Vec::is_empty),
+            "the delete clears the config URI: {published:?}"
+        );
+        let meta = workspaces
+            .roots
+            .get(&dir.path().to_path_buf())
+            .expect("the root survives its config's deletion");
+        assert!(
+            !meta.has_config && meta.config_error.is_none() && meta.config_committed,
+            "genuine absence reloads to committed defaults"
+        );
+        assert!(
+            meta.verdicts.entries.is_empty(),
+            "the deleted config's verdicts are gone: {:?}",
+            meta.verdicts
+        );
+    }
+
+    #[test]
+    fn every_marker_event_reanswers_the_config_uri() {
+        // The didOpen boundary mitigation (decision 023 addendum): the server
+        // never hears `didOpen` for a file no client routes to it, so the
+        // config URI's publish record can only reset on marker events —
+        // every one of them force-republishes, skipping the diff.
+        let dir = workspace_with_files(&[
+            (
+                ".lattice.toml",
+                "[[override]]\npaths = [\"doc.md\"]\nstale_references = { expect = 5 }\n",
+            ),
+            ("doc.md", "See `gone.md` here.\n"),
+        ]);
+        let mut workspaces = scan_workspaces(&dir);
+        let config_uri = file_uri(&dir, ".lattice.toml");
+        // Seed the publish cache: the drift warning is now what the client
+        // holds, so an unforced diff would read the next pass as no-change.
+        let _seed = diff_diagnostics(&mut workspaces, &HashSet::new());
+
+        let (server, client) = Connection::memory();
+        for round in 0..2 {
+            drive(
+                &server,
+                &mut workspaces,
+                lsp::method::DID_CHANGE_WATCHED_FILES,
+                watched_params(&config_uri, lsp::file_change_type::CHANGED),
+            );
+            let published = drain_publishes(&client);
+            let config = published.get(&config_uri).unwrap_or_else(|| {
+                panic!("marker event {round} re-answers the config URI: {published:?}")
+            });
+            assert!(
+                any_message_contains(config, "expects 5"),
+                "the unchanged drift flag is re-sent, diff skipped (round {round}): {config:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn config_watcher_event_applies_under_an_open_dirty_config_draft() {
+        // The arbitration pin (decision 023 addendum): 017 §3's buffer-wins
+        // rule is markdown-only. A synced, edited (dirty) config buffer
+        // never gains authority — the draft indexes nothing, joins no
+        // buffer-authority set, and the watcher event for the same file
+        // still applies disk.
+        let dir =
+            workspace_with_files(&[(".lattice.toml", ""), ("doc.md", "See `gone.md` here.\n")]);
+        let mut workspaces = scan_workspaces(&dir);
+        let config_uri = file_uri(&dir, ".lattice.toml");
+        let doc_uri = file_uri(&dir, "doc.md");
+        let seed = diff_diagnostics(&mut workspaces, &HashSet::new());
+        assert!(
+            seed.iter().any(|(uri, _)| uri == &doc_uri),
+            "doc.md starts with its live finding: {seed:?}"
+        );
+
+        let (server, client) = Connection::memory();
+        // The client routes the config to us: open with a divergent draft,
+        // then edit it — the didChange draft adjudicates nothing.
+        drive(
+            &server,
+            &mut workspaces,
+            lsp::method::DID_OPEN,
+            open_params(&config_uri, "# a diverging draft\n"),
+        );
+        let opened = drain_publishes(&client);
+        assert!(
+            opened.get(&config_uri).is_some_and(Vec::is_empty),
+            "the open boundary re-answers the (clean) config URI: {opened:?}"
+        );
+        drive(
+            &server,
+            &mut workspaces,
+            lsp::method::DID_CHANGE,
+            serde_json::json!({
+                "textDocument": { "uri": config_uri, "version": 2 },
+                "contentChanges": [ { "text": "# a further diverging draft\n" } ]
+            }),
+        );
+        assert!(
+            drain_publishes(&client).is_empty(),
+            "the config draft adjudicates nothing"
+        );
+        assert!(
+            !workspaces.documents.contains_key(&uri_to_path(&config_uri)),
+            "the TOML is never indexed as a markdown document"
+        );
+        assert!(
+            !workspaces.open_documents.contains(&config_uri)
+                && !workspaces.dirty_documents.contains(&config_uri),
+            "the config joins no buffer-authority set — buffer-wins stays markdown-only"
+        );
+
+        // Disk moves under the open dirty draft: the watcher event applies.
+        fs::write(
+            dir.path().join(".lattice.toml"),
+            "[[override]]\npaths = [\"doc.md\"]\nstale_references = { expect = 1 }\n",
+        )
+        .expect("commit a new config on disk under the open draft");
+        drive(
+            &server,
+            &mut workspaces,
+            lsp::method::DID_CHANGE_WATCHED_FILES,
+            watched_params(&config_uri, lsp::file_change_type::CHANGED),
+        );
+        let published = drain_publishes(&client);
+        assert!(
+            published.get(&doc_uri).is_some_and(Vec::is_empty),
+            "the disk commitment adjudicated under the open dirty draft — the matched expect suppresses doc.md: {published:?}"
+        );
+    }
+
+    #[test]
+    fn config_did_save_commits_and_the_watcher_echo_is_a_no_op() {
+        // Accepted sync's commitment courier (decision 023 addendum): a
+        // synced client's didSave for the config applies the reload, and the
+        // watcher event for the same write dedupes — the reload is
+        // idempotent and the publish diff swallows the echo's no-op, while
+        // the config URI is re-answered both times.
+        let dir =
+            workspace_with_files(&[(".lattice.toml", ""), ("doc.md", "See `gone.md` here.\n")]);
+        let mut workspaces = scan_workspaces(&dir);
+        let config_uri = file_uri(&dir, ".lattice.toml");
+        let doc_uri = file_uri(&dir, "doc.md");
+        let seed = diff_diagnostics(&mut workspaces, &HashSet::new());
+        assert!(
+            seed.iter().any(|(uri, _)| uri == &doc_uri),
+            "doc.md starts with its live finding: {seed:?}"
+        );
+
+        let new_config = "[[override]]\npaths = [\"doc.md\"]\nstale_references = { expect = 1 }\n";
+        fs::write(dir.path().join(".lattice.toml"), new_config)
+            .expect("write the new config on disk");
+        let (server, client) = Connection::memory();
+        drive(
+            &server,
+            &mut workspaces,
+            lsp::method::DID_SAVE,
+            save_params(&config_uri, new_config),
+        );
+        let published = drain_publishes(&client);
+        assert!(
+            published.get(&doc_uri).is_some_and(Vec::is_empty),
+            "the didSave commitment applies the reload — doc.md suppresses: {published:?}"
+        );
+        assert!(
+            published.get(&config_uri).is_some_and(Vec::is_empty),
+            "the save is answered on the config URI: {published:?}"
+        );
+
+        // The watcher delivers the same write: deduped to a no-op for the
+        // documents, re-answered for the config URI.
+        drive(
+            &server,
+            &mut workspaces,
+            lsp::method::DID_CHANGE_WATCHED_FILES,
+            watched_params(&config_uri, lsp::file_change_type::CHANGED),
+        );
+        let published = drain_publishes(&client);
+        assert!(
+            !published.contains_key(&doc_uri),
+            "the idempotent echo republishes no document: {published:?}"
+        );
+        assert!(
+            published.get(&config_uri).is_some_and(Vec::is_empty),
+            "the echo still re-answers the config URI: {published:?}"
+        );
+    }
+
+    #[test]
+    fn broken_config_cli_refuses_while_the_server_holds_last_good() {
+        // The conformance differential's broken-config complement: the
+        // set-equality invariant is defined over *valid* on-disk configs;
+        // where the diagnostic function is undefined, each surface expresses
+        // "a failed commitment changes nothing" in its own execution model —
+        // the CLI gates and stops (exit 2), the server holds last-good and
+        // flags the config URI.
+        let valid_config =
+            "[[override]]\npaths = [\"report.md\"]\nstale_references = { expect = 2 }\n";
+        let report_text = "See `gone-a.md` and `gone-b.md` here.\n";
+        let dir =
+            workspace_with_files(&[(".lattice.toml", valid_config), ("report.md", report_text)]);
+        let mut workspaces = scan_workspaces(&dir);
+        let report_uri = file_uri(&dir, "report.md");
+        let config_uri = file_uri(&dir, ".lattice.toml");
+        let initial = diff_diagnostics(&mut workspaces, &HashSet::new());
+        assert!(
+            initial.is_empty(),
+            "the valid commitment suppresses everything: {initial:?}"
+        );
+
+        // The shared disk state both surfaces run on: a broken config.
+        fs::write(dir.path().join(".lattice.toml"), "[[override\n")
+            .expect("break the config on disk");
+        let (server, client) = Connection::memory();
+        drive(
+            &server,
+            &mut workspaces,
+            lsp::method::DID_CHANGE_WATCHED_FILES,
+            watched_params(&config_uri, lsp::file_change_type::CHANGED),
+        );
+        let published = drain_publishes(&client);
+        assert!(
+            published.get(&report_uri).is_none_or(Vec::is_empty),
+            "the server holds last-good — no resurface: {published:?}"
+        );
+        let config = published
+            .get(&config_uri)
+            .expect("the server publishes the load error on the config URI");
+        assert_eq!(
+            config.first().and_then(|d| d["severity"].as_u64()),
+            Some(1),
+            "the server's analogue of the refusal is the error diagnostic: {config:?}"
+        );
+
+        // Every CLI subcommand refuses the same state with exit 2.
+        let mut lint_buf = Vec::new();
+        let lint_err = crate::lint::run(dir.path(), false, true, false, &mut lint_buf)
+            .expect_err("lint refuses the broken config");
+        assert_eq!(
+            crate::failure_exit_code(&lint_err),
+            2,
+            "lint maps the refusal to exit 2: {lint_err:#}"
+        );
+        let mut mv_buf = Vec::new();
+        let mv_err = crate::mv::run(
+            &dir.path().join("report.md"),
+            &dir.path().join("moved.md"),
+            true,
+            &mut mv_buf,
+        )
+        .expect_err("mv refuses the broken config");
+        assert_eq!(
+            crate::failure_exit_code(&mv_err),
+            2,
+            "mv maps the refusal to exit 2: {mv_err:#}"
+        );
+        let mut format_buf = Vec::new();
+        let format_err = crate::format::run(dir.path(), true, &mut format_buf)
+            .expect_err("format refuses the broken config");
+        assert_eq!(
+            crate::failure_exit_code(&format_err),
+            2,
+            "format maps the refusal to exit 2: {format_err:#}"
         );
     }
 
