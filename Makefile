@@ -7,7 +7,7 @@
 #   make release-major   # 0.1.0 -> 1.0.0
 #   make release V=0.2.0 # explicit version
 
-.PHONY: build-release check deny fuzz print-fuzz-targets soak machete metadata mutants setup setup-hooks setup-tools test release release-patch release-minor release-major publish tag-current
+.PHONY: build-release check deny fuzz print-fuzz-targets run soak machete metadata mutants setup setup-hooks setup-tools test release release-patch release-minor release-major publish tag-current
 
 # Get current version from Cargo.toml
 CURRENT_VERSION := $(shell grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
@@ -100,6 +100,19 @@ machete:
 # like jq. Unlike `make check` (which runs `cargo update`), it never bumps deps.
 metadata:
 	@cargo metadata --locked --format-version 1
+
+# --- Run ---
+
+# Exercise the freshly built lattice, never the one on PATH: builds the debug
+# binary and execs it by its target/ path. ARGS is passed verbatim; DIR sets
+# the working directory (default: this repo), for subcommands that resolve the
+# workspace from cwd.
+#   make run ARGS="lint --verbose"
+#   make run ARGS="lint tickets/misc/x.md" DIR=../CatenaryInternal
+DIR ?= .
+run:
+	@cargo build --quiet
+	@cd $(DIR) && $(CURDIR)/target/debug/lattice $(ARGS)
 
 # --- Test ---
 
