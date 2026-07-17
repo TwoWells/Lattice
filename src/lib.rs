@@ -29,6 +29,7 @@ mod lint;
 mod lsp;
 mod metadata;
 mod mv;
+mod overrides;
 mod server;
 mod span;
 mod structural;

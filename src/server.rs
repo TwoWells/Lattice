@@ -21,6 +21,7 @@ use crate::completion::Context as CompletionContext;
 use crate::config::{Config, ConfigError, FragmentAlgorithm};
 use crate::line_index::LineIndex;
 use crate::lsp;
+use crate::overrides::{self, OverrideVerdicts};
 use crate::span::Span;
 use crate::validation::{self, Diagnostic, Severity};
 use crate::workspace::{
@@ -81,6 +82,14 @@ struct RootMeta {
     config_error: Option<ConfigError>,
     /// Whether a `.lattice.toml` was found at the root.
     has_config: bool,
+    /// The `[[override]]` expect-aggregate verdicts held from the last
+    /// commitment point — `didOpen`, `didSave`, or a watched-files batch
+    /// (decision 023, issue 064). Every published set is filtered through this
+    /// held verdict at the materialization seam; `didChange` recomputes live
+    /// diagnostics but never re-adjudicates, so counts move mid-edit while the
+    /// suppression decision does not. Starts empty (nothing suppressed) and is
+    /// populated by the first commitment publish.
+    verdicts: OverrideVerdicts,
 }
 
 /// The server's flat document store: every parsed document keyed by absolute
@@ -729,6 +738,7 @@ impl Workspaces {
                 config: parts.config,
                 config_error: parts.config_error,
                 has_config: parts.has_config,
+                verdicts: OverrideVerdicts::default(),
             },
         );
         for (rel, data) in parts.files {
@@ -4467,7 +4477,11 @@ fn handle_notification(
                     None => None,
                 };
                 match publish {
-                    Some(true) => publish_all_diagnostics(
+                    // A didChange is a draft, not a commitment (decision 023):
+                    // live diagnostics recompute, but the published sets are
+                    // filtered through the override verdicts held from the
+                    // last save point — no mid-edit resurface flicker.
+                    Some(true) => publish_draft_diagnostics(
                         connection,
                         workspaces,
                         &one_uri(&params.text_document.uri),
@@ -4814,7 +4828,25 @@ fn force_republish(connection: &Connection, workspaces: &mut Workspaces, uri: &s
     Ok(())
 }
 
-/// Publish diagnostics for the files whose diagnostics changed.
+/// Whether a publish pass is a save-point commitment or a mid-edit draft
+/// (decision 023): a commitment re-adjudicates each root's `[[override]]`
+/// expect verdicts from the freshly computed live set and holds them; a draft
+/// filters through the verdicts held from the last commitment — counts move
+/// mid-edit, the suppression decision does not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Adjudication {
+    /// Recompute each root's verdicts from this pass's live set and hold them
+    /// (`didOpen` / `didSave` / watched-files batches and every other
+    /// disk-anchored publish).
+    Commit,
+    /// Filter through the held verdicts without re-adjudicating (the
+    /// `didChange` graph-tier arm — the draft).
+    Held,
+}
+
+/// Publish diagnostics for the files whose diagnostics changed, at a
+/// **commitment point**: the pass re-adjudicates every root's override
+/// verdicts before filtering (decision 023).
 ///
 /// The cheap whole-graph recompute still happens internally (see
 /// [`diff_diagnostics`]), but the expensive per-diagnostic materialization and
@@ -4832,7 +4864,30 @@ fn publish_all_diagnostics(
     workspaces: &mut Workspaces,
     changed_uris: &HashSet<String>,
 ) -> Result<()> {
-    for (uri, diagnostics) in diff_diagnostics(workspaces, changed_uris) {
+    let sets = diff_diagnostics(workspaces, changed_uris);
+    send_publishes(connection, sets)
+}
+
+/// Publish diagnostics for the files whose diagnostics changed, **between**
+/// commitments (the `didChange` graph-tier arm): live diagnostics are
+/// recomputed as always, but the published sets are filtered through each
+/// root's held verdicts — no re-adjudication, so a mid-edit count crossing
+/// never flashes a resurface (decision 023).
+fn publish_draft_diagnostics(
+    connection: &Connection,
+    workspaces: &mut Workspaces,
+    changed_uris: &HashSet<String>,
+) -> Result<()> {
+    let sets = diff_diagnostics_with(workspaces, changed_uris, Adjudication::Held);
+    send_publishes(connection, sets)
+}
+
+/// Send one `publishDiagnostics` notification per diffed `(uri, set)` pair.
+fn send_publishes(
+    connection: &Connection,
+    sets: Vec<(String, Vec<lsp::Diagnostic>)>,
+) -> Result<()> {
+    for (uri, diagnostics) in sets {
         let params = lsp::PublishDiagnosticsParams { uri, diagnostics };
         let notif = Notification::new(lsp::method::PUBLISH_DIAGNOSTICS.to_string(), params);
         connection.sender.send(Message::Notification(notif))?;
@@ -4927,9 +4982,14 @@ fn desired_diagnostics(workspaces: &Workspaces) -> BTreeMap<String, Vec<lsp::Dia
     // Ascending root order: a document under overlapping folders is inserted by
     // the shallow root first and overwritten by the deepest, so the deepest
     // workspace's set wins the shared URI (matching `diff_diagnostics`).
-    for root in workspaces.roots.keys() {
+    for (root, meta) in &workspaces.roots {
         let workspace = workspaces.root_view(root);
-        let all_diagnostics = collect_all_diagnostics(&workspace);
+        let mut all_diagnostics = collect_all_diagnostics(&workspace);
+        // The desired set is post-adjudication: filtered through the root's
+        // held override verdicts, exactly as production publishes (decision
+        // 023). The oracle never re-adjudicates — it asks what the client
+        // should currently hold, and that is the held verdict's answer.
+        overrides::suppress_matched(&meta.verdicts, &mut all_diagnostics);
 
         let mut by_file: BTreeMap<PathBuf, Vec<lsp::Diagnostic>> = BTreeMap::new();
         for diag in &all_diagnostics {
@@ -4985,9 +5045,78 @@ fn desired_diagnostics(workspaces: &Workspaces) -> BTreeMap<String, Vec<lsp::Dia
 /// diagnostics are cleared. Only non-empty entries are cached, so an absent
 /// entry means "the client currently holds none". The result is sorted by URI
 /// for deterministic output.
+///
+/// The commitment-mode entry point ([`Adjudication::Commit`]); the `didChange`
+/// draft goes through [`diff_diagnostics_with`] directly.
 fn diff_diagnostics(
     workspaces: &mut Workspaces,
     changed_uris: &HashSet<String>,
+) -> Vec<(String, Vec<lsp::Diagnostic>)> {
+    diff_diagnostics_with(workspaces, changed_uris, Adjudication::Commit)
+}
+
+/// Collect one root's live diagnostics through the override pass (issue 064,
+/// decision 023), split per file.
+///
+/// At a commitment, the root's expect verdicts are re-adjudicated from the
+/// live set just collected and returned (for the caller to hold on the
+/// [`RootMeta`] once its borrow ends); between commitments the held verdicts
+/// bind and `None` is returned. Either way, the matched members' findings are
+/// filtered out here — exactly once, at the seam where desired sets
+/// materialize, and nowhere else: `compute_structural` is shared with `lint`,
+/// which runs its own aggregate pass, so filtering there would double-apply.
+fn adjudicated_root_diagnostics(
+    workspace: &WorkspaceView,
+    meta: &RootMeta,
+    adjudication: Adjudication,
+) -> (BTreeMap<PathBuf, Vec<Diagnostic>>, Option<OverrideVerdicts>) {
+    let mut live = collect_all_diagnostics(workspace);
+    let committed = match adjudication {
+        Adjudication::Commit => Some(overrides::adjudicate(
+            &meta.config.overrides,
+            workspace.files().keys().map(PathBuf::as_path),
+            &live,
+        )),
+        Adjudication::Held => None,
+    };
+    let verdicts = committed.as_ref().unwrap_or(&meta.verdicts);
+    overrides::suppress_matched(verdicts, &mut live);
+    let mut by_file: BTreeMap<PathBuf, Vec<Diagnostic>> = BTreeMap::new();
+    for diag in live {
+        by_file.entry(diag.file.clone()).or_default().push(diag);
+    }
+    (by_file, committed)
+}
+
+/// Canonicalize each changed URI to the form the publish cache is keyed by, so
+/// the force-re-materialize check lines up with the per-file URIs. A document's
+/// canonical form joins its primary root's canonical scan path (which differs
+/// from the client-supplied folder key only under a symlink — issue 047).
+fn canonicalize_changed_uris(
+    workspaces: &Workspaces,
+    changed_uris: &HashSet<String>,
+) -> HashSet<String> {
+    changed_uris
+        .iter()
+        .filter_map(|uri| {
+            let abs = uri_to_path(uri);
+            let doc = workspaces.documents.get(&abs)?;
+            let root = doc.primary_root.as_ref()?;
+            let meta = workspaces.roots.get(root)?;
+            let rel = abs.strip_prefix(root).ok()?;
+            Some(path_to_uri(&meta.canonical_root.join(rel)))
+        })
+        .collect()
+}
+
+/// [`diff_diagnostics`] with an explicit adjudication mode (decision 023):
+/// under [`Adjudication::Commit`] each root's verdicts are re-adjudicated and
+/// held; under [`Adjudication::Held`] the last commitment's verdicts bind
+/// unchanged. The filtering itself lives in [`adjudicated_root_diagnostics`].
+fn diff_diagnostics_with(
+    workspaces: &mut Workspaces,
+    changed_uris: &HashSet<String>,
+    adjudication: Adjudication,
 ) -> Vec<(String, Vec<lsp::Diagnostic>)> {
     // A file the detector decided to (re-)materialize: its fresh Lattice and LSP
     // vectors, plus whether the LSP form differs from what the client holds.
@@ -5004,25 +5133,13 @@ fn diff_diagnostics(
     #[cfg(test)]
     RECOMPUTE_COUNT.with(|count| count.set(count.get() + 1));
 
-    // Canonicalize each changed URI to the form the cache is keyed by, so the
-    // force-re-materialize check below lines up with the per-file URIs. A
-    // document's canonical form joins its primary root's canonical scan path
-    // (which differs from the client-supplied folder key only under a symlink —
-    // issue 047).
-    let changed_canonical: HashSet<String> = changed_uris
-        .iter()
-        .filter_map(|uri| {
-            let abs = uri_to_path(uri);
-            let doc = workspaces.documents.get(&abs)?;
-            let root = doc.primary_root.as_ref()?;
-            let meta = workspaces.roots.get(root)?;
-            let rel = abs.strip_prefix(root).ok()?;
-            Some(path_to_uri(&meta.canonical_root.join(rel)))
-        })
-        .collect();
+    let changed_canonical = canonicalize_changed_uris(workspaces, changed_uris);
 
     let mut materialized: Vec<Materialized> = Vec::new();
     let mut present: HashSet<String> = HashSet::new();
+    // The verdicts a commitment pass re-adjudicated, applied to each root's
+    // `RootMeta` after the immutable phase-1 borrow ends (decision 023).
+    let mut new_verdicts: Vec<(PathBuf, OverrideVerdicts)> = Vec::new();
 
     // Phase 1 — detection. With an immutable view of the store and the published
     // cache, recompute each file's Lattice vector, decide whether it changed,
@@ -5044,9 +5161,10 @@ fn diff_diagnostics(
         // the test oracle `desired_diagnostics` settles the same URI.
         for (root, meta) in workspaces.roots.iter().rev() {
             let workspace = workspaces.root_view(root);
-            let mut by_file: BTreeMap<PathBuf, Vec<Diagnostic>> = BTreeMap::new();
-            for diag in collect_all_diagnostics(&workspace) {
-                by_file.entry(diag.file.clone()).or_default().push(diag);
+            let (mut by_file, committed) =
+                adjudicated_root_diagnostics(&workspace, meta, adjudication);
+            if let Some(verdicts) = committed {
+                new_verdicts.push((root.clone(), verdicts));
             }
 
             // The publish/cache URI is keyed by the client-supplied folder path
@@ -5098,6 +5216,14 @@ fn diff_diagnostics(
                     send,
                 });
             }
+        }
+    }
+
+    // Hold the commitment's fresh verdicts (decision 023): every publish until
+    // the next commitment — the `didChange` drafts — filters through these.
+    for (root, verdicts) in new_verdicts {
+        if let Some(meta) = workspaces.roots.get_mut(&root) {
+            meta.verdicts = verdicts;
         }
     }
 
@@ -11423,6 +11549,391 @@ mod tests {
         );
 
         shutdown(&client, server_thread);
+    }
+
+    // -----------------------------------------------------------------------
+    // Save-point adjudication (decision 023, issue 064, ticket server 13)
+    //
+    // The `[[override]]` expect-aggregate pass on the publish path: verdicts
+    // re-adjudicate at commitments (didOpen / didSave / watched batches) and
+    // hold between them, and at every save point the server-published set per
+    // file equals `lint::run` on the same disk state.
+    // -----------------------------------------------------------------------
+
+    /// Drive one notification straight through `handle_notification` on the
+    /// test thread (no `serve` loop), so `drain_publishes` is deterministic.
+    fn drive(
+        server: &Connection,
+        workspaces: &mut Workspaces,
+        method: &str,
+        params: serde_json::Value,
+    ) {
+        let notif = Notification::new(method.to_string(), params);
+        handle_notification(server, workspaces, notif).expect("notification handled");
+    }
+
+    /// `didOpen` params for `uri` with `text`.
+    fn open_params(uri: &str, text: &str) -> serde_json::Value {
+        serde_json::json!({
+            "textDocument": {
+                "uri": uri,
+                "languageId": "markdown",
+                "version": 1,
+                "text": text
+            }
+        })
+    }
+
+    /// `didSave` params for `uri` carrying `text`.
+    fn save_params(uri: &str, text: &str) -> serde_json::Value {
+        serde_json::json!({ "textDocument": { "uri": uri }, "text": text })
+    }
+
+    #[test]
+    fn override_matched_expect_suppresses_at_every_commitment() {
+        // Acceptance (ticket server 13): a matched tripwire's member findings
+        // are absent from every publish — didOpen, didSave, and a watched
+        // batch — while a non-member's findings publish raw.
+        let report_text = "See `gone-a.md` and `gone-b.md` here.\n";
+        let dir = workspace_with_files(&[
+            (
+                ".lattice.toml",
+                "[[override]]\npaths = [\"report.md\"]\nstale_references = { expect = 2 }\nhint = \"verbatim absorption\"\n",
+            ),
+            ("report.md", report_text),
+            ("other.md", "# Other\n"),
+        ]);
+        let mut workspaces = scan_workspaces(&dir);
+        let report_uri = file_uri(&dir, "report.md");
+        let other_uri = file_uri(&dir, "other.md");
+        let (server, client) = Connection::memory();
+
+        // didOpen is a commitment: the verdict adjudicates 2 = 2, so the open
+        // is answered with an explicit empty set, not the raw findings.
+        drive(
+            &server,
+            &mut workspaces,
+            lsp::method::DID_OPEN,
+            open_params(&report_uri, report_text),
+        );
+        let published = drain_publishes(&client);
+        let opened = published
+            .get(&report_uri)
+            .expect("didOpen answers report.md");
+        assert!(
+            opened.is_empty(),
+            "a matched expect suppresses the member findings at didOpen, got {opened:?}"
+        );
+
+        // didSave re-adjudicates to the same matched verdict: still suppressed,
+        // still answered (issue 062's forced save answer).
+        drive(
+            &server,
+            &mut workspaces,
+            lsp::method::DID_SAVE,
+            save_params(&report_uri, report_text),
+        );
+        let published = drain_publishes(&client);
+        let saved = published
+            .get(&report_uri)
+            .expect("didSave answers report.md");
+        assert!(
+            saved.is_empty(),
+            "a matched expect suppresses the member findings at didSave, got {saved:?}"
+        );
+
+        // A watched-files batch is a commitment too: a non-member's new
+        // finding publishes raw while the matched members stay suppressed.
+        fs::write(dir.path().join("other.md"), "See `gone-c.md` here.\n")
+            .expect("rewrite other.md on disk");
+        drive(
+            &server,
+            &mut workspaces,
+            lsp::method::DID_CHANGE_WATCHED_FILES,
+            serde_json::json!({ "changes": [
+                { "uri": other_uri, "type": lsp::file_change_type::CHANGED },
+            ] }),
+        );
+        let published = drain_publishes(&client);
+        let other = published
+            .get(&other_uri)
+            .expect("the watched change publishes other.md");
+        assert!(
+            any_message_contains(other, "stale reference"),
+            "a non-member's finding publishes raw through the batch, got {other:?}"
+        );
+        assert!(
+            published.get(&report_uri).is_none_or(Vec::is_empty),
+            "the matched members stay suppressed across the batch: {published:?}"
+        );
+    }
+
+    #[test]
+    fn mid_edit_count_crossing_holds_until_the_save() {
+        // Acceptance (ticket server 13): typing a third stale reference into
+        // an `expect = 2` member moves no publish — the held verdict binds
+        // between commitments — and the save re-adjudicates 3 ≠ 2, so every
+        // member finding resurfaces in that commitment's publish.
+        let report_text = "See `gone-a.md` and `gone-b.md` here.\n";
+        let grown_text = "See `gone-a.md` and `gone-b.md` and `gone-c.md` here.\n";
+        let dir = workspace_with_files(&[
+            (
+                ".lattice.toml",
+                "[[override]]\npaths = [\"report.md\"]\nstale_references = { expect = 2 }\n",
+            ),
+            ("report.md", report_text),
+        ]);
+        let mut workspaces = scan_workspaces(&dir);
+        let report_uri = file_uri(&dir, "report.md");
+        let (server, client) = Connection::memory();
+
+        drive(
+            &server,
+            &mut workspaces,
+            lsp::method::DID_OPEN,
+            open_params(&report_uri, report_text),
+        );
+        let opened = drain_publishes(&client);
+        assert!(
+            opened.get(&report_uri).is_none_or(Vec::is_empty),
+            "the open commitment adjudicates the match and suppresses: {opened:?}"
+        );
+
+        // The draft: a mid-edit count crossing. The held verdict suppresses by
+        // membership, not by count, so nothing is published at all.
+        drive(
+            &server,
+            &mut workspaces,
+            lsp::method::DID_CHANGE,
+            serde_json::json!({
+                "textDocument": { "uri": report_uri, "version": 2 },
+                "contentChanges": [ { "text": grown_text } ]
+            }),
+        );
+        let mid_edit = drain_publishes(&client);
+        assert!(
+            mid_edit.is_empty(),
+            "a mid-edit count crossing moves no publish until the save: {mid_edit:?}"
+        );
+
+        // The save commits: 3 ≠ 2 drifts, and every member finding resurfaces.
+        drive(
+            &server,
+            &mut workspaces,
+            lsp::method::DID_SAVE,
+            save_params(&report_uri, grown_text),
+        );
+        let published = drain_publishes(&client);
+        let saved = published
+            .get(&report_uri)
+            .expect("the drifting save answers report.md");
+        let stale_count = saved
+            .iter()
+            .filter(|d| {
+                d.get("message")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|m| m.starts_with("stale reference"))
+            })
+            .count();
+        assert_eq!(
+            stale_count, 3,
+            "the drifted commitment resurfaces every member finding, got {saved:?}"
+        );
+    }
+
+    #[test]
+    fn expect_shadows_disabled_suppresses_and_drifts_like_lint() {
+        // The expect-resets-level shape (issue 064 observation 2): an outer
+        // `disabled` freeze and a nested later `{ expect = N }`. The shadowed
+        // file emits at base level and the matched aggregate swallows it; the
+        // frozen file is silenced per-file. Breaking the nested count on a
+        // save resurfaces ONLY the expect's member — the freeze holds.
+        let dir = workspace_with_files(&[
+            (
+                ".lattice.toml",
+                "[[override]]\npaths = [\"archive/**\"]\nstale_references = \"disabled\"\n\n[[override]]\npaths = [\"archive/sweep/**\"]\nstale_references = { expect = 1 }\n",
+            ),
+            ("archive/notes.md", "See `gone-a.md` here.\n"),
+            ("archive/sweep/readme.md", "See `gone-b.md` here.\n"),
+        ]);
+        let mut workspaces = scan_workspaces(&dir);
+        let notes_uri = file_uri(&dir, "archive/notes.md");
+        let readme_uri = file_uri(&dir, "archive/sweep/readme.md");
+        let (server, client) = Connection::memory();
+
+        drive(
+            &server,
+            &mut workspaces,
+            lsp::method::DID_OPEN,
+            open_params(&notes_uri, "See `gone-a.md` here.\n"),
+        );
+        drive(
+            &server,
+            &mut workspaces,
+            lsp::method::DID_OPEN,
+            open_params(&readme_uri, "See `gone-b.md` here.\n"),
+        );
+        let published = drain_publishes(&client);
+        assert!(
+            published.get(&notes_uri).is_none_or(Vec::is_empty),
+            "the frozen file publishes nothing: {published:?}"
+        );
+        assert!(
+            published.get(&readme_uri).is_none_or(Vec::is_empty),
+            "the shadowed file's finding is swallowed by the matched aggregate: {published:?}"
+        );
+
+        // Break the nested count at a save: 2 ≠ 1 drifts the expect.
+        drive(
+            &server,
+            &mut workspaces,
+            lsp::method::DID_SAVE,
+            save_params(&readme_uri, "See `gone-b.md` and `gone-c.md` here.\n"),
+        );
+        let published = drain_publishes(&client);
+        let readme = published
+            .get(&readme_uri)
+            .expect("the drifting save answers readme.md");
+        assert!(
+            any_message_contains(readme, "stale reference"),
+            "the expect's member resurfaces on drift, got {readme:?}"
+        );
+        assert!(
+            published.get(&notes_uri).is_none_or(Vec::is_empty),
+            "the frozen file stays silent through the drift: {published:?}"
+        );
+    }
+
+    /// Parse one `lattice lint` output line of the `path:line: severity:
+    /// message` shape into its parts; `None` for preamble / ledger / config
+    /// lines (and anything else not anchored on a `.md` file).
+    fn parse_lint_line(line: &str) -> Option<(String, u32, String, String)> {
+        let (anchor, rest) = line.split_once(": ")?;
+        let (severity, message) = rest.split_once(": ")?;
+        let (path, lineno) = anchor.rsplit_once(':')?;
+        if Path::new(path).extension().is_none_or(|ext| ext != "md") {
+            return None;
+        }
+        let lineno: u32 = lineno.parse().ok()?;
+        Some((
+            path.to_string(),
+            lineno,
+            severity.to_string(),
+            message.to_string(),
+        ))
+    }
+
+    #[test]
+    fn server_published_sets_equal_lint_run_at_save_points() {
+        // The decision 023 conformance invariant, as a differential: with all
+        // buffers saved, the server-published diagnostic set for every file
+        // equals what `lattice lint` reports on the same disk state. The
+        // fixture carries a matched expect, a drifted expect, the
+        // expect-shadows-disabled shape, and an un-overridden raw finding.
+        let files: &[(&str, &str)] = &[
+            (
+                ".lattice.toml",
+                concat!(
+                    "[[override]]\npaths = [\"report.md\"]\nstale_references = { expect = 2 }\nhint = \"verbatim absorption\"\n\n",
+                    "[[override]]\npaths = [\"ledger.md\"]\nstale_references = { expect = 3 }\n\n",
+                    "[[override]]\npaths = [\"archive/**\"]\nstale_references = \"disabled\"\n\n",
+                    "[[override]]\npaths = [\"archive/sweep/**\"]\nstale_references = { expect = 1 }\n",
+                ),
+            ),
+            // Matched (2 = 2): suppressed on both surfaces.
+            ("report.md", "See `gone-a.md` and `gone-b.md` here.\n"),
+            // Drifted (2 ≠ 3): raw on both surfaces.
+            ("ledger.md", "See `gone-c.md` and `gone-d.md` here.\n"),
+            // Frozen per-file: silent on both surfaces.
+            ("archive/notes.md", "See `gone-e.md` here.\n"),
+            // Expect-shadows-disabled, matched (1 = 1): suppressed on both.
+            ("archive/sweep/readme.md", "See `gone-f.md` here.\n"),
+            // No override: raw on both surfaces.
+            ("plain.md", "See `gone-g.md` here.\n"),
+        ];
+        let dir = workspace_with_files(files);
+        let mut workspaces = scan_workspaces(&dir);
+        let (server, client) = Connection::memory();
+
+        // Open and save every buffer with its on-disk text: every commitment
+        // point fires, and the final disk state equals every buffer.
+        let md_files: Vec<(&str, &str)> = files
+            .iter()
+            .filter(|(rel, _)| Path::new(rel).extension().is_some_and(|ext| ext == "md"))
+            .copied()
+            .collect();
+        let mut server_published: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
+        for (rel, text) in &md_files {
+            let uri = file_uri(&dir, rel);
+            drive(
+                &server,
+                &mut workspaces,
+                lsp::method::DID_OPEN,
+                open_params(&uri, text),
+            );
+            server_published.extend(drain_publishes(&client));
+            drive(
+                &server,
+                &mut workspaces,
+                lsp::method::DID_SAVE,
+                save_params(&uri, text),
+            );
+            server_published.extend(drain_publishes(&client));
+        }
+
+        // The reference surface: `lint::run` on the same disk state (quiet —
+        // the ledger and preamble are presentation, not diagnostics).
+        let mut buf = Vec::new();
+        let _failed =
+            crate::lint::run(dir.path(), false, true, false, &mut buf).expect("lint runs");
+        let lint_out = String::from_utf8(buf).expect("lint output is utf-8");
+        let mut lint_sets: HashMap<String, Vec<(u32, String, String)>> = HashMap::new();
+        for line in lint_out.lines() {
+            if let Some((path, lineno, severity, message)) = parse_lint_line(line) {
+                lint_sets
+                    .entry(path)
+                    .or_default()
+                    .push((lineno, severity, message));
+            }
+        }
+
+        // Per file: the server's last-published set equals lint's set.
+        for (rel, _) in &md_files {
+            let uri = file_uri(&dir, rel);
+            let mut server_set: Vec<(u32, String, String)> = server_published
+                .get(&uri)
+                .map(|diags| {
+                    diags
+                        .iter()
+                        .map(|d| {
+                            let line = d["range"]["start"]["line"]
+                                .as_u64()
+                                .expect("published diagnostic carries a range");
+                            let line = u32::try_from(line).expect("line number fits u32") + 1;
+                            let severity = match d["severity"].as_i64() {
+                                Some(1) => "error",
+                                Some(2) => "warning",
+                                Some(3) => "info",
+                                _ => "hint",
+                            };
+                            let message = d["message"].as_str().unwrap_or_default().to_string();
+                            (line, severity.to_string(), message)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            server_set.sort();
+            let mut lint_set = lint_sets.remove(*rel).unwrap_or_default();
+            lint_set.sort();
+            assert_eq!(
+                server_set, lint_set,
+                "server and lint must publish the same set for {rel} at the save point"
+            );
+        }
+        assert!(
+            lint_sets.is_empty(),
+            "lint reported findings on files the differential did not visit: {lint_sets:?}"
+        );
     }
 
     // -----------------------------------------------------------------------
