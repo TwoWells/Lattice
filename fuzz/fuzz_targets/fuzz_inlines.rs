@@ -5,14 +5,18 @@
 //! emphasis / strong / strikethrough runs).
 //! `parse_tree` already runs the inline pass, so re-running `parse_inlines`
 //! must be a no-op: idempotence is the invariant. Also asserts the tree stays
-//! well-formed, inline resource fields remain faithful to the source, and every
-//! emphasis-run span is delimited correctly.
+//! well-formed, inline resource fields remain faithful to the source, every
+//! emphasis-run span is delimited correctly, and — the differential oracle of
+//! issue 056 — the internal `[` → `]` precomputation the link parser relies on
+//! equals a naive quadratic reference walk over every inline-host slice, so a
+//! missing or spurious bracket match cannot hide behind the emitted-node checks.
 
 #![no_main]
 
 use lattice::fuzz_api::{parse_inlines, parse_tree};
 use lattice::invariants::{
-    assert_emphasis_span_fidelity, assert_inline_resource_fidelity, assert_tree_wellformed,
+    assert_bracket_table_fidelity, assert_emphasis_span_fidelity,
+    assert_inline_resource_fidelity, assert_tree_wellformed,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -39,4 +43,5 @@ fuzz_target!(|data: &[u8]| {
     assert_tree_wellformed(&tree);
     assert_inline_resource_fidelity(&tree);
     assert_emphasis_span_fidelity(&tree);
+    assert_bracket_table_fidelity(&tree);
 });

@@ -6,7 +6,9 @@
 //! These assertions define what a *correct* parse looks like, independent of
 //! any particular input: a well-formed tree, well-formed frontmatter blocks,
 //! in-bounds HTML-tag spans, content fidelity (resolved text faithful to the
-//! source bytes), and LSP position round-tripping. They are the substance of
+//! source bytes), LSP position round-tripping, and differential oracles that
+//! recompute an internal result a simpler way and require the two to agree (the
+//! bracket-match table, an edit sequence's reparse). They are the substance of
 //! both hardening suites:
 //!
 //! - [`property_tests`](crate::property_tests) generates structured and random
@@ -42,7 +44,7 @@ use crate::html::HtmlTag;
 use crate::line_index::LineIndex;
 use crate::validation::Diagnostic;
 use crate::workspace::parse_content;
-use crate::{json, lsp, metadata, structural, toml, yaml};
+use crate::{inline, json, lsp, metadata, structural, toml, yaml};
 
 // ---------------------------------------------------------------------------
 // Full-pipeline helper
@@ -446,6 +448,238 @@ pub fn assert_emphasis_span_fidelity(tree: &Tree) {
             node.kind
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Bracket-match differential oracle (issue 056)
+// ---------------------------------------------------------------------------
+
+/// The role a byte plays in the naive bracket-matching reference walk.
+///
+/// `Inert` covers everything that is not a live bracket: ordinary text, the
+/// backslash of an escape and the character it escapes, and every byte of a
+/// closed backtick code span (including brackets inside it).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BracketRole {
+    /// A `[` the walk reached: an opener.
+    Open,
+    /// A `]` the walk reached: a closer.
+    Close,
+    /// Not a live bracket.
+    Inert,
+}
+
+/// Length of the run of `byte` starting at `pos`.
+///
+/// The reference walk's own counter. Deliberately not
+/// `crate::inline::count_char`: the whole point of the oracle is that the
+/// reference shares no code with the table it checks, so a regression in the
+/// production run-counting helper (the issue 017 class) shows up as a
+/// disagreement rather than being cancelled out on both sides.
+fn run_length(bytes: &[u8], pos: usize, byte: u8) -> usize {
+    let mut len = 0;
+    while pos + len < bytes.len() && bytes[pos + len] == byte {
+        len += 1;
+    }
+    len
+}
+
+/// End (exclusive) of the code span opened by a run of `ticks` backticks at
+/// `open`, or `None` when the run is never closed.
+///
+/// A code span closes on the next run of *exactly* `ticks` backticks; a run of a
+/// different length is content and is skipped whole. A backslash inside a code
+/// span is literal — it cannot escape the closing run — so this scan looks at
+/// backticks only. Written from scratch for the same reason as [`run_length`].
+fn reference_code_span_end(bytes: &[u8], open: usize, ticks: usize) -> Option<usize> {
+    let mut i = open + ticks;
+    while i < bytes.len() {
+        if bytes[i] == b'`' {
+            let run = run_length(bytes, i, b'`');
+            if run == ticks {
+                return Some(i + run);
+            }
+            i += run;
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
+/// Classify every byte of `bytes` as a live opener, a live closer, or inert.
+///
+/// A single left-to-right walk restating the two skipping rules of the inline
+/// parser's bracket pass in the simplest form that can express them:
+///
+/// - a backslash followed by any byte consumes both, so `\[` is literal text and
+///   never an opener (a trailing lone backslash escapes nothing);
+/// - a backtick run closed by a later run of the same length is a code span, and
+///   every byte from the opener through the closer is inert — brackets included.
+///   An unclosed run consumes only its own backticks, so brackets after it stay
+///   live.
+///
+/// Every byte this walk inspects is ASCII, and no ASCII byte can appear inside a
+/// multi-byte UTF-8 sequence, so classifying bytes rather than characters cannot
+/// mistake a continuation byte for a bracket.
+fn bracket_roles(bytes: &[u8]) -> Vec<BracketRole> {
+    let mut roles = vec![BracketRole::Inert; bytes.len()];
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' if i + 1 < bytes.len() => i += 2,
+            b'`' => {
+                let ticks = run_length(bytes, i, b'`');
+                i = reference_code_span_end(bytes, i, ticks).unwrap_or(i + ticks);
+            }
+            b'[' => {
+                roles[i] = BracketRole::Open;
+                i += 1;
+            }
+            b']' => {
+                roles[i] = BracketRole::Close;
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    roles
+}
+
+/// The naive quadratic reference bracket-match table for `bytes`.
+///
+/// This is the loop the production precomputation replaced: for *every* live `[`,
+/// rescan forward from scratch, counting nesting depth over the live brackets,
+/// and take the `]` that brings the depth back to zero. Re-deriving each entry
+/// independently is O(n²) — which is exactly why production stopped doing it —
+/// but it is short enough to check by eye, and it shares no code with the
+/// single-pass stack table it is compared against.
+///
+/// Exposed so the deterministic teeth test can build an honest table and corrupt
+/// it, proving the comparison rejects a missing, spurious, or mismapped match.
+#[must_use]
+pub fn naive_bracket_matches(bytes: &[u8]) -> Vec<Option<usize>> {
+    let roles = bracket_roles(bytes);
+    let mut matches = vec![None; bytes.len()];
+    for (open, role) in roles.iter().enumerate() {
+        if *role != BracketRole::Open {
+            continue;
+        }
+        let mut depth = 1usize;
+        for (pos, later) in roles.iter().enumerate().skip(open + 1) {
+            match later {
+                BracketRole::Open => depth += 1,
+                BracketRole::Close => {
+                    depth -= 1;
+                    if depth == 0 {
+                        matches[open] = Some(pos);
+                        break;
+                    }
+                }
+                BracketRole::Inert => {}
+            }
+        }
+    }
+    matches
+}
+
+/// Assert two bracket-match tables over `bytes` are equal, entry by entry.
+///
+/// `table` is the implementation under test and `reference` the oracle's answer;
+/// the message names the disagreeing byte position and both verdicts, so a
+/// counterexample points straight at the bracket that moved.
+///
+/// Exposed so the deterministic teeth test can drive this exact comparison with a
+/// deliberately corrupted table — otherwise a differential that never fires could
+/// be vacuous and no one would know.
+pub fn assert_bracket_tables_equal(
+    bytes: &[u8],
+    table: &[Option<usize>],
+    reference: &[Option<usize>],
+) {
+    let slice = String::from_utf8_lossy(bytes);
+    assert_eq!(
+        table.len(),
+        reference.len(),
+        "bracket-match table has {} entries for {} bytes; the reference has {} — the table must \
+         carry one entry per byte\n  slice: {slice:?}",
+        table.len(),
+        bytes.len(),
+        reference.len()
+    );
+    for (pos, (got, want)) in table.iter().zip(reference.iter()).enumerate() {
+        assert_eq!(
+            got,
+            want,
+            "bracket-match table disagrees with the naive reference walk at byte {pos} \
+             (byte {:?}): table says {got:?}, reference says {want:?} — a missing, spurious, or \
+             mismapped bracket match\n  slice: {slice:?}",
+            bytes.get(pos).map(|&b| char::from(b))
+        );
+    }
+}
+
+/// The differential bracket-match oracle of issue 056, over one byte slice.
+///
+/// The inline parser precomputes `[` → matching `]` for a whole inline host in one
+/// escape- and code-span-aware pass, so link parsing never rescans (a run like
+/// `[[[[...` used to be quadratic). That table is internal, and the downstream
+/// fidelity invariants cannot see it: they check the fields of the nodes that were
+/// emitted, so a mismapped bracket that produces a *wrong* link is caught, but one
+/// that produces a *missing* or *spurious* link is invisible — nothing asserts
+/// over a node that was never created. A bracket mismapped across a code-span
+/// boundary by miscounted backtick runs (the issue 017 undercount class) is
+/// exactly that: silent wrong output.
+///
+/// This closes the gap by recomputing the table with [`naive_bracket_matches`] —
+/// an independent quadratic walk that shares no code with the production pass —
+/// and asserting entry-by-entry equality. Both directions are covered by
+/// construction: a `Some` where the reference says `None` is a spurious match, a
+/// `None` where the reference says `Some` is a missing one, and two different
+/// `Some`s are a mismap.
+///
+/// The two implementations agree on *every* byte slice, so the invariant is stated
+/// without exemptions: no skip list, no "unless", nothing to broaden. The escape
+/// rule is `\` + any byte and the code-span rule is backtick-run pairing, in both
+/// the table and the reference; a `[` either walk skips is `None` on both sides.
+///
+/// What this does *not* pin is the wider question of whether the table's skip rules
+/// match the inline scanner's. The scanner treats more constructs as opaque than
+/// the table does — an inline math span, a raw HTML tag, an autolink — and walks
+/// past them, while the table walks straight through their contents. Both sides of
+/// this comparison mirror the table's own documented rules, deliberately: an oracle
+/// that re-derived the scanner's opacity would have to re-implement math, tag, and
+/// autolink recognition, and a reference that duplicates production logic checks
+/// nothing.
+pub fn assert_bracket_table_agrees(bytes: &[u8]) {
+    let table = inline::precompute_bracket_matches(bytes);
+    let reference = naive_bracket_matches(bytes);
+    assert_bracket_tables_equal(bytes, &table, &reference);
+}
+
+/// Assert the bracket-match table agrees with the naive reference walk over every
+/// byte slice the inline pass builds one for, plus the whole document.
+///
+/// The inline scanner builds a table per inline host — every `Paragraph`,
+/// `Heading`, and `TableCell` span — so those slices are the inputs production
+/// actually feeds it, and each is checked here on its own. The whole source is
+/// checked too: the table function is pure over any byte slice, and the extra arm
+/// keeps the oracle live for documents with no inline host at all (everything
+/// inside a fence, say) where the per-host loop would otherwise check nothing.
+///
+/// Host spans are assumed sliceable — [`assert_tree_wellformed`] is the invariant
+/// that guarantees it, and both suites assert it on the same tree first.
+pub fn assert_bracket_table_fidelity(tree: &Tree) {
+    let source = tree.source();
+    for node in tree.nodes() {
+        if matches!(
+            node.kind,
+            ElementKind::Paragraph | ElementKind::Heading { .. } | ElementKind::TableCell
+        ) {
+            assert_bracket_table_agrees(&source.as_bytes()[node.span.start..node.span.end]);
+        }
+    }
+    assert_bracket_table_agrees(source.as_bytes());
 }
 
 // ---------------------------------------------------------------------------

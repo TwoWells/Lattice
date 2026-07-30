@@ -649,14 +649,28 @@ pub fn find_closing_backticks(bytes: &[u8], start: usize, count: usize) -> Optio
 /// Precompute, for every `[` in `bytes`, the index of its matching `]`.
 ///
 /// One left-to-right pass using a stack, with the same backslash-escape and
-/// backtick-span skipping rules as [`find_matching_bracket`]. The result for
-/// any given `[` is identical to calling `find_matching_bracket` at that
-/// position, but the whole table is built in O(n) so the inline scanner never
-/// re-scans — eliminating quadratic backtracking on inputs like `[[[[...`.
+/// backtick-span skipping rules as [`find_matching_bracket`], so the whole table
+/// is built in O(n) and the inline scanner never re-scans — eliminating the
+/// quadratic backtracking a run like `[[[[...` used to drive.
 ///
-/// Entries are `None` for byte positions that are not an unmatched-then-closed
-/// `[` (including non-`[` bytes and `[` with no matching `]`).
-fn precompute_bracket_matches(bytes: &[u8]) -> Vec<Option<usize>> {
+/// Entries are `None` for every byte position that is not a `[` the pass reached
+/// and later closed. Three cases yield `None`: a non-`[` byte, a `[` the pass
+/// skipped (backslash-escaped, or inside a closed backtick span), and a reached
+/// `[` whose `]` never arrives. For a `[` the pass *does* reach, the entry equals
+/// [`find_matching_bracket`] called at that position — the depth-counting walk
+/// this table replaced. The equality is stated for reached positions only: a
+/// skipped `[` is not a bracket at all here, whereas `find_matching_bracket`
+/// starts scanning from wherever it is pointed and would happily match one.
+///
+/// The scanner only ever indexes this table at positions its own walk reaches
+/// (which applies the same escape and code-span rules), so a `None` at a skipped
+/// position is exactly the intended "not a bracket" answer.
+///
+/// [`crate::invariants::assert_bracket_table_agrees`] is the differential oracle
+/// for that contract: it recomputes the table with a naive quadratic reference
+/// walk and asserts equality position by position, so a missing, spurious, or
+/// mismapped match cannot pass silently (issue 056).
+pub fn precompute_bracket_matches(bytes: &[u8]) -> Vec<Option<usize>> {
     let mut matches = vec![None; bytes.len()];
     let mut stack: Vec<usize> = Vec::new();
     let mut i = 0;
@@ -1963,6 +1977,27 @@ mod tests {
                 assert_eq!(title, "references", "link title preserved");
             }
             other => panic!("expected Link, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bracket_table_passes_differential_oracle() {
+        // Issue 056: the precomputed table must equal the naive quadratic walk it
+        // replaced. Checked here, next to the optimization, on the cases most
+        // likely to separate a stack pass from a rescan — nesting, escape parity,
+        // and brackets that straddle a code span whose backtick runs differ in
+        // length. The property suite and `fuzz_inlines` drive the same assertion
+        // over generated and mutated inputs.
+        for case in [
+            "[a [b [c] d] e](url \"references\")\n",
+            "[[[[a]]]] and [[[[b]\n",
+            "\\[a](url) and [b\\](url) and \\\\[c](url)\n",
+            "[a `b[c` d](url) and ``e ` [f] g`` and ```[h](url)\n",
+            "`[a\nb` [c](url)\n",
+            "日[本](url)語 [a\u{200b}b](url) \\🎉[c](url)\n",
+        ] {
+            let tree = parse(case);
+            crate::invariants::assert_bracket_table_fidelity(&tree);
         }
     }
 

@@ -57,10 +57,12 @@ use crate::block::{self, Tree};
 use crate::fm;
 use crate::html::{self, HtmlTag};
 use crate::invariants::{
-    Edit, assert_block_wellformed, assert_carrier_fidelity, assert_edit_sequence_stable,
+    Edit, assert_block_wellformed, assert_bracket_table_agrees, assert_bracket_table_fidelity,
+    assert_bracket_tables_equal, assert_carrier_fidelity, assert_edit_sequence_stable,
     assert_emphasis_span_fidelity, assert_frontmatter_scalar_fidelity, assert_html_tag_in_bounds,
     assert_inline_resource_fidelity, assert_line_index_agrees, assert_structural_invariants,
     assert_tree_wellformed, carrier_backlinks, collect_scalars, detect_frontmatter,
+    naive_bracket_matches,
 };
 use crate::line_index::LineIndex;
 use crate::{inline, json, toml, yaml};
@@ -287,6 +289,71 @@ fn link_fragment() -> impl Strategy<Value = String> {
         (inline_text(8), url_text(), inline_text(8))
             .prop_map(|(label, u, title)| format!("[{label}]: {u} \"{title}\"\n")),
         url_text().prop_map(|u| format!("<{u}>\n")),
+    ]
+}
+
+// ---------------------------------------------------------------------------
+// Generators — bracket surface (issue 056)
+// ---------------------------------------------------------------------------
+
+/// A single token of bracket soup: the alphabet whose interleavings decide a
+/// bracket match. Openers and closers, backslash escapes (including the doubled
+/// backslash that escapes itself and so leaves the next bracket live), backtick
+/// runs of one to three ticks, the image bang, the destination parens, a math
+/// dollar, and multi-byte / zero-width filler that must never be mistaken for a
+/// bracket byte.
+fn bracket_token() -> impl Strategy<Value = &'static str> {
+    prop_oneof![
+        Just("["),
+        Just("]"),
+        Just("[]"),
+        Just("]["),
+        Just("!["),
+        Just("]("),
+        Just(")"),
+        Just("](./a.md)"),
+        Just("[^n]"),
+        Just("\\["),
+        Just("\\]"),
+        Just("\\\\"),
+        Just("\\`"),
+        Just("`"),
+        Just("``"),
+        Just("```"),
+        Just("$"),
+        Just("a"),
+        Just(" "),
+        Just("\n"),
+        Just("日"),
+        Just("\u{200b}"),
+    ]
+}
+
+/// Random bracket soup: a short concatenation of [`bracket_token`]s. The oracle's
+/// sharpest generator — nesting depth, escape parity, and backtick-run pairing all
+/// vary together, which is exactly where a single-pass table and a rescanning walk
+/// could disagree.
+fn bracket_soup() -> impl Strategy<Value = String> {
+    proptest::collection::vec(bracket_token(), 0..24).prop_map(|v| format!("{}\n", v.concat()))
+}
+
+/// A shaped bracket fragment: the named cases of the bracket surface — nesting,
+/// escaped brackets, code-span interaction, unmatched openers and stray closers,
+/// image versus link brackets, and the three reference forms — with generated text
+/// in the positions where content is free.
+fn bracket_fragment() -> impl Strategy<Value = String> {
+    prop_oneof![
+        (inline_text(8), url_text()).prop_map(|(t, u)| format!("[a [{t}] b]({u})\n")),
+        (inline_text(8), url_text()).prop_map(|(t, u)| format!("[[[{t}]]]({u})\n")),
+        inline_text(8).prop_map(|t| format!("[a \\[{t}\\] b](./x.md)\n")),
+        inline_text(8).prop_map(|t| format!("[a `{t}[b` c](./x.md)\n")),
+        inline_text(8).prop_map(|t| format!("[a ``{t}`[b`` c](./x.md)\n")),
+        inline_text(8).prop_map(|t| format!("[a ```{t}[b c](./x.md)\n")),
+        inline_text(8).prop_map(|t| format!("[[[[{t}\n")),
+        inline_text(8).prop_map(|t| format!("]]]]{t}]\n")),
+        (inline_text(8), url_text()).prop_map(|(t, u)| format!("![a [{t}] b]({u})\n")),
+        inline_text(8).prop_map(|t| format!("[{t}][r] [{t}][] [{t}]\n")),
+        inline_text(8).prop_map(|t| format!("[a $b[{t}$ c](./x.md)\n")),
     ]
 }
 
@@ -734,6 +801,29 @@ proptest! {
         let tree = parse_full(&doc);
         assert_tree_wellformed(&tree);
         assert_emphasis_span_fidelity(&tree);
+    }
+
+    /// The inline parser's precomputed `[` → `]` table equals a naive quadratic
+    /// reference walk, for every inline-host slice and for the whole document —
+    /// the differential oracle of issue 056. The precomputation is internal, and
+    /// the content-fidelity invariants only ever inspect nodes that *were*
+    /// emitted, so a bracket the table loses or invents (a link silently missing
+    /// or appearing) is invisible to them; comparing the table itself against an
+    /// independent walk covers both directions. This is the assertion the
+    /// `fuzz_inlines` target shares, so the two suites cannot drift.
+    #[test]
+    fn bracket_table_agrees_with_naive_walk(
+        doc in prop_oneof![
+            bracket_soup(),
+            proptest::collection::vec(bracket_fragment(), 0..8).prop_map(|v| v.concat()),
+            proptest::collection::vec(link_fragment(), 0..8).prop_map(|v| v.concat()),
+            markdown_document(),
+            arbitrary_string(200),
+        ]
+    ) {
+        let tree = parse_full(&doc);
+        assert_tree_wellformed(&tree);
+        assert_bracket_table_fidelity(&tree);
     }
 }
 
@@ -1333,6 +1423,132 @@ fn structural_invariants_hold_on_carrier_expected_colon_multibyte() {
     assert_structural_invariants(include_str!(
         "../fuzz/corpus/fuzz_structural/carrier_expected_colon_multibyte.md"
     ));
+}
+
+#[test]
+fn bracket_table_agrees_on_known_inputs() {
+    // The named bracket cases, deterministically: nesting, escape parity,
+    // code-span interaction (including backtick runs longer than their closers —
+    // the issue 017 undercount surface), unmatched openers and stray closers,
+    // image versus link brackets, the reference forms, and multi-byte / zero-width
+    // bytes adjacent to brackets. `assert_bracket_table_fidelity` compares the
+    // production table against the naive walk on every inline-host slice and on
+    // the whole document, so reaching the end proves each agreed.
+    let cases = [
+        "",
+        "[]\n",
+        "[a](./x.md)\n",
+        "[a [b [c] d] e](./x.md \"references\")\n",
+        "[[[[a]]]]\n",
+        "[[[[a\n",
+        "]]]]a]\n",
+        "]text[\n",
+        "\\[a](./x.md)\n",
+        "[a\\](./x.md)\n",
+        "\\\\[a](./x.md)\n",
+        "\\\\\\[a](./x.md)\n",
+        "[a \\] b](./x.md)\n",
+        "`[a](./x.md)`\n",
+        "[a `b[c` d](./x.md)\n",
+        "[a `b]c` d](./x.md)\n",
+        "``a ` [b] c`` [d](./x.md)\n",
+        "```[a](./x.md)\n",
+        "`[a\nb` [c](./x.md)\n",
+        "\\`[a](./x.md)\n",
+        "![a [b] c](./pic.png)\n",
+        "\\![a](./pic.png)\n",
+        "!\\[a](./pic.png)\n",
+        "[a][r] [b][] [c]\n\n[r]: ./x.md\n",
+        "[a][b[c]d]\n",
+        "text[^note] [a](./x.md)\n\n[^note]: body\n",
+        "日[本](./a.md)語 🎉[b](./b.md)🎉\n",
+        "[a\u{200b}b](./x.md) \u{200b}[c](./y.md)\n",
+        "\\é[a](./x.md) \\🎉[b](./y.md)\n",
+        "| [a [b] c](./x.md) | `[d]` |\n| --- | --- |\n| [e](./y.md) | ] |\n",
+        "# [a [b] c](./x.md)\n",
+        "> [a `b[c` d](./x.md)\n",
+        "```\n[a](./x.md) `[b`\n```\n",
+        "\u{feff}[a](./x.md)\n",
+        "[a](./x.md)\r\n[b `c[d`](./y.md)\r\n",
+        "[a](./x.md)\r[b](./y.md)\r",
+    ];
+    for case in cases {
+        let tree = parse_full(case);
+        assert_tree_wellformed(&tree);
+        assert_bracket_table_fidelity(&tree);
+    }
+
+    // The curated `fuzz_inlines` seeds for the same surface, byte-exact: the
+    // corpus and this suite check identical inputs through identical assertions.
+    let seeds = [
+        include_str!("../fuzz/corpus/fuzz_inlines/bracket_nesting.md"),
+        include_str!("../fuzz/corpus/fuzz_inlines/bracket_escapes.md"),
+        include_str!("../fuzz/corpus/fuzz_inlines/bracket_code_span.md"),
+        include_str!("../fuzz/corpus/fuzz_inlines/bracket_unmatched.md"),
+        include_str!("../fuzz/corpus/fuzz_inlines/bracket_image_vs_link.md"),
+        include_str!("../fuzz/corpus/fuzz_inlines/bracket_reference_forms.md"),
+        include_str!("../fuzz/corpus/fuzz_inlines/bracket_multibyte_zerowidth.md"),
+        include_str!("../fuzz/corpus/fuzz_inlines/bracket_opaque_spans.md"),
+    ];
+    for seed in seeds {
+        let tree = parse_full(seed);
+        assert_tree_wellformed(&tree);
+        assert_bracket_table_fidelity(&tree);
+    }
+}
+
+#[test]
+fn bracket_table_oracle_has_teeth() {
+    // The differential is not vacuous. A correct parser never makes the two
+    // implementations disagree, so the only way to show the comparison has teeth
+    // is to hand it a corrupted table and require each of the three failure
+    // classes to be rejected: a *missing* match (the entry dropped), a *spurious*
+    // one (an entry invented at a `[` the walk skips), and a *mismapped* one (the
+    // entry pointing at the wrong `]`). Missing and spurious are precisely the
+    // classes the emitted-node fidelity checks are blind to.
+    let source = "[a [b] c](./x.md) and `[d]` and \\[e]\n";
+    let bytes = source.as_bytes();
+
+    // The honest reference table, and the production table agreeing with it.
+    assert_bracket_table_agrees(bytes);
+    let honest = naive_bracket_matches(bytes);
+
+    let open = honest
+        .iter()
+        .position(Option::is_some)
+        .expect("the source carries at least one matched bracket pair");
+    let close = honest[open].expect("the located entry is a match");
+    let skipped = (0..bytes.len())
+        .find(|&i| bytes[i] == b'[' && honest[i].is_none())
+        .expect("the source carries a `[` the walk skips (escaped or inside a code span)");
+
+    let mut missing = honest.clone();
+    missing[open] = None;
+
+    let mut spurious = honest.clone();
+    spurious[skipped] = Some(close);
+
+    let mut mismapped = honest.clone();
+    mismapped[open] = Some(close + 1);
+
+    for (class, corrupted) in [
+        ("missing", missing),
+        ("spurious", spurious),
+        ("mismapped", mismapped),
+    ] {
+        let caught = std::panic::catch_unwind(|| {
+            assert_bracket_tables_equal(bytes, &corrupted, &honest);
+        });
+        assert!(
+            caught.is_err(),
+            "the bracket-table comparison must reject a {class} match — otherwise the oracle is \
+             vacuous"
+        );
+    }
+
+    // And the genuine invariant still passes on the honest source (teeth, not a
+    // hair trigger).
+    assert_bracket_table_agrees(bytes);
 }
 
 #[test]
