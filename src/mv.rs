@@ -22,7 +22,10 @@
 //! Exactly two surfaces carry a path a move forces:
 //! 1. **Forward-link destinations** ([`crate::block::Link`]) in every file's
 //!    body — inbound links into the moved set, and the moved files' own outbound
-//!    links.
+//!    links. Embed destinations ([`crate::block::LinkKind::Embed`] — image,
+//!    video, and audio sources) are enumerated here too: they are
+//!    existence-checked like any other reference (issue 058), so leaving one
+//!    unrewritten would *create* a diagnostic the governing property forbids.
 //! 2. **Backlink entries** in every file's frontmatter — entries naming a moved
 //!    file, and moved files' own entries.
 //!
@@ -463,7 +466,13 @@ fn collect_forward_link_edits(
             // is re-derived from the definition's raw URL below. So only the
             // target matters here.
             let target = match &link.kind {
-                LinkKind::IntraProject { target, .. } | LinkKind::NonMarkdown { target } => target,
+                // An embed destination is a forced coordinate like any other
+                // (issue 058): once a dangling embed carries a diagnostic, a
+                // move that left it unrewritten would *create* one, breaking the
+                // governing property.
+                LinkKind::IntraProject { target, .. }
+                | LinkKind::NonMarkdown { target }
+                | LinkKind::Embed { target } => target,
                 LinkKind::External { .. } | LinkKind::IntraDocument { .. } => continue,
             };
 
@@ -524,9 +533,13 @@ fn collect_forward_link_edits(
 /// URL as its `ElementKind::Link` payload but no inline destination span; the
 /// authored destination lives in the definition. We resolve the label from the
 /// link's text and find the matching `ReferenceDef`, then locate its URL span.
+///
+/// A reference-style *embed* (`![alt][label]`) works identically once its
+/// leading `!` is dropped — the bracket shape after it is the same (issue 058).
 fn reference_def_url_span(tree: &block::Tree, link_span: Span) -> Option<Span> {
     let source = tree.source();
     let slice = &source[link_span.start..link_span.end.min(source.len())];
+    let slice = slice.strip_prefix('!').unwrap_or(slice);
     let label = reference_link_label(slice)?;
     let (def_id, _node) = tree.find_ref_def(&label)?;
     let def_node = tree.node(def_id);
@@ -1310,6 +1323,66 @@ mod tests {
     }
 
     #[test]
+    fn drift_preserving_isomorphism_clean_with_embeds() {
+        // The governing property over the embed surface (issue 058). Before the
+        // embed existence check landed, this arm was vacuous: an unrewritten
+        // embed carried no diagnostic on either side of a move. Now a missed
+        // retarget *creates* an error, so the isomorphism equality below is what
+        // forces the engine to enumerate embed destinations.
+        let fixture = Fixture::new(&[
+            (
+                "docs/guide.md",
+                concat!(
+                    "# Guide\n\n",
+                    "![diagram](../assets/arch.png)\n\n",
+                    "[the same asset](../assets/arch.png)\n\n",
+                    "<img src=\"../assets/arch.png\">\n\n",
+                    "![clip](../assets/demo.mp4)\n\n",
+                    "![tune](../assets/theme.mp3)\n",
+                ),
+            ),
+            ("assets/arch.png", "PNG"),
+            ("assets/demo.mp4", "MP4"),
+            ("assets/theme.mp3", "MP3"),
+        ]);
+
+        // Pre-move the graph is clean — every embed resolves.
+        let pre = validation::collect_all(&fixture.scan());
+        assert!(
+            pre.is_empty(),
+            "clean embed fixture has no diagnostics: {pre:#?}"
+        );
+
+        // (a) Move the asset directory: every inbound embed is an edge with one
+        // moved endpoint, so each must be re-rendered.
+        let edits = assert_isomorphism(&fixture, "assets", "static");
+        assert_eq!(
+            total_edit_count(&edits),
+            5,
+            "all four embeds and the one plain link retarget: {edits:#?}"
+        );
+        let post = validation::collect_all(&apply(&fixture, &edits).scan());
+        assert!(
+            post.is_empty(),
+            "moving the embedded assets leaves the graph clean: {post:#?}"
+        );
+
+        // (b) Move the embedding *document*: its own embed spellings are
+        // relative to its location, so they are re-rendered too.
+        let edits = assert_isomorphism(&fixture, "docs/guide.md", "guide.md");
+        assert_eq!(
+            total_edit_count(&edits),
+            5,
+            "the moved document re-renders its own five outbound references: {edits:#?}"
+        );
+        let post = validation::collect_all(&apply(&fixture, &edits).scan());
+        assert!(
+            post.is_empty(),
+            "moving the embedding document leaves the graph clean: {post:#?}"
+        );
+    }
+
+    #[test]
     fn drift_preserving_isomorphism_drifted() {
         // Three deliberate drifts must survive verbatim at translated
         // coordinates: (1) a missing backlink, (2) a stale backlink entry, and
@@ -1473,9 +1546,9 @@ mod tests {
     #[test]
     fn non_markdown_source_edits_its_one_referrer() {
         // A non-markdown asset with a single inbound `NonMarkdown` link (a plain
-        // `[text](asset)` link, not an `![]()` image embed — images are
-        // `ElementKind::Image`, outside `FileData.links`): moving it must edit
-        // the referrer (enumeration (a) only) and refuse nothing.
+        // `[text](asset)` link — the `![]()` embed form is covered by
+        // `embed_destination_is_retargeted_by_move`): moving it must edit the
+        // referrer (enumeration (a) only) and refuse nothing.
         let fixture = Fixture::new(&[
             ("doc.md", "# Doc\n\n[logo](img/logo.png)\n"),
             ("img/logo.png", "PNG"),
@@ -1500,6 +1573,162 @@ mod tests {
         assert_eq!(
             doc_edits[0].new_text, "assets/logo.png",
             "the image link retargets to the asset's new location"
+        );
+    }
+
+    // --- Embed destinations (issue 058) ---
+
+    /// Move `old_rel` to `new_rel` in `fixture` and return the edits recorded
+    /// against `edited_rel`, asserting it is the only edited file.
+    fn sole_file_edits(
+        fixture: &Fixture,
+        old_rel: &str,
+        new_rel: &str,
+        edited_rel: &str,
+    ) -> Vec<super::MoveTextEdit> {
+        let ws = fixture.scan();
+        let edits = compute_move_edits(
+            &ws,
+            &fixture.root().join(old_rel),
+            &fixture.root().join(new_rel),
+            &fs_exists,
+        )
+        .expect("move computes");
+        assert_eq!(
+            edits.edits.len(),
+            1,
+            "exactly one file is edited: {edits:#?}"
+        );
+        edits
+            .edits
+            .get(&fixture.root().join(edited_rel))
+            .cloned()
+            .unwrap_or_else(|| panic!("{edited_rel} edited: {edits:#?}"))
+    }
+
+    #[test]
+    fn embed_destination_is_retargeted_by_move() {
+        // Moving an asset must re-render the `![]()` embeds of it, not only the
+        // plain links — the blind spot issue 058 names. All three markdown embed
+        // node kinds (image / video / audio) are exercised.
+        let fixture = Fixture::new(&[
+            (
+                "doc.md",
+                "# Doc\n\n![logo](img/logo.png)\n\n![clip](img/demo.mp4)\n\n![tune](img/theme.mp3)\n",
+            ),
+            ("img/logo.png", "PNG"),
+            ("img/demo.mp4", "MP4"),
+            ("img/theme.mp3", "MP3"),
+        ]);
+
+        let doc_edits = sole_file_edits(&fixture, "img", "assets", "doc.md");
+        let texts: Vec<&str> = doc_edits.iter().map(|e| e.new_text.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec!["assets/logo.png", "assets/demo.mp4", "assets/theme.mp3"],
+            "every embed destination retargets, in document order: {doc_edits:#?}"
+        );
+    }
+
+    #[test]
+    fn embed_edit_preserves_alt_text_title_and_fragment() {
+        // The edit lands on the destination's path bytes only: the alt text, the
+        // title, and a `#` fragment are all outside the span.
+        let fixture = Fixture::new(&[
+            (
+                "doc.md",
+                "# Doc\n\n![the alt](img/pic.svg#view \"Caption\")\n",
+            ),
+            ("img/pic.svg", "SVG"),
+        ]);
+
+        let doc_edits = sole_file_edits(&fixture, "img", "assets", "doc.md");
+        assert_eq!(doc_edits.len(), 1, "one embed edit: {doc_edits:#?}");
+        assert_eq!(
+            doc_edits[0].new_text, "assets/pic.svg",
+            "only the path is rewritten"
+        );
+
+        let mut spliced = fs::read_to_string(fixture.root().join("doc.md")).expect("read doc.md");
+        let span = doc_edits[0].span;
+        spliced.replace_range(span.start..span.end, &doc_edits[0].new_text);
+        assert!(
+            spliced.contains("![the alt](assets/pic.svg#view \"Caption\")"),
+            "alt text, fragment, and title ride along verbatim: {spliced}"
+        );
+    }
+
+    #[test]
+    fn html_embed_src_is_retargeted_by_move() {
+        // The raw-HTML embed forms carry their destination in `src`, not `href`.
+        let fixture = Fixture::new(&[
+            (
+                "doc.md",
+                concat!(
+                    "# Doc\n\n",
+                    "<img src=\"img/logo.png\">\n\n",
+                    "<video src=\"img/demo.mp4\"></video>\n\n",
+                    "<audio src=\"img/theme.mp3\"></audio>\n",
+                ),
+            ),
+            ("img/logo.png", "PNG"),
+            ("img/demo.mp4", "MP4"),
+            ("img/theme.mp3", "MP3"),
+        ]);
+
+        let doc_edits = sole_file_edits(&fixture, "img", "assets", "doc.md");
+        let texts: Vec<&str> = doc_edits.iter().map(|e| e.new_text.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec!["assets/logo.png", "assets/demo.mp4", "assets/theme.mp3"],
+            "each HTML embed's `src` value retargets: {doc_edits:#?}"
+        );
+    }
+
+    #[test]
+    fn reference_style_embed_is_retargeted_at_its_definition() {
+        // A reference-style embed has no inline destination, so the edit lands on
+        // its `ReferenceDef` URL — the same fallback a reference-style link uses.
+        let fixture = Fixture::new(&[
+            ("doc.md", "# Doc\n\n![alt][pic]\n\n[pic]: img/logo.png\n"),
+            ("img/logo.png", "PNG"),
+        ]);
+
+        let doc_edits = sole_file_edits(&fixture, "img", "assets", "doc.md");
+        assert_eq!(doc_edits.len(), 1, "one definition edit: {doc_edits:#?}");
+        assert_eq!(
+            doc_edits[0].new_text, "assets/logo.png",
+            "the definition URL retargets"
+        );
+        let source = fs::read_to_string(fixture.root().join("doc.md")).expect("read doc.md");
+        assert_eq!(
+            &source[doc_edits[0].span.start..doc_edits[0].span.end],
+            "img/logo.png",
+            "the edit replaces the definition's URL token, not the `![alt][pic]` call site"
+        );
+    }
+
+    #[test]
+    fn embed_of_an_untouched_asset_is_not_edited() {
+        // Clause 4: an edge with no endpoint in the moved set stays authored
+        // verbatim, embeds included.
+        let fixture = Fixture::new(&[
+            ("doc.md", "# Doc\n\n![logo](img/logo.png)\n"),
+            ("img/logo.png", "PNG"),
+            ("other.md", "# Other\n"),
+        ]);
+        let ws = fixture.scan();
+        let edits = compute_move_edits(
+            &ws,
+            &fixture.root().join("other.md"),
+            &fixture.root().join("moved/other.md"),
+            &fs_exists,
+        )
+        .expect("move computes");
+        assert_eq!(
+            total_edit_count(&edits),
+            0,
+            "an embed of an unmoved asset from an unmoved document is untouched: {edits:#?}"
         );
     }
 

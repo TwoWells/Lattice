@@ -55,6 +55,10 @@ pub struct Diagnostic {
 /// - Predicate membership in the configured vocabulary.
 /// - Predicate policy compliance (optional vs required).
 /// - Fragment resolution against headings in the target document.
+///
+/// Embeds (`![alt](x.png)`, `<img src>`, `<video src>`, `<audio src>`) are
+/// checked for target existence only — they carry no predicate and derive no
+/// backlink (issue 058).
 pub fn validate_forward_links(workspace: &impl WorkspaceLike) -> Vec<Diagnostic> {
     let config = workspace.config();
     let mut diagnostics = Vec::new();
@@ -94,6 +98,31 @@ pub fn validate_forward_links(workspace: &impl WorkspaceLike) -> Vec<Diagnostic>
                             link.line,
                             link.span,
                             target,
+                            "link",
+                            &mut diagnostics,
+                        );
+                    }
+                }
+
+                LinkKind::Embed { target } => {
+                    // An embed resolves through the same oracle as a plain
+                    // non-markdown link (issue 058): a dangling one renders
+                    // broken, so it is a defect, not a convention — ungated,
+                    // exactly like the link check above. It carries no
+                    // predicate and no fragment, so existence (and the scope
+                    // boundary) is the whole check.
+                    if workspace.crosses_boundary(target) {
+                        diagnostics.push(cross_boundary_diagnostic(
+                            workspace, file_path, link.line, link.span, target,
+                        ));
+                    } else {
+                        check_target_exists(
+                            workspace,
+                            file_path,
+                            link.line,
+                            link.span,
+                            target,
+                            "embed",
                             &mut diagnostics,
                         );
                     }
@@ -123,6 +152,7 @@ pub fn validate_forward_links(workspace: &impl WorkspaceLike) -> Vec<Diagnostic>
                         link.line,
                         link.span,
                         target,
+                        "link",
                         &mut diagnostics,
                     );
                     check_predicate(
@@ -186,19 +216,23 @@ fn cross_boundary_diagnostic(
     }
 }
 
-/// Check that a link target exists as a file in the workspace or on disk.
+/// Check that a link or embed target exists as a file in the workspace or on
+/// disk.
 ///
 /// `target` is a root-free link target (absolute for a document-relative link,
 /// the root-relative remainder otherwise). Existence is checked in the store's
 /// key space (markdown, via `file`) or on disk (`root.join(target)`, which
 /// yields the target's absolute path for either form). The message displays the
-/// root-relative form, the one edge where the workspace root re-enters.
+/// root-relative form, the one edge where the workspace root re-enters, and
+/// names the reference kind via `noun` (`"link"` or `"embed"`) — one oracle,
+/// two spellings, so a broken embed reads as a broken embed.
 fn check_target_exists(
     workspace: &impl WorkspaceLike,
     source: &Path,
     line: usize,
     span: Span,
     target: &Path,
+    noun: &str,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     let is_markdown = target.extension().is_some_and(|ext| ext == "md");
@@ -215,7 +249,7 @@ fn check_target_exists(
             file: source.to_path_buf(),
             line,
             severity: Severity::Error,
-            message: format!("link target does not exist: {}", display.display()),
+            message: format!("{noun} target does not exist: {}", display.display()),
             span: Some(span),
         });
     }
@@ -990,6 +1024,100 @@ predicates = \"required\"
             errors[0].message.contains("does not exist"),
             "message mentions non-existence: {}",
             errors[0].message
+        );
+    }
+
+    // --- Embed target existence (issue 058) ---
+
+    #[test]
+    fn dangling_embed_targets_are_errors() {
+        // Every embed kind that exists as a distinct node type — markdown image,
+        // markdown video (`![](*.mp4)`), markdown audio (`![](*.mp3)`), and the
+        // three raw-HTML tags — must surface a dangling target. Before issue 058
+        // each of these rendered broken and linted clean.
+        for source in [
+            "![logo](missing.png)\n",
+            "![clip](missing.mp4)\n",
+            "![tune](missing.mp3)\n",
+            "<img src=\"missing.png\">\n",
+            "<video src=\"missing.mp4\"></video>\n",
+            "<audio src=\"missing.mp3\"></audio>\n",
+        ] {
+            let (_dir, ws) = setup_workspace(&[("index.md", source)]);
+            let diags = validate_forward_links(&ws);
+            let errors: Vec<_> = diags
+                .iter()
+                .filter(|d| d.severity == Severity::Error)
+                .collect();
+
+            assert_eq!(
+                errors.len(),
+                1,
+                "exactly one error for the dangling embed in `{source}`: {diags:?}"
+            );
+            assert!(
+                errors[0]
+                    .message
+                    .starts_with("embed target does not exist:"),
+                "the message names the embed, not a plain link: {}",
+                errors[0].message
+            );
+        }
+    }
+
+    #[test]
+    fn resolving_embed_targets_are_clean() {
+        // The mirror image: an embed whose asset exists is silent, at every
+        // authored spelling (document-relative, `./`, and root-relative).
+        let (_dir, ws) = setup_workspace(&[
+            (
+                "docs/index.md",
+                "![a](img/logo.png)\n\n![b](./img/logo.png)\n\n![c](/docs/img/logo.png)\n",
+            ),
+            ("docs/img/logo.png", "PNG"),
+        ]);
+
+        let diags = validate_forward_links(&ws);
+        assert!(
+            diags.is_empty(),
+            "a resolving embed produces no diagnostics at all — no error, no \
+             predicate info (an embed asserts no relation): {diags:?}"
+        );
+    }
+
+    #[test]
+    fn external_embed_source_is_skipped() {
+        let (_dir, ws) = setup_workspace(&[(
+            "index.md",
+            "![remote](https://example.com/a.png)\n\n![proto](//cdn.example.com/b.png)\n",
+        )]);
+
+        let diags = validate_forward_links(&ws);
+        assert!(
+            diags.is_empty(),
+            "a remote embed source is never resolved against the workspace: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn embed_derives_no_backlink_obligation() {
+        // An embed of a *markdown* file is still an embed: existence-checked, but
+        // it must not become an `IntraProject` edge that expects a reciprocal
+        // backlink on its target (which would make every embed a warning).
+        let (_dir, ws) = setup_workspace(&[
+            ("index.md", "![inline](other.md)\n"),
+            ("other.md", "# Other\n"),
+        ]);
+
+        let forward = validate_forward_links(&ws);
+        assert!(
+            forward.is_empty(),
+            "an existing markdown embed target is clean: {forward:?}"
+        );
+        let backlinks = validate_backlinks(&ws);
+        assert!(
+            backlinks.is_empty(),
+            "an embed derives no backlink obligation: {backlinks:?}"
         );
     }
 

@@ -2710,7 +2710,9 @@ fn go_to_definition(
     let link = find_classified_link(&file_data.tree, &root.join(&rel_path), node.span)?;
 
     match &link.kind {
-        LinkKind::IntraProject { target, .. } | LinkKind::NonMarkdown { target } => {
+        LinkKind::IntraProject { target, .. }
+        | LinkKind::NonMarkdown { target }
+        | LinkKind::Embed { target } => {
             // `root.join` yields the target's absolute path for either target
             // form: it replaces on an absolute (document-relative) target and
             // appends onto a root-relative remainder.
@@ -3290,9 +3292,9 @@ fn document_links(workspaces: &Workspaces, uri: &str) -> Vec<lsp::DocumentLink> 
         // emitting a file-top link here — it would send an in-page anchor to the
         // top of the file you're already in, which reads as broken.
         let target_uri = match &link.kind {
-            LinkKind::IntraProject { target, .. } | LinkKind::NonMarkdown { target } => {
-                path_to_uri(&root.join(target))
-            }
+            LinkKind::IntraProject { target, .. }
+            | LinkKind::NonMarkdown { target }
+            | LinkKind::Embed { target } => path_to_uri(&root.join(target)),
             LinkKind::External { .. } | LinkKind::IntraDocument { .. } => continue,
         };
         let line = link.line.saturating_sub(1) as u32;
@@ -3401,11 +3403,14 @@ fn hover_preview(
     let root = workspace.root();
     let file_links = file_data.tree.links(&root.join(&rel_path));
 
-    // Find the link on the cursor's line.
+    // Find the link on the cursor's line. Embeds are skipped rather than
+    // matched-and-rejected: an embed asserts no relation, so it has no hover to
+    // show, and letting one win the line would hide the hover of a real link
+    // sharing that line (issue 058).
     let cursor_line = params.position.line;
-    let link = file_links
-        .iter()
-        .find(|l| l.line.saturating_sub(1) as u32 == cursor_line)?;
+    let link = file_links.iter().find(|l| {
+        l.line.saturating_sub(1) as u32 == cursor_line && !matches!(l.kind, LinkKind::Embed { .. })
+    })?;
 
     let (target, fragment, predicate) = match &link.kind {
         LinkKind::IntraProject {
@@ -3415,8 +3420,11 @@ fn hover_preview(
             ..
         } => (target.clone(), fragment.clone(), predicate.as_str()),
         LinkKind::NonMarkdown { target } => (target.clone(), None, "references"),
-        // No hover for external or intra-document links.
-        LinkKind::External { .. } | LinkKind::IntraDocument { .. } => return None,
+        // No hover for external or intra-document links, nor for embeds (which
+        // the candidate filter above already excluded).
+        LinkKind::External { .. } | LinkKind::IntraDocument { .. } | LinkKind::Embed { .. } => {
+            return None;
+        }
     };
 
     let target_data = workspace.file(&target)?;

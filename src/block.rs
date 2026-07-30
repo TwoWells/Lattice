@@ -452,6 +452,24 @@ pub enum LinkKind {
         /// 019 clause 8). `WorkspaceLike` maps it onto a stored key / abs path.
         target: PathBuf,
     },
+    /// Embed of an in-project resource — an image, video, or audio source
+    /// (`![alt](x.png)`, `<img src>`, `<video src>`, `<audio src>`).
+    ///
+    /// An embed is a graph edge like any other path-bearing reference: its
+    /// target is existence-checked (issue 058) and re-rendered by the move
+    /// engine, so a moved asset never leaves a broken embed behind. It carries
+    /// no predicate and derives no backlink obligation — an embed renders a
+    /// resource, it does not assert a relation — so only the target is stored.
+    /// A `#` fragment (as in `x.svg#view`) rides along verbatim in the source
+    /// and is excluded from `target`, matching the move rule for fragments
+    /// (decision 020 clause 4).
+    Embed {
+        /// Resolved path to the embedded resource, in the same root-free form
+        /// as [`NonMarkdown::target`](Self::NonMarkdown): absolute for a
+        /// document-relative source, the relative remainder for a root-relative
+        /// (`/x`) one (decision 019 clause 8).
+        target: PathBuf,
+    },
     /// Intra-project link to a markdown file.
     IntraProject {
         /// Resolved path to the target `.md` file: absolute for a
@@ -793,14 +811,19 @@ fn scan_title(s: &str, start: usize) -> Option<(String, usize)> {
 /// - inline `[text](dest "title")` — the bare `dest` run;
 /// - angle-bracketed inline `[text](<dest> "title")` — the run *inside* the
 ///   angle brackets, so the edit stays between `<` and `>`;
+/// - an `![alt](dest "title")` embed — the `dest` run after the `!`, in either
+///   the bare or angle-bracketed form (issue 058);
 /// - an `@dest` import directive — the path after the `@`;
-/// - a raw-HTML `<a href="dest">…</a>` anchor — the `href` attribute value.
+/// - a raw-HTML `<a href="dest">…</a>` anchor — the `href` attribute value;
+/// - a raw-HTML `<img>` / `<video>` / `<audio>` / `<iframe>` embed — the `src`
+///   attribute value (issue 058).
 ///
-/// Returns `None` for a reference-style link (`[text][label]`, `[text][]`,
-/// `[label]`), whose destination lives in a separate `ReferenceDef` node, not in
-/// the link span — the caller edits the definition's URL via
-/// [`Tree::find_ref_def`] instead. Also `None` for an autolink or any link whose
-/// span does not carry an editable inline destination.
+/// Returns `None` for a reference-style link or embed (`[text][label]`,
+/// `![alt][label]`, `[text][]`, `[label]`), whose destination lives in a
+/// separate `ReferenceDef` node, not in the link span — the caller edits the
+/// definition's URL via [`Tree::find_ref_def`] instead. Also `None` for an
+/// autolink or any link whose span does not carry an editable inline
+/// destination.
 #[must_use]
 pub fn link_destination_span(source: &str, link_span: Span) -> Option<Span> {
     let start = link_span.start;
@@ -813,8 +836,11 @@ pub fn link_destination_span(source: &str, link_span: Span) -> Option<Span> {
 
     match bytes[0] {
         b'@' => import_destination_span(slice, start),
-        b'<' => html_anchor_href_span(slice, start),
+        b'<' => html_resource_attr_span(slice, start),
         b'[' => inline_link_destination_span(slice, start),
+        // An embed node's span opens on the `!`; the destination sits in the
+        // `[alt](dest)` remainder, which is the plain inline link shape.
+        b'!' if bytes.get(1) == Some(&b'[') => inline_link_destination_span(&slice[1..], start + 1),
         _ => None,
     }
 }
@@ -834,17 +860,30 @@ fn import_destination_span(slice: &str, base: usize) -> Option<Span> {
     Some(Span::new(dest_start, dest_start + path_len))
 }
 
-/// Destination span of a raw-HTML `<a href="dest">` anchor — the `href`
-/// attribute value, trimmed of any `#` fragment. `base` is the byte offset of
-/// the slice's first byte in the full source.
-fn html_anchor_href_span(slice: &str, base: usize) -> Option<Span> {
-    // Locate `href`, then its quoted value. Case-insensitive attribute name,
-    // matching the tokenizer; the value delimiter is `"` or `'`.
+/// Destination span of a raw-HTML resource reference — the `href` attribute of
+/// an `<a>` anchor, or the `src` attribute of an `<img>` / `<video>` / `<audio>`
+/// / `<iframe>` embed (issue 058) — trimmed of any `#` fragment. `base` is the
+/// byte offset of the slice's first byte in the full source.
+///
+/// The node kind is not available here (the caller has only a span), so `href`
+/// is tried first and `src` second. The two never compete: an `<a>` carries no
+/// `src` and an embed tag carries no `href`, and a nested `<img src>` inside an
+/// `<a href>`'s span is reached only after the anchor's own `href` has matched.
+fn html_resource_attr_span(slice: &str, base: usize) -> Option<Span> {
+    html_attr_value_span(slice, base, "href").or_else(|| html_attr_value_span(slice, base, "src"))
+}
+
+/// Span of one named attribute's quoted value within a raw-HTML tag slice,
+/// trimmed of any `#` fragment. `base` is the byte offset of the slice's first
+/// byte in the full source.
+fn html_attr_value_span(slice: &str, base: usize, attr: &str) -> Option<Span> {
+    // Locate the attribute name, then its quoted value. Case-insensitive
+    // attribute name, matching the tokenizer; the value delimiter is `"` or `'`.
     let lower = slice.to_ascii_lowercase();
     let mut search = 0;
-    while let Some(rel) = lower[search..].find("href") {
+    while let Some(rel) = lower[search..].find(attr) {
         let name_at = search + rel;
-        let after = name_at + "href".len();
+        let after = name_at + attr.len();
         // Skip optional whitespace, require `=`.
         let sbytes = slice.as_bytes();
         let mut i = after;
@@ -4553,6 +4592,36 @@ fn classify_link(url: &str, title: &str, doc_path: &Path, line: usize, span: Spa
     Some(Link { line, span, kind })
 }
 
+/// Classify an embed source URL (image / video / audio) into a [`Link`].
+///
+/// Mirrors [`classify_link`]'s resolution — same [`is_external`] oracle, same
+/// [`resolve_target_path`] coordinates — but lands every in-project destination
+/// in [`LinkKind::Embed`] regardless of extension: an embed asserts no relation,
+/// so it never becomes an [`LinkKind::IntraProject`] edge with a predicate and a
+/// backlink obligation. Returns `None` for an empty source and for a
+/// fragment-only one (`![](#x)`), neither of which denotes a file.
+fn classify_embed(url: &str, doc_path: &Path, line: usize, span: Span) -> Option<Link> {
+    if url.is_empty() || url.starts_with('#') {
+        return None;
+    }
+
+    let kind = if is_external(url) {
+        LinkKind::External {
+            url: url.to_string(),
+        }
+    } else {
+        let (path_str, _fragment) = split_url_fragment(url);
+        if path_str.is_empty() {
+            return None;
+        }
+        LinkKind::Embed {
+            target: resolve_target_path(path_str, doc_path),
+        }
+    };
+
+    Some(Link { line, span, kind })
+}
+
 /// Classify an import directive path into a [`Link`].
 fn classify_import(path: &str, doc_path: &Path, line: usize, span: Span) -> Link {
     let target = resolve_target_path(path, doc_path);
@@ -4984,6 +5053,19 @@ impl Tree {
                     let line = byte_offset_to_line(&self.source, node.span.start);
                     if let Some(link) = classify_link(url, title, doc_path, line, node.span) {
                         links.push(link);
+                    }
+                }
+                ElementKind::Image { url, .. }
+                | ElementKind::Video { url, .. }
+                | ElementKind::Audio { url, .. } => {
+                    // An embed is a path-bearing edge too (issue 058): its
+                    // target is existence-checked and re-rendered by the move
+                    // engine, so it belongs in the extracted link set. The
+                    // `Embed` kind keeps it out of the predicate / backlink /
+                    // connectivity passes, which key on `IntraProject`.
+                    let line = byte_offset_to_line(&self.source, node.span.start);
+                    if let Some(embed) = classify_embed(url, doc_path, line, node.span) {
+                        links.push(embed);
                     }
                 }
                 ElementKind::Import { path } => {
@@ -7620,6 +7702,180 @@ mod tests {
             matches!(&node.kind, ElementKind::ReferenceDef { url, .. } if url == "other.md"),
             "the ReferenceDef carries the destination: {:?}",
             node.kind
+        );
+    }
+
+    // --- Embeds are extracted edges (issue 058) ---
+
+    /// The single extracted link's kind for a source, asserting exactly one.
+    fn only_link_kind(source: &str) -> LinkKind {
+        let tree = parse(source);
+        let mut links = tree.links(Path::new("docs/doc.md"));
+        assert_eq!(links.len(), 1, "expected exactly one link: {links:?}");
+        links.remove(0).kind
+    }
+
+    #[test]
+    fn markdown_image_extracts_as_embed() {
+        match only_link_kind("![logo](img/logo.png)\n") {
+            LinkKind::Embed { target } => assert_eq!(
+                target,
+                Path::new("docs/img/logo.png"),
+                "an image embed resolves against the document's directory"
+            ),
+            other => panic!("expected an Embed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn markdown_video_and_audio_extract_as_embeds() {
+        // `classify_media` splits `![](*.mp4)` / `![](*.mp3)` into distinct node
+        // kinds; all three embed kinds must reach the same `Embed` edge.
+        for (source, expected) in [
+            ("![clip](media/demo.mp4)\n", "docs/media/demo.mp4"),
+            ("![tune](media/track.mp3)\n", "docs/media/track.mp3"),
+        ] {
+            match only_link_kind(source) {
+                LinkKind::Embed { target } => assert_eq!(
+                    target,
+                    Path::new(expected),
+                    "the embed target resolves: {source}"
+                ),
+                other => panic!("expected an Embed for {source}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn html_embed_tags_extract_as_embeds() {
+        for (source, expected) in [
+            ("<img src=\"img/logo.png\">\n", "docs/img/logo.png"),
+            (
+                "<video src=\"media/demo.mp4\"></video>\n",
+                "docs/media/demo.mp4",
+            ),
+            (
+                "<audio src=\"media/track.mp3\"></audio>\n",
+                "docs/media/track.mp3",
+            ),
+        ] {
+            match only_link_kind(source) {
+                LinkKind::Embed { target } => assert_eq!(
+                    target,
+                    Path::new(expected),
+                    "the HTML embed `src` resolves: {source}"
+                ),
+                other => panic!("expected an Embed for {source}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn embed_carries_no_predicate_edge() {
+        // An embed of a markdown file is still an `Embed`, never an
+        // `IntraProject` edge: it renders a resource, it asserts no relation, so
+        // it must derive no predicate and no backlink obligation.
+        match only_link_kind("![inline](other.md)\n") {
+            LinkKind::Embed { target } => assert_eq!(
+                target,
+                Path::new("docs/other.md"),
+                "a markdown embed is still an embed edge"
+            ),
+            other => panic!("expected an Embed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn external_embed_is_not_a_workspace_target() {
+        assert!(
+            matches!(
+                only_link_kind("![remote](https://example.com/a.png)\n"),
+                LinkKind::External { .. }
+            ),
+            "a remote embed source is external, never a workspace path"
+        );
+    }
+
+    #[test]
+    fn embed_with_empty_or_fragment_only_source_is_dropped() {
+        for source in ["![alt]()\n", "![alt](#x)\n"] {
+            let tree = parse(source);
+            let links = tree.links(Path::new("docs/doc.md"));
+            assert!(
+                links.is_empty(),
+                "an embed denoting no file forms no edge: {source} -> {links:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dest_span_markdown_embed() {
+        let (_span, slice) = only_link_dest_slice("![alt](img/logo.png)\n");
+        assert_eq!(
+            slice, "img/logo.png",
+            "the embed destination is the path run after the `!`"
+        );
+    }
+
+    #[test]
+    fn dest_span_markdown_embed_title_and_fragment_excluded() {
+        let source = "![alt](pic.svg#view \"Caption\")\n";
+        let (span, slice) = only_link_dest_slice(source);
+        assert_eq!(
+            slice, "pic.svg",
+            "neither the `#fragment` nor the title is in the embed's span"
+        );
+        assert_eq!(
+            &source[span.end..span.end + 5],
+            "#view",
+            "the span ends exactly before the `#`"
+        );
+    }
+
+    #[test]
+    fn dest_span_markdown_embed_angle_bracketed() {
+        let source = "![alt](<a pic.png>)\n";
+        let (span, slice) = only_link_dest_slice(source);
+        assert_eq!(
+            slice, "a pic.png",
+            "the angle-bracketed embed destination is the run inside `<>`"
+        );
+        assert_eq!(
+            source.as_bytes()[span.start - 1],
+            b'<',
+            "the edit range starts after the `<`"
+        );
+    }
+
+    #[test]
+    fn dest_span_html_embed_src() {
+        for (source, expected) in [
+            ("<img src=\"img/logo.png\">\n", "img/logo.png"),
+            ("<video src=\"media/demo.mp4\"></video>\n", "media/demo.mp4"),
+            (
+                "<audio src=\"media/track.mp3\"></audio>\n",
+                "media/track.mp3",
+            ),
+        ] {
+            let (_span, slice) = only_link_dest_slice(source);
+            assert_eq!(
+                slice, expected,
+                "the HTML embed destination is the `src` value: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn dest_span_reference_style_embed_is_none() {
+        // Like a reference-style link, a reference-style embed's destination
+        // lives in its ReferenceDef — the move engine edits that instead.
+        let source = "![alt][pic]\n\n[pic]: img/logo.png\n";
+        let tree = parse(source);
+        let links = tree.links(Path::new("doc.md"));
+        assert_eq!(links.len(), 1, "one embed extracted: {links:?}");
+        assert!(
+            link_destination_span(source, links[0].span).is_none(),
+            "a reference-style embed carries no inline destination span"
         );
     }
 
