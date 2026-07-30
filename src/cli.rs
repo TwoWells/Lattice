@@ -458,9 +458,14 @@ containment grants no membership, config, or reference privileges.
   - Cross-boundary references are `[external]` aliases — nothing new. A plain
     relative link (or a `../` escape) whose target lands in another scope encodes
     the host layout and fails the move test wholesale, so it is a DEFECT, not a
-    reference. Lattice names the fix:
+    reference. Lattice names the fix, and diagnoses WHICH boundary was crossed:
         error: link target `X` is outside this scope -- reference it through an
         `[external]` alias
+        error: link target `X` is in a git submodule (a separate repository,
+        treated as external) -- reference it through an `[external]` alias
+    The second wording is the markerless `.git` boundary. The fix is identical;
+    only the diagnosis differs, so an author is never sent hunting for a
+    `.lattice.toml` that is not there.
     A boundary-crossing path-shaped MENTION is its warn-tier sibling (a stale
     reference carrying the same alias suggestion). Rewrite the reference as
     `{Name}/path` and alias `Name` in the referrer's own `[external]` table
@@ -853,6 +858,13 @@ mod tests {
                 && CONFIG_REFERENCE.contains("reference it through an")
                 && CONFIG_REFERENCE.contains("`[external]` alias"),
             "the reference names the steering diagnostic"
+        );
+        // Both wordings, since issue 052 gave the markerless `.git` crossing
+        // its own diagnosis: quoting only one leaves the other unrecognizable.
+        assert!(
+            CONFIG_REFERENCE.contains("is in a git submodule (a separate repository,")
+                && CONFIG_REFERENCE.contains("treated as external)"),
+            "the reference quotes the git-submodule variant of the steering diagnostic"
         );
         // The override-vs-scope rule of thumb (decision 019 clause 5).
         assert!(

@@ -34,6 +34,7 @@ mod server;
 mod span;
 mod structural;
 mod toml;
+mod uri;
 mod validation;
 mod workspace;
 mod yaml;

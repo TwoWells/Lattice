@@ -24,6 +24,7 @@ use crate::line_index::LineIndex;
 use crate::lsp;
 use crate::overrides::{self, OverrideVerdicts, VerdictKind};
 use crate::span::Span;
+use crate::uri::{path_to_uri, uri_to_path};
 use crate::validation::{self, Diagnostic, Severity};
 use crate::workspace::{
     Boundary, BoundaryKind, FileData, Workspace, WorkspaceView, compute_structural,
@@ -154,7 +155,7 @@ struct Workspaces {
     /// and force-invalidated on every marker event (the config is unsynced,
     /// so no `didOpen` boundary ever resets its record).
     published: HashMap<String, PublishedDiagnostics>,
-    /// URIs of documents currently open in the editor — live between
+    /// Absolute paths of documents currently open in the editor — live between
     /// `textDocument/didOpen` and `textDocument/didClose`.
     ///
     /// The editor buffer is authoritative for these (decision 017 §3): a
@@ -163,19 +164,40 @@ struct Workspaces {
     /// buffer with stale bytes — and an open file edited in the editor already
     /// reaches the server through `didChange`, so the watcher event would be a
     /// second source of truth (the issue 009 duplication class). A `changed`
-    /// event is therefore dropped while its URI is in this set **and** the
+    /// event is therefore dropped while its path is in this set **and** the
     /// buffer holds state disk doesn't ([`Self::dirty_documents`], issue 061);
     /// create/delete membership events are honored regardless (ticket
     /// server 09). It also pins buffer authority across a workspace-folder
     /// change: a folder added over an open document keeps the buffer, and a
     /// folder removed under one keeps it serving rootless.
-    open_documents: HashSet<String>,
+    ///
+    /// # Keying (issue 069)
+    ///
+    /// Keyed by the **decoded path** [`uri_to_path`] yields, exactly like
+    /// [`Self::documents`] — never by the raw URI string. Arbitration compares
+    /// what a watcher event and a `didOpen` name, and two components may spell
+    /// one file differently (one percent-encodes a space, the other does not),
+    /// so a URI-keyed check is spelling-dependent: it misses silently and fails
+    /// open, applying disk over a live buffer. Deciding identity once, at the
+    /// boundary, removes the dependence structurally. It is also the premise
+    /// decision 024's buffer locality rests on — one buffer per document — which
+    /// URI-spelling aliasing would break at the level of identity.
+    ///
+    /// **Out of scope:** symlink and case-insensitivity aliasing. Two paths
+    /// that differ by a symlink hop, or only in case on a case-insensitive
+    /// filesystem, are still two keys here. Collapsing them means
+    /// `fs::canonicalize`, a semantic change — it resolves symlinks (which
+    /// issue 047 deliberately keeps distinct from the client's folder spelling)
+    /// and fails on a path not yet on disk (a `didOpen` for a new file) — so it
+    /// is deferred to its own decision. This keying fixes **spelling** aliasing
+    /// (percent-encoding variants) only.
+    open_documents: HashSet<PathBuf>,
     /// Open documents whose buffer may hold state that is not on disk: opened
     /// with text diverging from the file's bytes, or edited (`didChange`)
     /// since the last save.
     ///
     /// This is the strict buffer-wins set — decision 017 §3 as narrowed by
-    /// issue 061. A watched `changed` event is dropped only for these URIs,
+    /// issue 061. A watched `changed` event is dropped only for these paths,
     /// because their buffer is the sole copy of unsaved state. An open
     /// document *not* in this set holds a mere snapshot of its last save: an
     /// external process rewriting the file makes disk strictly newer, so the
@@ -184,7 +206,10 @@ struct Workspaces {
     /// pre-rewrite content indefinitely, and every cross-file predicate judged
     /// against it is a phantom — issue 061's mass-`lattice mv` shape, where
     /// the in-place link rewrites of open counterpart files never landed.
-    dirty_documents: HashSet<String>,
+    ///
+    /// Keyed by decoded path on the same terms, and for the same reason, as
+    /// [`Self::open_documents`] (issue 069).
+    dirty_documents: HashSet<PathBuf>,
     /// A borrowable default configuration for rootless single-file views
     /// (issue 051): a document outside every root parses and serves its
     /// document-scoped features under defaults, with the graph tier inert.
@@ -549,9 +574,10 @@ impl Workspaces {
     /// entries from the old absolute path to the new one and reparses each under
     /// its (possibly changed) primary root, rather than re-reading a whole
     /// scope. A file rename moves the single entry; a directory rename moves
-    /// every document under the old prefix. The `open_documents` set and the
-    /// per-URI `published` cache are re-keyed alongside so buffer authority and
-    /// publication diffing follow the file. Returns whether anything moved.
+    /// every document under the old prefix. The `open_documents` /
+    /// `dirty_documents` sets and the per-URI `published` cache are re-keyed
+    /// alongside so buffer authority and publication diffing follow the file.
+    /// Returns whether anything moved.
     ///
     /// Reparsing (not a bare key swap) is required because a document parses
     /// relative to its root, and the link classification / structural existence
@@ -587,14 +613,13 @@ impl Workspaces {
             // key so an open renamed file stays editor-authoritative (its
             // divergence state included) and its stale publication under the
             // old URI is cleared.
+            if self.open_documents.remove(&old_key) {
+                self.open_documents.insert(new_key.clone());
+            }
+            if self.dirty_documents.remove(&old_key) {
+                self.dirty_documents.insert(new_key.clone());
+            }
             let old_uri = path_to_uri(&old_key);
-            let new_uri = path_to_uri(&new_key);
-            if self.open_documents.remove(&old_uri) {
-                self.open_documents.insert(new_uri.clone());
-            }
-            if self.dirty_documents.remove(&old_uri) {
-                self.dirty_documents.insert(new_uri);
-            }
             if self.published.remove(&old_uri).is_some() {
                 cleared.push(old_uri);
             }
@@ -886,7 +911,7 @@ impl Workspaces {
             .collect();
         for key in affected {
             let new_primary = self.deepest_root_for(&key);
-            let is_open = self.open_documents.contains(&path_to_uri(&key));
+            let is_open = self.open_documents.contains(&key);
             if new_primary.is_none() && !is_open {
                 self.documents.remove(&key);
             } else {
@@ -1032,7 +1057,7 @@ impl Workspaces {
         self.rebuild_git_boundaries();
         for key in self.document_keys_under(scope_root) {
             let new_primary = self.deepest_root_for(&key);
-            let is_open = self.open_documents.contains(&path_to_uri(&key));
+            let is_open = self.open_documents.contains(&key);
             if new_primary.is_none() && !is_open {
                 self.documents.remove(&key);
             } else {
@@ -1346,16 +1371,6 @@ fn register_watched_files(connection: &Connection) -> Result<()> {
     );
     connection.sender.send(Message::Request(req))?;
     Ok(())
-}
-
-/// Convert an LSP URI to a filesystem path.
-fn uri_to_path(uri: &str) -> PathBuf {
-    PathBuf::from(uri.strip_prefix("file://").unwrap_or(uri))
-}
-
-/// Convert a filesystem path to an LSP URI string.
-fn path_to_uri(path: &Path) -> String {
-    format!("file://{}", path.display())
 }
 
 /// Whether a URI names a markdown file (a case-insensitive `.md` extension),
@@ -4537,26 +4552,24 @@ fn handle_notification(
         lsp::method::DID_OPEN => {
             let params: lsp::DidOpenTextDocumentParams = serde_json::from_value(notif.params)?;
             // The editor now owns this document's truth: while it is open, a
-            // watched-file `changed` event for the same URI is dropped so the
+            // watched-file `changed` event for the same file is dropped so the
             // synced buffer is never clobbered by stale disk bytes (decision 017
-            // §3, ticket server 09).
-            workspaces
-                .open_documents
-                .insert(params.text_document.uri.clone());
+            // §3, ticket server 09). Buffer authority is recorded against the
+            // decoded path, so a watcher that spells the URI differently still
+            // names the same document (issue 069).
+            let abs = uri_to_path(&params.text_document.uri);
+            workspaces.open_documents.insert(abs.clone());
             // Divergence at the open boundary (issue 061): a buffer opened
             // with the file's current bytes is a snapshot disk may later
             // refresh; one opened divergent (an editor attaching with
             // unflushed modifications, or no file on disk yet) carries state
             // that exists nowhere else and keeps strict buffer authority.
-            let abs = uri_to_path(&params.text_document.uri);
             let matches_disk =
                 std::fs::read_to_string(&abs).is_ok_and(|disk| disk == params.text_document.text);
             if matches_disk {
-                workspaces.dirty_documents.remove(&params.text_document.uri);
+                workspaces.dirty_documents.remove(&abs);
             } else {
-                workspaces
-                    .dirty_documents
-                    .insert(params.text_document.uri.clone());
+                workspaces.dirty_documents.insert(abs);
             }
             // Index the buffer wherever it belongs: a document inside a scanned
             // workspace folder updates that workspace; one opened outside every
@@ -4573,21 +4586,22 @@ fn handle_notification(
             // so watched-file `changed` events for it are honored again (decision
             // 017 §3), and per the LSP spec content authority reverts to the
             // filesystem — reconcile the index to disk (issue 046).
-            workspaces.open_documents.remove(&params.text_document.uri);
-            workspaces.dirty_documents.remove(&params.text_document.uri);
+            let abs = uri_to_path(&params.text_document.uri);
+            workspaces.open_documents.remove(&abs);
+            workspaces.dirty_documents.remove(&abs);
             reconcile_closed_document(connection, workspaces, &params.text_document.uri)?;
         }
         lsp::method::DID_SAVE => {
             let params: lsp::DidSaveTextDocumentParams = serde_json::from_value(notif.params)?;
             // The buffer was flushed: it no longer holds state disk doesn't,
             // so a later watched change may reconcile it (issue 061).
-            workspaces.dirty_documents.remove(&params.text_document.uri);
+            let abs = uri_to_path(&params.text_document.uri);
+            workspaces.dirty_documents.remove(&abs);
             if let Some(text) = &params.text {
                 // The save payload carries the text: upsert it by path.
                 workspaces.sync_document_content(&params.text_document.uri, text);
             } else {
                 // No text in the save payload: reconcile the document to disk.
-                let abs = uri_to_path(&params.text_document.uri);
                 workspaces.update_from_disk(&abs);
             }
             // A save is answered unconditionally (issue 062): the delta diff
@@ -4600,9 +4614,8 @@ fn handle_notification(
             if let Some(change) = params.content_changes.into_iter().last() {
                 // The buffer now holds unsaved edits: strict buffer authority
                 // until the next save (issue 061).
-                workspaces
-                    .dirty_documents
-                    .insert(params.text_document.uri.clone());
+                let abs = uri_to_path(&params.text_document.uri);
+                workspaces.dirty_documents.insert(abs.clone());
                 // A didChange targets an already-open (already-indexed) document,
                 // so it never changes membership. Upsert the buffer, then choose
                 // the publish path from the document's placement:
@@ -4617,7 +4630,6 @@ fn handle_notification(
                 // - rootless (issue 051): publish nothing; the graph tier has
                 //   nothing to say for a single file.
                 workspaces.sync_document_content(&params.text_document.uri, &change.text);
-                let abs = uri_to_path(&params.text_document.uri);
                 let publish = match workspaces
                     .documents
                     .get(&abs)
@@ -4766,6 +4778,11 @@ fn handle_watched_files_change(
         if !is_markdown_uri(&change.uri) {
             continue;
         }
+        // Decide identity once, here: the buffer-authority check below and the
+        // store lookup are both by decoded path, so a watcher event that spells
+        // the URI differently from the `didOpen` that recorded the buffer still
+        // resolves to the same document (issue 069).
+        let abs = uri_to_path(&change.uri);
         match change.change_type {
             // `changed` carries disk content. It is dropped only while the
             // open buffer holds state disk doesn't — unsaved edits, or a
@@ -4777,8 +4794,8 @@ fn handle_watched_files_change(
             // superseded — disk is strictly newer — so it falls through and
             // reconciles from disk exactly like a closed file.
             lsp::file_change_type::CHANGED
-                if workspaces.open_documents.contains(&change.uri)
-                    && workspaces.dirty_documents.contains(&change.uri) =>
+                if workspaces.open_documents.contains(&abs)
+                    && workspaces.dirty_documents.contains(&abs) =>
             {
                 tracing::warn!(
                     uri = %change.uri,
@@ -4795,18 +4812,18 @@ fn handle_watched_files_change(
             lsp::file_change_type::CREATED
             | lsp::file_change_type::CHANGED
             | lsp::file_change_type::DELETED => {
-                let abs = uri_to_path(&change.uri);
-                if workspaces.deepest_root_for(&abs).is_some() {
-                    match workspaces.apply_from_disk(&abs) {
-                        DiskUpdate::Membership => membership_changed = true,
-                        DiskUpdate::Content => content_changed.push(abs),
-                        // Nothing indexed moved (e.g. a delete echo for a file
-                        // never indexed, or bytes the server already holds):
-                        // no debt, and no re-materialization to force.
-                        DiskUpdate::Untouched => continue,
-                    }
-                    changed_docs.insert(change.uri.clone());
+                if workspaces.deepest_root_for(&abs).is_none() {
+                    continue;
                 }
+                match workspaces.apply_from_disk(&abs) {
+                    DiskUpdate::Membership => membership_changed = true,
+                    DiskUpdate::Content => content_changed.push(abs),
+                    // Nothing indexed moved (e.g. a delete echo for a file
+                    // never indexed, or bytes the server already holds):
+                    // no debt, and no re-materialization to force.
+                    DiskUpdate::Untouched => continue,
+                }
+                changed_docs.insert(change.uri.clone());
             }
             _ => {}
         }
@@ -6095,25 +6112,6 @@ mod tests {
         assert_eq!(
             children[1].name, "Another",
             "second child should be Another"
-        );
-    }
-
-    #[test]
-    fn uri_to_path_extracts_path() {
-        let path = uri_to_path("file:///home/user/project/doc.md");
-        assert_eq!(
-            path,
-            PathBuf::from("/home/user/project/doc.md"),
-            "should extract filesystem path from URI"
-        );
-    }
-
-    #[test]
-    fn path_to_uri_creates_file_uri() {
-        let uri = path_to_uri(Path::new("/home/user/project/doc.md"));
-        assert_eq!(
-            uri, "file:///home/user/project/doc.md",
-            "should create file:// URI"
         );
     }
 
@@ -9925,7 +9923,7 @@ mod tests {
 
         let mut workspaces = Workspaces::new();
         // didOpen with an unsaved buffer diverging from disk, before any folder.
-        workspaces.open_documents.insert(uri.clone());
+        workspaces.open_documents.insert(abs.clone());
         workspaces.sync_document_content(&uri, "# In Buffer\n\n# In Buffer\n");
         assert!(
             workspaces
@@ -9976,7 +9974,7 @@ mod tests {
 
         let mut workspaces = Workspaces::new();
         workspaces.add_folder(&path_to_uri(&root));
-        workspaces.open_documents.insert(uri.clone());
+        workspaces.open_documents.insert(abs.clone());
         workspaces.sync_document_content(&uri, "# Title\n\n## Section\n");
         assert!(
             document_symbols(&workspaces, &uri).is_some_and(|s| !s.is_empty()),
@@ -10014,7 +10012,7 @@ mod tests {
         workspaces.add_folder(&path_to_uri(&root));
         // Open a.md; b.md stays scan-only.
         let a_uri = path_to_uri(&a_abs);
-        workspaces.open_documents.insert(a_uri.clone());
+        workspaces.open_documents.insert(a_abs.clone());
         workspaces.sync_document_content(&a_uri, "# A\n");
         assert_eq!(workspaces.documents.len(), 2, "two documents were scanned");
 
@@ -10122,7 +10120,7 @@ mod tests {
         let mut workspaces = Workspaces::new();
         workspaces.add_folder(&path_to_uri(&root));
         // Open the buffer so it survives the removal (decision 017 §3).
-        workspaces.open_documents.insert(doc_uri.clone());
+        workspaces.open_documents.insert(doc_abs.clone());
         workspaces.sync_document_content(&doc_uri, "[peer](peer.md \"references\")\n");
         assert_eq!(
             workspaces
@@ -10488,7 +10486,7 @@ mod tests {
 
         // Opened directly, the document is rootless (excluded from the host graph)
         // and serves document-scoped features (symbols) under defaults.
-        workspaces.open_documents.insert(inner_uri.clone());
+        workspaces.open_documents.insert(inner_abs.clone());
         workspaces.sync_document_content(&inner_uri, "# Vendored\n\n## Section\n");
         assert!(
             workspaces
@@ -10674,7 +10672,7 @@ mod tests {
         workspaces.add_folder(&path_to_uri(&root));
         workspaces.add_folder(&path_to_uri(&sub));
         // peer.md is open in the editor; inner.md stays scan-only.
-        workspaces.open_documents.insert(peer_uri.clone());
+        workspaces.open_documents.insert(peer_abs.clone());
         workspaces.sync_document_content(&peer_uri, "# Peer\n");
         assert_eq!(
             workspaces
@@ -11636,6 +11634,112 @@ mod tests {
         );
 
         shutdown(&client, server_thread);
+    }
+
+    #[test]
+    fn buffer_authority_matches_on_identity_not_uri_spelling() {
+        // Issue 069: a spec-compliant client percent-encodes the URI of a path
+        // holding a space, and a second courier (a watcher, another client)
+        // may spell the same file without the escape. Identity is decided once
+        // at the boundary — `uri_to_path` — so both spellings name one
+        // document, and the buffer-wins verdict of decision 017 §3 cannot
+        // depend on which spelling arrived.
+        //
+        // Against the raw-URI-keyed sets this replaces, the encoded `didOpen`
+        // recorded the escape verbatim: the matching spelling was dropped and
+        // the differing one applied, so disk silently clobbered the live
+        // buffer (and the store key held a literal `%20` that matched no file
+        // on disk in the first place).
+        let dir = workspace_with_files(&[(".lattice.toml", ""), ("my note.md", "# On Disk\n")]);
+        let abs = dir.path().join("my note.md");
+        let encoded_uri = path_to_uri(&abs);
+        assert!(
+            encoded_uri.ends_with("/my%20note.md"),
+            "the emitted URI percent-encodes the space: {encoded_uri}"
+        );
+        // The same file spelled the way a client that never encodes sends it.
+        let raw_uri = format!("file://{}", abs.display());
+        assert_ne!(
+            raw_uri, encoded_uri,
+            "the two spellings of one file are textually distinct"
+        );
+
+        let mut workspaces = scan_workspaces(&dir);
+        let (server, _client) = Connection::memory();
+
+        // didOpen under the ENCODED spelling, with text diverging from disk:
+        // the buffer is now the sole copy of unsaved state.
+        drive(
+            &server,
+            &mut workspaces,
+            lsp::method::DID_OPEN,
+            open_params(&encoded_uri, "# In Buffer\n"),
+        );
+        assert_eq!(
+            workspaces
+                .documents
+                .get(&abs)
+                .map(|doc| doc.data.tree.source().to_string())
+                .as_deref(),
+            Some("# In Buffer\n"),
+            "the encoded URI indexed the buffer at the real path, not at a literal `%20` key: {:?}",
+            workspaces.documents.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            workspaces.documents.len(),
+            1,
+            "one file is one document — an undecoded key would split it in two: {:?}",
+            workspaces.documents.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            workspaces.open_documents.contains(&abs) && workspaces.dirty_documents.contains(&abs),
+            "buffer authority is recorded under the decoded path"
+        );
+
+        // An external process rewrites the file. A watched `changed` event
+        // under EITHER spelling must be dropped — the buffer holds unsaved
+        // state, whichever way the courier spells the file.
+        fs::write(&abs, "# Rewritten On Disk\n").expect("rewrite the file under the open buffer");
+        for uri in [&encoded_uri, &raw_uri] {
+            drive(
+                &server,
+                &mut workspaces,
+                lsp::method::DID_CHANGE_WATCHED_FILES,
+                watched_params(uri, lsp::file_change_type::CHANGED),
+            );
+            let source = workspaces
+                .documents
+                .get(&abs)
+                .map(|doc| doc.data.tree.source().to_string());
+            assert_eq!(
+                source.as_deref(),
+                Some("# In Buffer\n"),
+                "the watched change spelled `{uri}` is dropped — buffer wins on identity, not spelling"
+            );
+        }
+
+        // The release side agrees on identity too: a `didClose` under the OTHER
+        // spelling clears the same document's authority and hands content back
+        // to the filesystem (issue 046).
+        drive(
+            &server,
+            &mut workspaces,
+            lsp::method::DID_CLOSE,
+            serde_json::json!({ "textDocument": { "uri": raw_uri } }),
+        );
+        assert!(
+            !workspaces.open_documents.contains(&abs) && !workspaces.dirty_documents.contains(&abs),
+            "a didClose under a different spelling clears the same document's authority"
+        );
+        assert_eq!(
+            workspaces
+                .documents
+                .get(&abs)
+                .map(|doc| doc.data.tree.source().to_string())
+                .as_deref(),
+            Some("# Rewritten On Disk\n"),
+            "the close reconciled the released document from disk"
+        );
     }
 
     #[test]
@@ -13006,9 +13110,10 @@ mod tests {
             !workspaces.documents.contains_key(&uri_to_path(&config_uri)),
             "the TOML is never indexed as a markdown document"
         );
+        let config_abs = uri_to_path(&config_uri);
         assert!(
-            !workspaces.open_documents.contains(&config_uri)
-                && !workspaces.dirty_documents.contains(&config_uri),
+            !workspaces.open_documents.contains(&config_abs)
+                && !workspaces.dirty_documents.contains(&config_abs),
             "the config joins no buffer-authority set — buffer-wins stays markdown-only"
         );
 
