@@ -35,6 +35,18 @@
 //! `[external]` alias config are untouched by construction — they are the
 //! post-move judgment surface (decision 020 clause 5).
 //!
+//! # The fragment axis: heading rename (issue 057)
+//!
+//! A heading rename is the same operation one axis over — a coordinate change on
+//! the *fragment* axis, where a file move is one on the *path* axis — so it rides
+//! the same machinery: [`compute_heading_rename_edits`] assembles a cross-file
+//! edit set out of the same span-precise destination extraction
+//! ([`crate::block::link_fragment_span`], the path-axis primitive one step
+//! further along the destination run) and the same reference-definition
+//! resolution. The two axes are exact mirrors: a file move re-renders the path
+//! and rides the fragment along verbatim; a heading rename re-renders the
+//! fragment and leaves the path byte-identical.
+//!
 //! # What the engine does not do (a sketch for the property/fuzz arm)
 //!
 //! The engine is read-only: it computes spans and replacement text but never
@@ -64,7 +76,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use thiserror::Error;
 
-use crate::block::{self, LinkKind};
+use crate::block::{self, HeadingId, LinkKind};
+use crate::config::FragmentAlgorithm;
 use crate::fm::{self, FmNode, FmValue};
 use crate::span::Span;
 use crate::validation;
@@ -818,6 +831,321 @@ fn push_edit(
 }
 
 // ---------------------------------------------------------------------------
+// The fragment axis: heading rename (issue 057, decision 020)
+// ---------------------------------------------------------------------------
+
+/// Compute the complete, forced edit set for renaming the heading on
+/// `heading_line` of `doc_rel` to `new_name`.
+///
+/// `doc_rel` is the document's key in `workspace`'s coordinates;
+/// `heading_line` is its heading's 1-based source line (as carried by
+/// [`crate::block::Heading::line`]). Returns per-file byte-span edits keyed by
+/// absolute path — the same transport [`compute_move_edits`] produces, so both
+/// axes reach an `lsp::WorkspaceEdit` (or disk) through one mapping — or `None`
+/// when `doc_rel` holds no heading on that line.
+///
+/// The edit set covers exactly the forced coordinate changes:
+/// 1. the heading's own text (its `text_span`);
+/// 2. every cross-file link fragment that resolves to the renamed heading —
+///    inline, angle-bracketed, `@import`-free, raw-HTML `href`, and
+///    reference-style (edited once at the definition's URL);
+/// 3. every same-document `#anchor` in `doc_rel` itself (validated since issue
+///    021, so a stale one is an error);
+/// 4. a *sibling* fragment whose slug the rename renumbers — a duplicate-slug
+///    heading whose `-1` suffix the rename dissolves is a moved coordinate too.
+///
+/// Path spellings are never touched (the fragment is spliced alone), so a link
+/// with no fragment, an embed (which carries no fragment predicate), a backlink
+/// entry, and every prose / backticked / exception-key mention of the old title
+/// are left for judgment — decision 020 clause 5, verbatim on this axis.
+///
+/// The governing property carries over: a heading rename changes fragment
+/// coordinates, not the graph. A clean workspace stays clean, and pre-existing
+/// drift (a fragment that resolved to nothing before) survives verbatim.
+pub fn compute_heading_rename_edits(
+    workspace: &impl WorkspaceLike,
+    doc_rel: &Path,
+    heading_line: usize,
+    new_name: &str,
+) -> Option<BTreeMap<PathBuf, Vec<MoveTextEdit>>> {
+    let root = workspace.root();
+    let doc_data = workspace.file(doc_rel)?;
+    let doc_abs = root.join(doc_rel);
+    let index = doc_data
+        .headings
+        .iter()
+        .position(|heading| heading.line == heading_line)?;
+    let text_span = doc_data.headings[index].text_span;
+
+    let mut edits: BTreeMap<PathBuf, Vec<MoveTextEdit>> = BTreeMap::new();
+    push_edit(
+        &mut edits,
+        doc_abs.clone(),
+        MoveTextEdit {
+            span: text_span,
+            new_text: new_name.to_string(),
+        },
+    );
+
+    // The post-rename coordinates come from re-parsing the renamed document, so
+    // every slug is produced by the one slugger the fragment diagnostics read
+    // (`Tree::headings`, dedup counters included) rather than a second
+    // implementation that could drift from it.
+    let source = doc_data.tree.source();
+    let mut renamed = String::with_capacity(source.len() + new_name.len());
+    renamed.push_str(&source[..text_span.start]);
+    renamed.push_str(new_name);
+    renamed.push_str(&source[text_span.end..]);
+    let renamed_data = crate::workspace::parse_content(&renamed, &doc_abs, workspace.config());
+    if renamed_data.headings.len() != doc_data.headings.len() {
+        // The new name changed the document's heading structure (it opened a
+        // block of its own, or closed one), so heading `index` no longer names
+        // the same node and no fragment mapping can be trusted. Return the
+        // heading edit alone: honest-but-partial, with any drift visible as a
+        // diagnostic rather than a wrong retarget.
+        return Some(edits);
+    }
+
+    let map = FragmentMap {
+        old: &doc_data.headings,
+        new: &renamed_data.headings,
+        anchors: &renamed_data.anchors,
+        algorithm: workspace.config().policy.fragments,
+    };
+    collect_fragment_edits(workspace, doc_rel, &map, text_span, &mut edits);
+
+    for file_edits in edits.values_mut() {
+        file_edits.sort_by_key(|e| (e.span.start, e.span.end));
+    }
+    Some(edits)
+}
+
+/// Collect the forced fragment edits across every file in the workspace.
+///
+/// Enumeration is the referrer set the references machinery answers: every
+/// cached link whose target resolves to `doc_rel` and carries a fragment, plus
+/// `doc_rel`'s own same-document anchors. A reference-style link's fragment
+/// lives in its definition's URL, so it is edited there and deduped per
+/// definition (N call sites, one edit).
+fn collect_fragment_edits(
+    workspace: &impl WorkspaceLike,
+    doc_rel: &Path,
+    map: &FragmentMap<'_>,
+    heading_span: Span,
+    edits: &mut BTreeMap<PathBuf, Vec<MoveTextEdit>>,
+) {
+    let root = workspace.root();
+    for (source_key, file_data) in workspace.files_iter() {
+        let is_renamed_doc = source_key.as_path() == doc_rel;
+        let src_text = file_data.tree.source();
+        // Fragment spans already edited in this file, so multiple reference-style
+        // call sites sharing one definition produce one edit.
+        let mut edited: Vec<Span> = Vec::new();
+
+        for link in &file_data.links {
+            let fragment = match &link.kind {
+                // A same-document anchor resolves against its own file's
+                // headings, so only the renamed document's anchors are ours.
+                LinkKind::IntraDocument { fragment } if is_renamed_doc => fragment.as_str(),
+                LinkKind::IntraProject {
+                    target,
+                    fragment: Some(fragment),
+                    ..
+                } if target_to_rel_key(root, target) == doc_rel => fragment.as_str(),
+                // Everything else carries no fragment resolving to this heading:
+                // an external URL, a non-markdown link, a fragmentless link, and
+                // an embed — whose `#` suffix is not a heading predicate (it is
+                // never resolved or checked, issue 058), so it is not a
+                // coordinate this rename moves.
+                _ => continue,
+            };
+
+            let Some(new_fragment) = map.retarget(fragment) else {
+                continue;
+            };
+
+            let span = if let Some(inline) = block::link_fragment_span(src_text, link.span) {
+                inline
+            } else if let Some(url_span) = reference_def_url_span(&file_data.tree, link.span) {
+                let raw = &src_text[url_span.start..url_span.end];
+                let Some(hash) = raw.find('#') else {
+                    continue;
+                };
+                Span::new(url_span.start + hash + 1, url_span.end)
+            } else {
+                continue;
+            };
+
+            // A link nested inside the renamed heading's own text is replaced
+            // wholesale by the heading edit; a second edit inside that range
+            // would overlap it.
+            if is_renamed_doc && span.start < heading_span.end && heading_span.start < span.end {
+                continue;
+            }
+            if edited.contains(&span) {
+                continue;
+            }
+            edited.push(span);
+            push_edit(
+                edits,
+                root.join(source_key),
+                MoveTextEdit {
+                    span,
+                    new_text: new_fragment,
+                },
+            );
+        }
+    }
+}
+
+/// Which anchor form a fragment matched a heading through — the pre-rename
+/// coordinate's "spelling style", the fragment-axis analogue of [`PathStyle`].
+///
+/// A retargeted fragment is re-rendered in the same form it was authored in, so
+/// a document whose fragments are spelled in one algorithm keeps that algorithm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SlugForm {
+    /// The heading's explicit `{#id}` attribute.
+    Explicit,
+    /// The computed GitHub slug.
+    Github,
+    /// The computed GitLab slug.
+    Gitlab,
+    /// The computed VS Code slug.
+    Vscode,
+}
+
+impl SlugForm {
+    /// The forms a fragment may resolve through under `algorithm`, in
+    /// resolution order. An explicit `{#id}` is always eligible (it is not a
+    /// computed slug, so no algorithm gates it — mirroring
+    /// `validation::check_fragment`); the computed forms are gated exactly as
+    /// the fragment check gates them.
+    fn eligible(algorithm: Option<FragmentAlgorithm>) -> &'static [Self] {
+        match algorithm {
+            Some(FragmentAlgorithm::Github) => &[Self::Explicit, Self::Github],
+            Some(FragmentAlgorithm::Gitlab) => &[Self::Explicit, Self::Gitlab],
+            Some(FragmentAlgorithm::Vscode) => &[Self::Explicit, Self::Vscode],
+            None => &[Self::Explicit, Self::Github, Self::Gitlab, Self::Vscode],
+        }
+    }
+
+    /// A heading's anchor under this form, or `None` when the heading has no
+    /// such form (a computed heading has no explicit id, and an explicitly
+    /// pinned one computes no slug).
+    fn coordinate(self, heading: &block::Heading) -> Option<&str> {
+        match (&heading.id, self) {
+            (HeadingId::Explicit(id), Self::Explicit) => Some(id),
+            (
+                HeadingId::Computed {
+                    github,
+                    gitlab,
+                    vscode,
+                },
+                form,
+            ) => match form {
+                Self::Github => Some(github),
+                Self::Gitlab => Some(gitlab),
+                Self::Vscode => Some(vscode),
+                Self::Explicit => None,
+            },
+            (HeadingId::Explicit(_), _) => None,
+        }
+    }
+}
+
+/// The fragment-axis coordinate map a single heading rename induces on one
+/// document: its heading anchors before and after, and the effective fragment
+/// algorithm.
+///
+/// Resolution mirrors `validation::check_fragment` exactly — the same eligible
+/// forms under the same `[policy] fragments` pin — with one addition the
+/// diagnostic has no need for: *which* heading a fragment resolves to
+/// (document order, first match wins, as a renderer resolves duplicate ids).
+/// That identity is what keeps a rename from silently retargeting a referrer:
+/// an edit is emitted only when the same heading's coordinate changed, never
+/// because some *other* heading answers to the old spelling.
+struct FragmentMap<'a> {
+    /// The document's headings before the rename.
+    old: &'a [block::Heading],
+    /// The same headings after it, positionally aligned with `old`.
+    new: &'a [block::Heading],
+    /// The document's explicit raw-HTML anchors after the rename.
+    anchors: &'a [block::Anchor],
+    /// The configured fragment algorithm, or `None` when unpinned.
+    algorithm: Option<FragmentAlgorithm>,
+}
+
+impl FragmentMap<'_> {
+    /// The retargeted fragment for `fragment`, or `None` when the rename forces
+    /// no edit on it.
+    ///
+    /// `None` covers every non-forced case: the top-of-document idioms, a
+    /// fragment pinned by an explicit raw-HTML anchor (that coordinate does not
+    /// move, so the reference stays valid), a fragment that resolved to nothing
+    /// before the rename (pre-existing drift, which must survive verbatim), a
+    /// fragment whose heading's coordinate is unchanged (a same-slug sibling,
+    /// or a heading whose `{#id}` pins it), and the ambiguous case where no
+    /// post-rename spelling names the same heading unambiguously — refused
+    /// rather than guessed, leaving the drift visible as a diagnostic.
+    fn retarget(&self, fragment: &str) -> Option<String> {
+        // `#` and `#top` scroll to the top of the document regardless of
+        // headings, exactly as `check_fragment` treats them: never a heading
+        // coordinate, so never renamed.
+        if fragment.is_empty() || fragment.eq_ignore_ascii_case("top") {
+            return None;
+        }
+        // An explicit `<a id>` / `<a name>` anchor with this id keeps the
+        // fragment resolving after the rename (issue 025), so no edit is
+        // forced — the author pinned a coordinate the rename does not move.
+        if self.anchors.iter().any(|anchor| anchor.id == fragment) {
+            return None;
+        }
+        let (index, form) = self.resolve(self.old, fragment)?;
+        let new_fragment = self.new_coordinate(index, form)?;
+        if new_fragment == fragment {
+            return None;
+        }
+        // The new spelling must name the very heading the old one did. It
+        // cannot, for instance, be shadowed by an earlier heading that now
+        // answers to it.
+        if self.resolve(self.new, new_fragment)?.0 != index {
+            return None;
+        }
+        Some(new_fragment.to_string())
+    }
+
+    /// The index of the first heading `fragment` resolves to, with the form it
+    /// matched through — `validation::check_fragment`'s predicate, plus the
+    /// identity of the match.
+    fn resolve(&self, headings: &[block::Heading], fragment: &str) -> Option<(usize, SlugForm)> {
+        headings.iter().enumerate().find_map(|(index, heading)| {
+            SlugForm::eligible(self.algorithm)
+                .iter()
+                .find(|form| form.coordinate(heading) == Some(fragment))
+                .map(|form| (index, *form))
+        })
+    }
+
+    /// The post-rename coordinate of heading `index`, in the form the authored
+    /// fragment used where the renamed heading still has that form.
+    ///
+    /// A heading that gained or lost an explicit `{#id}` has no counterpart for
+    /// the authored form; it falls back to the pinned id, or to the effective
+    /// algorithm's slug (GitHub's when unpinned — the first form
+    /// [`SlugForm::eligible`] offers).
+    fn new_coordinate(&self, index: usize, form: SlugForm) -> Option<&str> {
+        let heading = self.new.get(index)?;
+        if let Some(coordinate) = form.coordinate(heading) {
+            return Some(coordinate);
+        }
+        SlugForm::eligible(self.algorithm)
+            .iter()
+            .find_map(|fallback| fallback.coordinate(heading))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // CLI surface: `lattice mv <old> <new>` (ticket mv/03, decision 020 clause 3)
 // ---------------------------------------------------------------------------
 
@@ -1092,28 +1420,9 @@ mod tests {
     }
 
     /// Apply a computed [`super::MoveEdits`] to a fresh temp copy of `fixture`
-    /// and perform the rename on disk, returning the applied copy. Splices each
-    /// file's edits back-to-front so earlier byte offsets stay valid.
+    /// and perform the rename on disk, returning the applied copy.
     fn apply(fixture: &Fixture, edits: &super::MoveEdits) -> Fixture {
-        let out = TempDir::new().expect("create temp dir");
-        // Copy every entry (including .git / .lattice.toml) from the source.
-        copy_tree(fixture.dir.path(), out.path());
-
-        // Apply text edits per file (keyed by absolute path in the *source*
-        // tree; translate onto the output tree by rebasing the root).
-        for (abs_path, file_edits) in &edits.edits {
-            let rel = abs_path
-                .strip_prefix(fixture.dir.path())
-                .expect("edit path under source root");
-            let target = out.path().join(rel);
-            let mut text = fs::read_to_string(&target).expect("read edited file");
-            let mut sorted = file_edits.clone();
-            sorted.sort_by_key(|e| e.span.start);
-            for edit in sorted.iter().rev() {
-                text.replace_range(edit.span.start..edit.span.end, &edit.new_text);
-            }
-            fs::write(&target, text).expect("write edited file");
-        }
+        let out = apply_text_edits(fixture, &edits.edits);
 
         // Perform the rename on the output tree.
         let old_rel = edits
@@ -1126,12 +1435,46 @@ mod tests {
             .new
             .strip_prefix(fixture.dir.path())
             .expect("rename new under source root");
-        let old_abs = out.path().join(old_rel);
-        let new_abs = out.path().join(new_rel);
+        let old_abs = out.root().join(old_rel);
+        let new_abs = out.root().join(new_rel);
         if let Some(parent) = new_abs.parent() {
             fs::create_dir_all(parent).expect("create rename dest parent");
         }
         fs::rename(&old_abs, &new_abs).expect("perform rename");
+
+        out
+    }
+
+    /// Apply a per-file byte-span edit set to a fresh temp copy of `fixture`,
+    /// returning the applied copy. Splices each file's edits back-to-front so
+    /// earlier byte offsets stay valid as later ones are replaced — the same
+    /// order [`super::apply_to_disk`] uses.
+    ///
+    /// Shared by both coordinate axes: a move applies this plus the rename; a
+    /// heading rename (issue 057) is text edits alone.
+    fn apply_text_edits(
+        fixture: &Fixture,
+        edits: &BTreeMap<PathBuf, Vec<super::MoveTextEdit>>,
+    ) -> Fixture {
+        let out = TempDir::new().expect("create temp dir");
+        // Copy every entry (including .git / .lattice.toml) from the source.
+        copy_tree(fixture.dir.path(), out.path());
+
+        // Edits are keyed by absolute path in the *source* tree; translate onto
+        // the output tree by rebasing the root.
+        for (abs_path, file_edits) in edits {
+            let rel = abs_path
+                .strip_prefix(fixture.dir.path())
+                .expect("edit path under source root");
+            let target = out.path().join(rel);
+            let mut text = fs::read_to_string(&target).expect("read edited file");
+            let mut sorted = file_edits.clone();
+            sorted.sort_by_key(|e| e.span.start);
+            for edit in sorted.iter().rev() {
+                text.replace_range(edit.span.start..edit.span.end, &edit.new_text);
+            }
+            fs::write(&target, text).expect("write edited file");
+        }
 
         Fixture { dir: out }
     }
@@ -1998,7 +2341,488 @@ mod tests {
         );
     }
 
-    // --- 5. CLI surface: `lattice mv` (ticket mv/03, decision 020 clause 3) ---
+    // --- 5. The fragment axis: heading rename (issue 057) ---
+
+    /// The 1-based source line of the uniquely-named heading `text` in `rel`.
+    fn heading_line(ws: &Workspace, rel: &str, text: &str) -> usize {
+        let file = ws
+            .file(Path::new(rel))
+            .unwrap_or_else(|| panic!("{rel} is indexed"));
+        let matches: Vec<usize> = file
+            .headings
+            .iter()
+            .filter(|h| h.text == text)
+            .map(|h| h.line)
+            .collect();
+        assert_eq!(
+            matches.len(),
+            1,
+            "heading `{text}` must be unique in {rel} to address it by text: {matches:?}"
+        );
+        matches[0]
+    }
+
+    /// Compute the forced edit set for renaming `rel`'s `heading_text` to
+    /// `new_name`, asserting the heading resolves.
+    fn rename_edits(
+        ws: &Workspace,
+        rel: &str,
+        line: usize,
+        new_name: &str,
+    ) -> BTreeMap<PathBuf, Vec<super::MoveTextEdit>> {
+        super::compute_heading_rename_edits(ws, Path::new(rel), line, new_name)
+            .expect("heading rename should compute an edit set")
+    }
+
+    /// Total number of text edits across all files in a rename edit set.
+    fn rename_edit_count(edits: &BTreeMap<PathBuf, Vec<super::MoveTextEdit>>) -> usize {
+        edits.values().map(Vec::len).sum()
+    }
+
+    /// Drive the governing property for one heading rename: the post-rename
+    /// graph-diagnostic image must equal the pre-rename one.
+    ///
+    /// Unlike a file move, a heading rename moves no *file* coordinate — every
+    /// diagnostic stays on its own file and line — so the image is compared
+    /// directly, with no transport. Path spellings are still normalized away
+    /// (`kind_multiset`), since a diagnostic naming the renamed document renders
+    /// its path in several styles; the fragment token itself is compared
+    /// verbatim, which is what makes a healed or newly-broken fragment fail.
+    fn assert_fragment_isomorphism(
+        fixture: &Fixture,
+        rel: &str,
+        heading_text: &str,
+        new_name: &str,
+    ) -> (BTreeMap<PathBuf, Vec<super::MoveTextEdit>>, Fixture) {
+        let ws = fixture.scan();
+        let pre = validation::collect_all(&ws);
+        let line = heading_line(&ws, rel, heading_text);
+        let edits = rename_edits(&ws, rel, line, new_name);
+
+        let applied = apply_text_edits(fixture, &edits);
+        let post = validation::collect_all(&applied.scan());
+
+        assert_eq!(
+            kind_multiset(&post),
+            kind_multiset(&pre),
+            "post-rename graph diagnostics must equal the pre-rename set\n  pre: {pre:#?}\n  post: {post:#?}"
+        );
+        assert_eq!(
+            severity_histogram(&post),
+            severity_histogram(&pre),
+            "per-file severity histogram must be unchanged by a rename"
+        );
+        (edits, applied)
+    }
+
+    #[test]
+    fn heading_rename_isomorphism_clean_across_referrer_forms() {
+        // The governing property on the fragment axis (decision 020, issue 057):
+        // a rename on a clean workspace leaves it clean. Every referrer form is
+        // present — an inline cross-file fragment, a reference-style definition
+        // shared by two call sites, and a same-document anchor — so a missed
+        // retarget *creates* a broken-fragment error the equality catches.
+        let fixture = Fixture::new(&[
+            (
+                "guide.md",
+                concat!(
+                    "---\nbacklinks:\n  referenced_by:\n",
+                    "    - index.md\n    - notes/refs.md\n---\n",
+                    "# Guide\n\n",
+                    "## Old Section\n\n",
+                    "[back to the top](#guide)\n\n",
+                    "[jump to the section](#old-section)\n\n",
+                    "Prose keeps `guide.md#old-section` verbatim.\n",
+                ),
+            ),
+            (
+                "index.md",
+                concat!(
+                    "# Index\n\n",
+                    "[the old section](guide.md#old-section \"references\")\n\n",
+                    "[the whole guide](guide.md \"references\")\n",
+                ),
+            ),
+            (
+                "notes/refs.md",
+                concat!(
+                    "# Refs\n\n",
+                    "[the old section][sec]\n\n",
+                    "[again][sec]\n\n",
+                    "[sec]: ../guide.md#old-section \"references\"\n",
+                ),
+            ),
+        ]);
+
+        let pre = validation::collect_all(&fixture.scan());
+        assert!(pre.is_empty(), "clean fixture has no diagnostics: {pre:#?}");
+
+        let (edits, applied) =
+            assert_fragment_isomorphism(&fixture, "guide.md", "Old Section", "New Section");
+
+        // The heading, the same-document anchor, the inline cross-file fragment,
+        // and the one reference definition — four edits, three files. The
+        // fragmentless link, the `#guide` anchor, and the prose mention are not
+        // coordinates this rename moves.
+        assert_eq!(
+            rename_edit_count(&edits),
+            4,
+            "heading + same-doc anchor + inline referrer + one refdef: {edits:#?}"
+        );
+        assert_eq!(edits.len(), 3, "three files carry edits: {edits:#?}");
+
+        let post = validation::collect_all(&applied.scan());
+        assert!(
+            post.is_empty(),
+            "the renamed workspace stays clean: {post:#?}"
+        );
+
+        let guide = read_rel(&applied, "guide.md");
+        assert!(
+            guide.contains("## New Section")
+                && guide.contains("[jump to the section](#new-section)"),
+            "the heading and its same-document anchor both move: {guide}"
+        );
+        assert!(
+            guide.contains("[back to the top](#guide)"),
+            "an anchor naming a different heading is untouched: {guide}"
+        );
+        assert!(
+            guide.contains("`guide.md#old-section`"),
+            "the prose mention stays for judgment (clause 5): {guide}"
+        );
+        assert_eq!(
+            read_rel(&applied, "index.md"),
+            concat!(
+                "# Index\n\n",
+                "[the old section](guide.md#new-section \"references\")\n\n",
+                "[the whole guide](guide.md \"references\")\n",
+            ),
+            "only the fragment is spliced: the path spelling and the fragmentless link are byte-identical"
+        );
+        assert_eq!(
+            read_rel(&applied, "notes/refs.md"),
+            concat!(
+                "# Refs\n\n",
+                "[the old section][sec]\n\n",
+                "[again][sec]\n\n",
+                "[sec]: ../guide.md#new-section \"references\"\n",
+            ),
+            "two call sites share one definition, so the fragment is edited once, in the definition"
+        );
+    }
+
+    #[test]
+    fn heading_rename_leaves_a_same_slug_sibling_alone() {
+        // Duplicate slugs: `## Details` twice yields `details` and `details-1`.
+        // Renaming the *second* must not touch `#details` — that fragment
+        // resolves to the first heading, whose coordinate does not move.
+        let fixture = Fixture::new(&[(
+            "notes.md",
+            concat!(
+                "# Notes\n\n",
+                "## Details\n\n",
+                "[the first](#details)\n\n",
+                "## Details\n\n",
+                "[the second](#details-1)\n",
+            ),
+        )]);
+
+        let ws = fixture.scan();
+        let pre = validation::collect_all(&ws);
+        assert!(pre.is_empty(), "both anchors resolve pre-rename: {pre:#?}");
+
+        // Address the second duplicate by line (its text is not unique).
+        let second = ws
+            .file(Path::new("notes.md"))
+            .expect("notes.md indexed")
+            .headings
+            .iter()
+            .filter(|h| h.text == "Details")
+            .nth(1)
+            .expect("two `Details` headings")
+            .line;
+        let edits = rename_edits(&ws, "notes.md", second, "Extras");
+        assert_eq!(
+            rename_edit_count(&edits),
+            2,
+            "the heading and the `#details-1` referrer only: {edits:#?}"
+        );
+
+        let applied = apply_text_edits(&fixture, &edits);
+        assert_eq!(
+            read_rel(&applied, "notes.md"),
+            concat!(
+                "# Notes\n\n",
+                "## Details\n\n",
+                "[the first](#details)\n\n",
+                "## Extras\n\n",
+                "[the second](#extras)\n",
+            ),
+            "the same-slug sibling's referrer is untouched"
+        );
+        let post = validation::collect_all(&applied.scan());
+        assert!(post.is_empty(), "both anchors still resolve: {post:#?}");
+    }
+
+    #[test]
+    fn heading_rename_renumbers_the_surviving_duplicate() {
+        // The other direction of the duplicate-slug hazard: renaming the *first*
+        // `## Details` dissolves the second's `-1` suffix, so `#details-1` is a
+        // moved coordinate too. Leaving it would break it — the governing
+        // property forces both edits.
+        let fixture = Fixture::new(&[(
+            "notes.md",
+            concat!(
+                "# Notes\n\n",
+                "## Details\n\n",
+                "[the first](#details)\n\n",
+                "## Details\n\n",
+                "[the second](#details-1)\n",
+            ),
+        )]);
+
+        let ws = fixture.scan();
+        let first = ws
+            .file(Path::new("notes.md"))
+            .expect("notes.md indexed")
+            .headings
+            .iter()
+            .find(|h| h.text == "Details")
+            .expect("a `Details` heading")
+            .line;
+        let edits = rename_edits(&ws, "notes.md", first, "Extras");
+
+        let applied = apply_text_edits(&fixture, &edits);
+        assert_eq!(
+            read_rel(&applied, "notes.md"),
+            concat!(
+                "# Notes\n\n",
+                "## Extras\n\n",
+                "[the first](#extras)\n\n",
+                "## Details\n\n",
+                "[the second](#details)\n",
+            ),
+            "the renamed heading's referrer follows it, and the surviving duplicate's \
+             renumbered slug follows the dedup counter"
+        );
+        let post = validation::collect_all(&applied.scan());
+        assert!(
+            post.is_empty(),
+            "renumbering left every anchor resolving: {post:#?}"
+        );
+    }
+
+    #[test]
+    fn heading_rename_touches_no_fragmentless_or_embed_referrer() {
+        // A link to the file with no fragment names the document, not the
+        // heading. An embed's `#` suffix is not a heading predicate — it is
+        // never resolved or checked (issue 058) — so it is not a coordinate this
+        // rename moves. Both stay byte-identical.
+        let referrer = concat!(
+            "# Referrer\n\n",
+            "[the whole file](target.md \"references\")\n\n",
+            "![an inline embed](target.md#old-heading)\n\n",
+            "Bare mention target.md#old-heading stays too.\n",
+        );
+        let fixture = Fixture::new(&[
+            (
+                "target.md",
+                "---\nbacklinks:\n  referenced_by:\n    - referrer.md\n---\n# Target\n\n## Old Heading\n",
+            ),
+            ("referrer.md", referrer),
+        ]);
+
+        let ws = fixture.scan();
+        let line = heading_line(&ws, "target.md", "Old Heading");
+        let edits = rename_edits(&ws, "target.md", line, "New Heading");
+        assert_eq!(
+            rename_edit_count(&edits),
+            1,
+            "only the heading text itself is forced: {edits:#?}"
+        );
+        let applied = apply_text_edits(&fixture, &edits);
+        assert_eq!(
+            read_rel(&applied, "referrer.md"),
+            referrer,
+            "the referrer is byte-identical: no fragmentless, embed, or prose edit"
+        );
+    }
+
+    #[test]
+    fn heading_rename_leaves_an_explicitly_pinned_id_alone() {
+        // A `{#id}` heading's coordinate is the pinned id, which a text rename
+        // does not move (the `{#id}` sits outside the heading's `text_span`), so
+        // no referrer edit is forced.
+        let fixture = Fixture::new(&[
+            (
+                "pinned.md",
+                "---\nbacklinks:\n  referenced_by:\n    - ref.md\n---\n# Pinned\n\n## Old Title {#stable}\n",
+            ),
+            (
+                "ref.md",
+                "# Ref\n\n[to it](pinned.md#stable \"references\")\n",
+            ),
+        ]);
+
+        let (edits, applied) =
+            assert_fragment_isomorphism(&fixture, "pinned.md", "Old Title", "New Title");
+        assert_eq!(
+            rename_edit_count(&edits),
+            1,
+            "a pinned id moves no referrer: {edits:#?}"
+        );
+        assert!(
+            read_rel(&applied, "pinned.md").contains("## New Title {#stable}"),
+            "the text changes and the pinned id survives: {}",
+            read_rel(&applied, "pinned.md")
+        );
+    }
+
+    #[test]
+    fn heading_rename_leaves_an_anchor_pinned_fragment_alone() {
+        // An explicit `<a id>` anchor with the same id keeps the fragment
+        // resolving after the rename (issue 025): the author pinned a coordinate
+        // the rename does not move, so no edit is forced.
+        let fixture = Fixture::new(&[(
+            "anchored.md",
+            concat!(
+                "# Anchored\n\n",
+                "<a id=\"old-section\"></a>\n\n",
+                "## Old Section\n\n",
+                "[jump](#old-section)\n",
+            ),
+        )]);
+
+        let (edits, applied) =
+            assert_fragment_isomorphism(&fixture, "anchored.md", "Old Section", "New Section");
+        assert_eq!(
+            rename_edit_count(&edits),
+            1,
+            "the anchor-pinned referrer is not forced: {edits:#?}"
+        );
+        assert!(
+            read_rel(&applied, "anchored.md").contains("[jump](#old-section)"),
+            "the referrer still resolves through the anchor: {}",
+            read_rel(&applied, "anchored.md")
+        );
+    }
+
+    #[test]
+    fn heading_rename_preserves_pre_existing_fragment_drift() {
+        // Drift survives verbatim: a fragment that resolved to nothing before the
+        // rename still resolves to nothing after it, with the same message. The
+        // engine fixes nothing and breaks nothing.
+        let referrer = concat!(
+            "# Ref\n\n",
+            "[gone](guide.md#never-existed \"references\")\n\n",
+            "[here](guide.md#old-section \"references\")\n",
+        );
+        let fixture = Fixture::new(&[
+            (
+                "guide.md",
+                "---\nbacklinks:\n  referenced_by:\n    - ref.md\n---\n# Guide\n\n## Old Section\n",
+            ),
+            ("ref.md", referrer),
+        ]);
+
+        let pre = validation::collect_all(&fixture.scan());
+        assert_eq!(
+            errors(&pre).len(),
+            1,
+            "exactly one pre-existing broken fragment: {pre:#?}"
+        );
+
+        let (_edits, applied) =
+            assert_fragment_isomorphism(&fixture, "guide.md", "Old Section", "New Section");
+        assert!(
+            read_rel(&applied, "ref.md").contains("#never-existed"),
+            "the unresolved fragment is left verbatim: {}",
+            read_rel(&applied, "ref.md")
+        );
+    }
+
+    #[test]
+    fn heading_rename_re_renders_in_the_pinned_algorithm() {
+        // With `[policy] fragments` pinned, a referrer is authored in that
+        // algorithm's spelling and must be re-rendered in the same one — the
+        // fragment-axis analogue of preserving an authored path style.
+        // "Héllo Wörld" → gitlab `hllo-wrld` (github would be `héllo-wörld`).
+        let fixture = Fixture::new(&[
+            (".lattice.toml", "[policy]\nfragments = \"gitlab\"\n"),
+            (
+                "guide.md",
+                "---\nbacklinks:\n  referenced_by:\n    - ref.md\n---\n# Guide\n\n## Héllo Wörld\n",
+            ),
+            (
+                "ref.md",
+                "# Ref\n\n[to it](guide.md#hllo-wrld \"references\")\n",
+            ),
+        ]);
+
+        let (_edits, applied) =
+            assert_fragment_isomorphism(&fixture, "guide.md", "Héllo Wörld", "Nëw Nàme");
+        assert!(
+            read_rel(&applied, "ref.md").contains("guide.md#nw-nme"),
+            "the referrer is re-rendered as the gitlab slug: {}",
+            read_rel(&applied, "ref.md")
+        );
+        let post = validation::collect_all(&applied.scan());
+        assert!(
+            post.is_empty(),
+            "the pinned-algorithm fragment still resolves: {post:#?}"
+        );
+    }
+
+    #[test]
+    fn heading_rename_emits_no_edit_overlapping_the_heading_text() {
+        // A degenerate self-anchoring heading: `[#](#-)` slugs to `-`, so the
+        // link inside the heading's own text points at that very heading. The
+        // heading edit replaces that text wholesale, so the fragment edit inside
+        // it must be dropped — an overlapping pair would corrupt the splice.
+        let fixture = Fixture::new(&[("odd.md", "# Odd\n\n## [#](#-)\n")]);
+        let ws = fixture.scan();
+        let heading = ws
+            .file(Path::new("odd.md"))
+            .expect("odd.md indexed")
+            .headings
+            .iter()
+            .find(|h| h.level == 2)
+            .expect("the level-2 heading");
+        assert!(
+            matches!(&heading.id, crate::block::HeadingId::Computed { github, .. } if github == "-"),
+            "the fixture's premise: the heading slugs to `-`: {:?}",
+            heading.id
+        );
+        let line = heading.line;
+        let edits = rename_edits(&ws, "odd.md", line, "Renamed");
+        assert_eq!(
+            rename_edit_count(&edits),
+            1,
+            "the nested self-reference is subsumed by the heading edit: {edits:#?}"
+        );
+        assert_eq!(
+            read_rel(&apply_text_edits(&fixture, &edits), "odd.md"),
+            "# Odd\n\n## Renamed\n",
+            "the splice lands cleanly"
+        );
+    }
+
+    #[test]
+    fn heading_rename_declines_a_line_with_no_heading() {
+        let fixture = Fixture::new(&[("a.md", "# A\n\nProse.\n")]);
+        let ws = fixture.scan();
+        assert!(
+            super::compute_heading_rename_edits(&ws, Path::new("a.md"), 3, "X").is_none(),
+            "a prose line names no heading to rename"
+        );
+        assert!(
+            super::compute_heading_rename_edits(&ws, Path::new("missing.md"), 1, "X").is_none(),
+            "an unindexed document has no headings"
+        );
+    }
+
+    // --- 6. CLI surface: `lattice mv` (ticket mv/03, decision 020 clause 3) ---
 
     /// Run `lattice lint` over the fixture root, returning `(failed, output)`.
     /// The ledger is suppressed (`quiet`) so assertions focus on diagnostics.

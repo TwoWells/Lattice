@@ -2365,8 +2365,7 @@ fn prepare_rename(
 ) -> Option<lsp::Range> {
     let (workspace, rel_path) = workspaces.resolve_document(&params.text_document.uri)?;
     let file_data = workspace.file(&rel_path)?;
-    let headings = file_data.tree.headings();
-    let heading = heading_at_line(&headings, params.position.line)?;
+    let heading = heading_at_line(&file_data.headings, params.position.line)?;
 
     Some(span_to_lsp_range(
         file_data.tree.source(),
@@ -2375,30 +2374,31 @@ fn prepare_rename(
     ))
 }
 
-/// Rename a heading's text.
+/// Rename a heading — its own text *and* every fragment that referred to it.
 ///
-/// Uses the tree's `text_span` for the edit range, supporting ATX, setext,
-/// and HTML headings.
+/// A heading rename is a coordinate change on the fragment axis exactly as a file
+/// move is one on the path axis (issue 057, decision 020), so it rides the same
+/// engine: [`crate::mv::compute_heading_rename_edits`] returns the complete
+/// forced edit set — the heading's `text_span` (ATX, setext, and HTML alike),
+/// every cross-file `file.md#slug` referrer, and every same-document `#slug`
+/// anchor — and the same [`merge_span_edits`] mapping turns it into one atomic
+/// [`lsp::WorkspaceEdit`]. Path spellings, embeds, prose mentions of the old
+/// title, and exception keys are untouched: the judgment surface stays in the
+/// loop (decision 020 clause 5).
 fn do_rename(workspaces: &Workspaces, params: &lsp::RenameParams) -> Option<lsp::WorkspaceEdit> {
     let (workspace, rel_path) = workspaces.resolve_document(&params.text_document.uri)?;
     let file_data = workspace.file(&rel_path)?;
-    let headings = file_data.tree.headings();
-    let heading = heading_at_line(&headings, params.position.line)?;
+    let heading = heading_at_line(&file_data.headings, params.position.line)?;
 
-    let range = span_to_lsp_range(
-        file_data.tree.source(),
-        &file_data.line_index,
-        &heading.text_span,
-    );
+    let edits = crate::mv::compute_heading_rename_edits(
+        &workspace,
+        &rel_path,
+        heading.line,
+        &params.new_name,
+    )?;
 
-    let mut changes = std::collections::HashMap::new();
-    changes.insert(
-        params.text_document.uri.clone(),
-        vec![lsp::TextEdit {
-            range,
-            new_text: params.new_name.clone(),
-        }],
-    );
+    let mut changes: HashMap<String, Vec<lsp::TextEdit>> = HashMap::new();
+    merge_span_edits(workspaces, &edits, &mut changes);
 
     Some(lsp::WorkspaceEdit {
         changes: Some(changes),
@@ -2455,7 +2455,7 @@ fn will_rename_files(
         let edits = crate::mv::compute_move_edits(&view, &old_abs, &new_abs, &fs_exists)
             .map_err(|e| e.to_string())?;
 
-        merge_move_edits(workspaces, &edits, &mut changes);
+        merge_span_edits(workspaces, &edits.edits, &mut changes);
     }
 
     Ok(lsp::WorkspaceEdit {
@@ -2463,19 +2463,24 @@ fn will_rename_files(
     })
 }
 
-/// Convert one move's per-file byte-span edits into LSP `TextEdit`s and merge
+/// Convert an engine's per-file byte-span edits into LSP `TextEdit`s and merge
 /// them into `changes` (keyed by document URI).
 ///
 /// Each edited file's source and cached [`LineIndex`] come from the flat
 /// document store, so the byte→UTF-16 conversion matches every other publish.
-/// A file the store does not hold is skipped — the engine only enumerates files
+/// A file the store does not hold is skipped — the engines only enumerate files
 /// in the view, so this is defensive.
-fn merge_move_edits(
+///
+/// Shared by both coordinate axes: the path-axis move engine
+/// ([`will_rename_files`]) and the fragment-axis heading rename
+/// ([`do_rename`]) hand their edit sets to the same mapping, so neither surface
+/// has a private notion of a workspace edit.
+fn merge_span_edits(
     workspaces: &Workspaces,
-    edits: &crate::mv::MoveEdits,
+    edits: &BTreeMap<PathBuf, Vec<crate::mv::MoveTextEdit>>,
     changes: &mut HashMap<String, Vec<lsp::TextEdit>>,
 ) {
-    for (abs_path, file_edits) in &edits.edits {
+    for (abs_path, file_edits) in edits {
         let Some(doc) = workspaces.documents.get(abs_path) else {
             continue;
         };
@@ -6313,6 +6318,83 @@ mod tests {
         assert_eq!(
             edits[0].range.end.character, 11,
             "edit ends at 3 + len('Old Name')"
+        );
+    }
+
+    #[test]
+    fn rename_edits_referrer_fragments_across_the_workspace() {
+        // Issue 057: the rename edit covers the heading *and* every fragment that
+        // referred to it — a same-document anchor and a cross-file
+        // `file.md#slug` — in one atomic workspace edit.
+        let dir = workspace_with_files(&[
+            (
+                "guide.md",
+                "# Guide\n\n## Old Section\n\n[jump](#old-section)\n",
+            ),
+            (
+                "index.md",
+                "# Index\n\n[the section](guide.md#old-section \"references\")\n",
+            ),
+        ]);
+        let workspaces = scan_workspaces(&dir);
+        let guide_uri = file_uri(&dir, "guide.md");
+
+        let params = lsp::RenameParams {
+            text_document: lsp::TextDocumentIdentifier {
+                uri: guide_uri.clone(),
+            },
+            position: lsp::Position {
+                line: 2,
+                character: 0,
+            },
+            new_name: "New Section".to_string(),
+        };
+        let edit = do_rename(&workspaces, &params).expect("should produce edit");
+        let changes = edit.changes.expect("should have changes");
+        assert_eq!(
+            changes.len(),
+            2,
+            "the renamed document and its referrer are both edited: {changes:?}"
+        );
+
+        let guide_edits = changes
+            .get(&guide_uri)
+            .expect("edits for the renamed document");
+        assert_eq!(
+            guide_edits.len(),
+            2,
+            "the heading text and its same-document anchor: {guide_edits:?}"
+        );
+        assert_eq!(
+            guide_edits[0].new_text, "New Section",
+            "the heading edit comes first (sorted by position)"
+        );
+        assert_eq!(guide_edits[0].range.start.line, 2, "heading is on line 2");
+        assert_eq!(
+            guide_edits[1].new_text, "new-section",
+            "the anchor carries the new slug, not the new title"
+        );
+        assert_eq!(guide_edits[1].range.start.line, 4, "anchor is on line 4");
+
+        let index_edits = changes
+            .get(&file_uri(&dir, "index.md"))
+            .expect("edits for the referrer");
+        assert_eq!(
+            index_edits.len(),
+            1,
+            "one fragment edit in the referrer: {index_edits:?}"
+        );
+        assert_eq!(index_edits[0].new_text, "new-section", "the new slug");
+        // `[the section](guide.md#old-section "references")` — the range covers
+        // the fragment alone: it starts after the `#` (character 23) and ends at
+        // 23 + len("old-section"), leaving the path spelling untouched.
+        assert_eq!(
+            index_edits[0].range.start.character, 23,
+            "the edit starts just after the `#`"
+        );
+        assert_eq!(
+            index_edits[0].range.end.character, 34,
+            "the edit ends at the end of the old fragment"
         );
     }
 
