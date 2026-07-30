@@ -71,7 +71,7 @@ toolchain; `make fuzz` forces it.
 - **Single target:** `make fuzz T=fuzz_yaml`
 - **Parallel soak:** `make soak FUZZ_TIME=3600` — runs all targets *at once*
   (one process each), so a 1 h/target soak takes ~1 h of wall-clock instead of
-  ~8 h. Needs ≥9 cores (8 single-threaded targets + headroom) and ~4 GB RAM;
+  ~9 h. Needs ≥10 cores (9 single-threaded targets + headroom) and ~4 GB RAM;
   per-target logs in `fuzz/soak-*.log`.
 - **Targets** (one per parser entry point): `fuzz_parse_tree`, `fuzz_yaml`,
   `fuzz_toml`, `fuzz_json`, `fuzz_full`, `fuzz_tokenize_tag`, `fuzz_inlines`.

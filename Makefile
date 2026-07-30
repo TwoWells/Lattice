@@ -163,8 +163,8 @@ fuzz:
 
 # Soak every target IN PARALLEL for FUZZ_TIME seconds each (one process per
 # target), so `make soak FUZZ_TIME=3600` meets a 1 h/target bar in ~1 h of
-# wall-clock instead of ~8 h. Each target is single-threaded, so on a machine
-# with >= 9 cores (8 targets + headroom) there is no contention. Per-target
+# wall-clock instead of ~9 h. Each target is single-threaded, so on a machine
+# with >= 10 cores (9 targets + headroom) there is no contention. Per-target
 # output goes to fuzz/soak-<target>.log; a non-zero exit means at least one
 # target crashed (its reproducer is under fuzz/artifacts/<target>/).
 soak:

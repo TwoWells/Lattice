@@ -2,17 +2,23 @@ name: fuzz-soak
 
 # Coverage-guided fuzz soak on a schedule (see AGENTS.md "Fuzzing"). Each
 # cargo-fuzz target runs as its own job, so a single-threaded target gets a
-# whole runner — the >=9-core requirement of the local `make soak` (which packs
+# whole runner — the >=10-core requirement of the local `make soak` (which packs
 # every target onto one box) does not apply here. Standard GitHub-hosted runners
 # are free with unlimited minutes on public repositories, so this costs nothing:
 # keep every job on `ubuntu-latest` (larger runners bill even on public repos).
 #
-# Silent on green. On a finding a job uploads the minimized input, opens or
-# updates a deduplicated tracking issue, and opens a PR adding the shrunk input
-# to the seed corpus — turning AGENTS.md's "add the reproducing input" step into
-# a ready artifact. PR CI stays as `make check` (it already replays
-# proptest-regressions and the committed corpus seeds); this job only hunts for
-# *new* bugs.
+# Silent on green, red on a finding. On a finding a job uploads the minimized
+# input, opens or updates a deduplicated tracking issue, opens a PR adding the
+# shrunk input to the seed corpus — turning AGENTS.md's "add the reproducing
+# input" step into a ready artifact — and then fails the job, so the finding
+# shows up in the run list and not only in the filed issue. PR CI stays as
+# `make check` (it already replays proptest-regressions and the committed corpus
+# seeds); this job only hunts for *new* bugs.
+#
+# Each target's *discovered* corpus is cached per target, so coverage
+# accumulates across runs instead of restarting from the committed seeds every
+# time (issue 005). Only curated seeds are committed; libFuzzer's own finds are
+# git-ignored and live in the cache.
 
 on:
   schedule:
@@ -55,6 +61,11 @@ jobs:
   soak:
     needs: targets
     runs-on: ubuntu-latest
+    # Sized to the longest scheduled run (the weekly 5400s/target soak = 90 min)
+    # plus headroom for toolchain install, the cargo-fuzz build, and cache I/O.
+    # Also a ceiling on a workflow_dispatch with an oversized fuzz_time, and far
+    # tighter than GitHub's 360-minute default if a target ever wedges.
+    timeout-minutes: 150
     strategy:
       fail-fast: false
       matrix:
@@ -81,6 +92,18 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: fuzz-${{ matrix.target }}
+
+      # The discovered corpus, restored from the newest previous run of THIS
+      # target and saved fresh afterwards. The key carries the run id so it
+      # never hits and the post-job save always writes a new snapshot; the
+      # restore-keys prefix is what actually pulls the last one back. Per-target
+      # keys keep independent caches rather than one contended blob.
+      - name: Restore discovered corpus
+        uses: actions/cache@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ matrix.target }}-
 
       - name: Soak ${{ matrix.target }}
         id: fuzz
@@ -170,3 +193,25 @@ jobs:
             gh issue create --title "soak crash: $TARGET" --label fuzz-finding \
               --body-file /tmp/issue-body.md
           fi
+
+      # The fuzz step is `continue-on-error` so the filing steps above always
+      # get to run; without this the job would go GREEN on a real crash. Restate
+      # the doctrine in the job summary, where whoever opens the red run reads
+      # it, then fail.
+      - name: Fail the job on a finding
+        if: steps.fuzz.outcome == 'failure'
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          {
+            printf "## Fuzz finding in \`%s\`\n\n" "$TARGET"
+            printf 'A finding is a **real, reproducible bug, never a\n'
+            printf 'flake.** Never re-run to make it pass. Per AGENTS.md:\n\n'
+            printf "1. Minimize: \`cargo fuzz tmin %s <input>\`\n" "$TARGET"
+            printf "2. Add the input to \`fuzz/corpus/%s/\`\n" "$TARGET"
+            printf "3. Add a deterministic \`#[cfg(test)]\` regression so\n"
+            printf '   the fix holds without the fuzzer\n'
+            printf '4. Fix the parser — or, if the invariant was over-\n'
+            printf '   strict, refine it precisely, never broaden it\n'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 1
