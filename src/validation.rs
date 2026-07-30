@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use crate::block::{self, HeadingId, LinkKind};
 use crate::config::{Config, ConnectivityPolicy, FragmentAlgorithm, PredicatePolicy};
 use crate::span::Span;
-use crate::workspace::{WorkspaceLike, target_to_key};
+use crate::workspace::{BoundaryKind, WorkspaceLike, target_to_key};
 
 /// Diagnostic severity level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,9 +87,9 @@ pub fn validate_forward_links(workspace: &impl WorkspaceLike) -> Vec<Diagnostic>
                 }
 
                 LinkKind::NonMarkdown { target } => {
-                    if workspace.crosses_boundary(target) {
+                    if let Some(kind) = workspace.boundary_crossing(target) {
                         diagnostics.push(cross_boundary_diagnostic(
-                            workspace, file_path, link.line, link.span, target,
+                            workspace, file_path, link.line, link.span, target, kind,
                         ));
                     } else {
                         check_target_exists(
@@ -111,9 +111,9 @@ pub fn validate_forward_links(workspace: &impl WorkspaceLike) -> Vec<Diagnostic>
                     // exactly like the link check above. It carries no
                     // predicate and no fragment, so existence (and the scope
                     // boundary) is the whole check.
-                    if workspace.crosses_boundary(target) {
+                    if let Some(kind) = workspace.boundary_crossing(target) {
                         diagnostics.push(cross_boundary_diagnostic(
-                            workspace, file_path, link.line, link.span, target,
+                            workspace, file_path, link.line, link.span, target, kind,
                         ));
                     } else {
                         check_target_exists(
@@ -140,9 +140,9 @@ pub fn validate_forward_links(workspace: &impl WorkspaceLike) -> Vec<Diagnostic>
                     // existence / predicate / fragment checks below (all of which
                     // assume an in-scope target) are moot — the fix is to write
                     // it as an `[external]` alias.
-                    if workspace.crosses_boundary(target) {
+                    if let Some(kind) = workspace.boundary_crossing(target) {
                         diagnostics.push(cross_boundary_diagnostic(
-                            workspace, file_path, link.line, link.span, target,
+                            workspace, file_path, link.line, link.span, target, kind,
                         ));
                         continue;
                     }
@@ -196,21 +196,34 @@ pub fn validate_forward_links(workspace: &impl WorkspaceLike) -> Vec<Diagnostic>
 /// displayed target is the root-relative form where one exists (a crossing into
 /// a nested scope), or the absolute path where the target climbed out of the
 /// scope entirely (no meaningful rel-path in this root's coordinates).
+///
+/// The *situation* differs by [`BoundaryKind`] even though the fix does not
+/// (issue 052): a markerless `.git` boundary is the markerless instance of an
+/// external system — a separate repository — and telling the author "outside
+/// this scope" invites a hunt for a marker that is not there. Both spellings
+/// steer to the same `[external]` alias; only the diagnosis is differentiated.
 fn cross_boundary_diagnostic(
     workspace: &impl WorkspaceLike,
     source: &Path,
     line: usize,
     span: Span,
     target: &Path,
+    kind: BoundaryKind,
 ) -> Diagnostic {
     let display = target_to_key(workspace.root(), target);
+    let situation = match kind {
+        BoundaryKind::Scope => format!("link target `{}` is outside this scope", display.display()),
+        BoundaryKind::Git => format!(
+            "link target `{}` is in a git submodule (a separate repository, treated as external)",
+            display.display()
+        ),
+    };
     Diagnostic {
         file: source.to_path_buf(),
         line,
         severity: Severity::Error,
         message: format!(
-            "link target `{}` is outside this scope — reference it through an `[external]` alias (see `lattice help config`)",
-            display.display()
+            "{situation} — reference it through an `[external]` alias (see `lattice help config`)"
         ),
         span: Some(span),
     }
@@ -907,6 +920,41 @@ mod tests {
             errors[0].message.contains("nonexistent.md"),
             "message includes target path: {}",
             errors[0].message
+        );
+    }
+
+    #[test]
+    fn cross_boundary_message_is_differentiated_by_boundary_kind() {
+        // Issue 052: one disposition, two situations. A crossing into a nested
+        // `.lattice.toml` scope keeps the "outside this scope" wording; a
+        // crossing into a marker-less `.git` submodule says what it actually
+        // hit — a separate repository. Both steer to the same `[external]`
+        // alias (decision 019 clause 3).
+        let (dir, _ws) = setup_workspace(&[
+            (
+                "index.md",
+                "[scope](nested/inner.md \"references\")\n\n[repo](vendor/inner.md \"references\")\n",
+            ),
+            ("nested/.lattice.toml", ""),
+            ("nested/inner.md", "# Inner\n"),
+        ]);
+        fs::create_dir_all(dir.path().join("vendor/.git")).expect("create the submodule's .git");
+        fs::write(dir.path().join("vendor/inner.md"), "# Vendored\n")
+            .expect("write the submodule's document");
+        let ws = Workspace::scan(dir.path()).expect("rescan with both boundary kinds");
+
+        let diags = validate_forward_links(&ws);
+        let messages: Vec<&str> = diags.iter().map(|d| d.message.as_str()).collect();
+        assert!(
+            messages.iter().any(|m| m
+                .contains("link target `nested/inner.md` is outside this scope — reference it through an `[external]` alias")),
+            "a nested-scope crossing keeps the scope wording: {messages:?}"
+        );
+        assert!(
+            messages.iter().any(|m| m.contains(
+                "link target `vendor/inner.md` is in a git submodule (a separate repository, treated as external) — reference it through an `[external]` alias"
+            )),
+            "a `.git` crossing names the separate repository: {messages:?}"
         );
     }
 

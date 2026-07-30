@@ -311,11 +311,14 @@ pub fn compute_move_edits(
 
     // A directory carrying a nested scope marker is refused in v1.
     if is_directory
-        && let Some(boundary) = workspace.boundaries().iter().find(|b| b.starts_with(old))
+        && let Some(boundary) = workspace
+            .boundaries()
+            .iter()
+            .find(|b| b.path.starts_with(old))
     {
         return Err(MoveError::DirectoryContainsMarker {
             source_path: old.to_path_buf(),
-            boundary: boundary.clone(),
+            boundary: boundary.path.clone(),
         });
     }
 

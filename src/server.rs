@@ -26,8 +26,8 @@ use crate::overrides::{self, OverrideVerdicts, VerdictKind};
 use crate::span::Span;
 use crate::validation::{self, Diagnostic, Severity};
 use crate::workspace::{
-    FileData, Workspace, WorkspaceView, compute_structural, discover_scope_boundaries,
-    find_scope_root, parse_content, target_to_key,
+    Boundary, BoundaryKind, FileData, Workspace, WorkspaceView, compute_structural,
+    discover_scope_boundaries, find_scope_root, parse_content, target_to_key,
 };
 
 /// What the client currently holds for one document: the Lattice diagnostics
@@ -256,17 +256,29 @@ impl Workspaces {
     /// A document behind a nested `.git` non-root environment
     /// ([`Self::git_boundaries`]) has no graph of its own (decision 019
     /// resolution 2): it is rootless — excluded from every host scope, served
-    /// document-scoped under defaults (051 semantics) — so it never resolves to a
-    /// covering root.
+    /// document-scoped under defaults (051 semantics).
+    ///
+    /// The gate is what a boundary *means*, not a blanket veto (issue 052): a
+    /// boundary excludes a subtree from its **host's** graph; it never vetoes a
+    /// scope registered at or inside the boundary itself. So it fires only when
+    /// the deepest covering registered root is strictly **above** a covering
+    /// boundary — `deepest` and every covering `g` are ancestors of `abs`, hence
+    /// comparable, so `!deepest.starts_with(g)` is exactly "`g` lies strictly
+    /// below `deepest`". A submodule opened directly as its own client folder
+    /// therefore keeps the fallback scope its direct entry granted it, while the
+    /// host's documents still see it as foreign — the entry-point independence
+    /// decision 019 claims.
     fn deepest_root_for(&self, abs: &Path) -> Option<PathBuf> {
-        if self.git_boundaries.iter().any(|g| abs.starts_with(g)) {
-            return None;
-        }
-        self.roots
+        let deepest = self
+            .roots
             .keys()
             .filter(|root| abs.starts_with(root))
-            .max_by_key(|root| root.components().count())
-            .cloned()
+            .max_by_key(|root| root.components().count())?;
+        let gated = self
+            .git_boundaries
+            .iter()
+            .any(|g| abs.starts_with(g) && !deepest.starts_with(g));
+        (!gated).then(|| deepest.clone())
     }
 
     /// The absolute paths of every document under `root`, by range scan.
@@ -288,15 +300,40 @@ impl Workspaces {
 
     /// The strictly-deeper scope boundaries nested inside `root`: every
     /// registered scope root `root` is a proper ancestor of, plus every nested
-    /// `.git` non-root environment beneath it (decision 019). A link resolving
-    /// into one of these has crossed a boundary
-    /// ([`WorkspaceLike::crosses_boundary`]).
-    fn boundaries_under(&self, root: &Path) -> Vec<PathBuf> {
+    /// `.git` non-root environment beneath it (decision 019), each tagged with
+    /// its kind. A link resolving into one of these has crossed a boundary
+    /// ([`WorkspaceLike::crosses_boundary`]), and the tag is what lets the
+    /// diagnostic say *which kind* of foreign territory it landed in.
+    ///
+    /// Both chains are strictly deeper: `root` is never a boundary of its own
+    /// view. That matters for a directly-opened submodule, which is a registered
+    /// root **and** a `.git` boundary — without the exclusion its own view would
+    /// declare every one of its documents out of scope. A directory in both
+    /// chains is emitted once, as [`BoundaryKind::Git`]: membership in
+    /// `git_boundaries` is exactly "carries `.git`, carries no marker"
+    /// (`collect_git_boundaries` recurses through marker scopes rather than
+    /// recording them), so the git tag is the true one.
+    fn boundaries_under(&self, root: &Path) -> Vec<Boundary> {
         self.roots
             .keys()
-            .filter(|other| other.as_path() != root && other.starts_with(root))
-            .chain(self.git_boundaries.iter().filter(|g| g.starts_with(root)))
-            .cloned()
+            .filter(|other| {
+                other.as_path() != root
+                    && other.starts_with(root)
+                    && !self.git_boundaries.contains(other.as_path())
+            })
+            .map(|other| Boundary {
+                path: other.clone(),
+                kind: BoundaryKind::Scope,
+            })
+            .chain(
+                self.git_boundaries
+                    .iter()
+                    .filter(|g| g.as_path() != root && g.starts_with(root))
+                    .map(|g| Boundary {
+                        path: g.clone(),
+                        kind: BoundaryKind::Git,
+                    }),
+            )
             .collect()
     }
 
@@ -778,8 +815,8 @@ impl Workspaces {
         // 2): it is left unscanned and tracked as a boundary by
         // `rebuild_git_boundaries`, so a foreign repo is never indexed.
         for nested in discover_scope_boundaries(scope_root) {
-            if nested.join(".lattice.toml").is_file() {
-                self.register_scope(&nested);
+            if nested.kind == BoundaryKind::Scope {
+                self.register_scope(&nested.path);
             }
         }
     }
@@ -802,10 +839,11 @@ impl Workspaces {
     /// its own `.git` sub-environments) but never into a `.git` boundary itself.
     fn collect_git_boundaries(scope_root: &Path, out: &mut BTreeSet<PathBuf>) {
         for boundary in discover_scope_boundaries(scope_root) {
-            if boundary.join(".lattice.toml").is_file() {
-                Self::collect_git_boundaries(&boundary, out);
-            } else {
-                out.insert(boundary);
+            match boundary.kind {
+                BoundaryKind::Scope => Self::collect_git_boundaries(&boundary.path, out),
+                BoundaryKind::Git => {
+                    out.insert(boundary.path);
+                }
             }
         }
     }
@@ -873,12 +911,24 @@ impl Workspaces {
 
     /// Add `scope_root` and every strictly-deeper marker scope beneath it to
     /// `out`, walking client-spelling directories on disk.
+    ///
+    /// Discriminates exactly as `register_scope` and `collect_git_boundaries`
+    /// do: only a `.lattice.toml`-bearing boundary is an active nested scope
+    /// root. A `.git`-only boundary is a non-root environment (decision 019
+    /// resolution 2) — never registered by the walk-down, so reporting it
+    /// "active" would only keep a *directly-opened* submodule's root alive after
+    /// its own folder closed, and the boundary gate could never be restored
+    /// (issue 052). The seed is unconditional: a directly-opened submodule is
+    /// legitimately its own active root, entering as the seed of its own
+    /// folder's walk rather than as a nested boundary of the host's.
     fn collect_scope_tree(scope_root: &Path, out: &mut BTreeSet<PathBuf>) {
         if !out.insert(scope_root.to_path_buf()) {
             return;
         }
         for nested in discover_scope_boundaries(scope_root) {
-            Self::collect_scope_tree(&nested, out);
+            if nested.kind == BoundaryKind::Scope {
+                Self::collect_scope_tree(&nested.path, out);
+            }
         }
     }
 
@@ -10426,12 +10476,13 @@ mod tests {
             !workspaces.documents.contains_key(&inner_abs),
             "a nested `.git` repo is not eagerly scanned"
         );
-        // The host's link into it crosses the boundary → steering error.
+        // The host's link into it crosses the boundary → steering error, named
+        // by boundary kind (issue 052).
         let host = collect_all_diagnostics(&workspaces.root_view(&root));
         assert!(
             host.iter()
                 .any(|d| d.file.as_path() == Path::new("outer.md")
-                    && d.message.contains("outside this scope")),
+                    && d.message.contains("is in a git submodule")),
             "the link into the nested `.git` steers to an alias: {host:?}"
         );
 
@@ -10457,6 +10508,276 @@ mod tests {
                 .file(Path::new("vendor/inner.md"))
                 .is_none(),
             "the nested `.git` document never joins the host graph"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Doubly-opened submodule (issue 052)
+    //
+    // A host folder and a marker-less `.git` submodule nested inside it, both
+    // opened as client folders. The submodule's own registered root must win
+    // the host's boundary gate — decision 019 resolution 2's direct-entry tier
+    // — while the host keeps seeing it as foreign territory.
+    // -----------------------------------------------------------------------
+
+    /// The doubly-opened arrangement: a configured host scope linking into a
+    /// marker-less `.git` submodule that holds a two-document graph of its own.
+    /// `sub/inner.md` carries a duplicate heading slug (a structural defect,
+    /// config-free) and a `references` link to `sub/peer.md` (an edge that would
+    /// demand a backlink *if* a graph tier were running). Returns the temp dir —
+    /// kept alive by the caller — and the canonical host root.
+    fn host_with_git_submodule() -> (tempfile::TempDir, PathBuf) {
+        let dir = workspace_with_files(&[
+            (".lattice.toml", ""),
+            ("outer.md", "[into sub](sub/inner.md \"references\")\n"),
+        ]);
+        let root = fs::canonicalize(dir.path()).expect("canonicalize temp dir");
+        fs::create_dir_all(root.join("sub/.git")).expect("create the submodule's .git");
+        fs::write(
+            root.join("sub/inner.md"),
+            "# Inner\n\n# Inner\n\n[peer](peer.md \"references\")\n",
+        )
+        .expect("write the submodule's document");
+        fs::write(root.join("sub/peer.md"), "# Peer\n").expect("write the submodule's peer");
+        (dir, root)
+    }
+
+    #[test]
+    fn doubly_opened_submodule_owns_its_documents_in_both_orders() {
+        // Issue 052 / decision 019's entry-point independence, extended to the
+        // `.git` case: with both folders open, the submodule's documents belong
+        // to the scope its direct opening registered — not to `None` — and the
+        // host's graph never contains them. Both open orders agree, because the
+        // gate is now a query over both maps rather than a prefix veto applied
+        // before the roots are consulted: host-then-submodule used to lose them
+        // in `add_folder`'s `refresh_placement` loop, and submodule-then-host in
+        // `add_folder(host)`'s range scan reaching into the submodule.
+        let (_dir, root) = host_with_git_submodule();
+        let sub = root.join("sub");
+        let inner_abs = sub.join("inner.md");
+        let root_uri = path_to_uri(&root);
+        let sub_uri = path_to_uri(&sub);
+
+        for (label, order) in [
+            ("host then submodule", [&root_uri, &sub_uri]),
+            ("submodule then host", [&sub_uri, &root_uri]),
+        ] {
+            let mut workspaces = Workspaces::new();
+            for uri in order {
+                workspaces.add_folder(uri);
+            }
+
+            assert_eq!(
+                workspaces
+                    .documents
+                    .get(&inner_abs)
+                    .and_then(|d| d.primary_root.as_deref()),
+                Some(sub.as_path()),
+                "{label}: the directly-opened submodule owns its documents — a registered root at the boundary wins the gate"
+            );
+            assert!(
+                workspaces
+                    .root_view(&sub)
+                    .file(Path::new("inner.md"))
+                    .is_some(),
+                "{label}: the submodule's own view contains its documents"
+            );
+            assert!(
+                workspaces
+                    .root_view(&root)
+                    .file(Path::new("sub/inner.md"))
+                    .is_none(),
+                "{label}: the host's graph never contains the submodule's documents"
+            );
+        }
+    }
+
+    #[test]
+    fn doubly_opened_submodule_serves_the_structural_tier_only() {
+        // Tier precision (issue 052): "lints under defaults" means STRUCTURAL.
+        // The submodule registers with no `.lattice.toml`, so `has_config` is
+        // false and `collect_all_diagnostics` skips the graph tier — the
+        // duplicate heading slug surfaces, the missing backlink for the in-scope
+        // `references` edge correctly does not.
+        let (_dir, root) = host_with_git_submodule();
+        let sub = root.join("sub");
+
+        let mut workspaces = Workspaces::new();
+        workspaces.add_folder(&path_to_uri(&root));
+        workspaces.add_folder(&path_to_uri(&sub));
+
+        let view = workspaces.root_view(&sub);
+        assert!(
+            !view.has_config(),
+            "a marker-less submodule registers with no config — the graph tier is off"
+        );
+        let diagnostics = collect_all_diagnostics(&view);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.file.as_path() == Path::new("inner.md")
+                    && d.message.contains("duplicate heading slug")),
+            "the restored tier is structural: {diagnostics:?}"
+        );
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.message.contains("expected backlink")),
+            "the graph tier stays silent — no marker, no backlink universe: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn host_steering_into_the_submodule_survives_and_names_the_submodule() {
+        // The host's plain link into the submodule is still a clause-3 defect
+        // while the submodule folder is open — the submodule remains a boundary
+        // of the host's graph; only the *query* changed. And the message now
+        // names the situation: a separate repository, not a missing marker.
+        let (_dir, root) = host_with_git_submodule();
+        let sub = root.join("sub");
+
+        let mut workspaces = Workspaces::new();
+        workspaces.add_folder(&path_to_uri(&root));
+        workspaces.add_folder(&path_to_uri(&sub));
+
+        let diagnostics = collect_all_diagnostics(&workspaces.root_view(&root));
+        let steering = diagnostics
+            .iter()
+            .find(|d| d.file.as_path() == Path::new("outer.md") && d.severity == Severity::Error)
+            .unwrap_or_else(|| {
+                panic!("the host's link into the submodule errors: {diagnostics:?}")
+            });
+        assert!(
+            steering.message.contains("is in a git submodule")
+                && steering.message.contains("[external]` alias"),
+            "the crossing names the separate repository and steers to the alias: {}",
+            steering.message
+        );
+    }
+
+    #[test]
+    fn closing_the_submodule_folder_restores_the_boundary_gate() {
+        // The other direction of issue 052: a `.git`-only boundary is not an
+        // active nested scope root, so removing the submodule's own folder
+        // leaves nothing keeping its scope visible. It deregisters, its
+        // scan-only documents are evicted, its open ones keep serving rootless,
+        // and the host's gate fires again. Without `collect_scope_tree`'s
+        // discrimination the walk-down would report the boundary "active", the
+        // root would never be found stale, and every assertion below would fail.
+        let (_dir, root) = host_with_git_submodule();
+        let sub = root.join("sub");
+        let inner_abs = sub.join("inner.md");
+        let peer_abs = sub.join("peer.md");
+        let peer_uri = path_to_uri(&peer_abs);
+
+        let mut workspaces = Workspaces::new();
+        workspaces.add_folder(&path_to_uri(&root));
+        workspaces.add_folder(&path_to_uri(&sub));
+        // peer.md is open in the editor; inner.md stays scan-only.
+        workspaces.open_documents.insert(peer_uri.clone());
+        workspaces.sync_document_content(&peer_uri, "# Peer\n");
+        assert_eq!(
+            workspaces
+                .documents
+                .get(&peer_abs)
+                .and_then(|d| d.primary_root.as_deref()),
+            Some(sub.as_path()),
+            "the open document belongs to the submodule's scope before the removal"
+        );
+
+        workspaces.remove_folder(&path_to_uri(&sub));
+
+        assert!(
+            !workspaces.roots.contains_key(&sub),
+            "the submodule's scope root deregisters — no surviving folder keeps it visible"
+        );
+        assert!(
+            !workspaces.documents.contains_key(&inner_abs),
+            "the scan-only document is evicted"
+        );
+        assert!(
+            workspaces
+                .documents
+                .get(&peer_abs)
+                .is_some_and(|d| d.primary_root.is_none()),
+            "the open document keeps serving, now rootless"
+        );
+        assert!(
+            workspaces.deepest_root_for(&inner_abs).is_none(),
+            "the host's boundary gate fires again — the submodule is foreign territory once more"
+        );
+    }
+
+    #[test]
+    fn doubly_opened_submodule_document_is_reachable_by_a_watched_change() {
+        // `handle_watched_files_change` applies a `.md` event only when the path
+        // resolves to some root, so the shadowed root froze the submodule's
+        // documents against disk for as long as the host stayed open (issue 052's
+        // severity note). With the gate fixed the event reaches them.
+        let (_dir, root) = host_with_git_submodule();
+        let sub = root.join("sub");
+        let inner_abs = sub.join("inner.md");
+
+        let mut workspaces = Workspaces::new();
+        workspaces.add_folder(&path_to_uri(&root));
+        workspaces.add_folder(&path_to_uri(&sub));
+
+        fs::write(&inner_abs, "# Rewritten On Disk\n").expect("rewrite the submodule's document");
+        assert!(
+            workspaces.deepest_root_for(&inner_abs).is_some(),
+            "the watched-files gate admits the submodule's document"
+        );
+        workspaces.update_from_disk(&inner_abs);
+        assert!(
+            workspaces.documents.get(&inner_abs).is_some_and(|d| d
+                .data
+                .tree
+                .source()
+                .contains("Rewritten On Disk")),
+            "the disk change is applied, not dropped"
+        );
+    }
+
+    #[test]
+    fn marker_scope_below_a_git_boundary_opened_directly_resolves_to_the_marker() {
+        // The discriminator for the fix that lets a registered root win the gate
+        // over one that would strip registered roots out of `git_boundaries`:
+        // here the registered root sits a level *below* the gating boundary, so
+        // keying on "the root is the boundary" would leave it shadowed. The
+        // boundary set itself is untouched — the submodule is still a boundary
+        // of the host, exactly as decision 019 requires.
+        let dir = workspace_with_files(&[(".lattice.toml", ""), ("outer.md", "# Outer\n")]);
+        let root = fs::canonicalize(dir.path()).expect("canonicalize temp dir");
+        let sub = root.join("sub");
+        let inner_scope = sub.join("docs");
+        fs::create_dir_all(sub.join(".git")).expect("create the submodule's .git");
+        fs::create_dir_all(&inner_scope).expect("create the inner scope directory");
+        fs::write(inner_scope.join(".lattice.toml"), "").expect("write the inner marker");
+        fs::write(inner_scope.join("doc.md"), "# Doc\n").expect("write the inner document");
+        let doc_abs = inner_scope.join("doc.md");
+
+        let mut workspaces = Workspaces::new();
+        workspaces.add_folder(&path_to_uri(&root));
+        workspaces.add_folder(&path_to_uri(&inner_scope));
+
+        assert!(
+            workspaces.git_boundaries.contains(&sub),
+            "the submodule remains a `.git` boundary of the host — the fix changes the query, not the boundary set"
+        );
+        assert_eq!(
+            workspaces
+                .documents
+                .get(&doc_abs)
+                .and_then(|d| d.primary_root.as_deref()),
+            Some(inner_scope.as_path()),
+            "a marker scope registered below the boundary owns its documents"
+        );
+        assert!(
+            workspaces
+                .root_view(&root)
+                .file(Path::new("sub/docs/doc.md"))
+                .is_none(),
+            "the host's graph still excludes everything behind the submodule"
         );
     }
 

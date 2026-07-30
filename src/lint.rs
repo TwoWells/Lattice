@@ -1813,8 +1813,10 @@ mod tests {
 
         let (failed, output) = run_lint(&dir);
         assert!(
-            failed && output.contains("outside this scope"),
-            "a link into a nested `.git` environment steers to an alias: {output}"
+            failed
+                && output.contains("is in a git submodule")
+                && output.contains("[external]` alias"),
+            "a link into a nested `.git` environment names the separate repository and steers to an alias: {output}"
         );
         assert!(
             !output.contains("vendor/inner.md:"),
