@@ -6,6 +6,34 @@
 //! Publishes diagnostics on file open, save, and change. Provides workspace
 //! symbols, rename, references, type hierarchy, and call hierarchy for
 //! headings. Supports multiple workspace folders.
+//!
+//! # Which copy does this surface read? (decision 024 clause 9)
+//!
+//! Content lives in the two-tier [`crate::store`]: a **saved** copy per indexed
+//! document (disk truth) and an **overlay** copy per open, diverged buffer.
+//! Every surface declares which it reads, and the asymmetry is deliberate — a
+//! `WorkspaceEdit` is consumed synchronously by the client that owns those
+//! buffers, whereas a diagnostic persists and would be re-resolved later
+//! against a state that may have moved.
+//!
+//! - **Diagnostics read perspective.** A document's rows are computed from the
+//!   saved world with *its own* buffer overlaid, and nobody else's
+//!   ([`merge_perspectives`]). This is buffer locality, the model's headline.
+//! - **Reads and edits read current.** Hover, symbols, folding, semantic
+//!   tokens, navigation, completion, formatting, `rename` and
+//!   `willRenameFiles` all resolve through [`Workspaces::resolve_document`] /
+//!   [`Workspaces::current_view`]: buffer where one exists, saved copy
+//!   everywhere else. An edit computed against saved coordinates and applied to
+//!   a diverged buffer would land in the wrong place, and a position-bearing
+//!   answer must be anchored in the text on screen.
+//!
+//! # Standing constraint: no cross-file positions in diagnostics (clause 10)
+//!
+//! A [`Diagnostic`] carries no `relatedInformation`, and under this model it
+//! must not gain one that points into another file: there is no vocabulary for
+//! a position in another document's *current* state. Such a position would be
+//! saved-state coordinates resolved against a possibly-diverged buffer — wrong
+//! by construction, and silently so.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
@@ -24,6 +52,7 @@ use crate::line_index::LineIndex;
 use crate::lsp;
 use crate::overrides::{self, OverrideVerdicts, VerdictKind};
 use crate::span::Span;
+use crate::store::{DiskUpdate, Document, DocumentStore, TIERS, Tier};
 use crate::uri::{path_to_uri, uri_to_path};
 use crate::validation::{self, Diagnostic, Severity};
 use crate::workspace::{
@@ -46,27 +75,6 @@ struct PublishedDiagnostics {
     lattice: Vec<Diagnostic>,
     /// The materialized LSP diagnostics last sent to the client.
     lsp: Vec<lsp::Diagnostic>,
-}
-
-/// A single parsed document: the one owner of its [`FileData`] plus the deepest
-/// root that covers it (ticket server 10).
-///
-/// Content has exactly one home regardless of how it arrived — a directory
-/// scan, a `didOpen`, or both — so no two containers can disagree about a
-/// document, which is what the dual `inner`/`singletons` ownership (issue 051)
-/// made possible.
-struct Document {
-    /// Parsed data, always parsed relative to `primary_root` (or the file name
-    /// when rootless), so its link classification matches how the owning root
-    /// resolves it.
-    data: FileData,
-    /// The deepest workspace root whose path covers this document, or `None`
-    /// when the document lies outside every folder — a rootless single-file
-    /// document (issue 051). `None` documents stay diagnostic-quiet: they are
-    /// absent from every root's range scan, so the publish/pull tier never sees
-    /// them, while their document-scoped features still resolve by direct path
-    /// lookup.
-    primary_root: Option<PathBuf>,
 }
 
 /// Root-level state for one workspace folder. Carries no file list — membership
@@ -105,15 +113,16 @@ struct RootMeta {
     verdicts: OverrideVerdicts,
 }
 
-/// The server's flat document store: every parsed document keyed by absolute
-/// path (its single owner), plus root metadata. Root membership is derived by
-/// range scan — `documents.range(root..).take_while(|(p, _)| p.starts_with(root))`
+/// The server's document state: the two-tier [`DocumentStore`] (decision 024)
+/// plus root metadata. Root membership is derived by range scan over the store
 /// — which is component-wise (via `Path::starts_with`), so a `Lattice` folder
 /// never captures a `LatticeInternal` sibling the way a string-keyed range
 /// would (ticket server 10).
 struct Workspaces {
-    /// Every parsed document, keyed by absolute path — the single content owner.
-    documents: BTreeMap<PathBuf, Document>,
+    /// The saved store (disk truth) and the overlay store (open buffers), each
+    /// with one writer channel enforced by the [`crate::store`] module
+    /// boundary (decision 024 clause 1, issue 067).
+    store: DocumentStore,
     /// Every active **scope root**, keyed by the (client-spelling) directory a
     /// marker declares — a `.lattice.toml` scope or a `.git` non-root
     /// environment (decision 019). Roots derive from markers, not folders: an
@@ -155,33 +164,29 @@ struct Workspaces {
     /// and force-invalidated on every marker event (the config is unsynced,
     /// so no `didOpen` boundary ever resets its record).
     published: HashMap<String, PublishedDiagnostics>,
-    /// Absolute paths of documents currently open in the editor — live between
-    /// `textDocument/didOpen` and `textDocument/didClose`.
+    /// Absolute paths of documents the client currently holds a buffer for —
+    /// live between `textDocument/didOpen` and `textDocument/didClose`.
     ///
-    /// The editor buffer is authoritative for these (decision 017 §3): a
-    /// `workspace/didChangeWatchedFiles` `changed` event carries *disk* content,
-    /// so honoring it for a file open with unsaved edits would clobber the live
-    /// buffer with stale bytes — and an open file edited in the editor already
-    /// reaches the server through `didChange`, so the watcher event would be a
-    /// second source of truth (the issue 009 duplication class). A `changed`
-    /// event is therefore dropped while its path is in this set **and** the
-    /// buffer holds state disk doesn't ([`Self::dirty_documents`], issue 061);
-    /// create/delete membership events are honored regardless (ticket
-    /// server 09). It also pins buffer authority across a workspace-folder
-    /// change: a folder added over an open document keeps the buffer, and a
-    /// folder removed under one keeps it serving rootless.
+    /// Under decision 024 this is **client state, not arbitration**: it records
+    /// which documents the editor owns a buffer for, and it decides exactly two
+    /// things. (1) Clause 1's materialize-before-write: a disk write landing on
+    /// an open document with no overlay entry must first move the pre-update
+    /// saved parse into the overlay, because the client still holds that text.
+    /// (2) Whether an uncovered document survives a workspace-folder removal.
+    /// No watched event is ever dropped on account of it — the saved store's
+    /// writers are unconditional — and the dirty set it used to pair with is
+    /// retired outright (017 §3 superseded).
     ///
     /// # Keying (issue 069)
     ///
-    /// Keyed by the **decoded path** [`uri_to_path`] yields, exactly like
-    /// [`Self::documents`] — never by the raw URI string. Arbitration compares
-    /// what a watcher event and a `didOpen` name, and two components may spell
+    /// Keyed by the **decoded path** [`uri_to_path`] yields, exactly like the
+    /// document store — never by the raw URI string. Two components may spell
     /// one file differently (one percent-encodes a space, the other does not),
-    /// so a URI-keyed check is spelling-dependent: it misses silently and fails
-    /// open, applying disk over a live buffer. Deciding identity once, at the
-    /// boundary, removes the dependence structurally. It is also the premise
-    /// decision 024's buffer locality rests on — one buffer per document — which
-    /// URI-spelling aliasing would break at the level of identity.
+    /// so a URI-keyed set is spelling-dependent and misses silently. Deciding
+    /// identity once, at the boundary, removes the dependence structurally. It
+    /// is also the premise decision 024's buffer locality rests on — one buffer
+    /// per document — which URI-spelling aliasing would break at the level of
+    /// identity.
     ///
     /// **Out of scope:** symlink and case-insensitivity aliasing. Two paths
     /// that differ by a symlink hop, or only in case on a case-insensitive
@@ -192,60 +197,22 @@ struct Workspaces {
     /// is deferred to its own decision. This keying fixes **spelling** aliasing
     /// (percent-encoding variants) only.
     open_documents: HashSet<PathBuf>,
-    /// Open documents whose buffer may hold state that is not on disk: opened
-    /// with text diverging from the file's bytes, or edited (`didChange`)
-    /// since the last save.
-    ///
-    /// This is the strict buffer-wins set — decision 017 §3 as narrowed by
-    /// issue 061. A watched `changed` event is dropped only for these paths,
-    /// because their buffer is the sole copy of unsaved state. An open
-    /// document *not* in this set holds a mere snapshot of its last save: an
-    /// external process rewriting the file makes disk strictly newer, so the
-    /// watched event reconciles it from disk exactly like a closed file.
-    /// Without the narrowing, a long-open saved document pins the index to
-    /// pre-rewrite content indefinitely, and every cross-file predicate judged
-    /// against it is a phantom — issue 061's mass-`lattice mv` shape, where
-    /// the in-place link rewrites of open counterpart files never landed.
-    ///
-    /// Keyed by decoded path on the same terms, and for the same reason, as
-    /// [`Self::open_documents`] (issue 069).
-    dirty_documents: HashSet<PathBuf>,
     /// A borrowable default configuration for rootless single-file views
     /// (issue 051): a document outside every root parses and serves its
     /// document-scoped features under defaults, with the graph tier inert.
     default_config: Config,
 }
 
-/// The structural-cache debt one disk reconciliation leaves its caller.
-///
-/// [`Workspaces::apply_from_disk`] mutates the store without paying any
-/// structural recompute, so the watched-files batch handler can fold N debts
-/// into one sweep (issue 063); [`Workspaces::update_from_disk`] settles the
-/// debt immediately for single-file callers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DiskUpdate {
-    /// The store did not change: the path is neither on disk nor indexed, or
-    /// the on-disk bytes already match the indexed content.
-    Untouched,
-    /// An existing document's content was re-read in place. Only its own
-    /// structural cache is owed — no membership changed.
-    Content,
-    /// A document joined or left the store. Any sibling's bare-path existence
-    /// answer may have flipped, so a full-workspace sweep is owed.
-    Membership,
-}
-
 impl Workspaces {
     /// An empty store with no roots and no documents.
     fn new() -> Self {
         Self {
-            documents: BTreeMap::new(),
+            store: DocumentStore::new(),
             roots: BTreeMap::new(),
             client_folders: BTreeSet::new(),
             git_boundaries: BTreeSet::new(),
             published: HashMap::new(),
             open_documents: HashSet::new(),
-            dirty_documents: HashSet::new(),
             default_config: Config::default(),
         }
     }
@@ -306,21 +273,28 @@ impl Workspaces {
         (!gated).then(|| deepest.clone())
     }
 
-    /// The absolute paths of every document under `root`, by range scan.
+    /// The absolute paths of every document under `root` (either tier), by
+    /// range scan.
     fn document_keys_under(&self, root: &Path) -> Vec<PathBuf> {
-        self.documents
-            .range(root.to_path_buf()..)
-            .take_while(|(abs, _)| abs.starts_with(root))
-            .map(|(abs, _)| abs.clone())
-            .collect()
+        self.store.keys_under(root)
     }
 
     /// The configuration a document with the given primary root parses under:
     /// the root's config, or the rootless default (issue 051).
     fn config_for(&self, primary: Option<&Path>) -> &Config {
+        Self::config_of(&self.roots, &self.default_config, primary)
+    }
+
+    /// [`Self::config_for`] over the two fields it actually reads, so a caller
+    /// that also holds `&mut self.store` can borrow them disjointly.
+    fn config_of<'a>(
+        roots: &'a BTreeMap<PathBuf, RootMeta>,
+        default_config: &'a Config,
+        primary: Option<&Path>,
+    ) -> &'a Config {
         primary
-            .and_then(|root| self.roots.get(root))
-            .map_or(&self.default_config, |meta| &meta.config)
+            .and_then(|root| roots.get(root))
+            .map_or(default_config, |meta| &meta.config)
     }
 
     /// The strictly-deeper scope boundaries nested inside `root`: every
@@ -362,29 +336,20 @@ impl Workspaces {
             .collect()
     }
 
-    /// Build the per-root view the graph/diagnostic pipeline and cross-file
-    /// document features consume: every document **whose primary root is `root`**,
-    /// keyed by path relative to `root`.
+    /// Wrap a per-root file map in the view the shared pipeline consumes.
     ///
-    /// Membership is the range scan tightened to `primary_root == root`
+    /// Membership is always the range scan tightened to `primary_root == root`
     /// (decision 019, ticket server 10's anticipated filter): a document under a
     /// strictly-deeper boundary belongs to that nested scope's graph, not this
     /// one, so the two scopes are disjoint — the host never sees the nested
-    /// scope's files, and vice versa.
-    fn root_view(&self, root: &Path) -> WorkspaceView<'_> {
-        let mut files = BTreeMap::new();
-        for (abs, doc) in self
-            .documents
-            .range(root.to_path_buf()..)
-            .take_while(|(abs, _)| abs.starts_with(root))
-        {
-            if doc.primary_root.as_deref() != Some(root) {
-                continue;
-            }
-            if let Ok(rel) = abs.strip_prefix(root) {
-                files.insert(rel.to_path_buf(), &doc.data);
-            }
-        }
+    /// scope's files, and vice versa. Which *copy* of each document the map
+    /// holds is the caller's declaration (decision 024 clause 9: diagnostics
+    /// read perspective, edits and reads read current).
+    fn view_over<'a>(
+        &'a self,
+        root: &Path,
+        files: BTreeMap<PathBuf, &'a FileData>,
+    ) -> WorkspaceView<'a> {
         let (config, has_config) = self.roots.get(root).map_or_else(
             || (&self.default_config, false),
             |meta| (&meta.config, meta.has_config),
@@ -396,6 +361,34 @@ impl Workspaces {
             files,
             self.boundaries_under(root),
         )
+    }
+
+    /// The **saved world** for one root: every document at its last-committed
+    /// content. This is what every document other than the perspective's focus
+    /// is judged against, and what the `[[override]]` aggregate adjudicates over
+    /// — the conformance surface `lattice lint` shares (decision 024 clause 8).
+    fn saved_view(&self, root: &Path) -> WorkspaceView<'_> {
+        self.view_over(root, self.store.saved_files(root))
+    }
+
+    /// The **perspective** one document's own rows are computed under: the
+    /// saved world with `focus`'s buffer swapped in (decision 024's headline).
+    ///
+    /// A no-op for a document with no overlay entry, which is what makes the
+    /// merge free for every undiverged document.
+    fn perspective_view(&self, root: &Path, focus: &Path) -> WorkspaceView<'_> {
+        self.view_over(root, self.store.perspective_files(root, focus))
+    }
+
+    /// Every document of one root at its **current** text — buffers where they
+    /// exist, saved copies elsewhere.
+    ///
+    /// The read and edit surfaces' view (decision 024 clause 9). An edit
+    /// computed against saved coordinates and applied to a diverged buffer
+    /// lands in the wrong place, and a hover or semantic token must describe
+    /// the text on screen.
+    fn current_view(&self, root: &Path) -> WorkspaceView<'_> {
+        self.view_over(root, self.store.current_files(root))
     }
 
     /// Build a single-file view over one rootless document (issue 051): its
@@ -414,140 +407,173 @@ impl Workspaces {
 
     // --- Document resolution ---
 
-    /// Resolve a URI to the view and relative path for its **graph/diagnostic**
-    /// tier: the deepest covering root, or `None` for a rootless or unindexed
-    /// document (which pulls/publishes nothing — issue 051).
+    /// Resolve a URI to the view and relative path for its **diagnostic** tier:
+    /// its own perspective under the deepest covering root, or `None` for a
+    /// rootless or unindexed document (which publishes nothing — issue 051).
     fn resolve(&self, uri: &str) -> Option<(WorkspaceView<'_>, PathBuf)> {
         let abs = uri_to_path(uri);
-        let doc = self.documents.get(&abs)?;
-        let root = doc.primary_root.as_ref()?;
-        let rel = abs.strip_prefix(root).ok()?.to_path_buf();
-        Some((self.root_view(root), rel))
+        let root = self.store.current(&abs)?.primary_root.clone()?;
+        let rel = abs.strip_prefix(&root).ok()?.to_path_buf();
+        Some((self.perspective_view(&root, &abs), rel))
     }
 
     /// Resolve a URI to the view and relative path that serve its
     /// **document-scoped** features (semantic tokens, folding, symbols, hover,
-    /// formatting, document links, completion, navigation, …).
+    /// formatting, document links, completion, navigation, …) and its edit
+    /// surfaces.
+    ///
+    /// Both read **current** text (decision 024 clause 9): the client applies a
+    /// `WorkspaceEdit` to the buffers it holds, and a position-bearing answer
+    /// must be anchored in the text on screen.
     ///
     /// A single direct path lookup: a rooted document resolves against its
-    /// deepest root's view; a rootless document (issue 051) against a
-    /// single-file view. There is no two-phase workspace-then-singleton
-    /// fallback — the flat store made it unnecessary.
+    /// root's current view; a rootless document (issue 051) against a
+    /// single-file view.
     fn resolve_document(&self, uri: &str) -> Option<(WorkspaceView<'_>, PathBuf)> {
         let abs = uri_to_path(uri);
-        let doc = self.documents.get(&abs)?;
+        let doc = self.store.current(&abs)?;
         match doc.primary_root.as_ref() {
             Some(root) => {
                 let rel = abs.strip_prefix(root).ok()?.to_path_buf();
-                Some((self.root_view(root), rel))
+                Some((self.current_view(root), rel))
             }
             None => Some((self.single_file_view(&abs, doc), document_rel(&abs, None))),
         }
     }
 
-    // --- Content upsert / eviction / reconciliation ---
+    // --- Overlay-store writers: didOpen / didChange / didClose -------------
 
-    /// Sync an opened or edited document's in-memory content into the store,
-    /// keyed by path. Content has one home: a URI under a folder joins that
-    /// root's membership; one outside every folder is rootless (issue 051) and
-    /// stays diagnostic-quiet. `primary_root` is computed at insert.
-    fn sync_document_content(&mut self, uri: &str, content: &str) {
+    /// Seed the buffer copy for a `didOpen` (decision 024 clause 3).
+    ///
+    /// A `didOpen` is a **claim, not a source**: it asserts "here is what I am
+    /// holding", never "here is what is on disk", so it never writes the saved
+    /// store. This is what kills issue 067's read-then-`didOpen` race by
+    /// construction — a client that read a file before an external edit and
+    /// opened it afterwards makes a stale claim that can mislead exactly one
+    /// document's rows.
+    ///
+    /// Divergence is decided against the **saved copy**, which is exactly the
+    /// question the sharing rule asks ("can this document share the saved
+    /// parse?"). A document with no saved copy — gitignored, outside every
+    /// root, or not yet written to disk — always materializes.
+    fn open_buffer(&mut self, uri: &str, content: &str) {
         let abs = uri_to_path(uri);
-        let existed = self.documents.contains_key(&abs);
-        let primary = self.deepest_root_for(&abs);
-        let rooted = primary.is_some();
-        let data = {
-            // Links classify against the absolute path (root-free), so the config
-            // affects only the frontmatter predicate check — placement is derived
-            // separately below.
-            let config = self.config_for(primary.as_deref());
-            parse_content(content, &abs, config)
-        };
-        self.documents.insert(
-            abs.clone(),
-            Document {
-                data,
-                primary_root: primary,
-            },
-        );
-        if existed || !rooted {
-            // An edit to an already-indexed document, or a rootless document
-            // (issue 051): no root's membership changed — a rootless document
-            // appears in no root's range scan, so no other document's
-            // bare-path existence answer can flip. Refresh this document's
-            // own cache only.
-            self.recompute_structural(&abs);
-        } else {
-            // A rooted document joined the membership: a bare-path existence
-            // answer can flip in any document that shares a root, so
-            // recompute the structural caches.
-            self.recompute_all_structural();
+        if self.store.source(&abs, Tier::Saved) == Some(content) {
+            // Undiverged: store nothing and share the saved parse. One parse,
+            // not two, so a client holding hundreds of unmodified documents
+            // open does not double the store.
+            self.store.open_buffer(&abs, None);
+            return;
+        }
+        let doc = self.parse_buffer(&abs, content);
+        self.store.open_buffer(&abs, Some(doc));
+        self.recompute_structural(&abs);
+    }
+
+    /// Materialize (or replace) the buffer copy for a `didChange`.
+    ///
+    /// Membership never moves: a `didChange` targets an already-open document
+    /// and the saved store is untouched, so no other document's bare-path
+    /// existence answer can flip. Only this document's own cache is owed.
+    fn change_buffer(&mut self, uri: &str, content: &str) {
+        let abs = uri_to_path(uri);
+        let doc = self.parse_buffer(&abs, content);
+        self.store.change_buffer(&abs, doc);
+        self.recompute_structural(&abs);
+    }
+
+    /// Drop the buffer copy at `didClose`. The saved store never held buffer
+    /// content, so there is nothing to revert (decision 024 clause 4).
+    fn close_buffer(&mut self, abs: &Path) {
+        self.store.close_buffer(abs);
+    }
+
+    /// Parse buffer `content` for `abs` under its placement's config.
+    fn parse_buffer(&self, abs: &Path, content: &str) -> Document {
+        let primary = self.deepest_root_for(abs);
+        // Links classify against the absolute path (root-free), so the config
+        // affects only the frontmatter predicate check.
+        let config = self.config_for(primary.as_deref());
+        Document {
+            data: parse_content(content, abs, config),
+            primary_root: primary,
         }
     }
 
-    /// Reconcile a document to disk: re-read and re-parse it, or drop it if it
-    /// is gone (issue 046 didClose semantics; watched create/change/delete).
-    /// Its `primary_root` is recomputed at insert. Settles the structural debt
-    /// immediately; the watched-files batch handler calls
-    /// [`Self::apply_from_disk`] directly to pay one sweep for a whole batch.
+    // --- Saved-store writers: didSave / watched files ----------------------
+
+    /// Commit a `didSave` carrying `includeText` — the one seam between the
+    /// tiers (decision 024 clause 1). The saved copy becomes the buffer's
+    /// content and the overlay entry is dropped.
+    fn commit_save(&mut self, uri: &str, content: &str) {
+        let abs = uri_to_path(uri);
+        let primary = self.deepest_root_for(&abs);
+        let data = {
+            let config = Self::config_of(&self.roots, &self.default_config, primary.as_deref());
+            parse_content(content, &abs, config)
+        };
+        match self.store.commit_save(&abs, primary, data) {
+            DiskUpdate::Membership => self.recompute_all_structural(),
+            DiskUpdate::Content | DiskUpdate::Untouched => self.recompute_structural(&abs),
+        }
+    }
+
+    /// The absent-`includeText` `didSave` fallback: drop the overlay and
+    /// re-read disk into the saved store.
+    fn commit_save_from_disk(&mut self, abs: &Path) {
+        let primary = self.deepest_root_for(abs);
+        let update = {
+            let config = Self::config_of(&self.roots, &self.default_config, primary.as_deref());
+            self.store
+                .commit_save_from_disk(abs, primary.clone(), &|content| {
+                    parse_content(content, abs, config)
+                })
+        };
+        self.settle(abs, update);
+    }
+
+    /// Reconcile the saved copy to disk and settle the structural debt in one
+    /// step. Every production caller splits the two — the watched-files batch
+    /// folds N debts into one sweep (issue 063), and `didClose` inspects the
+    /// [`DiskUpdate`] to decide whether it caught a watcher miss — so this
+    /// survives as the tests' one-shot convenience.
+    #[cfg(test)]
     fn update_from_disk(&mut self, abs: &Path) {
-        match self.apply_from_disk(abs) {
+        let update = self.apply_from_disk(abs);
+        self.settle(abs, update);
+    }
+
+    /// Pay the structural debt one saved-store write left.
+    fn settle(&mut self, abs: &Path, update: DiskUpdate) {
+        match update {
             DiskUpdate::Membership => self.recompute_all_structural(),
             DiskUpdate::Content => self.recompute_structural(abs),
             DiskUpdate::Untouched => {}
         }
     }
 
-    /// Reconcile a document to disk without recomputing any structural cache,
-    /// returning the debt the caller owes ([`DiskUpdate`]).
+    /// Reconcile the saved copy to disk without recomputing any structural
+    /// cache, returning the debt the caller owes ([`DiskUpdate`]).
+    ///
+    /// **Unconditional** (decision 024, issue 067): no buffer-wins drop, no
+    /// dirty check. The saved store never held buffer content, so a watched
+    /// event has nothing to clobber — it only ever refreshes disk truth, and
+    /// an open document's own rows keep reading its overlay. Where the document
+    /// is open and undiverged, the store first materializes the pre-update
+    /// saved parse into the overlay (clause 1), so the client's text is never
+    /// silently replaced by content it never sent.
     ///
     /// Folding the recompute out of the per-file apply is what keeps a bulk
     /// `didChangeWatchedFiles` batch `O(batch + workspace)` instead of
-    /// `O(batch × workspace)`: a directory move delivered as hundreds of
-    /// created/deleted events must not pay a full-workspace sweep per event
-    /// (issue 063). Re-reading bytes identical to the indexed content reports
-    /// [`DiskUpdate::Untouched`] — nothing reparsed, nothing owed — so a
-    /// watcher echo of content the server already holds costs one read.
+    /// `O(batch × workspace)` (issue 063).
     fn apply_from_disk(&mut self, abs: &Path) -> DiskUpdate {
-        if !abs.is_file() {
-            return if self.documents.remove(abs).is_some() {
-                DiskUpdate::Membership
-            } else {
-                DiskUpdate::Untouched
-            };
-        }
-        let Ok(content) = std::fs::read_to_string(abs) else {
-            // Exists but unreadable: drop it so no stale content lingers —
-            // stricter than the test-only incremental `Workspace::update`,
-            // which keeps the stale entry and surfaces the read error.
-            return if self.documents.remove(abs).is_some() {
-                DiskUpdate::Membership
-            } else {
-                DiskUpdate::Untouched
-            };
-        };
-        let existed = match self.documents.get(abs) {
-            Some(doc) if doc.data.tree.source() == content => return DiskUpdate::Untouched,
-            Some(_) => true,
-            None => false,
-        };
         let primary = self.deepest_root_for(abs);
-        let data = {
-            let config = self.config_for(primary.as_deref());
-            parse_content(&content, abs, config)
-        };
-        self.documents.insert(
-            abs.to_path_buf(),
-            Document {
-                data,
-                primary_root: primary,
-            },
-        );
-        if existed {
-            DiskUpdate::Content
-        } else {
-            DiskUpdate::Membership
-        }
+        let open = self.open_documents.contains(abs);
+        let config = Self::config_of(&self.roots, &self.default_config, primary.as_deref());
+        self.store
+            .apply_from_disk(abs, open, primary.clone(), &|content| {
+                parse_content(content, abs, config)
+            })
     }
 
     /// Drop a rootless single-file document (issue 051) — used on `didClose`,
@@ -556,11 +582,12 @@ impl Workspaces {
     fn remove_single_file(&mut self, uri: &str) {
         let abs = uri_to_path(uri);
         if self
-            .documents
-            .get(&abs)
+            .store
+            .current(&abs)
             .is_some_and(|doc| doc.primary_root.is_none())
         {
-            self.documents.remove(&abs);
+            self.store.close_buffer(&abs);
+            self.store.evict_saved(&abs);
         }
     }
 
@@ -569,75 +596,50 @@ impl Workspaces {
     /// **without a rescan**.
     ///
     /// The move engine's text edits were already applied to buffers by the
-    /// client before it renamed on disk (decision 017 §3), so the content at the
-    /// new key is authoritative and correct — re-keying just moves the parsed
-    /// entries from the old absolute path to the new one and reparses each under
-    /// its (possibly changed) primary root, rather than re-reading a whole
-    /// scope. A file rename moves the single entry; a directory rename moves
-    /// every document under the old prefix. The `open_documents` /
-    /// `dirty_documents` sets and the per-URI `published` cache are re-keyed
-    /// alongside so buffer authority and publication diffing follow the file.
-    /// Returns whether anything moved.
+    /// client before it renamed on disk, so the content at the new key is
+    /// correct in **both** tiers — re-keying just moves the parsed entries
+    /// from the old absolute path to the new one and re-derives each under its
+    /// (possibly changed) primary root, rather than re-reading a whole scope.
+    /// A file rename moves the single entry; a directory rename moves every
+    /// document under the old prefix. The `open_documents` set and the per-URI
+    /// `published` cache are re-keyed alongside so client state and publication
+    /// diffing follow the file.
     ///
-    /// Reparsing (not a bare key swap) is required because a document parses
+    /// Re-deriving (not a bare key swap) is required because a document parses
     /// relative to its root, and the link classification / structural existence
-    /// checks read the new coordinate; the buffer text is preserved verbatim.
+    /// checks read the new coordinate; each tier's text is preserved verbatim.
     ///
     /// Returns the old URIs that held a published diagnostic set, so the caller
     /// can send each an explicit empty publish — the re-publish diff iterates
     /// the *current* store and never revisits a vanished key.
     fn rekey_rename(&mut self, old_abs: &Path, new_abs: &Path) -> Vec<String> {
-        // Every stored document at, or under, the old path (a file is its own
-        // sole member; a directory prefixes several).
-        let moved: Vec<PathBuf> = self
-            .documents
-            .range(old_abs.to_path_buf()..)
-            .take_while(|(abs, _)| abs.starts_with(old_abs))
-            .map(|(abs, _)| abs.clone())
-            .collect();
         let mut cleared = Vec::new();
-        for old_key in moved {
-            let Some(doc) = self.documents.remove(&old_key) else {
-                continue;
-            };
-            // Translate the key under the rename: the source maps to the
-            // destination, a contained member keeps its suffix.
-            let new_key = if old_key == old_abs {
-                new_abs.to_path_buf()
-            } else {
-                old_key
-                    .strip_prefix(old_abs)
-                    .map_or_else(|_| old_key.clone(), |suffix| new_abs.join(suffix))
-            };
-            // Follow the buffer-authority and publication-diff state to the new
-            // key so an open renamed file stays editor-authoritative (its
-            // divergence state included) and its stale publication under the
-            // old URI is cleared.
+        for (old_key, new_key) in self.store.rekey(old_abs, new_abs) {
+            // Follow the client-state and publication-diff records to the new
+            // key so an open renamed file stays open and its stale publication
+            // under the old URI is cleared.
             if self.open_documents.remove(&old_key) {
                 self.open_documents.insert(new_key.clone());
-            }
-            if self.dirty_documents.remove(&old_key) {
-                self.dirty_documents.insert(new_key.clone());
             }
             let old_uri = path_to_uri(&old_key);
             if self.published.remove(&old_uri).is_some() {
                 cleared.push(old_uri);
             }
-            // Reparse from the preserved buffer under the destination's primary
-            // root — placement and coordinate change, content does not.
+            // Re-derive each tier's parse under the destination's primary root
+            // — placement and coordinate change, content does not.
             let primary = self.deepest_root_for(&new_key);
-            let source = doc.data.tree.source().to_string();
-            let data = {
-                let config = self.config_for(primary.as_deref());
-                parse_content(&source, &new_key, config)
-            };
-            self.documents.insert(
-                new_key,
-                Document {
-                    data,
-                    primary_root: primary,
-                },
-            );
+            self.store.set_primary_root(&new_key, primary.as_deref());
+            for tier in TIERS {
+                let Some(source) = self.store.source(&new_key, tier).map(str::to_string) else {
+                    continue;
+                };
+                let data = {
+                    let config =
+                        Self::config_of(&self.roots, &self.default_config, primary.as_deref());
+                    parse_content(&source, &new_key, config)
+                };
+                self.store.reparse_in_place(&new_key, tier, data);
+            }
         }
         cleared
     }
@@ -651,101 +653,105 @@ impl Workspaces {
     ///
     /// Placement is metadata: the parse tree and its cached links are root-free
     /// (links classify against the absolute path, decision 019 clause 8), so a
-    /// re-root within one config cannot change them, and the `FileData` — buffer
-    /// included — is preserved untouched, keeping an open editor buffer
-    /// authoritative across the change (decision 017 §3) without touching disk or
-    /// the parser. One parse-time derivation, however, *is* config-sensitive:
-    /// `FileData::backlink_diagnostics`, the frontmatter unknown-predicate check,
-    /// reads the predicate vocabulary. A re-root that crosses a scope boundary
-    /// (a live split/merge, or a folder add/remove over a marker scope) changes
-    /// the effective config, so when the predicate vocabulary actually differs
-    /// this reparses from the buffer to refresh that derivation. The
+    /// re-root within one config cannot change them, and each tier's
+    /// `FileData` — the buffer copy included — is preserved untouched without
+    /// touching disk or the parser. One parse-time derivation, however, *is*
+    /// config-sensitive: `FileData::backlink_diagnostics`, the frontmatter
+    /// unknown-predicate check, reads the predicate vocabulary. A re-root that
+    /// crosses a scope boundary (a live split/merge, or a folder add/remove
+    /// over a marker scope) changes the effective config, so when the predicate
+    /// vocabulary actually differs this re-derives every tier's parse. The
     /// root-dependent structural cache is refreshed by the caller's
     /// `recompute_all_structural` afterward.
     fn refresh_placement(&mut self, abs: &Path) {
         let new_primary = self.deepest_root_for(abs);
-        let Some(doc) = self.documents.get(abs) else {
+        let Some(old_primary) = self.store.current(abs).map(|doc| doc.primary_root.clone()) else {
             return;
         };
-        let old_primary = doc.primary_root.clone();
         if old_primary == new_primary {
             return;
         }
         // Does the re-root change the predicate vocabulary the parse-time
-        // backlink check reads? Only then must the buffer be reparsed.
+        // backlink check reads? Only then must each tier be re-derived.
         let reparse = self.config_for(old_primary.as_deref()).predicates
             != self.config_for(new_primary.as_deref()).predicates;
-        if let Some(doc) = self.documents.get_mut(abs) {
-            doc.primary_root = new_primary;
-        }
+        self.store.set_primary_root(abs, new_primary.as_deref());
         if reparse {
-            self.reparse_from_buffer(abs);
+            self.reparse_in_place(abs);
         }
     }
 
-    /// Reparse a document from its in-memory buffer under its current primary
-    /// root's config (placement unchanged) — used by a config reload
-    /// (ticket server 08), which changes the config every owned document parses
-    /// under while preserving membership and unsaved buffers.
+    /// Re-derive every stored copy of a document from its **own** source under
+    /// its current primary root's config (placement unchanged) — used by a
+    /// config reload (ticket server 08), which changes the config every owned
+    /// document parses under while preserving membership and open buffers.
     ///
-    /// The reparse survives ticket server 11's placement/reparse split because
-    /// the config still feeds one *parse-time* derivation: the frontmatter
-    /// backlink-predicate check (`FileData::backlink_diagnostics`), which flags
-    /// an unknown predicate against the config vocabulary and records its line.
-    /// Link classification, by contrast, is config- and root-free, so a mere
-    /// placement change routes through `refresh_placement` instead (no reparse).
-    fn reparse_from_buffer(&mut self, abs: &Path) {
-        let Some(doc) = self.documents.get(abs) else {
-            return;
-        };
-        let primary = doc.primary_root.clone();
-        let source = doc.data.tree.source().to_string();
-        let data = {
-            let config = self.config_for(primary.as_deref());
-            parse_content(&source, abs, config)
-        };
-        if let Some(doc) = self.documents.get_mut(abs) {
-            doc.data = data;
+    /// The re-derivation survives ticket server 11's placement/reparse split
+    /// because the config still feeds one *parse-time* derivation: the
+    /// frontmatter backlink-predicate check (`FileData::backlink_diagnostics`),
+    /// which flags an unknown predicate against the config vocabulary and
+    /// records its line. Link classification, by contrast, is config- and
+    /// root-free, so a mere placement change routes through `refresh_placement`
+    /// instead (no reparse).
+    fn reparse_in_place(&mut self, abs: &Path) {
+        let primary = self.store.primary_root(abs);
+        for tier in TIERS {
+            let Some(source) = self.store.source(abs, tier).map(str::to_string) else {
+                continue;
+            };
+            let data = {
+                let config = Self::config_of(&self.roots, &self.default_config, primary.as_deref());
+                parse_content(&source, abs, config)
+            };
+            self.store.reparse_in_place(abs, tier, data);
         }
     }
 
     // --- Structural cache maintenance ---
 
-    /// Recompute one document's cached structural diagnostics against its
-    /// primary root's membership and config. A rootless document is left empty
-    /// (issue 051 — single-file documents carry no workspace-tier verdicts).
+    /// Recompute a document's cached structural diagnostics in **every** tier it
+    /// has a copy in, against its primary root's membership and config.
+    ///
+    /// Each tier reads the membership its own consumer is judged against: the
+    /// saved copy sees the saved world alone, so its rows are exactly what
+    /// `lattice lint` computes on the same disk state (the conformance
+    /// invariant); the overlay copy sees the same saved world **plus itself**,
+    /// because a document is always a member of its own perspective — that is
+    /// what makes a buffer-only file lint itself while staying invisible to
+    /// every other document until the first save (decision 024's notes).
+    ///
+    /// A rootless document is left empty (issue 051 — single-file documents
+    /// carry no workspace-tier verdicts).
     fn recompute_structural(&mut self, abs: &Path) {
-        let Some(doc) = self.documents.get(abs) else {
-            return;
-        };
-        let Some(root) = doc.primary_root.clone() else {
-            if let Some(doc) = self.documents.get_mut(abs) {
-                doc.data.structural = Vec::new();
-                doc.data.suppressions = crate::structural::FileSuppressions::default();
-            }
-            return;
-        };
-        let rel = abs.strip_prefix(&root).unwrap_or(abs).to_path_buf();
-        let config = self
-            .roots
-            .get(&root)
-            .map_or(&self.default_config, |meta| &meta.config);
-        // Membership under the primary root, by range scan through the flat
-        // store: a bare-path target `t` exists iff `root/t` is a document *of
-        // this scope* — `primary_root == root` (decision 019). A document under
-        // a strictly-deeper boundary lives in a nested scope, so it is not a
-        // member here; a mention resolving to it dangles as a stale reference
-        // that steers to the `[external]` alias, exactly as a cross-boundary
-        // link errors in the graph tier.
-        let file_exists = |target: &Path| {
-            self.documents
-                .get(&root.join(target))
-                .is_some_and(|doc| doc.primary_root.as_deref() == Some(root.as_path()))
-        };
-        let (diagnostics, suppressions) = compute_structural(&doc.data, &rel, config, &file_exists);
-        if let Some(doc) = self.documents.get_mut(abs) {
-            doc.data.structural = diagnostics;
-            doc.data.suppressions = suppressions;
+        for tier in TIERS {
+            let computed = {
+                let Some(doc) = self.store.tier(abs, tier) else {
+                    continue;
+                };
+                let Some(root) = doc.primary_root.clone() else {
+                    self.store.set_caches(
+                        abs,
+                        tier,
+                        Vec::new(),
+                        crate::structural::FileSuppressions::default(),
+                    );
+                    continue;
+                };
+                let rel = abs.strip_prefix(&root).unwrap_or(abs).to_path_buf();
+                let config = Self::config_of(&self.roots, &self.default_config, Some(&root));
+                // Membership under the primary root, by range scan through the
+                // saved store: a bare-path target `t` exists iff `root/t` is a
+                // saved document *of this scope* — `primary_root == root`
+                // (decision 019). A document under a strictly-deeper boundary
+                // lives in a nested scope, so it is not a member here.
+                let file_exists = |target: &Path| {
+                    let key = root.join(target);
+                    self.store.is_saved_member(&key, &root)
+                        || (tier == Tier::Overlay && key.as_path() == abs)
+                };
+                compute_structural(&doc.data, &rel, config, &file_exists)
+            };
+            self.store.set_caches(abs, tier, computed.0, computed.1);
         }
     }
 
@@ -759,9 +765,8 @@ impl Workspaces {
         #[cfg(test)]
         STRUCTURAL_SWEEP_COUNT.with(|count| count.set(count.get() + 1));
 
-        let keys: Vec<PathBuf> = self.documents.keys().cloned().collect();
-        for abs in &keys {
-            self.recompute_structural(abs);
+        for abs in self.store.all_keys() {
+            self.recompute_structural(&abs);
         }
     }
 
@@ -776,9 +781,8 @@ impl Workspaces {
     /// subdirectory scans the whole scope, and a nested `.lattice.toml` / `.git`
     /// becomes its own graph rather than being swallowed (resolution 1). Every
     /// document under the covering scope then recomputes its deepest primary
-    /// root, reparsing across a config boundary and leaving open buffers
-    /// authoritative (decision 017 §3), so the editor buffer is never shadowed by
-    /// disk and no orphaned entry remains.
+    /// root. Both tiers re-root together, so an open document keeps the buffer
+    /// it is holding across the change and no orphaned entry remains.
     fn add_folder(&mut self, uri: &str) {
         let folder = uri_to_path(uri);
         self.client_folders.insert(folder.clone());
@@ -830,10 +834,13 @@ impl Workspaces {
         );
         for (rel, data) in parts.files {
             let key = scope_root.join(&rel);
-            self.documents.entry(key).or_insert_with(|| Document {
-                data,
-                primary_root: Some(scope_root.to_path_buf()),
-            });
+            self.store.seed_scan(
+                key,
+                Document {
+                    data,
+                    primary_root: Some(scope_root.to_path_buf()),
+                },
+            );
         }
         // Recurse only into nested `.lattice.toml` scopes — those are graphs. A
         // nested `.git`-only environment is not a scope (decision 019 resolution
@@ -881,8 +888,8 @@ impl Workspaces {
     /// marker discovered by walk-down survives its own folder's removal, since
     /// the covering folder keeps it visible (decision 019 clause 7). A scan-only
     /// document left uncovered is evicted; an open one keeps serving, rootless or
-    /// re-rooted onto the covering scope with no dark window (decision 017 §3),
-    /// reparsing across a config boundary via `refresh_placement`.
+    /// re-rooted onto the covering scope with no dark window (its buffer rides
+    /// along), reparsing across a config boundary via `refresh_placement`.
     fn remove_folder(&mut self, uri: &str) {
         let folder = uri_to_path(uri);
         if !self.client_folders.remove(&folder) {
@@ -900,25 +907,33 @@ impl Workspaces {
         }
         self.rebuild_git_boundaries();
         let affected: Vec<PathBuf> = self
-            .documents
-            .iter()
+            .store
+            .current_documents()
+            .into_iter()
             .filter(|(_, doc)| {
                 doc.primary_root
                     .as_ref()
                     .is_some_and(|root| stale.contains(root))
             })
-            .map(|(abs, _)| abs.clone())
+            .map(|(abs, _)| abs.to_path_buf())
             .collect();
         for key in affected {
-            let new_primary = self.deepest_root_for(&key);
-            let is_open = self.open_documents.contains(&key);
-            if new_primary.is_none() && !is_open {
-                self.documents.remove(&key);
-            } else {
-                self.refresh_placement(&key);
-            }
+            self.reroot_or_evict(&key);
         }
         self.recompute_all_structural();
+    }
+
+    /// Re-root a document whose covering scope just changed, or evict its saved
+    /// copy when nothing covers it any more and the client holds no buffer for
+    /// it. An open document always survives — rootless, or re-rooted onto the
+    /// covering scope — so there is no dark window.
+    fn reroot_or_evict(&mut self, key: &Path) {
+        let uncovered = self.deepest_root_for(key).is_none();
+        if uncovered && !self.open_documents.contains(key) {
+            self.store.evict_saved(key);
+        } else {
+            self.refresh_placement(key);
+        }
     }
 
     /// The scope roots visible through the currently-open client folders: each
@@ -1028,7 +1043,7 @@ impl Workspaces {
     /// register it (and any scopes beneath it), re-root the captured range, and
     /// refresh the boundary neighborhood (decision 019 clause 6).
     ///
-    /// Open buffers are preserved (decision 017 §3); only the re-rooted documents
+    /// Open buffers are preserved (both tiers re-root together); only the re-rooted documents
     /// reparse, and then only across a config boundary that changes the predicate
     /// vocabulary — every other document is untouched. The host's now-crossing
     /// plain links resurface as steering errors, and its mentions into the split
@@ -1056,13 +1071,7 @@ impl Workspaces {
         }
         self.rebuild_git_boundaries();
         for key in self.document_keys_under(scope_root) {
-            let new_primary = self.deepest_root_for(&key);
-            let is_open = self.open_documents.contains(&key);
-            if new_primary.is_none() && !is_open {
-                self.documents.remove(&key);
-            } else {
-                self.refresh_placement(&key);
-            }
+            self.reroot_or_evict(&key);
         }
         self.recompute_all_structural();
     }
@@ -1109,13 +1118,14 @@ impl Workspaces {
         }
 
         let owned: Vec<PathBuf> = self
-            .documents
-            .iter()
+            .store
+            .current_documents()
+            .into_iter()
             .filter(|(_, doc)| doc.primary_root.as_deref() == Some(root))
-            .map(|(abs, _)| abs.clone())
+            .map(|(abs, _)| abs.to_path_buf())
             .collect();
         for abs in &owned {
-            self.reparse_from_buffer(abs);
+            self.reparse_in_place(abs);
         }
         self.recompute_all_structural();
     }
@@ -1178,10 +1188,10 @@ const REGISTER_CAPABILITY_REQUEST_ID: &str = "lattice-register-capability";
 const LATTICE_TOML_WATCH_GLOB: &str = "**/.lattice.toml";
 
 /// Glob the document watcher subscribes to: every markdown file at any depth
-/// under a workspace folder (decision 017, ticket server 09). Catches on-disk
-/// `.md` changes for files that are not open in the editor, where
-/// `textDocument` sync never fires; the buffer-wins rule reconciles it with the
-/// document-sync channel for open files.
+/// under a workspace folder (decision 017 §1, ticket server 09). It is the sole
+/// writer of the saved store's `.md` content alongside the initial scan and
+/// `didSave`, so there is nothing to reconcile it against: the document-sync
+/// channel writes the overlay store instead (decision 024).
 const MD_WATCH_GLOB: &str = "**/*.md";
 
 /// Run the LSP server on stdio.
@@ -1219,15 +1229,39 @@ fn serve(connection: &Connection) -> Result<()> {
     let capabilities = server_capabilities(&params);
     connection.initialize_finish(init_id, serde_json::json!({ "capabilities": capabilities }))?;
 
-    let workspaces = Workspaces::from_params(&params);
+    let mut workspaces = Workspaces::from_params(&params);
 
     // File watchers are dynamic-registration only, so register the
     // `.lattice.toml` watcher now — after `initialized` — when the client
     // advertises support. A client without it degrades to startup-only config
     // (decision 017); Lattice never runs its own watcher.
+    //
+    // Registration goes out *before* the cold-start publish below: it is a
+    // fire-and-forget request (its response is drained by `main_loop`), so
+    // arming the watch first means no disk change can slip past while the
+    // initial pass computes. The two are otherwise independent.
     if params.supports_watched_files_dynamic_registration() {
         register_watched_files(connection)?;
     }
+
+    // The cold-start publish. The scan has run, so the server already knows
+    // every finding in the workspace; on a push-only transport (decision 022)
+    // it owes the client that knowledge rather than sitting on it until some
+    // event happens to trigger a full pass.
+    //
+    // This does not weaken decision 024 clause 2. Clause 2 governs what may
+    // *move* a document's rows, and nothing here moves anything: no buffer
+    // exists yet, every row is computed from the saved world, and the publish
+    // diff sends only what the client does not already hold. Before the split,
+    // the first `didOpen`'s full pass introduced the workspace as a side
+    // effect; scoping buffer events to one document (clause 2's enforceable
+    // pair) removed that accident, so the introduction becomes explicit here
+    // instead of being lost. `Commit` adjudication, config channels included —
+    // it is a disk-anchored pass like any other commitment.
+    //
+    // Exactly once: every subsequent commitment runs the same diff against the
+    // cache this pass populates, so nothing is double-sent.
+    publish_all_diagnostics(connection, &mut workspaces, &HashSet::new())?;
 
     main_loop(connection, workspaces)?;
 
@@ -2334,8 +2368,10 @@ fn workspace_symbols(workspaces: &Workspaces, query: &str) -> Vec<lsp::SymbolInf
     // Enumerate rooted documents only — a rootless single-file document (issue
     // 051) is deliberately absent from workspace symbols, as it was when the
     // graph tier enumerated `inner` alone. Each document is visited once under
-    // its deepest root, so overlapping folders do not double-list it.
-    for (abs, doc) in &workspaces.documents {
+    // its deepest root, so overlapping folders do not double-list it. A read
+    // surface reads **current** text (decision 024 clause 9's audit): the
+    // symbol a user is looking for is the one in the buffer on screen.
+    for (abs, doc) in workspaces.store.current_documents() {
         let Some(root) = doc.primary_root.as_deref() else {
             continue;
         };
@@ -2478,12 +2514,14 @@ fn do_rename(workspaces: &Workspaces, params: &lsp::RenameParams) -> Option<lsp:
 /// edit set (decision 020 clause 2).
 ///
 /// Each `(oldUri, newUri)` is translated into a [`crate::mv::compute_move_edits`]
-/// call over the source's covering scope; every file's edits are converted to
-/// LSP ranges (through that file's cached [`LineIndex`]) and merged into one
-/// [`lsp::WorkspaceEdit`]. The client applies it to buffers, then performs the
-/// rename — so the buffer-wins rule (decision 017) holds with no new machinery,
-/// and the post-rename re-keying rides `workspace/didRenameFiles` plus the
-/// watched-file create/delete channel.
+/// call over the source's covering scope at each document's **current** text
+/// (decision 024 clause 9); every file's edits are converted to LSP ranges
+/// (through that file's cached [`LineIndex`]) and merged into one
+/// [`lsp::WorkspaceEdit`]. The client applies it to the buffers it holds, then
+/// performs the rename; the aftermath needs no special path, because the edits
+/// re-enter through the channels that already exist — buffer edits as
+/// `didChange`, disk writes as watcher events — plus
+/// `workspace/didRenameFiles`'s re-keying.
 ///
 /// A source outside every scope contributes no edits (there is no edit set to
 /// compute — a plain rename already does everything Lattice could; decision 020
@@ -2515,7 +2553,13 @@ fn will_rename_files(
             continue;
         };
 
-        let view = workspaces.root_view(&root);
+        // Decision 024 clause 9: an edit surface computes spans against each
+        // touched document's **current** text, because the client applies the
+        // returned edits to the buffers it holds. An edit computed against
+        // saved coordinates and applied to a diverged buffer lands in the
+        // wrong place. "Current" collapses to "saved" for a closed document,
+        // so openness is not a condition on service.
+        let view = workspaces.current_view(&root);
         let fs_exists = |p: &Path| p.is_file() || p.is_dir();
         let edits = crate::mv::compute_move_edits(&view, &old_abs, &new_abs, &fs_exists)
             .map_err(|e| e.to_string())?;
@@ -2531,10 +2575,12 @@ fn will_rename_files(
 /// Convert an engine's per-file byte-span edits into LSP `TextEdit`s and merge
 /// them into `changes` (keyed by document URI).
 ///
-/// Each edited file's source and cached [`LineIndex`] come from the flat
-/// document store, so the byte→UTF-16 conversion matches every other publish.
-/// A file the store does not hold is skipped — the engines only enumerate files
-/// in the view, so this is defensive.
+/// Each edited file's source and cached [`LineIndex`] come from its **current**
+/// copy — the buffer where the client holds one, the saved copy elsewhere
+/// (decision 024 clause 9) — which is the same text the engine computed the
+/// spans over, so the byte→UTF-16 conversion lands where the client will apply
+/// it. A file the store does not hold is skipped — the engines only enumerate
+/// files in the view, so this is defensive.
 ///
 /// Shared by both coordinate axes: the path-axis move engine
 /// ([`will_rename_files`]) and the fragment-axis heading rename
@@ -2546,7 +2592,7 @@ fn merge_span_edits(
     changes: &mut HashMap<String, Vec<lsp::TextEdit>>,
 ) {
     for (abs_path, file_edits) in edits {
-        let Some(doc) = workspaces.documents.get(abs_path) else {
+        let Some(doc) = workspaces.store.current(abs_path) else {
             continue;
         };
         let source = doc.data.tree.source();
@@ -2617,12 +2663,16 @@ fn find_references(workspaces: &Workspaces, params: &lsp::ReferenceParams) -> Ve
     // clause-3 defect, not an edge, and must not surface as a reference. (Plain
     // navigation — go-to-definition, outgoing calls — still follows a link
     // physically; only the reverse graph queries honor the partition.)
+    //
+    // A read surface reads **current** text (decision 024 clause 9's audit):
+    // the reference list must name the link the user can see, and a location it
+    // returns is resolved by the client against the buffer it holds. Whether
+    // `find_references` should instead answer over the saved graph — so the
+    // answer matches the committed world — is issue 072's question, left open
+    // deliberately rather than settled here.
     let cursor_abs = uri_to_path(&params.text_document.uri);
-    let cursor_root = workspaces
-        .documents
-        .get(&cursor_abs)
-        .and_then(|doc| doc.primary_root.clone());
-    for (abs, doc) in &workspaces.documents {
+    let cursor_root = workspaces.store.primary_root(&cursor_abs);
+    for (abs, doc) in workspaces.store.current_documents() {
         let Some(root) = doc.primary_root.as_deref() else {
             continue;
         };
@@ -3216,11 +3266,8 @@ fn call_hierarchy_incoming(
     // disjoint graphs, so a cross-boundary physical reference is a defect, not a
     // caller.
     let cursor_abs = uri_to_path(&item.uri);
-    let cursor_root = workspaces
-        .documents
-        .get(&cursor_abs)
-        .and_then(|doc| doc.primary_root.clone());
-    for (abs, doc) in &workspaces.documents {
+    let cursor_root = workspaces.store.primary_root(&cursor_abs);
+    for (abs, doc) in workspaces.store.current_documents() {
         let Some(root) = doc.primary_root.as_deref() else {
             continue;
         };
@@ -3386,7 +3433,7 @@ fn document_links(workspaces: &Workspaces, uri: &str) -> Vec<lsp::DocumentLink> 
 
 /// Collect all diagnostics for a workspace: structural (unconditional) +
 /// graph (gated by `.lattice.toml`).
-fn collect_all_diagnostics(workspace: &WorkspaceView) -> Vec<Diagnostic> {
+pub fn collect_all_diagnostics(workspace: &WorkspaceView) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
 
     // Structural diagnostics: always run, no config required. Read from the
@@ -4551,107 +4598,110 @@ fn handle_notification(
     match notif.method.as_str() {
         lsp::method::DID_OPEN => {
             let params: lsp::DidOpenTextDocumentParams = serde_json::from_value(notif.params)?;
-            // The editor now owns this document's truth: while it is open, a
-            // watched-file `changed` event for the same file is dropped so the
-            // synced buffer is never clobbered by stale disk bytes (decision 017
-            // §3, ticket server 09). Buffer authority is recorded against the
-            // decoded path, so a watcher that spells the URI differently still
-            // names the same document (issue 069).
+            // A `didOpen` is a **claim, not a source** (decision 024 clause 3):
+            // it seeds only the buffer copy, asserting "here is what I am
+            // holding", and never writes the saved store. That is what kills
+            // issue 067's read-then-`didOpen` race by construction — a client
+            // that read a file before an external edit and opened it afterwards
+            // makes a stale claim that can mislead exactly one document's rows,
+            // transiently, and can never reach the workspace.
+            //
+            // The buffer is recorded against the decoded path, so a watcher
+            // that spells the URI differently still names the same document
+            // (issue 069) — the one-buffer-per-document premise.
             let abs = uri_to_path(&params.text_document.uri);
-            workspaces.open_documents.insert(abs.clone());
-            // Divergence at the open boundary (issue 061): a buffer opened
-            // with the file's current bytes is a snapshot disk may later
-            // refresh; one opened divergent (an editor attaching with
-            // unflushed modifications, or no file on disk yet) carries state
-            // that exists nowhere else and keeps strict buffer authority.
-            let matches_disk =
-                std::fs::read_to_string(&abs).is_ok_and(|disk| disk == params.text_document.text);
-            if matches_disk {
-                workspaces.dirty_documents.remove(&abs);
-            } else {
-                workspaces.dirty_documents.insert(abs);
-            }
-            // Index the buffer wherever it belongs: a document inside a scanned
-            // workspace folder updates that workspace; one opened outside every
-            // folder becomes a single-file document (issue 051) so its
-            // document-scoped features are served without a workspace. The
-            // republish below enumerates scanned workspaces only, so a single-file
-            // document emits no diagnostics — the graph tier has nothing to say.
-            workspaces.sync_document_content(&params.text_document.uri, &params.text_document.text);
-            force_republish(connection, workspaces, &params.text_document.uri)?;
+            workspaces.open_documents.insert(abs);
+            workspaces.open_buffer(&params.text_document.uri, &params.text_document.text);
+            // A buffer event republishes **this document and nothing else**
+            // (decision 024 clause 2): the saved world did not move, so no
+            // other file's rows can have moved either.
+            force_republish(
+                connection,
+                workspaces,
+                &params.text_document.uri,
+                &PublishScope::Only(uri_to_path(&params.text_document.uri)),
+            )?;
         }
         lsp::method::DID_CLOSE => {
             let params: lsp::DidCloseTextDocumentParams = serde_json::from_value(notif.params)?;
-            // The buffer is gone: the document is no longer editor-authoritative,
-            // so watched-file `changed` events for it are honored again (decision
-            // 017 §3), and per the LSP spec content authority reverts to the
-            // filesystem — reconcile the index to disk (issue 046).
+            // The buffer is gone. With two stores there is nothing to revert —
+            // the saved copy never held buffer content (decision 024 clause 4)
+            // — so `didClose` is just: drop the overlay entry, then audit.
             let abs = uri_to_path(&params.text_document.uri);
+            let rootless = workspaces
+                .store
+                .current(&abs)
+                .is_some_and(|doc| doc.primary_root.is_none());
             workspaces.open_documents.remove(&abs);
-            workspaces.dirty_documents.remove(&abs);
-            reconcile_closed_document(connection, workspaces, &params.text_document.uri)?;
+            workspaces.close_buffer(&abs);
+            if rootless {
+                // A rootless single-file document (issue 051) has no
+                // disk-backed root to audit against and published nothing.
+                workspaces.remove_single_file(&params.text_document.uri);
+            } else {
+                close_document(connection, workspaces, &params.text_document.uri)?;
+            }
         }
         lsp::method::DID_SAVE => {
             let params: lsp::DidSaveTextDocumentParams = serde_json::from_value(notif.params)?;
-            // The buffer was flushed: it no longer holds state disk doesn't,
-            // so a later watched change may reconcile it (issue 061).
+            // The commitment, and the one seam between the two stores
+            // (decision 024 clause 1): the buffer's content becomes the saved
+            // copy and the overlay entry is dropped.
             let abs = uri_to_path(&params.text_document.uri);
-            workspaces.dirty_documents.remove(&abs);
             if let Some(text) = &params.text {
-                // The save payload carries the text: upsert it by path.
-                workspaces.sync_document_content(&params.text_document.uri, text);
+                // `includeText` is authoritative: the notification's text is
+                // byte-identical to what the client just wrote, so no disk read
+                // is owed (decision 024 clause 3).
+                workspaces.commit_save(&params.text_document.uri, text);
             } else {
-                // No text in the save payload: reconcile the document to disk.
-                workspaces.update_from_disk(&abs);
+                // The absent-text fallback re-reads disk.
+                workspaces.commit_save_from_disk(&abs);
             }
             // A save is answered unconditionally (issue 062): the delta diff
             // reads an unchanged set as silence, which a push-only client
-            // cannot tell from no answer.
-            force_republish(connection, workspaces, &params.text_document.uri)?;
+            // cannot tell from no answer. It is a commitment, so it runs the
+            // full pass — anyone's rows may have moved.
+            force_republish(
+                connection,
+                workspaces,
+                &params.text_document.uri,
+                &PublishScope::Full,
+            )?;
         }
         lsp::method::DID_CHANGE => {
             let params: lsp::DidChangeTextDocumentParams = serde_json::from_value(notif.params)?;
             if let Some(change) = params.content_changes.into_iter().last() {
-                // The buffer now holds unsaved edits: strict buffer authority
-                // until the next save (issue 061).
+                // A `didChange` materializes the overlay entry and touches
+                // nothing else: it targets an already-open document, and the
+                // saved store has no writer here at all. Membership cannot
+                // move, so no other document's rows can move — which is why
+                // the publish below is scoped to this document alone
+                // (decision 024 clause 2 and its performance corollary).
                 let abs = uri_to_path(&params.text_document.uri);
-                workspaces.dirty_documents.insert(abs.clone());
-                // A didChange targets an already-open (already-indexed) document,
-                // so it never changes membership. Upsert the buffer, then choose
-                // the publish path from the document's placement:
+                workspaces.change_buffer(&params.text_document.uri, &change.text);
+                // Publish path by placement:
                 //
-                // - rooted with `.lattice.toml`: the full graph path — a
-                //   link/backlink edit reaches other files — re-materializing
-                //   only the files the whole-graph recompute shows changed
-                //   (ticket perf 02), with the edited URI forced.
-                // - rooted without config: the cheap structural-tier delta —
-                //   only the edited file's diagnostics can change (issue 013 —
-                //   stage 2.5).
+                // - rooted with `.lattice.toml`: this document's rows under its
+                //   own perspective — the saved world with its buffer overlaid
+                //   — filtered through the override verdicts held from the last
+                //   commitment (decision 023: a draft never re-adjudicates).
+                // - rooted without config: the cheap structural-tier delta
+                //   (issue 013 — stage 2.5), which is the same document-scoped
+                //   answer computed without the graph collect.
                 // - rootless (issue 051): publish nothing; the graph tier has
                 //   nothing to say for a single file.
-                workspaces.sync_document_content(&params.text_document.uri, &change.text);
-                let publish = match workspaces
-                    .documents
-                    .get(&abs)
-                    .and_then(|doc| doc.primary_root.clone())
-                {
-                    Some(root) => Some(
-                        workspaces
-                            .roots
-                            .get(&root)
-                            .is_some_and(|meta| meta.has_config),
-                    ),
-                    None => None,
-                };
+                let publish = workspaces.store.primary_root(&abs).map(|root| {
+                    workspaces
+                        .roots
+                        .get(&root)
+                        .is_some_and(|meta| meta.has_config)
+                });
                 match publish {
-                    // A didChange is a draft, not a commitment (decision 023):
-                    // live diagnostics recompute, but the published sets are
-                    // filtered through the override verdicts held from the
-                    // last save point — no mid-edit resurface flicker.
                     Some(true) => publish_draft_diagnostics(
                         connection,
                         workspaces,
                         &one_uri(&params.text_document.uri),
+                        &abs,
                     )?,
                     Some(false) => {
                         publish_file_diagnostics(
@@ -4676,7 +4726,7 @@ fn handle_notification(
             // No single file's text changed — added folders bring cache-miss
             // files that re-materialize regardless, and removed ones are cleared
             // by the diff's absent-file pass. Open documents kept their buffers
-            // across the change (buffer-wins), so no dark window.
+            // across the change, so no dark window.
             publish_all_diagnostics(connection, workspaces, &HashSet::new())?;
         }
         lsp::method::DID_CHANGE_WATCHED_FILES => {
@@ -4784,31 +4834,22 @@ fn handle_watched_files_change(
         // resolves to the same document (issue 069).
         let abs = uri_to_path(&change.uri);
         match change.change_type {
-            // `changed` carries disk content. It is dropped only while the
-            // open buffer holds state disk doesn't — unsaved edits, or a
-            // divergent open (decision 017 §3, narrowed by issue 061): that
-            // buffer is the sole copy, and its own edits already reach the
-            // server through `didChange`, so honoring the watcher too would
-            // double-deliver (the issue 009 class). An open buffer matching
-            // its last save is a snapshot an external writer has just
-            // superseded — disk is strictly newer — so it falls through and
-            // reconciles from disk exactly like a closed file.
-            lsp::file_change_type::CHANGED
-                if workspaces.open_documents.contains(&abs)
-                    && workspaces.dirty_documents.contains(&abs) =>
-            {
-                tracing::warn!(
-                    uri = %change.uri,
-                    "watched change dropped: open buffer holds unsaved or divergent state (buffer wins)"
-                );
-            }
-            // created / deleted are membership changes honored regardless of
-            // open state; a non-open `changed` re-reads disk. All three route
-            // through `apply_from_disk`, which re-reads disk — reparsing a
-            // created/changed file and dropping a deleted one — and leaves the
-            // structural recompute to the batch settlement below. Only files
-            // under a folder are tracked (the watcher glob is folder-scoped),
-            // so an event outside every root is ignored.
+            // Every event type applies **unconditionally** (decision 024,
+            // issue 067): created / changed / deleted alike route through
+            // `apply_from_disk`, which re-reads disk — reparsing a
+            // created/changed file, dropping a deleted one — and leaves the
+            // structural recompute to the batch settlement below.
+            //
+            // There is no buffer-wins drop any more, and no dirty set to
+            // consult. The watcher is the sole writer of the saved copy, so
+            // there is nothing to clobber and nothing to arbitrate: an open
+            // document's own rows keep reading its overlay, and where the
+            // document is open and undiverged the store materializes the
+            // pre-update saved parse into the overlay first (clause 1), so the
+            // client's text is never replaced by content it never sent.
+            //
+            // Only files under a folder are tracked (the watcher glob is
+            // folder-scoped), so an event outside every root is ignored.
             lsp::file_change_type::CREATED
             | lsp::file_change_type::CHANGED
             | lsp::file_change_type::DELETED => {
@@ -4878,7 +4919,7 @@ fn handle_watched_files_change(
 /// client applied them to buffers and renamed on disk — so the content now
 /// living at each new path is correct. This re-keys the parsed entries onto the
 /// new coordinates **without a rescan** ([`Workspaces::rekey_rename`]),
-/// preserving open buffers (decision 017 §3). Each moved document's old URI gets
+/// preserving open buffers (both tiers re-key together). Each moved document's old URI gets
 /// an explicit empty publish to clear the client's stale diagnostics under the
 /// old name; then one graph-aware re-publish names the new URIs so their
 /// diagnostics (and any referrer whose edge the coordinate change moved) land at
@@ -4922,42 +4963,45 @@ fn handle_did_rename_files(
     Ok(())
 }
 
-/// Reconcile a just-closed document's index entry to disk and re-publish.
+/// Audit a just-closed document against disk and re-publish (decision 024
+/// clause 4). The caller has already dropped the overlay entry.
 ///
-/// On `textDocument/didClose` the editor discards the buffer and content
-/// authority reverts to the filesystem (LSP spec, issue 046). Re-read `uri`
-/// from disk via [`Workspace::update`] — which re-parses the file, or drops it
-/// if it is gone — so a buffer closed with unsaved edits leaves no discarded
-/// content indexed; disk never changed, so no watcher event would correct it.
-/// Re-publishes through the graph-aware [`publish_all_diagnostics`] path,
-/// naming the URI: reverting from buffer to disk content can move cross-file
-/// backlink/forward edges, so this mirrors the watched-file `changed` branch
-/// for closed files. A rootless document (issue 051) is simply dropped — it has
-/// no disk-backed root to revert to and published no diagnostics to clear.
-fn reconcile_closed_document(
-    connection: &Connection,
-    workspaces: &mut Workspaces,
-    uri: &str,
-) -> Result<()> {
+/// With two stores the *reconciliation* half of `didClose` disappears: the
+/// saved store never held buffer content, so there is nothing to revert. What
+/// survives is the audit, and it is opportunistic rather than necessary —
+/// re-read disk and compare against the **saved** copy, never against the
+/// buffer, which is being discarded and has authority over nothing:
+///
+/// - **Bytes match** — no-op. The saved copy was already correct and the close
+///   behaves as a pure buffer event.
+/// - **Bytes differ** — a missed disk change has just been *caught*. Apply it
+///   (the world genuinely moved, so this genuinely is a commitment) **and emit
+///   a loud trace**, because a firing detector means the watcher channel
+///   dropped an event (issue 068's territory, and the one place the drop
+///   becomes visible without client-side wire captures). Never heal silently:
+///   quiet healing is how issues 061 and 066 stayed unexplained for weeks.
+///
+/// Either way this is a commitment event and runs the full pass, naming the
+/// URI: the document's own rows revert from its buffer's perspective to the
+/// saved world, and a caught disk change can move anyone's.
+fn close_document(connection: &Connection, workspaces: &mut Workspaces, uri: &str) -> Result<()> {
     let abs = uri_to_path(uri);
-    match workspaces
-        .documents
-        .get(&abs)
-        .map(|doc| doc.primary_root.is_some())
-    {
-        Some(true) => {
-            // Rooted: content authority reverts to the filesystem — reconcile
-            // to disk (reparse, or drop if gone) and re-publish.
-            workspaces.update_from_disk(&abs);
-            publish_all_diagnostics(connection, workspaces, &one_uri(uri))
-        }
-        // Rootless single-file document: drop it; it published nothing.
-        Some(false) => {
-            workspaces.remove_single_file(uri);
-            Ok(())
-        }
-        None => Ok(()),
+    let audit = workspaces.apply_from_disk(&abs);
+    // A firing detector means the watcher channel dropped an event. Say so —
+    // the alternative, healing quietly, converts a channel defect into an
+    // invisible latency.
+    if audit != DiskUpdate::Untouched {
+        tracing::error!(
+            uri = %uri,
+            update = ?audit,
+            "WATCHER MISS CAUGHT: the didClose audit found disk differing from the saved copy and \
+             applied it. The watched-files channel dropped an event for this document — \
+             diagnostics for every file judged against it were computed from stale content until \
+             now (issue 068)."
+        );
     }
+    workspaces.settle(&abs, audit);
+    publish_all_diagnostics(connection, workspaces, &one_uri(uri))
 }
 
 // ---------------------------------------------------------------------------
@@ -4995,8 +5039,17 @@ fn one_uri(uri: &str) -> HashSet<String> {
 /// empty `publishDiagnostics` is sent for it. A rootless or unindexed document
 /// (issue 051) resolves to no workspace and publishes nothing, as before.
 ///
+/// `scope` declares which column of decision 024 clause 2 the triggering event
+/// sits in: a `didOpen` is a **buffer event** and republishes this document
+/// alone; a `didSave` is a **commitment** and runs the full pass.
+///
 /// No diagnostics are recomputed beyond the ordinary publish pass.
-fn force_republish(connection: &Connection, workspaces: &mut Workspaces, uri: &str) -> Result<()> {
+fn force_republish(
+    connection: &Connection,
+    workspaces: &mut Workspaces,
+    uri: &str,
+    scope: &PublishScope,
+) -> Result<()> {
     // The publish/cache key for this document when it is indexed under a root
     // (the same base `diff_diagnostics` keys the cache by). `None` for a
     // rootless or unindexed open, which publishes nothing.
@@ -5010,7 +5063,8 @@ fn force_republish(connection: &Connection, workspaces: &mut Workspaces, uri: &s
         workspaces.published.remove(canonical);
     }
 
-    publish_all_diagnostics(connection, workspaces, &one_uri(uri))?;
+    let sets = diff_diagnostics_with(workspaces, &one_uri(uri), Adjudication::Commit, scope);
+    send_publishes(connection, sets)?;
 
     // After the pass, a document that carries diagnostics has its cache entry
     // repopulated; a clean one has none (only non-empty entries are cached). The
@@ -5113,12 +5167,22 @@ fn publish_all_diagnostics(
 /// recomputed as always, but the published sets are filtered through each
 /// root's held verdicts — no re-adjudication, so a mid-edit count crossing
 /// never flashes a resurface (decision 023).
+///
+/// Scoped to `focus` alone (decision 024 clause 2): a buffer event may change
+/// only that document's rows, so no other file's cache entry is read or
+/// written.
 fn publish_draft_diagnostics(
     connection: &Connection,
     workspaces: &mut Workspaces,
     changed_uris: &HashSet<String>,
+    focus: &Path,
 ) -> Result<()> {
-    let sets = diff_diagnostics_with(workspaces, changed_uris, Adjudication::Held);
+    let sets = diff_diagnostics_with(
+        workspaces,
+        changed_uris,
+        Adjudication::Held,
+        &PublishScope::Only(focus.to_path_buf()),
+    );
     send_publishes(connection, sets)
 }
 
@@ -5223,22 +5287,39 @@ fn desired_diagnostics(workspaces: &Workspaces) -> BTreeMap<String, Vec<lsp::Dia
     // the shallow root first and overwritten by the deepest, so the deepest
     // workspace's set wins the shared URI (matching `diff_diagnostics`).
     for (root, meta) in &workspaces.roots {
-        let workspace = workspaces.root_view(root);
         // The desired set is post-adjudication: filtered through the root's
         // held override verdicts, exactly as production publishes (decision
         // 023). The oracle never re-adjudicates — it asks what the client
         // should currently hold, and that is the held verdict's answer
-        // ([`Adjudication::Held`]) — and it carries the config channel and
-        // the fabricated-config guard through the same shared collection.
-        let (mut by_file, _) = adjudicated_root_diagnostics(&workspace, meta, Adjudication::Held);
+        // ([`Adjudication::Held`]) — and it carries the perspective merge, the
+        // config channel, and the fabricated-config guard through the same
+        // shared collection.
+        let (mut by_file, _) = root_desired_rows(
+            workspaces,
+            root,
+            meta,
+            Adjudication::Held,
+            &PublishScope::Full,
+        );
 
         let config_rel = PathBuf::from(".lattice.toml");
         let config_channel =
-            (meta.has_config || meta.config_error.is_some()).then_some(&config_rel);
-        for rel_path in workspace.files().keys().chain(config_channel) {
-            let uri = path_to_uri(&root.join(rel_path));
-            let lattice = by_file.remove(rel_path).unwrap_or_default();
-            let fd = workspace.file(rel_path);
+            (meta.has_config || meta.config_error.is_some()).then_some(config_rel.clone());
+        let rels: Vec<PathBuf> = workspaces
+            .store
+            .current_files(root)
+            .into_keys()
+            .chain(config_channel)
+            .collect();
+        for rel_path in rels {
+            let uri = path_to_uri(&root.join(&rel_path));
+            let lattice = by_file.remove(&rel_path).unwrap_or_default();
+            // Materialize against the document's own current text: an overlay
+            // document's rows are anchored in its buffer.
+            let fd = workspaces
+                .store
+                .current(&root.join(&rel_path))
+                .map(|doc| &doc.data);
             let source = fd.map_or("", |fd| fd.tree.source());
             let index = fd.map_or(&empty, |fd| &fd.line_index);
             let diagnostics = lattice
@@ -5286,30 +5367,103 @@ fn desired_diagnostics(workspaces: &Workspaces) -> BTreeMap<String, Vec<lsp::Dia
 /// entry means "the client currently holds none". The result is sorted by URI
 /// for deterministic output.
 ///
-/// The commitment-mode entry point ([`Adjudication::Commit`]); the `didChange`
-/// draft goes through [`diff_diagnostics_with`] directly.
+/// The commitment-mode, full-scope entry point ([`Adjudication::Commit`],
+/// [`PublishScope::Full`]); the `didChange` draft goes through
+/// [`diff_diagnostics_with`] directly.
 fn diff_diagnostics(
     workspaces: &mut Workspaces,
     changed_uris: &HashSet<String>,
 ) -> Vec<(String, Vec<lsp::Diagnostic>)> {
-    diff_diagnostics_with(workspaces, changed_uris, Adjudication::Commit)
+    diff_diagnostics_with(
+        workspaces,
+        changed_uris,
+        Adjudication::Commit,
+        &PublishScope::Full,
+    )
 }
 
-/// Collect one root's live diagnostics through the override pass (issue 064,
-/// decision 023), split per file.
+/// Which documents a publish pass computes and diffs (decision 024 clause 2's
+/// enforceable pair).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PublishScope {
+    /// Every document under every root — a **commitment event** (`didSave`, a
+    /// watched-files batch, `didClose`, a folder or marker change). Anyone's
+    /// rows may have moved.
+    Full,
+    /// One document's own rows — a **buffer event** (`didOpen`, `didChange`).
+    /// The saved world did not move, so no other file's rows can have moved,
+    /// and no other file's cache entry is read or written.
+    Only(PathBuf),
+}
+
+/// The buffer-locality perspective merge (decision 024 clause 8) — the seam the
+/// [`crate::invariants::assert_buffer_locality`] differential pins.
 ///
-/// At a commitment, the root's expect verdicts are re-adjudicated from the
-/// live set just collected and returned (for the caller to hold on the
-/// [`RootMeta`] once its borrow ends); between commitments the held verdicts
-/// bind and `None` is returned. Either way, the matched members' findings are
-/// filtered out here — exactly once, at the seam where desired sets
-/// materialize, and nowhere else: `compute_structural` is shared with `lint`,
-/// which runs its own aggregate pass, so filtering there would double-apply.
-fn adjudicated_root_diagnostics(
-    workspace: &WorkspaceView,
+/// `saved_live` is the saved world's diagnostic vector: every document judged
+/// against everyone's last-committed state. `perspectives` supplies, for each
+/// document that has a diverged buffer, the view of the saved world with *that*
+/// document's buffer swapped in. Its rows replace that document's saved rows —
+/// **and only that document's**: every other row the perspective pass computed
+/// describes a document judged from somewhere other than its own seat, and is
+/// discarded unread.
+///
+/// That discard is the whole invariant. Merging any other row from a
+/// perspective pass would let one document's buffer reach another document's
+/// verdict, which is exactly what decision 024 forbids.
+pub fn merge_perspectives(
+    saved_live: Vec<Diagnostic>,
+    perspectives: &[(PathBuf, WorkspaceView<'_>)],
+) -> BTreeMap<PathBuf, Vec<Diagnostic>> {
+    let mut by_file: BTreeMap<PathBuf, Vec<Diagnostic>> = BTreeMap::new();
+    for diag in saved_live {
+        by_file.entry(diag.file.clone()).or_default().push(diag);
+    }
+    for (rel, view) in perspectives {
+        let rows = collect_all_diagnostics(view)
+            .into_iter()
+            .filter(|diag| &diag.file == rel)
+            .collect();
+        by_file.insert(rel.clone(), rows);
+    }
+    by_file
+}
+
+/// One root's desired per-file rows: the perspective merge, filtered through
+/// the root's `[[override]]` verdicts (issue 064, decision 023).
+///
+/// At a commitment the verdicts are re-adjudicated and returned (for the caller
+/// to hold on the [`RootMeta`] once its borrow ends); between commitments the
+/// held verdicts bind and `None` is returned. Either way the matched members'
+/// findings are filtered out here — exactly once, at the seam where desired
+/// sets materialize, and nowhere else: `compute_structural` is shared with
+/// `lint`, which runs its own aggregate pass, so filtering there would
+/// double-apply.
+///
+/// **Adjudication reads the saved world only.** A count is an aggregate over
+/// committed state; letting a diverged buffer move a verdict would suppress or
+/// resurface *other* files' rows from one document's unsaved draft — a buffer
+/// locality violation, and a conformance break against `lattice lint`, which
+/// reads disk.
+fn root_desired_rows(
+    workspaces: &Workspaces,
+    root: &Path,
     meta: &RootMeta,
     adjudication: Adjudication,
+    scope: &PublishScope,
 ) -> (BTreeMap<PathBuf, Vec<Diagnostic>>, Option<OverrideVerdicts>) {
+    // The focus of a scoped pass, as a root-relative key — `None` when the
+    // scoped document does not belong to this root, in which case the pass has
+    // nothing to say about it.
+    let focus_rel = match scope {
+        PublishScope::Full => None,
+        PublishScope::Only(abs) => match abs.strip_prefix(root) {
+            Ok(rel) if workspaces.store.primary_root(abs).as_deref() == Some(root) => {
+                Some(rel.to_path_buf())
+            }
+            _ => return (BTreeMap::new(), None),
+        },
+    };
+
     // A root holding a fabricated config — broken at scope registration with
     // no last-good (decision 023 addendum, issue 065) — publishes nothing
     // computed under it: defaults are the semantics of an absent config, not
@@ -5327,28 +5481,65 @@ fn adjudicated_root_diagnostics(
         };
         return (by_file, committed);
     }
-    let mut live = collect_all_diagnostics(workspace);
+
+    // A scoped draft needs no saved-world collect at all: it neither
+    // adjudicates nor reports on any other document.
+    let skip_saved_collect = focus_rel.is_some() && adjudication == Adjudication::Held;
+    let saved_view = workspaces.saved_view(root);
+    let saved_live = if skip_saved_collect {
+        Vec::new()
+    } else {
+        collect_all_diagnostics(&saved_view)
+    };
     let committed = match adjudication {
         Adjudication::Commit => Some(overrides::adjudicate(
             &meta.config.overrides,
-            workspace.files().keys().map(PathBuf::as_path),
-            &live,
+            saved_view.files().keys().map(PathBuf::as_path),
+            &saved_live,
         )),
         Adjudication::Held => None,
     };
-    let verdicts = committed.as_ref().unwrap_or(&meta.verdicts);
-    overrides::suppress_matched(verdicts, &mut live);
-    let mut by_file: BTreeMap<PathBuf, Vec<Diagnostic>> = BTreeMap::new();
-    for diag in live {
-        by_file.entry(diag.file.clone()).or_default().push(diag);
+
+    // The perspectives to merge: every diverged buffer this pass reports on.
+    let overlay_keys: Vec<PathBuf> = focus_rel.as_ref().map_or_else(
+        || workspaces.store.overlay_keys_of_root(root),
+        |rel| vec![root.join(rel)],
+    );
+    let perspectives: Vec<(PathBuf, WorkspaceView<'_>)> = overlay_keys
+        .iter()
+        .filter(|abs| workspaces.store.has_overlay(abs))
+        .filter_map(|abs| {
+            abs.strip_prefix(root)
+                .ok()
+                .map(|rel| (rel.to_path_buf(), workspaces.perspective_view(root, abs)))
+        })
+        .collect();
+
+    let mut by_file = merge_perspectives(saved_live, &perspectives);
+    // A scoped pass reports on exactly one document; drop every other row the
+    // saved-world collect produced (it was computed only to feed adjudication).
+    if let Some(rel) = &focus_rel {
+        let rows = by_file.remove(rel).unwrap_or_default();
+        by_file = BTreeMap::new();
+        by_file.insert(rel.clone(), rows);
     }
+
+    let verdicts = committed.as_ref().unwrap_or(&meta.verdicts);
+    for rows in by_file.values_mut() {
+        overrides::suppress_matched(verdicts, rows);
+    }
+
     // The config channel (decision 023 clause 4) rides the same per-root map
     // under the marker's pseudo-path, so the publish diff treats the config
     // URI exactly like a document's: sent when it changes, cleared when it
-    // empties.
-    let channel = config_channel_diagnostics(meta, verdicts);
-    if !channel.is_empty() {
-        by_file.insert(PathBuf::from(".lattice.toml"), channel);
+    // empties. A scoped **draft** leaves it alone — nothing it computes can
+    // move a workspace-health flag — but a scoped commitment (`didOpen`) must
+    // still answer it, because it re-adjudicated.
+    if focus_rel.is_none() || adjudication == Adjudication::Commit {
+        let channel = config_channel_diagnostics(meta, verdicts);
+        if !channel.is_empty() {
+            by_file.insert(PathBuf::from(".lattice.toml"), channel);
+        }
     }
     (by_file, committed)
 }
@@ -5437,33 +5628,150 @@ fn canonicalize_changed_uris(
         .iter()
         .filter_map(|uri| {
             let abs = uri_to_path(uri);
-            let doc = workspaces.documents.get(&abs)?;
-            let root = doc.primary_root.as_ref()?;
-            let meta = workspaces.roots.get(root)?;
-            let rel = abs.strip_prefix(root).ok()?;
+            let root = workspaces.store.primary_root(&abs)?;
+            let meta = workspaces.roots.get(&root)?;
+            let rel = abs.strip_prefix(&root).ok()?;
             Some(path_to_uri(&meta.canonical_root.join(rel)))
         })
         .collect()
 }
 
-/// [`diff_diagnostics`] with an explicit adjudication mode (decision 023):
-/// under [`Adjudication::Commit`] each root's verdicts are re-adjudicated and
-/// held; under [`Adjudication::Held`] the last commitment's verdicts bind
-/// unchanged. The filtering itself lives in [`adjudicated_root_diagnostics`].
+/// A file the publish detector decided to (re-)materialize: its fresh Lattice
+/// and LSP vectors, plus whether the LSP form differs from what the client
+/// holds.
+struct Materialized {
+    /// The publish-cache key (the client-spelling URI).
+    uri: String,
+    /// The freshly computed Lattice vector — the cheap change-detection key.
+    lattice: Vec<Diagnostic>,
+    /// Its UTF-16 materialization — what would go on the wire.
+    lsp: Vec<lsp::Diagnostic>,
+    /// Whether that materialization differs from the client's copy.
+    send: bool,
+}
+
+/// Materialize one root's share of a publish pass: decide, per file, whether
+/// its vector moved, and materialize only those that did.
+///
+/// Split out of [`diff_diagnostics_with`]'s phase 1 so the pass reads as its
+/// three phases (detect / apply / clear) rather than one long loop.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the per-root detection step genuinely needs the store, the root and its metadata, the scope, its computed rows, the force set, and both accumulators; bundling them into a struct would only rename the same parameters"
+)]
+fn materialize_root(
+    workspaces: &Workspaces,
+    root: &Path,
+    meta: &RootMeta,
+    scope: &PublishScope,
+    mut by_file: BTreeMap<PathBuf, Vec<Diagnostic>>,
+    changed_canonical: &HashSet<String>,
+    present: &mut HashSet<String>,
+    materialized: &mut Vec<Materialized>,
+) {
+    // Fallback index for the defensive unindexed-file path (the config
+    // channel); real files use their own cached `line_index`.
+    let empty = LineIndex::default();
+
+    // The publish/cache URI is keyed by the client-supplied folder path
+    // (`root`); the force-re-materialize check lines up with
+    // `changed_canonical`, derived from the root's canonical scan path. The two
+    // bases coincide unless the client opened the folder through a symlink;
+    // when they differ, the comparison is run on the canonical root so a moved
+    // diagnostic is not skipped (issue 047).
+    let root_is_canonical = root == meta.canonical_root.as_path();
+
+    // The config channel: one per-root URI outside the indexed markdown set
+    // (decision 023 clause 4), admitted to the publish-diff cache only while
+    // the root has a config state to report on — a marker on disk, or a
+    // recorded load error. On a config delete or root deregistration it drops
+    // out of `present`, so the phase-3 clear empties the client's copy.
+    let config_channel =
+        (meta.has_config || meta.config_error.is_some()).then(|| PathBuf::from(".lattice.toml"));
+
+    // A scoped pass visits exactly the keys `root_desired_rows` produced (its
+    // focus, plus the config channel when it committed); a full pass visits
+    // every current document of the root — the saved membership plus any
+    // buffer-only document, which is a member of its own perspective alone.
+    let rels: Vec<PathBuf> = match scope {
+        PublishScope::Full => workspaces
+            .store
+            .current_files(root)
+            .into_keys()
+            .chain(config_channel)
+            .collect(),
+        PublishScope::Only(_) => by_file.keys().cloned().collect(),
+    };
+
+    for rel_path in rels {
+        let uri = path_to_uri(&root.join(&rel_path));
+        if !present.insert(uri.clone()) {
+            // Already claimed by a deeper root in this pass.
+            continue;
+        }
+
+        let lattice = by_file.remove(&rel_path).unwrap_or_default();
+        let cached = workspaces.published.get(&uri);
+        let force = if root_is_canonical {
+            changed_canonical.contains(&uri)
+        } else {
+            changed_canonical.contains(&path_to_uri(&meta.canonical_root.join(&rel_path)))
+        };
+
+        // Reuse the cached materialization when this file's source is unchanged
+        // (it is not the edited file) and its Lattice vector still matches what
+        // produced the cached LSP form.
+        if !force {
+            match cached {
+                Some(prev) if prev.lattice == lattice => continue,
+                None if lattice.is_empty() => continue,
+                _ => {}
+            }
+        }
+
+        // Materialize against the document's **current** text: an overlay
+        // document's rows are anchored in its buffer, which is the text the
+        // client is displaying.
+        let fd = workspaces
+            .store
+            .current(&root.join(&rel_path))
+            .map(|doc| &doc.data);
+        let source = fd.map_or("", |fd| fd.tree.source());
+        let index = fd.map_or(&empty, |fd| &fd.line_index);
+        let lsp: Vec<lsp::Diagnostic> = lattice
+            .iter()
+            .map(|d| to_lsp_diagnostic(d, source, index))
+            .collect();
+        let send = cached.map_or(!lsp.is_empty(), |prev| prev.lsp != lsp);
+        materialized.push(Materialized {
+            uri,
+            lattice,
+            lsp,
+            send,
+        });
+    }
+}
+
+/// [`diff_diagnostics`] with an explicit adjudication mode and publish scope.
+///
+/// Adjudication (decision 023): under [`Adjudication::Commit`] each root's
+/// verdicts are re-adjudicated from the **saved world** and held; under
+/// [`Adjudication::Held`] the last commitment's verdicts bind unchanged.
+///
+/// Scope (decision 024 clause 2): under [`PublishScope::Full`] every document
+/// is recomputed and diffed; under [`PublishScope::Only`] exactly one
+/// document's rows are, and every other cache entry is left untouched — a
+/// buffer event cannot move another file's rows, so re-reading them would be
+/// work with no possible result. The phase-3 "cleared files" sweep is likewise
+/// skipped for a scoped pass: nothing left the workspace.
+///
+/// The per-file computation itself lives in [`root_desired_rows`].
 fn diff_diagnostics_with(
     workspaces: &mut Workspaces,
     changed_uris: &HashSet<String>,
     adjudication: Adjudication,
+    scope: &PublishScope,
 ) -> Vec<(String, Vec<lsp::Diagnostic>)> {
-    // A file the detector decided to (re-)materialize: its fresh Lattice and LSP
-    // vectors, plus whether the LSP form differs from what the client holds.
-    struct Materialized {
-        uri: String,
-        lattice: Vec<Diagnostic>,
-        lsp: Vec<lsp::Diagnostic>,
-        send: bool,
-    }
-
     // Count this whole-workspace recompute pass so tests can assert that a
     // batched watched-file notification collapses to one pass, not one per
     // changed file (ticket perf 07). Compiled out of release builds.
@@ -5482,88 +5790,30 @@ fn diff_diagnostics_with(
     // cache, recompute each file's Lattice vector, decide whether it changed,
     // and materialize only the changed files. Collect owned results so the cache
     // can be mutated afterward.
-    {
-        let published = &workspaces.published;
-        // Fallback index for the defensive unindexed-file path; real files use
-        // their own cached `line_index`.
-        let empty = LineIndex::default();
-
-        // Deepest root first (reverse key order), and each absolute URI is
-        // claimed by the first (deepest) root that indexes it: nested roots
-        // range-scan the same absolute file, and letting both compute the same
-        // publish-cache key makes successive passes alternate between the two
-        // roots' diagnostic sets — the deeper one's vector one pass, the
-        // shallower's the next (issue 050's flip-flop shape). The deepest root
-        // owning the URI matches how `resolve` routes document events and how
-        // the test oracle `desired_diagnostics` settles the same URI.
-        for (root, meta) in workspaces.roots.iter().rev() {
-            let workspace = workspaces.root_view(root);
-            let (mut by_file, committed) =
-                adjudicated_root_diagnostics(&workspace, meta, adjudication);
-            if let Some(verdicts) = committed {
-                new_verdicts.push((root.clone(), verdicts));
-            }
-
-            // The publish/cache URI is keyed by the client-supplied folder path
-            // (`root`); the force-re-materialize check lines up with
-            // `changed_canonical`, derived from the root's canonical scan path.
-            // The two bases coincide unless the client opened the folder through
-            // a symlink; when they differ, the comparison is run on the
-            // canonical root so a moved diagnostic is not skipped (issue 047).
-            let root_is_canonical = root.as_path() == meta.canonical_root.as_path();
-
-            // The config channel: one per-root URI outside the indexed
-            // markdown set (decision 023 clause 4), admitted to the
-            // publish-diff cache only while the root has a config state to
-            // report on — a marker on disk, or a recorded load error. On a
-            // config delete or root deregistration it drops out of `present`,
-            // so the phase-3 clear empties the client's copy.
-            let config_rel = PathBuf::from(".lattice.toml");
-            let config_channel =
-                (meta.has_config || meta.config_error.is_some()).then_some(&config_rel);
-
-            for rel_path in workspace.files().keys().chain(config_channel) {
-                let uri = path_to_uri(&root.join(rel_path));
-                if !present.insert(uri.clone()) {
-                    // Already claimed by a deeper root in this pass.
-                    continue;
-                }
-
-                let lattice = by_file.remove(rel_path).unwrap_or_default();
-                let cached = published.get(&uri);
-                let force = if root_is_canonical {
-                    changed_canonical.contains(&uri)
-                } else {
-                    changed_canonical.contains(&path_to_uri(&meta.canonical_root.join(rel_path)))
-                };
-
-                // Reuse the cached materialization when this file's source is
-                // unchanged (it is not the edited file) and its Lattice vector
-                // still matches what produced the cached LSP form.
-                if !force {
-                    match cached {
-                        Some(prev) if prev.lattice == lattice => continue,
-                        None if lattice.is_empty() => continue,
-                        _ => {}
-                    }
-                }
-
-                let fd = workspace.file(rel_path);
-                let source = fd.map_or("", |fd| fd.tree.source());
-                let index = fd.map_or(&empty, |fd| &fd.line_index);
-                let lsp: Vec<lsp::Diagnostic> = lattice
-                    .iter()
-                    .map(|d| to_lsp_diagnostic(d, source, index))
-                    .collect();
-                let send = cached.map_or(!lsp.is_empty(), |prev| prev.lsp != lsp);
-                materialized.push(Materialized {
-                    uri,
-                    lattice,
-                    lsp,
-                    send,
-                });
-            }
+    //
+    // Deepest root first (reverse key order), and each absolute URI is claimed
+    // by the first (deepest) root that indexes it: nested roots range-scan the
+    // same absolute file, and letting both compute the same publish-cache key
+    // makes successive passes alternate between the two roots' diagnostic sets
+    // — the deeper one's vector one pass, the shallower's the next (issue 050's
+    // flip-flop shape). The deepest root owning the URI matches how `resolve`
+    // routes document events and how the test oracle `desired_diagnostics`
+    // settles the same URI.
+    for (root, meta) in workspaces.roots.iter().rev() {
+        let (by_file, committed) = root_desired_rows(workspaces, root, meta, adjudication, scope);
+        if let Some(verdicts) = committed {
+            new_verdicts.push((root.clone(), verdicts));
         }
+        materialize_root(
+            workspaces,
+            root,
+            meta,
+            scope,
+            by_file,
+            &changed_canonical,
+            &mut present,
+            &mut materialized,
+        );
     }
 
     // Hold the commitment's fresh verdicts (decision 023): every publish until
@@ -5597,16 +5847,19 @@ fn diff_diagnostics_with(
     }
 
     // Phase 3 — clear files that left the workspace (cached but no longer
-    // present): send an empty vector and drop the entry.
-    let absent: Vec<String> = workspaces
-        .published
-        .keys()
-        .filter(|uri| !present.contains(uri.as_str()))
-        .cloned()
-        .collect();
-    for uri in absent {
-        workspaces.published.remove(&uri);
-        to_send.insert(uri, Vec::new());
+    // present): send an empty vector and drop the entry. Only a full pass can
+    // conclude a file is absent — a scoped pass never enumerated the others.
+    if *scope == PublishScope::Full {
+        let absent: Vec<String> = workspaces
+            .published
+            .keys()
+            .filter(|uri| !present.contains(uri.as_str()))
+            .cloned()
+            .collect();
+        for uri in absent {
+            workspaces.published.remove(&uri);
+            to_send.insert(uri, Vec::new());
+        }
     }
 
     to_send.into_iter().collect()
@@ -8639,16 +8892,30 @@ mod tests {
     // Publication diffing (issue 013)
     // -----------------------------------------------------------------------
 
-    /// Replace a file's content in the single-workspace test set, keyed under
-    /// the sole root's path.
-    fn edit(workspaces: &mut Workspaces, rel: &str, content: &str) {
+    /// Commit new content for a file in the single-workspace test set, keyed
+    /// under the sole root's path — a **saved-store** write, the shape a
+    /// `didSave` or a watched change has.
+    ///
+    /// Under decision 024 that is the only kind of edit that can move another
+    /// file's rows, so the publish-diff tests below (which are about the diff's
+    /// mechanics, not about buffer locality) drive commitments rather than
+    /// buffer events.
+    fn commit(workspaces: &mut Workspaces, rel: &str, content: &str) {
         let root = workspaces
             .roots
             .keys()
             .next()
             .expect("test workspace exists")
             .clone();
-        workspaces.sync_document_content(&path_to_uri(&root.join(rel)), content);
+        workspaces.commit_save(&path_to_uri(&root.join(rel)), content);
+    }
+
+    /// Simulate a `didOpen` on `uri` carrying `text`: record the client's
+    /// buffer and seed the overlay tier (decision 024 clause 3 — a claim, not a
+    /// source). Never writes the saved store.
+    fn open_buffer(workspaces: &mut Workspaces, uri: &str, text: &str) {
+        workspaces.open_documents.insert(uri_to_path(uri));
+        workspaces.open_buffer(uri, text);
     }
 
     #[test]
@@ -8702,7 +8969,7 @@ mod tests {
         let first = diff_diagnostics(&mut workspaces, &HashSet::new());
         assert!(first.is_empty(), "clean file publishes nothing: {first:?}");
 
-        edit(&mut workspaces, "a.md", "# A\n\n# A\n");
+        commit(&mut workspaces, "a.md", "# A\n\n# A\n");
         let second = diff_diagnostics(&mut workspaces, &HashSet::new());
         assert_eq!(second.len(), 1, "introducing a diagnostic republishes a.md");
         assert_eq!(
@@ -8721,7 +8988,7 @@ mod tests {
         let first = diff_diagnostics(&mut workspaces, &HashSet::new());
         assert_eq!(first.len(), 1, "first pass publishes a.md's diagnostic");
 
-        edit(&mut workspaces, "a.md", "# A\n");
+        commit(&mut workspaces, "a.md", "# A\n");
         let second = diff_diagnostics(&mut workspaces, &HashSet::new());
         assert_eq!(
             second.len(),
@@ -8833,7 +9100,7 @@ mod tests {
         // astral char (also four bytes). The trailing-whitespace span stays bytes
         // 4..5, so the Lattice vector is byte-identical, but the UTF-16 column of
         // its start shifts 4 -> 2. Only the forced re-materialization can catch it.
-        edit(&mut workspaces, "a.md", "😀 \n");
+        commit(&mut workspaces, "a.md", "😀 \n");
         let sent = diff_diagnostics(&mut workspaces, &one_uri(&changed_uri));
         assert_eq!(
             sent.len(),
@@ -8958,7 +9225,7 @@ mod tests {
         assert_client_matches(&workspaces, &client, "after initial sync");
 
         for (i, (rel, content)) in steps.iter().enumerate() {
-            edit(&mut workspaces, rel, content);
+            commit(&mut workspaces, rel, content);
             // Drive the full path with the edited URI, as a graph-tier didChange
             // does, so the force-re-materialize branch is exercised too.
             let changed = file_uri(&dir, rel);
@@ -8995,7 +9262,7 @@ mod tests {
             ("c.md", "trailing \n"),                // add trailing whitespace on c.md
         ];
         for (i, (rel, content)) in steps.iter().enumerate() {
-            edit(&mut workspaces, rel, content);
+            commit(&mut workspaces, rel, content);
             let uri = file_uri(&dir, rel);
             if let Some((uri, diagnostics)) = diff_file_diagnostics(&mut workspaces, &uri) {
                 apply_publish(&mut client, uri, diagnostics);
@@ -9048,7 +9315,7 @@ mod tests {
             ("b.md", "# B\n"),
         ];
         for (i, (rel, content)) in steps.iter().enumerate() {
-            edit(&mut workspaces, rel, content);
+            commit(&mut workspaces, rel, content);
             let changed = file_uri(&dir, rel);
             for (uri, diagnostics) in diff_diagnostics(&mut workspaces, &one_uri(&changed)) {
                 apply_publish(&mut client, uri, diagnostics);
@@ -9087,7 +9354,7 @@ mod tests {
 
         // Add the reciprocal backlink for index -> a, clearing one of index.md's
         // two warnings. a.md is the edited file; index.md is the one that moves.
-        edit(
+        commit(
             &mut workspaces,
             "a.md",
             "---\nbacklinks:\n  superseded_by:\n    - index.md\n---\n# A\n",
@@ -9770,7 +10037,11 @@ mod tests {
         // in-memory, so no file needs to exist on disk.
         let mut workspaces = rootless_workspaces();
         let uri = "file:///tmp/lattice-051-scratch.md";
-        workspaces.sync_document_content(uri, "**bold**, *italic*, and ~~strikethrough~~\n");
+        open_buffer(
+            &mut workspaces,
+            uri,
+            "**bold**, *italic*, and ~~strikethrough~~\n",
+        );
 
         let tokens = decode_tokens(&semantic_tokens_full(&workspaces, uri));
         assert_sorted_non_overlapping(&tokens);
@@ -9797,7 +10068,8 @@ mod tests {
         // preview feature — has an in-index target to resolve.
         let mut workspaces = rootless_workspaces();
         let uri = "file:///tmp/lattice-051-features/doc.md";
-        workspaces.sync_document_content(
+        open_buffer(
+            &mut workspaces,
             uri,
             "---\nbacklinks:\n  references:\n    - z.md\n    - a.md\n---\n# Title\n\n## Section\n\n[self](doc.md \"references\")\n",
         );
@@ -9847,7 +10119,7 @@ mod tests {
         let mut workspaces = scan_workspaces(&dir);
 
         let outside_uri = "file:///tmp/lattice-051-outside.md";
-        workspaces.sync_document_content(outside_uri, "**outside**\n");
+        open_buffer(&mut workspaces, outside_uri, "**outside**\n");
 
         let outside = decode_tokens(&semantic_tokens_full(&workspaces, outside_uri));
         assert!(
@@ -9872,7 +10144,7 @@ mod tests {
         let mut workspaces = rootless_workspaces();
         let uri = "file:///tmp/lattice-051-quiet.md";
         // A bare path to an absent file — a stale reference in a real workspace.
-        workspaces.sync_document_content(uri, "See docs/page.md for details.\n");
+        open_buffer(&mut workspaces, uri, "See docs/page.md for details.\n");
 
         let pushed = diff_diagnostics(&mut workspaces, &one_uri(uri));
         assert!(
@@ -9887,7 +10159,7 @@ mod tests {
         // backed workspace to revert to — so a later request no longer resolves.
         let mut workspaces = rootless_workspaces();
         let uri = "file:///tmp/lattice-051-close.md";
-        workspaces.sync_document_content(uri, "**live**\n");
+        open_buffer(&mut workspaces, uri, "**live**\n");
         assert!(
             !decode_tokens(&semantic_tokens_full(&workspaces, uri)).is_empty(),
             "the open single-file document serves tokens"
@@ -9924,11 +10196,11 @@ mod tests {
         let mut workspaces = Workspaces::new();
         // didOpen with an unsaved buffer diverging from disk, before any folder.
         workspaces.open_documents.insert(abs.clone());
-        workspaces.sync_document_content(&uri, "# In Buffer\n\n# In Buffer\n");
+        workspaces.open_buffer(&uri, "# In Buffer\n\n# In Buffer\n");
         assert!(
             workspaces
-                .documents
-                .get(&abs)
+                .store
+                .current(&abs)
                 .is_some_and(|d| d.primary_root.is_none()),
             "the open document is rootless before the folder is added"
         );
@@ -9937,11 +10209,11 @@ mod tests {
         workspaces.add_folder(&path_to_uri(&root));
 
         assert_eq!(
-            workspaces.documents.len(),
+            workspaces.store.len(),
             1,
             "the open buffer gained a root — no orphaned rootless entry remains"
         );
-        let doc = workspaces.documents.get(&abs).expect("document present");
+        let doc = workspaces.store.current(&abs).expect("document present");
         assert_eq!(
             doc.primary_root.as_deref(),
             Some(root.as_path()),
@@ -9975,7 +10247,7 @@ mod tests {
         let mut workspaces = Workspaces::new();
         workspaces.add_folder(&path_to_uri(&root));
         workspaces.open_documents.insert(abs.clone());
-        workspaces.sync_document_content(&uri, "# Title\n\n## Section\n");
+        workspaces.open_buffer(&uri, "# Title\n\n## Section\n");
         assert!(
             document_symbols(&workspaces, &uri).is_some_and(|s| !s.is_empty()),
             "the rooted open document serves symbols before the removal"
@@ -9984,7 +10256,7 @@ mod tests {
         // DID_CHANGE_WORKSPACE_FOLDERS remove while the document is open.
         workspaces.remove_folder(&path_to_uri(&root));
 
-        let doc = workspaces.documents.get(&abs).expect("open document kept");
+        let doc = workspaces.store.current(&abs).expect("open document kept");
         assert!(
             doc.primary_root.is_none(),
             "the open document recomputed to rootless"
@@ -10013,24 +10285,20 @@ mod tests {
         // Open a.md; b.md stays scan-only.
         let a_uri = path_to_uri(&a_abs);
         workspaces.open_documents.insert(a_abs.clone());
-        workspaces.sync_document_content(&a_uri, "# A\n");
-        assert_eq!(workspaces.documents.len(), 2, "two documents were scanned");
+        workspaces.open_buffer(&a_uri, "# A\n");
+        assert_eq!(workspaces.store.len(), 2, "two documents were scanned");
 
         workspaces.remove_folder(&path_to_uri(&root));
 
         assert!(
-            workspaces.documents.contains_key(&a_abs),
+            workspaces.store.current(&a_abs).is_some(),
             "the open document survives the removal (rootless)"
         );
         assert!(
-            !workspaces.documents.contains_key(&b_abs),
+            workspaces.store.current(&b_abs).is_none(),
             "the scan-only document is evicted"
         );
-        assert_eq!(
-            workspaces.documents.len(),
-            1,
-            "only the open document remains"
-        );
+        assert_eq!(workspaces.store.len(), 1, "only the open document remains");
     }
 
     #[test]
@@ -10067,8 +10335,8 @@ mod tests {
         // `sub/inner.md` belongs to the covering (outer) scope.
         assert_eq!(
             workspaces
-                .documents
-                .get(&inner_abs)
+                .store
+                .current(&inner_abs)
                 .and_then(|d| d.primary_root.as_deref()),
             Some(root.as_path()),
             "the nested-folder document belongs to the covering scope, not a config-less sub root"
@@ -10076,7 +10344,7 @@ mod tests {
 
         // The outer graph owns `sub/inner.md`, so `top.md`'s link into it
         // resolves rather than dangling.
-        let ancestor = workspaces.root_view(&root);
+        let ancestor = workspaces.current_view(&root);
         let diags = collect_all_diagnostics(&ancestor);
         assert!(
             !diags
@@ -10121,11 +10389,11 @@ mod tests {
         workspaces.add_folder(&path_to_uri(&root));
         // Open the buffer so it survives the removal (decision 017 §3).
         workspaces.open_documents.insert(doc_abs.clone());
-        workspaces.sync_document_content(&doc_uri, "[peer](peer.md \"references\")\n");
+        workspaces.open_buffer(&doc_uri, "[peer](peer.md \"references\")\n");
         assert_eq!(
             workspaces
-                .documents
-                .get(&doc_abs)
+                .store
+                .current(&doc_abs)
                 .and_then(|d| d.primary_root.as_deref()),
             Some(root.as_path()),
             "the open document belongs to the folder before removal"
@@ -10141,8 +10409,8 @@ mod tests {
         );
         assert!(
             workspaces
-                .documents
-                .get(&doc_abs)
+                .store
+                .current(&doc_abs)
                 .is_some_and(|d| d.primary_root.is_none()),
             "the open document re-rooted to rootless without a reparse"
         );
@@ -10170,8 +10438,8 @@ mod tests {
         workspaces.add_folder(&path_to_uri(&sub));
         assert_eq!(
             workspaces
-                .documents
-                .get(&inner_abs)
+                .store
+                .current(&inner_abs)
                 .and_then(|d| d.primary_root.as_deref()),
             Some(sub.as_path()),
             "the nested marker scope owns its document"
@@ -10190,8 +10458,8 @@ mod tests {
         );
         assert_eq!(
             workspaces
-                .documents
-                .get(&inner_abs)
+                .store
+                .current(&inner_abs)
                 .and_then(|d| d.primary_root.as_deref()),
             Some(sub.as_path()),
             "the nested document keeps its scope — no re-root"
@@ -10202,8 +10470,8 @@ mod tests {
     /// resolved to an absolute path — decision 019 clause 8).
     fn first_link_target(workspaces: &Workspaces, inner_abs: &Path) -> PathBuf {
         match &workspaces
-            .documents
-            .get(inner_abs)
+            .store
+            .current(inner_abs)
             .expect("inner indexed")
             .data
             .links[0]
@@ -10245,15 +10513,15 @@ mod tests {
             "walk-down from the outer root registers the nested scope"
         );
         assert_eq!(
-            a.documents
-                .get(&inner_abs)
+            a.store
+                .current(&inner_abs)
                 .and_then(|d| d.primary_root.as_deref()),
             Some(sub.as_path()),
             "the nested scope owns its document, entered from the outer root"
         );
         // The nested scope resolves the intra-scope link to sub/peer.md.
         let target = first_link_target(&a, &inner_abs);
-        let sub_view = a.root_view(&sub);
+        let sub_view = a.current_view(&sub);
         let key = sub_view
             .resolve_key(&target)
             .expect("nested scope resolves its intra-scope link");
@@ -10263,7 +10531,7 @@ mod tests {
             "the nested scope resolves inner.md's link to sub/peer.md"
         );
         // The outer scope is disjoint: its graph contains neither nested file.
-        let root_view = a.root_view(&root);
+        let root_view = a.current_view(&root);
         assert!(
             root_view.file(Path::new("sub/inner.md")).is_none()
                 && root_view.file(Path::new("sub/peer.md")).is_none(),
@@ -10275,14 +10543,14 @@ mod tests {
         let mut b = Workspaces::new();
         b.add_folder(&path_to_uri(&sub));
         assert_eq!(
-            b.documents
-                .get(&inner_abs)
+            b.store
+                .current(&inner_abs)
                 .and_then(|d| d.primary_root.as_deref()),
             Some(sub.as_path()),
             "the nested scope owns its document, entered directly"
         );
         let target_b = first_link_target(&b, &inner_abs);
-        let sub_view_b = b.root_view(&sub);
+        let sub_view_b = b.current_view(&sub);
         let key_b = sub_view_b
             .resolve_key(&target_b)
             .expect("direct entry resolves the same intra-scope link");
@@ -10314,7 +10582,7 @@ mod tests {
         workspaces.add_folder(&path_to_uri(&root));
 
         // Before the split: one scope; the link is in-scope and resolves.
-        let before = collect_all_diagnostics(&workspaces.root_view(&root));
+        let before = collect_all_diagnostics(&workspaces.current_view(&root));
         assert!(
             !before
                 .iter()
@@ -10323,8 +10591,8 @@ mod tests {
         );
         assert_eq!(
             workspaces
-                .documents
-                .get(&inner_abs)
+                .store
+                .current(&inner_abs)
                 .and_then(|d| d.primary_root.as_deref()),
             Some(root.as_path()),
             "before the split sub/inner.md belongs to the single scope"
@@ -10351,22 +10619,22 @@ mod tests {
         );
         assert_eq!(
             workspaces
-                .documents
-                .get(&inner_abs)
+                .store
+                .current(&inner_abs)
                 .and_then(|d| d.primary_root.as_deref()),
             Some(sub.as_path()),
             "sub/inner.md re-rooted into the new scope"
         );
         assert_eq!(
             workspaces
-                .documents
-                .get(&outer_abs)
+                .store
+                .current(&outer_abs)
                 .and_then(|d| d.primary_root.as_deref()),
             Some(root.as_path()),
             "outer.md stays in the host scope"
         );
         // The host's link now crosses the boundary → steering error.
-        let after = collect_all_diagnostics(&workspaces.root_view(&root));
+        let after = collect_all_diagnostics(&workspaces.current_view(&root));
         assert!(
             after
                 .iter()
@@ -10395,7 +10663,7 @@ mod tests {
 
         let mut workspaces = Workspaces::new();
         workspaces.add_folder(&path_to_uri(&root));
-        let before = collect_all_diagnostics(&workspaces.root_view(&root));
+        let before = collect_all_diagnostics(&workspaces.current_view(&root));
         assert!(
             before
                 .iter()
@@ -10423,14 +10691,14 @@ mod tests {
         );
         assert_eq!(
             workspaces
-                .documents
-                .get(&inner_abs)
+                .store
+                .current(&inner_abs)
                 .and_then(|d| d.primary_root.as_deref()),
             Some(root.as_path()),
             "sub/inner.md re-roots into the host scope"
         );
 
-        let after = collect_all_diagnostics(&workspaces.root_view(&root));
+        let after = collect_all_diagnostics(&workspaces.current_view(&root));
         assert!(
             !after
                 .iter()
@@ -10471,12 +10739,12 @@ mod tests {
 
         // The nested `.git` is never eagerly indexed: its file is not in the store.
         assert!(
-            !workspaces.documents.contains_key(&inner_abs),
+            workspaces.store.current(&inner_abs).is_none(),
             "a nested `.git` repo is not eagerly scanned"
         );
         // The host's link into it crosses the boundary → steering error, named
         // by boundary kind (issue 052).
-        let host = collect_all_diagnostics(&workspaces.root_view(&root));
+        let host = collect_all_diagnostics(&workspaces.current_view(&root));
         assert!(
             host.iter()
                 .any(|d| d.file.as_path() == Path::new("outer.md")
@@ -10487,11 +10755,11 @@ mod tests {
         // Opened directly, the document is rootless (excluded from the host graph)
         // and serves document-scoped features (symbols) under defaults.
         workspaces.open_documents.insert(inner_abs.clone());
-        workspaces.sync_document_content(&inner_uri, "# Vendored\n\n## Section\n");
+        workspaces.open_buffer(&inner_uri, "# Vendored\n\n## Section\n");
         assert!(
             workspaces
-                .documents
-                .get(&inner_abs)
+                .store
+                .current(&inner_abs)
                 .is_some_and(|d| d.primary_root.is_none()),
             "a document behind a nested `.git` is rootless, not a host member"
         );
@@ -10502,7 +10770,7 @@ mod tests {
         // It is still excluded from the host graph after opening.
         assert!(
             workspaces
-                .root_view(&root)
+                .current_view(&root)
                 .file(Path::new("vendor/inner.md"))
                 .is_none(),
             "the nested `.git` document never joins the host graph"
@@ -10567,22 +10835,22 @@ mod tests {
 
             assert_eq!(
                 workspaces
-                    .documents
-                    .get(&inner_abs)
+                    .store
+                    .current(&inner_abs)
                     .and_then(|d| d.primary_root.as_deref()),
                 Some(sub.as_path()),
                 "{label}: the directly-opened submodule owns its documents — a registered root at the boundary wins the gate"
             );
             assert!(
                 workspaces
-                    .root_view(&sub)
+                    .current_view(&sub)
                     .file(Path::new("inner.md"))
                     .is_some(),
                 "{label}: the submodule's own view contains its documents"
             );
             assert!(
                 workspaces
-                    .root_view(&root)
+                    .current_view(&root)
                     .file(Path::new("sub/inner.md"))
                     .is_none(),
                 "{label}: the host's graph never contains the submodule's documents"
@@ -10604,7 +10872,7 @@ mod tests {
         workspaces.add_folder(&path_to_uri(&root));
         workspaces.add_folder(&path_to_uri(&sub));
 
-        let view = workspaces.root_view(&sub);
+        let view = workspaces.current_view(&sub);
         assert!(
             !view.has_config(),
             "a marker-less submodule registers with no config — the graph tier is off"
@@ -10638,7 +10906,7 @@ mod tests {
         workspaces.add_folder(&path_to_uri(&root));
         workspaces.add_folder(&path_to_uri(&sub));
 
-        let diagnostics = collect_all_diagnostics(&workspaces.root_view(&root));
+        let diagnostics = collect_all_diagnostics(&workspaces.current_view(&root));
         let steering = diagnostics
             .iter()
             .find(|d| d.file.as_path() == Path::new("outer.md") && d.severity == Severity::Error)
@@ -10673,11 +10941,11 @@ mod tests {
         workspaces.add_folder(&path_to_uri(&sub));
         // peer.md is open in the editor; inner.md stays scan-only.
         workspaces.open_documents.insert(peer_abs.clone());
-        workspaces.sync_document_content(&peer_uri, "# Peer\n");
+        workspaces.open_buffer(&peer_uri, "# Peer\n");
         assert_eq!(
             workspaces
-                .documents
-                .get(&peer_abs)
+                .store
+                .current(&peer_abs)
                 .and_then(|d| d.primary_root.as_deref()),
             Some(sub.as_path()),
             "the open document belongs to the submodule's scope before the removal"
@@ -10690,13 +10958,13 @@ mod tests {
             "the submodule's scope root deregisters — no surviving folder keeps it visible"
         );
         assert!(
-            !workspaces.documents.contains_key(&inner_abs),
+            workspaces.store.current(&inner_abs).is_none(),
             "the scan-only document is evicted"
         );
         assert!(
             workspaces
-                .documents
-                .get(&peer_abs)
+                .store
+                .current(&peer_abs)
                 .is_some_and(|d| d.primary_root.is_none()),
             "the open document keeps serving, now rootless"
         );
@@ -10727,7 +10995,7 @@ mod tests {
         );
         workspaces.update_from_disk(&inner_abs);
         assert!(
-            workspaces.documents.get(&inner_abs).is_some_and(|d| d
+            workspaces.store.current(&inner_abs).is_some_and(|d| d
                 .data
                 .tree
                 .source()
@@ -10764,15 +11032,15 @@ mod tests {
         );
         assert_eq!(
             workspaces
-                .documents
-                .get(&doc_abs)
+                .store
+                .current(&doc_abs)
                 .and_then(|d| d.primary_root.as_deref()),
             Some(inner_scope.as_path()),
             "a marker scope registered below the boundary owns its documents"
         );
         assert!(
             workspaces
-                .root_view(&root)
+                .current_view(&root)
                 .file(Path::new("sub/docs/doc.md"))
                 .is_none(),
             "the host's graph still excludes everything behind the submodule"
@@ -10829,27 +11097,37 @@ mod tests {
     }
 
     #[test]
-    fn rootless_open_skips_workspace_structural_sweep() {
-        // A rootless document appears in no root's range scan, so opening one
-        // cannot flip any rooted document's bare-path existence answer — it
-        // must not pay the O(workspace) structural sweep. A rooted open that
-        // grows membership still must (ticket server 10 review).
+    fn buffer_events_never_sweep_but_a_membership_commitment_does() {
+        // Decision 024 clause 3, as a cost: a `didOpen` seeds only the overlay,
+        // so it can never grow the saved membership and therefore can never
+        // flip any document's bare-path existence answer — rootless or rooted,
+        // it must not pay the O(workspace) structural sweep. (Before the split
+        // a rooted open of an unindexed path grew membership and swept once.)
+        // A **commitment** that grows membership still must.
         let dir = workspace_with_files(&[("a.md", "# A\n"), ("b.md", "# B\n")]);
         let root = fs::canonicalize(dir.path()).expect("canonicalize temp dir");
         let mut workspaces = Workspaces::new();
         workspaces.add_folder(&path_to_uri(&root));
 
         let (sweeps, ()) = count_structural_sweeps(|| {
-            workspaces.sync_document_content("file:///tmp/lattice-10r-scratch.md", "# S\n");
+            workspaces.open_buffer("file:///tmp/lattice-10r-scratch.md", "# S\n");
         });
         assert_eq!(sweeps, 0, "a rootless open sweeps no structural caches");
 
         let (sweeps, ()) = count_structural_sweeps(|| {
-            workspaces.sync_document_content(&path_to_uri(&root.join("new.md")), "# N\n");
+            workspaces.open_buffer(&path_to_uri(&root.join("new.md")), "# N\n");
+        });
+        assert_eq!(
+            sweeps, 0,
+            "a rooted open is a claim, not a source: membership cannot grow, so nothing sweeps"
+        );
+
+        let (sweeps, ()) = count_structural_sweeps(|| {
+            workspaces.commit_save(&path_to_uri(&root.join("new.md")), "# N\n");
         });
         assert_eq!(
             sweeps, 1,
-            "a rooted open that grows membership sweeps exactly once"
+            "the save commits the new file into the saved membership and sweeps exactly once"
         );
     }
 
@@ -11214,8 +11492,9 @@ mod tests {
             "the registration also watches the markdown document glob (ticket server 09): {reg_json}"
         );
 
-        // Opening doc.md surfaces the stale-reference diagnostic.
-        open_doc(&client, &doc_uri, "See `artifact.md` here.\n");
+        // The cold-start publish surfaces doc.md's stale-reference diagnostic;
+        // it is never opened, so the reload below is the only thing that can
+        // move it.
         let before = recv_publish_for(&client, &doc_uri);
         assert!(
             !before.is_empty(),
@@ -11323,8 +11602,9 @@ mod tests {
         handshake(&client, &root_uri, true);
         let _reg = recv_message(&client); // client/registerCapability
 
-        // The link into the nested scope steers (two disjoint graphs).
-        open_doc(&client, &outer_uri, "[down](sub/inner.md \"references\")\n");
+        // The link into the nested scope steers (two disjoint graphs) — shown
+        // by the cold-start publish, with outer.md never opened, so the marker
+        // event below is the only thing that can move it.
         let before = recv_publish_for(&client, &outer_uri);
         assert!(
             any_message_contains(&before, "outside this scope"),
@@ -11366,14 +11646,22 @@ mod tests {
 
         handshake(&client, &root_uri, false);
 
-        // No registerCapability request is sent: the server is silent until a
-        // notification drives a publish, so a short wait must time out.
+        // The cold-start publish still runs — it is independent of the watcher
+        // — but no `registerCapability` request accompanies it. Every message
+        // the server sends must be a notification.
+        let initial = recv_message(&client);
+        assert!(
+            matches!(&initial, Message::Notification(notif)
+                if notif.method == lsp::method::PUBLISH_DIAGNOSTICS),
+            "a client without dynamic registration receives no registration request, \
+             only the cold-start publish, got {initial:?}"
+        );
         assert!(
             client
                 .receiver
                 .recv_timeout(std::time::Duration::from_millis(300))
                 .is_err(),
-            "a client without dynamic registration receives no registration request"
+            "and nothing else follows it"
         );
 
         // The server still serves: a didOpen yields diagnostics.
@@ -11426,11 +11714,12 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Watched-file document sync (ticket server 09, decision 017 §3)
+    // Watched-file document sync (ticket server 09, decision 017 §1)
     //
     // Same in-memory `Connection` harness as the ticket-08 tests: a `**/*.md`
-    // watcher reconciled with the document-sync channel by the buffer-wins
-    // rule and an open-document set.
+    // watcher, now the unconditional sole writer of the saved store's `.md`
+    // content — nothing to reconcile it against, because the document-sync
+    // channel writes the overlay store instead (decision 024).
     // -----------------------------------------------------------------------
 
     /// Deliver a `workspace/didChangeWatchedFiles` event for one URI with the
@@ -11559,6 +11848,14 @@ mod tests {
             "the registration request precedes the membership changes, got {reg:?}"
         );
 
+        // The cold-start publish introduces a.md's opening state: the target
+        // does not exist yet, so the bare path is a stale reference.
+        let initial = recv_publish_for(&client, &a_uri);
+        assert!(
+            any_message_contains(&initial, "stale reference"),
+            "the initialized pass introduces the never-opened source, got {initial:?}"
+        );
+
         // Create the target on disk; deliver the `created` event.
         fs::create_dir_all(root.join("docs")).expect("create docs dir");
         fs::write(root.join("docs/page.md"), "# Page\n").expect("write page.md");
@@ -11582,13 +11879,15 @@ mod tests {
     }
 
     #[test]
-    fn open_md_buffer_wins_then_close_reenables_watcher() {
-        // Decision 017 §3: while a `.md` file is open the synced buffer is
-        // authoritative. A watched `changed` event carrying divergent disk bytes
-        // is dropped — no diagnostic regresses to the on-disk version, and the
-        // open file's single edit is never delivered twice (issue 009 class).
-        // After didClose the watcher is re-enabled and the next `changed` event
-        // re-reads disk.
+    fn an_open_documents_rows_track_its_buffer_until_the_close() {
+        // What 017 §3's buffer-wins rule was actually protecting, kept — with
+        // the arbitration removed (decision 024). While a `.md` file is open,
+        // *its own* rows describe its buffer, and a watched `changed` event
+        // carrying the same disk bytes the server already holds moves nothing.
+        // On `didClose` the buffer is dropped and the document's rows fall back
+        // to its saved copy: no diagnostic ever regresses under the client's
+        // feet, and the single edit is never delivered twice (issue 009 class),
+        // because the two channels now write different stores.
         let dir = workspace_with_files(&[("doc.md", "See `disk-only.md` here.\n")]);
         let root = fs::canonicalize(dir.path()).expect("canonicalize temp dir");
         let root_uri = path_to_uri(&root);
@@ -11604,6 +11903,14 @@ mod tests {
             "the registration request precedes the document sync, got {reg:?}"
         );
 
+        // The cold-start publish introduces the document from its saved copy,
+        // before any buffer exists.
+        let initial = recv_publish_for(&client, &doc_uri);
+        assert!(
+            any_message_contains(&initial, "disk-only.md"),
+            "the initialized pass introduces the document from disk, got {initial:?}"
+        );
+
         // Open with a buffer that references a different (also absent) file than
         // disk. The publish reflects the buffer.
         open_doc(&client, &doc_uri, "See `buffer-only.md` here.\n");
@@ -11613,43 +11920,47 @@ mod tests {
             "the open buffer's diagnostic reflects the buffer, not the disk, got {opened:?}"
         );
 
-        // A watched `changed` event for the still-open file is dropped: no
-        // publish arrives, so the buffer is not clobbered by stale disk bytes.
+        // A watched `changed` event arrives for the still-open file. Disk is
+        // unchanged, so the saved copy is untouched and the buffer's rows do
+        // not move: no publish at all. (Under the retired rule this was an
+        // arbitration — the event was *dropped*; now it simply has nothing to
+        // say, which is the same silence for a structural reason.)
         send_watched_change(&client, &doc_uri, lsp::file_change_type::CHANGED);
         assert!(
             client
                 .receiver
                 .recv_timeout(std::time::Duration::from_millis(300))
                 .is_err(),
-            "an open file's watched `changed` event is dropped — buffer wins, no double delivery"
+            "an echo of content the server already holds moves nothing — no double delivery"
         );
 
-        // Close the file, then deliver the same event: now honored, disk wins.
+        // Close the file: the buffer is dropped, so the document's rows revert
+        // to its saved copy, which is disk.
         send_close(&client, &doc_uri);
-        send_watched_change(&client, &doc_uri, lsp::file_change_type::CHANGED);
         let after = recv_publish_for(&client, &doc_uri);
         assert!(
             any_message_contains(&after, "disk-only.md"),
-            "after didClose the watcher re-reads disk: the diagnostic now reflects disk, got {after:?}"
+            "with the buffer gone the document is judged from its saved copy, got {after:?}"
         );
 
         shutdown(&client, server_thread);
     }
 
     #[test]
-    fn buffer_authority_matches_on_identity_not_uri_spelling() {
-        // Issue 069: a spec-compliant client percent-encodes the URI of a path
-        // holding a space, and a second courier (a watcher, another client)
-        // may spell the same file without the escape. Identity is decided once
-        // at the boundary — `uri_to_path` — so both spellings name one
-        // document, and the buffer-wins verdict of decision 017 §3 cannot
-        // depend on which spelling arrived.
+    fn one_file_is_one_buffer_whatever_the_uri_spelling() {
+        // Issue 069, restated for the two-tier store (decision 024's
+        // precondition): a spec-compliant client percent-encodes the URI of a
+        // path holding a space, and a second courier (a watcher, another
+        // client) may spell the same file without the escape. Identity is
+        // decided once at the boundary — `uri_to_path` — so both spellings name
+        // **one** document with **one** overlay entry, which is the premise
+        // buffer locality rests on ("its own buffer", singular). URI-spelling
+        // aliasing would break it at the level of identity, and nothing
+        // downstream could detect it: both documents would look well-formed.
         //
         // Against the raw-URI-keyed sets this replaces, the encoded `didOpen`
-        // recorded the escape verbatim: the matching spelling was dropped and
-        // the differing one applied, so disk silently clobbered the live
-        // buffer (and the store key held a literal `%20` that matched no file
-        // on disk in the first place).
+        // recorded the escape verbatim and the store key held a literal `%20`
+        // that matched no file on disk.
         let dir = workspace_with_files(&[(".lattice.toml", ""), ("my note.md", "# On Disk\n")]);
         let abs = dir.path().join("my note.md");
         let encoded_uri = path_to_uri(&abs);
@@ -11668,7 +11979,7 @@ mod tests {
         let (server, _client) = Connection::memory();
 
         // didOpen under the ENCODED spelling, with text diverging from disk:
-        // the buffer is now the sole copy of unsaved state.
+        // one overlay entry, at the decoded path.
         drive(
             &server,
             &mut workspaces,
@@ -11676,29 +11987,30 @@ mod tests {
             open_params(&encoded_uri, "# In Buffer\n"),
         );
         assert_eq!(
-            workspaces
-                .documents
-                .get(&abs)
-                .map(|doc| doc.data.tree.source().to_string())
-                .as_deref(),
+            workspaces.store.source(&abs, Tier::Overlay),
             Some("# In Buffer\n"),
-            "the encoded URI indexed the buffer at the real path, not at a literal `%20` key: {:?}",
-            workspaces.documents.keys().collect::<Vec<_>>()
+            "the encoded URI seeded the buffer at the real path, not at a literal `%20` key: {:?}",
+            workspaces.store.all_keys()
         );
         assert_eq!(
-            workspaces.documents.len(),
+            workspaces.store.len(),
             1,
             "one file is one document — an undecoded key would split it in two: {:?}",
-            workspaces.documents.keys().collect::<Vec<_>>()
+            workspaces.store.all_keys()
+        );
+        assert_eq!(
+            workspaces.store.source(&abs, Tier::Saved),
+            Some("# On Disk\n"),
+            "the didOpen is a claim, not a source: the saved copy is untouched"
         );
         assert!(
-            workspaces.open_documents.contains(&abs) && workspaces.dirty_documents.contains(&abs),
-            "buffer authority is recorded under the decoded path"
+            workspaces.open_documents.contains(&abs),
+            "the client's buffer is recorded under the decoded path"
         );
 
         // An external process rewrites the file. A watched `changed` event
-        // under EITHER spelling must be dropped — the buffer holds unsaved
-        // state, whichever way the courier spells the file.
+        // under EITHER spelling reaches the same document's saved copy — and
+        // leaves its buffer alone, whichever way the courier spells the file.
         fs::write(&abs, "# Rewritten On Disk\n").expect("rewrite the file under the open buffer");
         for uri in [&encoded_uri, &raw_uri] {
             drive(
@@ -11707,20 +12019,27 @@ mod tests {
                 lsp::method::DID_CHANGE_WATCHED_FILES,
                 watched_params(uri, lsp::file_change_type::CHANGED),
             );
-            let source = workspaces
-                .documents
-                .get(&abs)
-                .map(|doc| doc.data.tree.source().to_string());
             assert_eq!(
-                source.as_deref(),
+                workspaces.store.source(&abs, Tier::Saved),
+                Some("# Rewritten On Disk\n"),
+                "the watched change spelled `{uri}` reaches the saved copy on identity, not spelling"
+            );
+            assert_eq!(
+                workspaces.store.source(&abs, Tier::Overlay),
                 Some("# In Buffer\n"),
-                "the watched change spelled `{uri}` is dropped — buffer wins on identity, not spelling"
+                "the client's buffer is untouched by the watched change spelled `{uri}`"
+            );
+            assert_eq!(
+                workspaces.store.len(),
+                1,
+                "still one document after the event spelled `{uri}`: {:?}",
+                workspaces.store.all_keys()
             );
         }
 
         // The release side agrees on identity too: a `didClose` under the OTHER
-        // spelling clears the same document's authority and hands content back
-        // to the filesystem (issue 046).
+        // spelling drops the same document's buffer, so its current text falls
+        // back to the saved copy.
         drive(
             &server,
             &mut workspaces,
@@ -11728,96 +12047,180 @@ mod tests {
             serde_json::json!({ "textDocument": { "uri": raw_uri } }),
         );
         assert!(
-            !workspaces.open_documents.contains(&abs) && !workspaces.dirty_documents.contains(&abs),
-            "a didClose under a different spelling clears the same document's authority"
+            !workspaces.open_documents.contains(&abs) && !workspaces.store.has_overlay(&abs),
+            "a didClose under a different spelling drops the same document's buffer"
         );
         assert_eq!(
             workspaces
-                .documents
-                .get(&abs)
+                .store
+                .current(&abs)
                 .map(|doc| doc.data.tree.source().to_string())
                 .as_deref(),
             Some("# Rewritten On Disk\n"),
-            "the close reconciled the released document from disk"
+            "with the buffer gone the document serves its saved copy"
         );
     }
 
     #[test]
-    fn watched_change_reconciles_open_saved_buffer() {
-        // Issue 061: buffer-wins is narrowed to buffers holding state disk
-        // doesn't. While the open buffer has unsaved edits the watched
-        // `changed` event is still dropped; once the buffer is saved it is a
-        // mere snapshot, so an external rewrite's watched event reconciles
-        // the index from disk instead of pinning it to the stale buffer.
+    fn watched_change_applies_in_every_buffer_state_without_moving_the_document() {
+        // Issue 061's ambition, delivered structurally (decision 024, issue
+        // 067). Issue 061 narrowed a *drop* to buffers holding unsaved state;
+        // the split removes the drop entirely, so the saved copy tracks disk in
+        // **every** buffer state — undiverged, mid-edit, and just-saved alike.
+        // That is strictly stronger than what 061 could reach: the mid-edit arm
+        // used to pin the index indefinitely.
+        //
+        // The other half is the locality guarantee that pays for it: the
+        // document's **own** rows never move, because they read its buffer and
+        // the buffer did not change. The client owns its buffer; disk moving
+        // underneath is news about the world, not about the text on screen.
         let dir = workspace_with_files(&[("doc.md", "See `disk-a.md` here.\n")]);
         let root = fs::canonicalize(dir.path()).expect("canonicalize temp dir");
-        let root_uri = path_to_uri(&root);
-        let doc_uri = path_to_uri(&root.join("doc.md"));
-
+        let abs = root.join("doc.md");
+        let doc_uri = path_to_uri(&abs);
+        let mut workspaces = Workspaces::new();
+        workspaces.add_folder(&path_to_uri(&root));
         let (server, client) = Connection::memory();
-        let server_thread = std::thread::spawn(move || serve(&server));
 
-        handshake(&client, &root_uri, true);
-        let reg = recv_message(&client);
+        // Arm 1 — open undiverged. No overlay entry: the document shares the
+        // saved parse (clause 1's sharing rule).
+        drive(
+            &server,
+            &mut workspaces,
+            lsp::method::DID_OPEN,
+            open_params(&doc_uri, "See `disk-a.md` here.\n"),
+        );
         assert!(
-            matches!(reg, Message::Request(_)),
-            "the registration request precedes the document sync, got {reg:?}"
+            !workspaces.store.has_overlay(&abs),
+            "an undiverged buffer stores no overlay entry — one parse, not two"
+        );
+        let opened = drain_publishes(&client);
+        assert!(
+            opened
+                .get(&doc_uri)
+                .is_some_and(|d| any_message_contains(d, "disk-a.md")),
+            "the open publish reflects the synced content: {opened:?}"
         );
 
-        // Open with the file's current bytes: a snapshot, not a divergence.
-        open_doc(&client, &doc_uri, "See `disk-a.md` here.\n");
-        let opened = recv_publish_for(&client, &doc_uri);
+        // An external rewrite lands on the open, undiverged document. The saved
+        // copy MUST move (unconditional), and because the client still holds
+        // the old text the pre-update saved parse is materialized into the
+        // overlay first — an absent entry never silently re-points at content
+        // the client never sent.
+        fs::write(&abs, "See `disk-b.md` here.\n").expect("rewrite doc.md on disk");
+        drive(
+            &server,
+            &mut workspaces,
+            lsp::method::DID_CHANGE_WATCHED_FILES,
+            watched_params(&doc_uri, lsp::file_change_type::CHANGED),
+        );
+        assert_eq!(
+            workspaces.store.source(&abs, Tier::Saved),
+            Some("See `disk-b.md` here.\n"),
+            "the watched change applies to the saved copy unconditionally"
+        );
+        assert_eq!(
+            workspaces.store.source(&abs, Tier::Overlay),
+            Some("See `disk-a.md` here.\n"),
+            "materialize-before-write preserved the text the client is holding"
+        );
         assert!(
-            any_message_contains(&opened, "disk-a.md"),
-            "the open publish reflects the synced content, got {opened:?}"
+            drain_publishes(&client)
+                .get(&doc_uri)
+                .is_none_or(|d| any_message_contains(d, "disk-a.md")),
+            "the document's own rows still describe its buffer, not the new disk bytes"
         );
 
-        // Edit the buffer: it now holds unsaved state.
-        send_change(&client, &doc_uri, "See `buffer-b.md` here.\n");
-        let changed = recv_publish_for(&client, &doc_uri);
-        assert!(
-            any_message_contains(&changed, "buffer-b.md"),
-            "the didChange publish reflects the edited buffer, got {changed:?}"
-        );
-
-        // An external process rewrites disk. While the buffer is dirty the
-        // watched event is dropped — the unsaved edits are the sole copy.
-        fs::write(root.join("doc.md"), "See `disk-c.md` here.\n").expect("rewrite doc.md on disk");
-        send_watched_change(&client, &doc_uri, lsp::file_change_type::CHANGED);
-        assert!(
-            client
-                .receiver
-                .recv_timeout(std::time::Duration::from_millis(300))
-                .is_err(),
-            "a dirty open buffer keeps strict buffer authority — the watched change is dropped"
-        );
-
-        // Save the buffer: it no longer holds state disk doesn't. The save is
-        // answered unconditionally (issue 062).
-        send_notification(
+        watched_change_applies_mid_edit_and_after_the_save(
+            &server,
             &client,
-            lsp::method::DID_SAVE,
+            &mut workspaces,
+            &abs,
+            &doc_uri,
+        );
+    }
+
+    /// Arms 2 and 3 of
+    /// [`watched_change_applies_in_every_buffer_state_without_moving_the_document`]:
+    /// mid-edit (the state that used to pin the index indefinitely) and
+    /// just-saved (the overlay dropped, sharing restored).
+    fn watched_change_applies_mid_edit_and_after_the_save(
+        server: &Connection,
+        client: &Connection,
+        workspaces: &mut Workspaces,
+        abs: &Path,
+        doc_uri: &str,
+    ) {
+        // Arm 2 — mid-edit. Under the pre-split model this state pinned the
+        // index; now the saved copy keeps tracking disk.
+        drive(
+            server,
+            workspaces,
+            lsp::method::DID_CHANGE,
             serde_json::json!({
-                "textDocument": { "uri": doc_uri },
-                "text": "See `buffer-b.md` here.\n"
+                "textDocument": { "uri": doc_uri, "version": 2 },
+                "contentChanges": [ { "text": "See `buffer-c.md` here.\n" } ]
             }),
         );
-        let saved = recv_publish_for(&client, &doc_uri);
+        let changed = drain_publishes(client);
         assert!(
-            any_message_contains(&saved, "buffer-b.md"),
-            "the save answer reflects the saved buffer, got {saved:?}"
+            changed
+                .get(doc_uri)
+                .is_some_and(|d| any_message_contains(d, "buffer-c.md")),
+            "the didChange publish reflects the edited buffer: {changed:?}"
+        );
+        fs::write(abs, "See `disk-d.md` here.\n").expect("rewrite doc.md mid-edit");
+        drive(
+            server,
+            workspaces,
+            lsp::method::DID_CHANGE_WATCHED_FILES,
+            watched_params(doc_uri, lsp::file_change_type::CHANGED),
+        );
+        assert_eq!(
+            workspaces.store.source(abs, Tier::Saved),
+            Some("See `disk-d.md` here.\n"),
+            "a mid-edit buffer no longer pins the saved copy — the drop is retired"
+        );
+        assert_eq!(
+            workspaces.store.source(abs, Tier::Overlay),
+            Some("See `buffer-c.md` here.\n"),
+            "the unsaved edit is untouched: it is the sole copy of that state"
+        );
+        assert!(
+            !drain_publishes(client).contains_key(doc_uri),
+            "the document's rows did not move, so nothing is republished for it"
         );
 
-        // The same watched event now reconciles from disk: the saved buffer is
-        // a stale snapshot of a file an external writer has superseded.
-        send_watched_change(&client, &doc_uri, lsp::file_change_type::CHANGED);
-        let reconciled = recv_publish_for(&client, &doc_uri);
-        assert!(
-            any_message_contains(&reconciled, "disk-c.md"),
-            "a saved open buffer reconciles from disk on a watched change, got {reconciled:?}"
+        // Arm 3 — just saved. The commitment drops the overlay and the buffer
+        // shares the saved copy again.
+        drive(
+            server,
+            workspaces,
+            lsp::method::DID_SAVE,
+            save_params(doc_uri, "See `buffer-c.md` here.\n"),
         );
-
-        shutdown(&client, server_thread);
+        assert!(
+            !workspaces.store.has_overlay(abs),
+            "didSave is the seam: the overlay entry is dropped or re-shared"
+        );
+        let saved = drain_publishes(client);
+        assert!(
+            saved
+                .get(doc_uri)
+                .is_some_and(|d| any_message_contains(d, "buffer-c.md")),
+            "the save answer reflects the committed buffer: {saved:?}"
+        );
+        drive(
+            server,
+            workspaces,
+            lsp::method::DID_CHANGE_WATCHED_FILES,
+            watched_params(doc_uri, lsp::file_change_type::CHANGED),
+        );
+        assert_eq!(
+            workspaces.store.source(abs, Tier::Saved),
+            Some("See `disk-d.md` here.\n"),
+            "the post-save watched change reconciles the saved copy from disk"
+        );
     }
 
     #[test]
@@ -11874,6 +12277,522 @@ mod tests {
         );
 
         shutdown(&client, server_thread);
+    }
+
+    // -----------------------------------------------------------------------
+    // Buffer locality on the wire (decision 024, issue 067)
+    //
+    // The cold-start publish, clause 2's enforceable pair, the
+    // read-then-`didOpen` race it kills by construction, the `didClose`
+    // watcher-miss detector, and the conformance invariant restated
+    // continuously rather than only at save points.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn initialized_publishes_the_whole_workspace_once() {
+        // The cold-start publish. On a push-only transport (decision 022) the
+        // server owes the client what the scan already told it, rather than
+        // sitting on it until some event happens to run a full pass — which is
+        // what the pre-split model did by accident, through the first
+        // `didOpen`'s full pass. Scoping buffer events to one document
+        // (decision 024 clause 2) removed that accident, so the introduction is
+        // explicit now.
+        //
+        // Clause 2 is untouched: no buffer exists at `initialized`, so no
+        // document's rows can have moved — the client's copy is simply brought
+        // current from the saved world.
+        let dir = workspace_with_files(&[
+            (".lattice.toml", ""),
+            // Never opened, never touched by any event: findable only through
+            // the initial pass.
+            ("orphan.md", "See `gone.md` here.\n"),
+            ("broken.md", "[gone](missing.md \"references\")\n"),
+            ("clean.md", "# Clean\n"),
+        ]);
+        let root = fs::canonicalize(dir.path()).expect("canonicalize temp dir");
+        let root_uri = path_to_uri(&root);
+        let orphan_uri = path_to_uri(&root.join("orphan.md"));
+        let broken_uri = path_to_uri(&root.join("broken.md"));
+        let clean_uri = path_to_uri(&root.join("clean.md"));
+
+        let (server, client) = Connection::memory();
+        let server_thread = std::thread::spawn(move || serve(&server));
+
+        handshake(&client, &root_uri, true);
+        let reg = recv_message(&client);
+        assert!(
+            matches!(reg, Message::Request(_)),
+            "the watch is armed before the initial pass computes, got {reg:?}"
+        );
+
+        // No didOpen, no didSave, no watched event — the findings arrive on
+        // the strength of the scan alone.
+        let initial = drain_publish_uris(&client);
+        assert!(
+            initial
+                .get(&orphan_uri)
+                .is_some_and(|d| any_message_contains(d, "stale reference")),
+            "a never-opened file's findings reach the client at initialized: {initial:?}"
+        );
+        assert!(
+            initial
+                .get(&broken_uri)
+                .is_some_and(|d| any_message_contains(d, "missing.md")),
+            "every file with findings is introduced: {initial:?}"
+        );
+        assert!(
+            !initial.contains_key(&clean_uri),
+            "a clean file is not published — the diff sends only what the client lacks: {initial:?}"
+        );
+
+        // Exactly once, and the diff dedupes from here on: a later commitment
+        // over the same disk state re-answers only the document it names
+        // (issue 062's forced save answer), never the whole workspace again.
+        send_notification(
+            &client,
+            lsp::method::DID_SAVE,
+            serde_json::json!({
+                "textDocument": { "uri": clean_uri },
+                "text": "# Clean\n"
+            }),
+        );
+        let after_save = drain_publish_uris(&client);
+        let mut answered: Vec<&String> = after_save.keys().collect();
+        answered.sort();
+        assert_eq!(
+            answered,
+            vec![&clean_uri],
+            "the initialized pass populated the publish cache, so the save re-answers only \
+             its own document — the workspace is not re-sent: {after_save:?}"
+        );
+
+        shutdown(&client, server_thread);
+    }
+
+    /// Drain every `publishDiagnostics` the server has queued, blocking briefly
+    /// for each, into a `uri -> diagnostics` map. Unlike `recv_publish_for` it
+    /// consumes nothing it cannot report, so a test can assert about a whole
+    /// pass rather than one document at a time.
+    fn drain_publish_uris(client: &Connection) -> HashMap<String, Vec<serde_json::Value>> {
+        let mut published: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
+        while let Ok(msg) = client
+            .receiver
+            .recv_timeout(std::time::Duration::from_millis(300))
+        {
+            if let Message::Notification(notif) = msg
+                && notif.method == lsp::method::PUBLISH_DIAGNOSTICS
+                && let Some(uri) = notif
+                    .params
+                    .get("uri")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            {
+                let diagnostics = notif
+                    .params
+                    .get("diagnostics")
+                    .and_then(serde_json::Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                published.insert(uri, diagnostics);
+            }
+        }
+        published
+    }
+
+    /// A `tracing` subscriber that records every event's rendered fields, so
+    /// the `didClose` detector's **loudness** can be asserted rather than
+    /// assumed. Decision 024 clause 4 makes the trace the point: healing a
+    /// caught watcher miss quietly would convert a channel defect into an
+    /// invisible latency, which is how issues 061 and 066 stayed unexplained
+    /// for weeks.
+    #[derive(Clone, Default)]
+    struct CapturedTraces(std::sync::Arc<std::sync::Mutex<Vec<(tracing::Level, String)>>>);
+
+    impl CapturedTraces {
+        /// Every captured `(level, rendered fields)` pair, in order.
+        fn events(&self) -> Vec<(tracing::Level, String)> {
+            self.0
+                .lock()
+                .map_or_else(|poison| poison.into_inner().clone(), |guard| guard.clone())
+        }
+    }
+
+    /// Renders an event's fields (including the implicit `message`) into one
+    /// string for substring assertions.
+    struct FieldRenderer(String);
+
+    impl tracing::field::Visit for FieldRenderer {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            use std::fmt::Write as _;
+            let _ = write!(self.0, " {}={value:?}", field.name());
+        }
+    }
+
+    impl tracing::Subscriber for CapturedTraces {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut renderer = FieldRenderer(String::new());
+            event.record(&mut renderer);
+            let entry = (*event.metadata().level(), renderer.0);
+            match self.0.lock() {
+                Ok(mut guard) => guard.push(entry),
+                Err(poison) => poison.into_inner().push(entry),
+            }
+        }
+        fn enter(&self, _span: &tracing::span::Id) {}
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    /// Whether a fixture's relative path names a markdown document.
+    fn is_markdown_rel(rel: &str) -> bool {
+        Path::new(rel)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
+    }
+
+    /// A symmetric two-file graph: `a.md` forward-links `b.md`, `b.md` carries
+    /// the matching backlink. Both clean, and every cross-file edge in play.
+    fn symmetric_pair() -> tempfile::TempDir {
+        workspace_with_files(&[
+            (".lattice.toml", ""),
+            ("a.md", "[b](b.md \"supersedes\")\n"),
+            (
+                "b.md",
+                "---\nbacklinks:\n  superseded_by:\n    - a.md\n---\n# B\n",
+            ),
+        ])
+    }
+
+    #[test]
+    fn a_buffer_event_publishes_one_document_a_commitment_publishes_the_workspace() {
+        // Decision 024 clause 2's enforceable pair, on the wire.
+        //
+        // Editing a.md's buffer to drop its forward link would, under the
+        // pre-split model, immediately flip b.md's backlink to stale — draft
+        // text in one editor buffer moving another file's verdict. Under buffer
+        // locality the `didChange` republishes a.md and NOTHING else; the same
+        // text committed by a `didSave` moves b.md, because a commitment is
+        // what the rest of the workspace is judged against.
+        let dir = symmetric_pair();
+        let mut workspaces = scan_workspaces(&dir);
+        let a_uri = file_uri(&dir, "a.md");
+        let b_uri = file_uri(&dir, "b.md");
+        let (server, client) = Connection::memory();
+
+        // Warm the publish cache at a commitment so "not republished" below is
+        // a real silence, not a cold-cache accident.
+        for (uri, diagnostics) in diff_diagnostics(&mut workspaces, &HashSet::new()) {
+            let _ = (uri, diagnostics);
+        }
+        drive(
+            &server,
+            &mut workspaces,
+            lsp::method::DID_OPEN,
+            open_params(&a_uri, "[b](b.md \"supersedes\")\n"),
+        );
+        drop(drain_publishes(&client));
+
+        // The buffer event: drop the forward link and add a broken one, so
+        // a.md's own rows genuinely move.
+        let edited = "[gone](missing.md \"references\")\n";
+        drive(
+            &server,
+            &mut workspaces,
+            lsp::method::DID_CHANGE,
+            serde_json::json!({
+                "textDocument": { "uri": a_uri, "version": 2 },
+                "contentChanges": [ { "text": edited } ]
+            }),
+        );
+        let mid_edit = drain_publishes(&client);
+        assert!(
+            mid_edit
+                .get(&a_uri)
+                .is_some_and(|d| any_message_contains(d, "missing.md")),
+            "the edited document's own rows are keystroke-live: {mid_edit:?}"
+        );
+        assert!(
+            !mid_edit.contains_key(&b_uri),
+            "a buffer event may not move any other file's published vector: {mid_edit:?}"
+        );
+
+        // The commitment: the same text, now on disk. b.md's backlink is
+        // judged against it and goes stale.
+        fs::write(dir.path().join("a.md"), edited).expect("commit the edit to disk");
+        drive(
+            &server,
+            &mut workspaces,
+            lsp::method::DID_SAVE,
+            save_params(&a_uri, edited),
+        );
+        let committed = drain_publishes(&client);
+        assert!(
+            committed
+                .get(&b_uri)
+                .is_some_and(|d| any_message_contains(d, "no corresponding forward link")),
+            "a commitment may move anyone's rows — b.md's backlink is now stale: {committed:?}"
+        );
+    }
+
+    #[test]
+    fn a_stale_didopen_claim_cannot_pin_the_workspace() {
+        // Issue 067's headline race, killed by construction (decision 024
+        // clause 3). The client read a.md, an external process then rewrote it
+        // on disk, and the client's `didOpen` lands *after* — so the buffer it
+        // claims is OLDER than disk. Under the pre-split model that mismatch
+        // marked the document dirty and granted its stale bytes strict
+        // authority over the whole workspace graph, indefinitely, and every
+        // watched `changed` event for it was dropped.
+        //
+        // Now: the claim seeds only the overlay, the watched event applies
+        // unconditionally, and the two answers coexist — the saved world
+        // reconciles (b.md's cross-file verdict corrects) while the overlay
+        // keeps serving the bytes the client says it is holding.
+        let dir = symmetric_pair();
+        let mut workspaces = scan_workspaces(&dir);
+        let a_abs = dir.path().join("a.md");
+        let a_uri = file_uri(&dir, "a.md");
+        let b_uri = file_uri(&dir, "b.md");
+        let (server, client) = Connection::memory();
+
+        // What the client read a moment ago, plus a marker of its own so the
+        // overlay's continued service is observable.
+        let claimed = "[b](b.md \"supersedes\")\n\nSee `ghost.md` here.\n";
+        // What disk holds by the time the didOpen arrives: the link is gone.
+        let on_disk = "# A\n\nThe link is gone.\n";
+        fs::write(&a_abs, on_disk).expect("external rewrite lands before the didOpen");
+
+        drive(
+            &server,
+            &mut workspaces,
+            lsp::method::DID_OPEN,
+            open_params(&a_uri, claimed),
+        );
+        assert_eq!(
+            workspaces.store.source(&a_abs, Tier::Saved),
+            Some("[b](b.md \"supersedes\")\n"),
+            "a didOpen is a claim, not a source: it never writes the saved store"
+        );
+        let opened = drain_publishes(&client);
+        assert!(
+            opened
+                .get(&a_uri)
+                .is_some_and(|d| any_message_contains(d, "ghost.md")),
+            "the claimed buffer drives the document's own rows: {opened:?}"
+        );
+        assert!(
+            !opened.contains_key(&b_uri),
+            "the stale claim did not reach any other document: {opened:?}"
+        );
+
+        // The watcher relays the external rewrite. It applies — there is
+        // nothing to arbitrate — and the workspace reconciles.
+        drive(
+            &server,
+            &mut workspaces,
+            lsp::method::DID_CHANGE_WATCHED_FILES,
+            watched_params(&a_uri, lsp::file_change_type::CHANGED),
+        );
+        assert_eq!(
+            workspaces.store.source(&a_abs, Tier::Saved),
+            Some(on_disk),
+            "the watched event reaches the saved copy despite the divergent open buffer"
+        );
+        assert_eq!(
+            workspaces.store.source(&a_abs, Tier::Overlay),
+            Some(claimed),
+            "the client's claim is still served for its own document"
+        );
+        let reconciled = drain_publishes(&client);
+        assert!(
+            reconciled
+                .get(&b_uri)
+                .is_some_and(|d| any_message_contains(d, "no corresponding forward link")),
+            "the saved world reconciled: b.md's backlink is judged against disk: {reconciled:?}"
+        );
+        assert!(
+            reconciled
+                .get(&a_uri)
+                .is_none_or(|d| any_message_contains(d, "ghost.md")),
+            "a.md's own rows still describe the buffer the client claims: {reconciled:?}"
+        );
+    }
+
+    #[test]
+    fn did_close_audit_is_silent_on_a_match_and_loud_on_a_caught_miss() {
+        // Decision 024 clause 4: `didClose` re-reads disk and compares against
+        // the SAVED copy — never against the buffer, which is being discarded.
+        // A match is a no-op and the close behaves as a pure buffer event. A
+        // mismatch means the watched-files channel dropped an event: apply it
+        // (the world genuinely moved) and say so loudly. Never heal silently.
+        let dir = workspace_with_files(&[("doc.md", "# Clean\n")]);
+        let abs = dir.path().join("doc.md");
+        let doc_uri = file_uri(&dir, "doc.md");
+        let (server, client) = Connection::memory();
+
+        // Arm 1 — the healthy session: disk matches the saved copy.
+        let mut workspaces = scan_workspaces(&dir);
+        let traces = CapturedTraces::default();
+        tracing::dispatcher::with_default(&tracing::Dispatch::new(traces.clone()), || {
+            drive(
+                &server,
+                &mut workspaces,
+                lsp::method::DID_OPEN,
+                open_params(&doc_uri, "# Clean\n"),
+            );
+            drive(
+                &server,
+                &mut workspaces,
+                lsp::method::DID_CLOSE,
+                serde_json::json!({ "textDocument": { "uri": doc_uri } }),
+            );
+        });
+        drop(drain_publishes(&client));
+        assert_eq!(
+            workspaces.store.source(&abs, Tier::Saved),
+            Some("# Clean\n"),
+            "the matching audit moves nothing"
+        );
+        assert!(
+            !traces
+                .events()
+                .iter()
+                .any(|(level, _)| *level == tracing::Level::ERROR),
+            "a matching audit is silent — it is a no-op commitment: {:?}",
+            traces.events()
+        );
+
+        // Arm 2 — a dropped watcher event: disk moved and no event arrived, so
+        // the saved copy is stale until the close catches it.
+        let mut workspaces = scan_workspaces(&dir);
+        let traces = CapturedTraces::default();
+        drive(
+            &server,
+            &mut workspaces,
+            lsp::method::DID_OPEN,
+            open_params(&doc_uri, "# Clean\n"),
+        );
+        fs::write(&abs, "See `gone.md` here.\n").expect("rewrite doc.md with no watcher event");
+        tracing::dispatcher::with_default(&tracing::Dispatch::new(traces.clone()), || {
+            drive(
+                &server,
+                &mut workspaces,
+                lsp::method::DID_CLOSE,
+                serde_json::json!({ "textDocument": { "uri": doc_uri } }),
+            );
+        });
+        assert_eq!(
+            workspaces.store.source(&abs, Tier::Saved),
+            Some("See `gone.md` here.\n"),
+            "the caught miss is applied — the world genuinely moved"
+        );
+        let loud = traces.events();
+        assert!(
+            loud.iter()
+                .any(|(level, message)| *level == tracing::Level::ERROR
+                    && message.contains("WATCHER MISS CAUGHT")),
+            "a firing detector is loud: it means the watcher channel dropped an event (issue 068): {loud:?}"
+        );
+        let closed = drain_publishes(&client);
+        assert!(
+            closed
+                .get(&doc_uri)
+                .is_some_and(|d| any_message_contains(d, "stale reference")),
+            "the close is a genuine commitment and republishes the corrected rows: {closed:?}"
+        );
+    }
+
+    #[test]
+    fn conformance_holds_continuously_for_every_overlay_free_document() {
+        // Decision 024's restated conformance invariant: for every document
+        // WITHOUT a diverged buffer, the published rows equal what `lattice
+        // lint` reports on the same disk state — **continuously**, not only at
+        // save points. Decision 023 could only state it at commitments because
+        // before the split the server's inputs were not disk between them.
+        //
+        // The fixture holds one document with a live, unsaved, graph-moving
+        // edit; every other document must still agree with lint mid-edit.
+        let files: &[(&str, &str)] = &[
+            (".lattice.toml", ""),
+            ("a.md", "[b](b.md \"supersedes\")\n"),
+            (
+                "b.md",
+                "---\nbacklinks:\n  superseded_by:\n    - a.md\n---\n# B\n",
+            ),
+            ("c.md", "See `gone.md` here.\n"),
+            ("d.md", "# D\n\n# D\n"),
+        ];
+        let dir = workspace_with_files(files);
+        let mut workspaces = scan_workspaces(&dir);
+        let a_uri = file_uri(&dir, "a.md");
+        let (server, client) = Connection::memory();
+
+        // A commitment pass first, so every document's rows have reached the
+        // client and the comparison below is against a fully answered client.
+        let mut published: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
+        for (rel, _) in files.iter().filter(|(rel, _)| is_markdown_rel(rel)) {
+            let uri = file_uri(&dir, rel);
+            drive(
+                &server,
+                &mut workspaces,
+                lsp::method::DID_SAVE,
+                save_params(
+                    &uri,
+                    std::str::from_utf8(&fs::read(dir.path().join(rel)).expect("read fixture"))
+                        .expect("fixture is utf-8"),
+                ),
+            );
+            published.extend(drain_publishes(&client));
+        }
+
+        // Now diverge a.md's buffer, hard: drop the forward link (which would
+        // flip b.md under a leaking model) and add a broken one.
+        drive(
+            &server,
+            &mut workspaces,
+            lsp::method::DID_OPEN,
+            open_params(&a_uri, "[b](b.md \"supersedes\")\n"),
+        );
+        published.extend(drain_publishes(&client));
+        drive(
+            &server,
+            &mut workspaces,
+            lsp::method::DID_CHANGE,
+            serde_json::json!({
+                "textDocument": { "uri": a_uri, "version": 2 },
+                "contentChanges": [ { "text": "[gone](missing.md \"references\")\n" } ]
+            }),
+        );
+        published.extend(drain_publishes(&client));
+        assert!(
+            workspaces.store.has_overlay(&dir.path().join("a.md")),
+            "the fixture must actually hold a diverged buffer"
+        );
+
+        // The reference surface: `lint::run` on the untouched disk state.
+        let mut lint = lint_diagnostic_sets(dir.path());
+
+        for (rel, _) in files.iter().filter(|(rel, _)| is_markdown_rel(rel)) {
+            if *rel == "a.md" {
+                // The one document WITH a diverged buffer: exempt by
+                // construction — lint has no counterpart for a buffer state.
+                continue;
+            }
+            let server_set = published_diagnostic_set(&published, &file_uri(&dir, rel));
+            let mut lint_set = lint.remove(*rel).unwrap_or_default();
+            lint_set.sort();
+            assert_eq!(
+                server_set, lint_set,
+                "mid-edit, an overlay-free document must still equal lint on the same disk state ({rel})"
+            );
+        }
     }
 
     #[test]
@@ -12041,18 +12960,23 @@ mod tests {
 
         handshake(&client, &root_uri, false);
 
-        // Open target.md (it becomes editor-authoritative). The full re-publish
-        // surfaces a.md's existing-file nudge, since target.md is in the index.
-        open_doc(&client, &target_uri, "# Target\n");
+        // a.md is never opened: the cold-start publish introduces it. While
+        // target.md is indexed, its reference is the existing-file nudge.
         let before = recv_publish_for(&client, &a_uri);
         assert!(
             any_message_contains(&before, "refers to an existing file"),
             "while target.md is indexed, a.md's reference is the existing-file nudge, got {before:?}"
         );
 
+        // Open target.md (undiverged, so it shares its saved parse). Being a
+        // buffer event it republishes target.md and nothing else, so the next
+        // publish for a.md below can only be the close's.
+        open_doc(&client, &target_uri, "# Target\n");
+
         // Delete target.md on disk while it is open, then close it. The close
-        // must reconcile to disk — the file is gone, so it is dropped from the
-        // index and a.md's reference flips to a stale reference.
+        // audits against disk — the file is gone, so it leaves the saved store
+        // (a caught watcher miss, applied loudly) and a.md's reference flips to
+        // a stale reference through the close's full pass.
         fs::remove_file(root.join("target.md")).expect("delete target.md while open");
         send_close(&client, &target_uri);
         let after = recv_publish_for(&client, &a_uri);
@@ -12605,6 +13529,57 @@ mod tests {
         ))
     }
 
+    /// Run `lattice lint` over `root` (quiet — the ledger and preamble are
+    /// presentation, not diagnostics) and bucket its findings per file as
+    /// `(1-based line, severity, message)`. The reference surface both
+    /// conformance differentials compare against.
+    fn lint_diagnostic_sets(root: &Path) -> HashMap<String, Vec<(u32, String, String)>> {
+        let mut buf = Vec::new();
+        let _failed = crate::lint::run(root, false, true, false, &mut buf).expect("lint runs");
+        let out = String::from_utf8(buf).expect("lint output is utf-8");
+        let mut sets: HashMap<String, Vec<(u32, String, String)>> = HashMap::new();
+        for line in out.lines() {
+            if let Some((path, lineno, severity, message)) = parse_lint_line(line) {
+                sets.entry(path)
+                    .or_default()
+                    .push((lineno, severity, message));
+            }
+        }
+        sets
+    }
+
+    /// The client's last-published set for `uri`, in `lint_diagnostic_sets`'s
+    /// shape and sorted so the two are directly comparable.
+    fn published_diagnostic_set(
+        published: &HashMap<String, Vec<serde_json::Value>>,
+        uri: &str,
+    ) -> Vec<(u32, String, String)> {
+        let mut set: Vec<(u32, String, String)> = published
+            .get(uri)
+            .map(|diags| {
+                diags
+                    .iter()
+                    .map(|d| {
+                        let line = d["range"]["start"]["line"]
+                            .as_u64()
+                            .expect("published diagnostic carries a range");
+                        let line = u32::try_from(line).expect("line number fits u32") + 1;
+                        let severity = match d["severity"].as_i64() {
+                            Some(1) => "error",
+                            Some(2) => "warning",
+                            Some(3) => "info",
+                            _ => "hint",
+                        };
+                        let message = d["message"].as_str().unwrap_or_default().to_string();
+                        (line, severity.to_string(), message)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        set.sort();
+        set
+    }
+
     #[test]
     fn server_published_sets_equal_lint_run_at_save_points() {
         // The decision 023 conformance invariant, as a differential: with all
@@ -12663,49 +13638,13 @@ mod tests {
             server_published.extend(drain_publishes(&client));
         }
 
-        // The reference surface: `lint::run` on the same disk state (quiet —
-        // the ledger and preamble are presentation, not diagnostics).
-        let mut buf = Vec::new();
-        let _failed =
-            crate::lint::run(dir.path(), false, true, false, &mut buf).expect("lint runs");
-        let lint_out = String::from_utf8(buf).expect("lint output is utf-8");
-        let mut lint_sets: HashMap<String, Vec<(u32, String, String)>> = HashMap::new();
-        for line in lint_out.lines() {
-            if let Some((path, lineno, severity, message)) = parse_lint_line(line) {
-                lint_sets
-                    .entry(path)
-                    .or_default()
-                    .push((lineno, severity, message));
-            }
-        }
+        // The reference surface: `lint::run` on the same disk state.
+        let mut lint = lint_diagnostic_sets(dir.path());
 
         // Per file: the server's last-published set equals lint's set.
         for (rel, _) in &md_files {
-            let uri = file_uri(&dir, rel);
-            let mut server_set: Vec<(u32, String, String)> = server_published
-                .get(&uri)
-                .map(|diags| {
-                    diags
-                        .iter()
-                        .map(|d| {
-                            let line = d["range"]["start"]["line"]
-                                .as_u64()
-                                .expect("published diagnostic carries a range");
-                            let line = u32::try_from(line).expect("line number fits u32") + 1;
-                            let severity = match d["severity"].as_i64() {
-                                Some(1) => "error",
-                                Some(2) => "warning",
-                                Some(3) => "info",
-                                _ => "hint",
-                            };
-                            let message = d["message"].as_str().unwrap_or_default().to_string();
-                            (line, severity.to_string(), message)
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            server_set.sort();
-            let mut lint_set = lint_sets.remove(*rel).unwrap_or_default();
+            let server_set = published_diagnostic_set(&server_published, &file_uri(&dir, rel));
+            let mut lint_set = lint.remove(*rel).unwrap_or_default();
             lint_set.sort();
             assert_eq!(
                 server_set, lint_set,
@@ -12713,8 +13652,8 @@ mod tests {
             );
         }
         assert!(
-            lint_sets.is_empty(),
-            "lint reported findings on files the differential did not visit: {lint_sets:?}"
+            lint.is_empty(),
+            "lint reported findings on files the differential did not visit: {lint:?}"
         );
     }
 
@@ -13063,11 +14002,13 @@ mod tests {
 
     #[test]
     fn config_watcher_event_applies_under_an_open_dirty_config_draft() {
-        // The arbitration pin (decision 023 addendum): 017 §3's buffer-wins
-        // rule is markdown-only. A synced, edited (dirty) config buffer
-        // never gains authority — the draft indexes nothing, joins no
-        // buffer-authority set, and the watcher event for the same file
-        // still applies disk.
+        // Decision 023's addendum, now an instance rather than an exception:
+        // a synced, edited config buffer adjudicates nothing — the draft
+        // indexes nothing and gets no overlay entry — and the watcher event
+        // for the same file still applies disk. Under decision 024 the
+        // markdown channel reaches the same answer by a different route (the
+        // saved store's writers are unconditional there too), so "017 §3 is
+        // markdown-only" stops being a special case for either side.
         let dir =
             workspace_with_files(&[(".lattice.toml", ""), ("doc.md", "See `gone.md` here.\n")]);
         let mut workspaces = scan_workspaces(&dir);
@@ -13107,14 +14048,17 @@ mod tests {
             "the config draft adjudicates nothing"
         );
         assert!(
-            !workspaces.documents.contains_key(&uri_to_path(&config_uri)),
+            workspaces
+                .store
+                .current(&uri_to_path(&config_uri))
+                .is_none(),
             "the TOML is never indexed as a markdown document"
         );
         let config_abs = uri_to_path(&config_uri);
         assert!(
             !workspaces.open_documents.contains(&config_abs)
-                && !workspaces.dirty_documents.contains(&config_abs),
-            "the config joins no buffer-authority set — buffer-wins stays markdown-only"
+                && !workspaces.store.has_overlay(&config_abs),
+            "the config joins neither the open set nor the overlay store"
         );
 
         // Disk moves under the open dirty draft: the watcher event applies.
@@ -13363,7 +14307,8 @@ mod tests {
             "the registration request precedes the marker event, got {reg:?}"
         );
 
-        open_doc(&client, &doc_uri, "See `artifact.md` here.\n");
+        // The cold-start publish gives doc.md's before-state; it is never
+        // opened, so the marker event's pass is the only thing that can move it.
         let before = recv_publish_for(&client, &doc_uri);
         assert!(
             any_message_contains(&before, "stale reference"),

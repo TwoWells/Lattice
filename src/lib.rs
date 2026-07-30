@@ -32,6 +32,7 @@ mod mv;
 mod overrides;
 mod server;
 mod span;
+mod store;
 mod structural;
 mod toml;
 mod uri;

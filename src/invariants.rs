@@ -34,8 +34,8 @@
     reason = "these are assertion helpers: panicking with a descriptive message on violation is their entire contract, the tree-wellformedness check is necessarily long, and each helper intentionally leads with a full explanatory paragraph describing the invariant it enforces"
 )]
 
-use std::collections::HashMap;
-use std::path::Path;
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
 
 use crate::block::{self, ElementKind, Syntax, Tree};
 use crate::config::Config;
@@ -43,8 +43,8 @@ use crate::fm::{self, Exceptions, FmNode, FmValue, FrontmatterBlock, ScalarSpan}
 use crate::html::HtmlTag;
 use crate::line_index::LineIndex;
 use crate::validation::Diagnostic;
-use crate::workspace::parse_content;
-use crate::{inline, json, lsp, metadata, structural, toml, yaml};
+use crate::workspace::{FileData, WorkspaceView, compute_structural, parse_content};
+use crate::{inline, json, lsp, metadata, server, structural, toml, yaml};
 
 // ---------------------------------------------------------------------------
 // Full-pipeline helper
@@ -1275,4 +1275,157 @@ pub fn assert_structural_diagnostics_valid(source: &str, diagnostics: &[Diagnost
 pub fn assert_structural_invariants(source: &str) {
     let diagnostics = collect_structural(source);
     assert_structural_diagnostics_valid(source, &diagnostics);
+}
+
+// ---------------------------------------------------------------------------
+// Buffer locality (decision 024, issue 067)
+// ---------------------------------------------------------------------------
+
+/// The synthetic root the buffer-locality workspace is anchored at.
+///
+/// Absolute (so link classification behaves as it does in production) and
+/// deliberately not on disk: every existence answer the differential depends on
+/// comes from workspace membership, not from the filesystem.
+const LOCALITY_ROOT: &str = "/lattice-buffer-locality";
+
+/// Build one synthetic document's parsed data plus its structural cache,
+/// against a membership oracle.
+fn locality_file(rel: &Path, text: &str, config: &Config, members: &[PathBuf]) -> FileData {
+    let mut data = parse_content(text, &Path::new(LOCALITY_ROOT).join(rel), config);
+    let file_exists = |target: &Path| members.iter().any(|m| m == target);
+    let (structural, suppressions) = compute_structural(&data, rel, config, &file_exists);
+    data.structural = structural;
+    data.suppressions = suppressions;
+    data
+}
+
+/// Compute every document's published diagnostic rows for a synthetic workspace
+/// under the **buffer-locality perspective merge** (decision 024 clause 8),
+/// optionally with one document carrying a diverged buffer.
+///
+/// `docs` is the saved world: `(root-relative path, disk text)` pairs. `overlay`
+/// is `(root-relative path, buffer text)` for the single document the client is
+/// holding a diverged buffer for, or `None` for the no-overlay run.
+///
+/// The merge itself is [`crate::server::merge_perspectives`] — the same
+/// function the LSP publish pass calls — so this oracle cannot drift from
+/// production. What it reproduces around that call is the store's two tiers:
+///
+/// - every document's structural cache is computed against the **saved**
+///   membership, exactly as [`crate::server`] recomputes them per tier;
+/// - the overlay document's cache additionally counts itself, because a
+///   document is always a member of its own perspective;
+/// - the saved view holds only saved copies, and the perspective view is that
+///   same map with the overlay swapped in for its one document.
+#[must_use]
+pub fn buffer_locality_rows(
+    docs: &[(&str, &str)],
+    overlay: Option<(&str, &str)>,
+) -> BTreeMap<PathBuf, Vec<Diagnostic>> {
+    let root = PathBuf::from(LOCALITY_ROOT);
+    let config = Config::default();
+    let members: Vec<PathBuf> = docs.iter().map(|(rel, _)| PathBuf::from(rel)).collect();
+
+    let saved: Vec<(PathBuf, FileData)> = docs
+        .iter()
+        .map(|(rel, text)| {
+            let rel = PathBuf::from(rel);
+            let data = locality_file(&rel, text, &config, &members);
+            (rel, data)
+        })
+        .collect();
+
+    // The overlay copy sees the saved membership plus itself: a buffer-only
+    // document lints itself and is invisible to every other document until the
+    // first save (decision 024's notes).
+    let overlaid = overlay.map(|(rel, text)| {
+        let rel = PathBuf::from(rel);
+        let mut members = members.clone();
+        if !members.contains(&rel) {
+            members.push(rel.clone());
+        }
+        let data = locality_file(&rel, text, &config, &members);
+        (rel, data)
+    });
+
+    let saved_files: BTreeMap<PathBuf, &FileData> = saved
+        .iter()
+        .map(|(rel, data)| (rel.clone(), data))
+        .collect();
+    let saved_view =
+        WorkspaceView::new(root.clone(), &config, true, saved_files.clone(), Vec::new());
+    let saved_live = server::collect_all_diagnostics(&saved_view);
+
+    let perspectives: Vec<(PathBuf, WorkspaceView<'_>)> = overlaid
+        .iter()
+        .map(|(rel, data)| {
+            let mut files = saved_files.clone();
+            files.insert(rel.clone(), data);
+            (
+                rel.clone(),
+                WorkspaceView::new(root.clone(), &config, true, files, Vec::new()),
+            )
+        })
+        .collect();
+
+    server::merge_perspectives(saved_live, &perspectives)
+}
+
+/// **The buffer-locality differential** (decision 024's enforcement clause).
+///
+/// > For any workspace and any buffer text overlaid on any single document S,
+/// > every file other than S produces a **byte-identical** diagnostic vector to
+/// > the run with no overlay.
+///
+/// This is the purity property the whole two-tier store exists to deliver, and
+/// it is the one place a regression would otherwise hide silently: every
+/// individual collector would keep working, and only the *merge* would have
+/// started letting one document's unsaved draft into another document's
+/// verdict. A cross-file check reading the overlaid document — fragment
+/// resolution against its headings, the reciprocal-link escape hatch reading
+/// its links, backlink reconciliation reading its frontmatter — is exactly the
+/// shape that leak takes, and every one of them is exercised here.
+///
+/// `focus` names the overlaid document; it need not be present in `docs` (a
+/// buffer opened on a path absent from disk is a member of its own perspective
+/// only).
+///
+/// # Panics
+///
+/// Panics with the offending file, and both diagnostic vectors, on violation.
+pub fn assert_buffer_locality(docs: &[(&str, &str)], focus: &str, buffer: &str) {
+    let base = buffer_locality_rows(docs, None);
+    let overlaid = buffer_locality_rows(docs, Some((focus, buffer)));
+    let focus_rel = PathBuf::from(focus);
+
+    for (rel, _) in docs {
+        let rel = PathBuf::from(rel);
+        if rel == focus_rel {
+            continue;
+        }
+        let before = base.get(&rel).map_or(&[][..], Vec::as_slice);
+        let after = overlaid.get(&rel).map_or(&[][..], Vec::as_slice);
+        assert_eq!(
+            before,
+            after,
+            "buffer locality violated: overlaying a buffer on {} moved {}'s diagnostic vector.\n\
+             A document's rows may read its own current text and everyone else's LAST SAVED \
+             state, and nobody else's buffer (decision 024).\n  buffer: {buffer:?}",
+            focus_rel.display(),
+            rel.display(),
+        );
+    }
+
+    // The complement: no document outside the workspace may acquire rows from
+    // the merge either. Only the focus may appear beyond the saved membership.
+    for rel in overlaid.keys() {
+        assert!(
+            rel == &focus_rel
+                || docs.iter().any(|(d, _)| Path::new(d) == rel)
+                || overlaid[rel].is_empty(),
+            "the perspective merge invented rows for {}, which is neither the overlaid document \
+             nor a member of the saved world",
+            rel.display()
+        );
+    }
 }

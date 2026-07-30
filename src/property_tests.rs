@@ -58,11 +58,11 @@ use crate::fm;
 use crate::html::{self, HtmlTag};
 use crate::invariants::{
     Edit, assert_block_wellformed, assert_bracket_table_agrees, assert_bracket_table_fidelity,
-    assert_bracket_tables_equal, assert_carrier_fidelity, assert_edit_sequence_stable,
-    assert_emphasis_span_fidelity, assert_frontmatter_scalar_fidelity, assert_html_tag_in_bounds,
-    assert_inline_resource_fidelity, assert_line_index_agrees, assert_structural_invariants,
-    assert_tree_wellformed, carrier_backlinks, collect_scalars, detect_frontmatter,
-    naive_bracket_matches,
+    assert_bracket_tables_equal, assert_buffer_locality, assert_carrier_fidelity,
+    assert_edit_sequence_stable, assert_emphasis_span_fidelity, assert_frontmatter_scalar_fidelity,
+    assert_html_tag_in_bounds, assert_inline_resource_fidelity, assert_line_index_agrees,
+    assert_structural_invariants, assert_tree_wellformed, buffer_locality_rows, carrier_backlinks,
+    collect_scalars, detect_frontmatter, naive_bracket_matches,
 };
 use crate::line_index::LineIndex;
 use crate::{inline, json, toml, yaml};
@@ -1180,6 +1180,160 @@ proptest! {
     ) {
         assert_structural_invariants(&source);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Generators — buffer locality (decision 024, issue 067)
+// ---------------------------------------------------------------------------
+
+/// The three file names the synthetic buffer-locality workspace uses. Fixed so
+/// generated bodies can reference each other and actually build graph edges —
+/// a workspace of mutually unreachable documents would exercise nothing.
+const LOCALITY_NAMES: [&str; 3] = ["a.md", "b.md", "c.md"];
+
+/// A body fragment that participates in the cross-file checks buffer locality
+/// governs: forward links with predicates (existence + predicate policy),
+/// fragment links (resolved against the *target's* headings), bare-path
+/// references (resolved against workspace membership), reciprocal links (the
+/// decision 008 escape hatch, which reads the counterpart's links), and
+/// headings that other documents' fragments resolve against.
+fn locality_fragment() -> impl Strategy<Value = String> {
+    prop_oneof![
+        Just("[a](a.md \"supersedes\")\n".to_string()),
+        Just("[b](b.md \"references\")\n".to_string()),
+        Just("[c](c.md \"amends\")\n".to_string()),
+        Just("[gone](missing.md \"references\")\n".to_string()),
+        Just("[frag](b.md#section \"references\")\n".to_string()),
+        Just("[frag](a.md#nowhere \"references\")\n".to_string()),
+        Just("See `b.md` for details.\n".to_string()),
+        Just("See `missing.md` for details.\n".to_string()),
+        Just("# Title\n\n## Section\n".to_string()),
+        Just("### Orphan Depth\n".to_string()),
+        Just("trailing \n".to_string()),
+        Just("plain prose here.\n".to_string()),
+    ]
+}
+
+/// A frontmatter block carrying backlink obligations, so the reconciliation
+/// checks (missing on the source, stale on the holder) participate.
+fn locality_frontmatter() -> impl Strategy<Value = String> {
+    prop_oneof![
+        Just(String::new()),
+        Just("---\nbacklinks:\n  superseded_by:\n    - a.md\n---\n".to_string()),
+        Just("---\nbacklinks:\n  referenced_by:\n    - b.md\n    - missing.md\n---\n".to_string()),
+        Just("---\nbacklinks:\n  amended_by:\n    - c.md\n---\n".to_string()),
+        Just("---\nbacklinks:\n  references:\n    - c.md\n---\n".to_string()),
+    ]
+}
+
+/// One synthetic document: optional frontmatter plus a handful of fragments.
+fn locality_document() -> impl Strategy<Value = String> {
+    (
+        locality_frontmatter(),
+        proptest::collection::vec(locality_fragment(), 0..4),
+    )
+        .prop_map(|(fm, frags)| format!("{}{}", fm, frags.concat()))
+}
+
+// ---------------------------------------------------------------------------
+// Properties — buffer locality (decision 024, issue 067)
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #![proptest_config(config())]
+
+    /// **The buffer-locality differential.** For any workspace and any buffer
+    /// overlaid on any single document S, every file other than S produces a
+    /// byte-identical diagnostic vector to the run with no overlay.
+    ///
+    /// This is the central claim of decision 024 shipped as a check rather than
+    /// a prose promise: a document's rows are a pure function of *(its own
+    /// current text; everyone else's last-saved state)*. The buffer is drawn
+    /// from the same structured generator as the documents — so it forms real
+    /// graph edges that a leaking merge would propagate — and from arbitrary
+    /// UTF-8, so the encoding axis rides along.
+    #[test]
+    fn buffer_locality_holds_for_any_overlay(
+        docs in proptest::collection::vec(locality_document(), 3..=3),
+        focus in 0usize..3,
+        buffer in prop_oneof![
+            9 => locality_document(),
+            1 => arbitrary_string(200),
+        ],
+    ) {
+        let files: Vec<(&str, &str)> = LOCALITY_NAMES
+            .iter()
+            .zip(docs.iter())
+            .map(|(name, text)| (*name, text.as_str()))
+            .collect();
+        assert_buffer_locality(&files, LOCALITY_NAMES[focus], &buffer);
+    }
+
+    /// The same property with the overlaid document absent from disk: a buffer
+    /// opened on a path no file backs is a member of its own perspective only,
+    /// so it must still not move anyone else's rows — a link to it dangles and
+    /// it satisfies no backlink obligation until the first save.
+    #[test]
+    fn buffer_locality_holds_for_a_buffer_only_document(
+        docs in proptest::collection::vec(locality_document(), 2..=2),
+        buffer in locality_document(),
+    ) {
+        let files: Vec<(&str, &str)> = LOCALITY_NAMES[..2]
+            .iter()
+            .zip(docs.iter())
+            .map(|(name, text)| (*name, text.as_str()))
+            .collect();
+        assert_buffer_locality(&files, LOCALITY_NAMES[2], &buffer);
+    }
+}
+
+/// The differential has teeth: a buffer that *would* move another file's rows
+/// under a naive merge leaves them untouched, while moving its own.
+///
+/// `a.md` forward-links `b.md` with `supersedes`, and `b.md`'s disk copy
+/// carries no backlink — so `a.md` holds a missing-backlink obligation. The
+/// buffer for `b.md` adds the reciprocal backlink (which under a merge that
+/// took the whole perspective pass would clear `a.md`'s row) *and* an
+/// unmatched one (which is `b.md`'s own new row). Buffer locality says the
+/// first must not happen and the second must.
+#[test]
+fn buffer_locality_differential_has_teeth() {
+    let docs: &[(&str, &str)] = &[("a.md", "[b](b.md \"supersedes\")\n"), ("b.md", "# B\n")];
+    let buffer = "---\nbacklinks:\n  superseded_by:\n    - a.md\n    - ghost.md\n---\n# B\n";
+
+    let base = buffer_locality_rows(docs, None);
+    let overlaid = buffer_locality_rows(docs, Some(("b.md", buffer)));
+
+    let a = std::path::PathBuf::from("a.md");
+    let b = std::path::PathBuf::from("b.md");
+
+    assert!(
+        base[&a]
+            .iter()
+            .any(|d| d.message.contains("expected backlink")),
+        "setup: a.md holds a missing-backlink obligation against b.md's disk copy: {:?}",
+        base[&a]
+    );
+    // The naive-merge trap: under b.md's own perspective a.md's obligation IS
+    // satisfied, so a merge that copied more than b.md's own rows would clear
+    // it. Buffer locality forbids that — nobody has committed the backlink.
+    assert_eq!(
+        base[&a], overlaid[&a],
+        "b.md's unsaved backlink must not clear a.md's obligation: {:?} vs {:?}",
+        base[&a], overlaid[&a]
+    );
+    // The positive half: b.md's own rows DO track its buffer, so the property
+    // is not passing by ignoring the overlay altogether.
+    assert!(
+        base.get(&b).is_none_or(Vec::is_empty),
+        "setup: b.md's disk copy is clean: {:?}",
+        base.get(&b)
+    );
+    assert!(
+        overlaid[&b].iter().any(|d| d.message.contains("ghost.md")),
+        "b.md's own rows are computed from its buffer: {:?}",
+        overlaid[&b]
+    );
 }
 
 // ---------------------------------------------------------------------------

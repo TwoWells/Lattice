@@ -256,7 +256,7 @@ pub struct DidChangeWatchedFilesParams {
 /// The `.md` document path branches on it (ticket server 09): created/deleted
 /// are membership changes honored regardless of open state, while a `changed`
 /// event re-reads disk only for files not currently open in the editor — the
-/// synced buffer is authoritative (decision 017 §3).
+/// synced buffer drives that document's own rows (decision 024).
 #[derive(Debug, Deserialize)]
 pub struct FileEvent {
     /// The changed file's URI.
