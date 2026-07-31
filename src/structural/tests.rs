@@ -5,10 +5,12 @@
 
 use std::collections::HashSet;
 
+use super::ledger::*;
 use super::*;
 use crate::block;
-use crate::config::Config;
-use crate::fm;
+use crate::config::{CodeBlockLanguagePolicy, Config};
+use crate::fm::{self, ExceptionLint};
+use crate::validation::Severity;
 use crate::yaml;
 
 fn diagnose(content: &str) -> Vec<Diagnostic> {
