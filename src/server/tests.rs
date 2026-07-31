@@ -7,11 +7,13 @@ use std::fs;
 use std::path::PathBuf;
 
 use super::diagnostics::*;
+use super::publish::*;
 use super::workspaces::*;
 use super::*;
 use crate::block::{HeadingId, Syntax};
 use crate::span::Span;
 use crate::store::Tier;
+use crate::validation::{Diagnostic, Severity};
 use crate::workspace::Workspace;
 
 // -----------------------------------------------------------------------
