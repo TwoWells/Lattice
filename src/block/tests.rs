@@ -3,6 +3,8 @@
 
 //! Tests for the block-structure parser.
 
+use super::parser::*;
+use super::scan::*;
 use super::*;
 
 /// Helper: parse a tree with no frontmatter.
