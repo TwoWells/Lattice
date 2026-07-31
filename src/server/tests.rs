@@ -6,9 +6,12 @@
 use std::fs;
 use std::path::PathBuf;
 
+use super::workspaces::*;
 use super::*;
 use crate::block::{HeadingId, Syntax};
 use crate::span::Span;
+use crate::store::Tier;
+use crate::workspace::Workspace;
 
 // -----------------------------------------------------------------------
 // Test helpers
