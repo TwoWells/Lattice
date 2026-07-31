@@ -7,9 +7,12 @@ use std::fs;
 use std::path::PathBuf;
 
 use super::diagnostics::*;
+use super::notify::*;
 use super::publish::*;
 use super::workspaces::*;
 use super::*;
+use lsp_server::Notification;
+
 use crate::block::{HeadingId, Syntax};
 use crate::span::Span;
 use crate::store::Tier;
