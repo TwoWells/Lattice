@@ -18,15 +18,16 @@ use super::notify::*;
 use super::publish::*;
 use super::rename::*;
 use super::semantic_tokens::*;
+use super::symbols::*;
 use super::workspaces::*;
 use super::*;
 use lsp_server::Notification;
 
-use crate::block::{Heading, HeadingId, LinkKind, Syntax};
+use crate::block::{ElementKind, Heading, HeadingId, LinkKind, Syntax};
 use crate::line_index::LineIndex;
 use crate::span::Span;
 use crate::store::Tier;
-use crate::uri::uri_to_path;
+use crate::uri::{path_to_uri, uri_to_path};
 use crate::validation::{self, Diagnostic, Severity};
 use crate::workspace::Workspace;
 
