@@ -1,0 +1,208 @@
+name: lockfile
+
+# Lockfile freshness — the scheduled owner of dependency updates.
+#
+# `make check` passes --locked to every cargo invocation that takes one, so
+# nothing on the push path rewrites Cargo.lock: the committed lockfile is the
+# tested lockfile, and CI builds exactly the versions that were tested locally
+# instead of re-resolving the registry every run (an upstream release can no
+# longer turn a green branch red with no local change).
+#
+# Freshness therefore has to come from somewhere deliberate — locally that is
+# `make update`; routinely it is this workflow. Once a week it runs
+# `cargo update` and then:
+#   - lockfile unchanged  -> exits green and silent, no PR, no noise;
+#   - lockfile changed    -> runs the full `make check` against the NEW lock,
+#     then opens or updates ONE PR on a deterministic branch with the diff;
+#   - check fails         -> fails the job loudly, breakage in the job summary.
+# That last case is the pattern working, not a nuisance: a breaking upstream
+# bump surfaces on a schedule, in isolation, on a branch nobody is waiting on —
+# which is exactly the failure a --locked CI-on-push can no longer produce.
+#
+# cargo-deny runs inside `make check`, so a fresh advisory gates this PR like
+# any other. This is the cargo-side counterpart to .github/dependabot.yml,
+# which covers only the github-actions ecosystem.
+
+on:
+  schedule:
+    # Weekly, Mon 05:00 UTC. Deliberately clear of soak.yml's crons (daily
+    # 03:00 and Sun 02:00, the latter running 90 min/target) so the two never
+    # contend for runners.
+    - cron: "0 5 * * 1"
+  workflow_dispatch:
+
+# One freshness run at a time; let an in-flight run finish rather than cancel
+# it — a cancelled run can leave the branch pushed but the PR unopened.
+concurrency:
+  group: lockfile
+  cancel-in-progress: false
+
+# Least privilege for the default token: push the update branch and open the
+# PR. As with soak.yml, the PR additionally requires the repo setting "Allow
+# GitHub Actions to create and approve pull requests" (Settings -> Actions ->
+# General -> Workflow permissions).
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  # Resolve and test. Provisioned exactly like ci.yml's check job — same image,
+  # same cache, same tools — because it runs the same `make check`, just
+  # against a lockfile that did not exist when the job started.
+  update:
+    runs-on: ubuntu-latest
+    container: ghcr.io/twowells/rust-ci:latest
+    # Container default shell is sh (dash); force bash (matches ci.yml).
+    defaults:
+      run:
+        shell: bash
+    outputs:
+      changed: ${{ steps.update.outputs.changed }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Materialize pinned Rust toolchain
+        run: |
+          rustup show
+          rustc --version && cargo --version
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo tools
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest,cargo-deny,cargo-machete
+
+      # Unlike ci.yml this job runs git, and in a container it runs as a
+      # different uid than the checkout's owner — without this every git call
+      # dies with "detected dubious ownership".
+      - name: Trust the workspace for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      # The one place in the repo that is *supposed* to rewrite Cargo.lock.
+      - name: cargo update
+        id: update
+        run: |
+          set -euo pipefail
+          mkdir -p lockfile-update
+          cargo update 2>&1 | tee lockfile-update/raw.log
+          if git diff --quiet -- Cargo.lock; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Cargo.lock is already fresh — nothing to do."
+            exit 0
+          fi
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          # The old -> new lines, minus the registry-index chatter. Falls back
+          # to the raw log if cargo's output format ever drifts, so the PR
+          # body is never silently empty.
+          grep -E '^[[:space:]]+(Updating|Adding|Removing|Downgrading) ' \
+            lockfile-update/raw.log \
+            | grep -v 'crates.io index' \
+            > lockfile-update/summary.txt || true
+          if [ ! -s lockfile-update/summary.txt ]; then
+            cp lockfile-update/raw.log lockfile-update/summary.txt
+          fi
+          # Snapshot the exact lock the check below is about to test; the PR
+          # job commits this file, so the proposed lock is the tested lock.
+          cp Cargo.lock lockfile-update/Cargo.lock
+
+      # continue-on-error so the summary step below always runs; without it a
+      # red check would only exist in the step log.
+      - name: make check against the updated lockfile
+        id: check
+        if: steps.update.outputs.changed == 'true'
+        continue-on-error: true
+        run: make check
+
+      - name: Stash the tested lockfile
+        if: steps.update.outputs.changed == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: cargo-update
+          path: lockfile-update/
+          if-no-files-found: error
+
+      - name: Fail the job on a broken update
+        if: steps.check.outcome == 'failure'
+        run: |
+          {
+            printf "## \`make check\` failed against the updated lockfile\n\n"
+            printf 'A dependency bump broke the build. No PR was opened.\n\n'
+            printf 'The lockfile that failed is attached to this run as the\n'
+            printf "\`cargo-update\` artifact. To reproduce locally:\n\n"
+            printf '    make update\n\n'
+            printf 'Then pin or patch the offending crate and commit the lock\n'
+            printf "deliberately. Note that \`main\` is unaffected: it still\n"
+            printf 'builds the previous, tested lockfile.\n\n'
+            printf 'Attempted bumps:\n\n'
+            printf "\`\`\`\n"
+            cat lockfile-update/summary.txt
+            printf "\`\`\`\n"
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 1
+
+  # Open or update the PR. Runs on a bare ubuntu-latest rather than the
+  # toolchain image: no cargo is needed here, and `gh` is preinstalled on the
+  # hosted runner (this is the same mechanism soak.yml uses to file its
+  # reproducer PRs). Skipped entirely when the lockfile did not change, and —
+  # via the default needs-success gate — when the check above failed.
+  pr:
+    needs: update
+    if: needs.update.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: cargo-update
+          path: lockfile-update
+
+      - name: Open or update the lockfile PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SERVER_URL: ${{ github.server_url }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          # Deterministic branch, force-pushed: a later week replaces the
+          # standing proposal instead of stacking a second, staler PR.
+          branch="deps/cargo-update"
+          title="build(deps): weekly cargo update"
+          run_url="$SERVER_URL/$REPOSITORY/actions/runs/$RUN_ID"
+
+          cp lockfile-update/Cargo.lock Cargo.lock
+          git config user.name  "github-actions[bot]"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$branch"
+          git add Cargo.lock
+          git commit -m "$title"
+          git push --force -u origin "$branch"
+
+          {
+            printf "Weekly \`cargo update\`: %s\n\n" "$run_url"
+            printf "\`\`\`\n"
+            cat lockfile-update/summary.txt
+            printf "\`\`\`\n\n"
+            printf "\`make check\` passed against this lockfile — fmt,\n"
+            printf 'clippy, cargo-deny, cargo-machete and the full nextest\n'
+            printf 'suite ran on exactly the resolution committed here, so\n'
+            printf 'merging it keeps tested-state == committed-state.\n\n'
+            printf 'cargo-deny runs inside that check, so a new advisory on\n'
+            printf 'any of these crates gates this PR like any other.\n'
+          } > pr-body.md
+
+          gh label create dependencies --color 0366D6 \
+            --description "Dependency and lockfile updates" 2>/dev/null || true
+
+          existing="$(gh pr list --head "$branch" --state open \
+            --json number --jq '.[0].number // empty' || true)"
+          if [ -n "$existing" ]; then
+            gh pr edit "$existing" --title "$title" --body-file pr-body.md
+          else
+            gh pr create --title "$title" --label dependencies \
+              --body-file pr-body.md
+          fi

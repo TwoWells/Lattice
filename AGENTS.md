@@ -55,7 +55,8 @@ Single crate. The `lattice` binary serves as both the LSP server and the CLI (`l
 
 ## Development Commands
 
-- **Check (full):** `make check` — format, lint, deny, machete, and test in one pass.
+- **Check (full):** `make check` — format, lint, deny, machete, and test in one pass. Every cargo invocation that accepts it runs `--locked`, so check never rewrites `Cargo.lock` — a lockfile out of sync with `Cargo.toml` fails the check instead. The committed lockfile is always the tested lockfile.
+- **Update deps:** `make update` — the deliberate refresh: `cargo update`, then the full check against the new lockfile. Routine freshness is owned by the weekly `lockfile.yml` workflow, which runs the same thing in CI and opens a PR with the diff.
 - **Test (all):** `make test`
 - **Test (filtered):** `make test T=<filter>`
 - **Test (repeat):** `make test T=<filter> N=<count>`

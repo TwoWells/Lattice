@@ -1,13 +1,14 @@
 # Lattice Makefile
 # Usage:
 #   make setup           # configure hooks + check tools (first time)
-#   make check           # fmt, lint, deny, machete, test
+#   make check           # fmt, lint, deny, machete, test (never writes Cargo.lock)
+#   make update          # cargo update, then check against the new lockfile
 #   make release-patch   # 0.1.0 -> 0.1.1
 #   make release-minor   # 0.1.0 -> 0.2.0
 #   make release-major   # 0.1.0 -> 1.0.0
 #   make release V=0.2.0 # explicit version
 
-.PHONY: build-release check deny fuzz print-fuzz-targets run soak machete metadata mutants setup setup-hooks setup-tools test release release-patch release-minor release-major publish tag-current
+.PHONY: build-release check deny fuzz print-fuzz-targets run soak machete metadata mutants setup setup-hooks setup-tools test update release release-patch release-minor release-major publish tag-current
 
 # Get current version from Cargo.toml
 CURRENT_VERSION := $(shell grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
@@ -63,19 +64,31 @@ setup-tools:
 # --- Check ---
 
 build-release:
-	@cargo build --release
+	@cargo build --release --locked
 
+# The single source of truth for "passing": fmt, clippy, deny, machete, tests.
+#
+# Every cargo invocation here that accepts --locked takes it, so a Cargo.lock
+# that disagrees with Cargo.toml FAILS the check instead of being silently
+# rewritten mid-run. The committed lockfile is therefore always the tested
+# lockfile, and CI resolves exactly the versions that were tested locally
+# instead of re-resolving the registry per run. `cargo fmt` and `cargo machete`
+# take no --locked and need none: neither resolves dependencies (machete reads
+# Cargo.toml and the sources directly).
+#
+# Nothing in this path updates dependencies. Refresh deliberately with
+# `make update`; routine freshness belongs to the weekly lockfile.yml workflow,
+# which does the update, runs this check against the new lock, and opens a PR.
 check: setup-tools
 	@PINNED=$$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml); \
 	 LATEST=$$(rustup run stable rustc --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' | head -1); \
 	 if [ -n "$$LATEST" ] && [ "$$PINNED" != "$$LATEST" ]; then \
 	   printf '\033[33mNote: rust-toolchain.toml pins %s, latest stable is %s\033[0m\n' "$$PINNED" "$$LATEST"; \
 	 fi
-	@cargo update --quiet
 	@cargo fmt -- -l | sed 's/^/fmt: formatted /'
-	@cargo clippy --tests --all-features --quiet -- -D warnings
+	@cargo clippy --locked --tests --all-features --quiet -- -D warnings
 	@tries=0; while true; do \
-	   cargo deny --log-level error check; rc=$$?; \
+	   cargo deny --locked --log-level error check; rc=$$?; \
 	   if [ $$rc -eq 0 ]; then break; \
 	   elif [ $$rc -ne 139 ]; then exit $$rc; \
 	   else \
@@ -86,10 +99,18 @@ check: setup-tools
 	 done
 	@cargo machete --skip-target-dir
 	@if [ "$(MEMLIMIT_KB)" != unlimited ]; then ulimit -v $(MEMLIMIT_KB); fi; \
-	 cargo nextest run --no-fail-fast --no-tests=pass --status-level fail --final-status-level fail --cargo-quiet --show-progress only
+	 cargo nextest run --locked --no-fail-fast --no-tests=pass --status-level fail --final-status-level fail --cargo-quiet --show-progress only
+
+# Deliberate dependency refresh: the ONLY local target that rewrites Cargo.lock.
+# Bumps every dependency to the newest semver-compatible release, then runs the
+# full check against that new lock — so a lockfile bump is never committed
+# untested. Commit Cargo.lock as its own `build(deps)` change.
+update:
+	@cargo update
+	@$(MAKE) check
 
 deny:
-	@cargo deny --log-level error check
+	@cargo deny --locked --log-level error check
 
 machete:
 	@cargo machete --skip-target-dir
@@ -97,7 +118,7 @@ machete:
 # Emit `cargo metadata` JSON WITHOUT mutating the lockfile: `--locked` makes
 # cargo error rather than update if Cargo.lock is out of date, so this both
 # verifies the lock is consistent (`make metadata >/dev/null`) and feeds tools
-# like jq. Unlike `make check` (which runs `cargo update`), it never bumps deps.
+# like jq. Like `make check`, it never bumps deps — only `make update` does.
 metadata:
 	@cargo metadata --locked --format-version 1
 
@@ -194,7 +215,7 @@ soak:
 CLEAN_T = $(subst \,,$(subst !,,$(T)))
 test:
 	@if [ "$(MEMLIMIT_KB)" != unlimited ]; then ulimit -v $(MEMLIMIT_KB); fi; \
-	 cargo nextest run $(if $(PROFILE),--profile $(PROFILE),) --status-level fail --final-status-level slow --cargo-quiet $(if $(N),--stress-count $(N),) $(if $(T),$(if $(findstring !,$(T)),-E 'not test($(CLEAN_T))',-E 'test($(T))'),)
+	 cargo nextest run --locked $(if $(PROFILE),--profile $(PROFILE),) --status-level fail --final-status-level slow --cargo-quiet $(if $(N),--stress-count $(N),) $(if $(T),$(if $(findstring !,$(T)),-E 'not test($(CLEAN_T))',-E 'test($(T))'),)
 
 # --- Release ---
 
