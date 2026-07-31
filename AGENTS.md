@@ -10,6 +10,45 @@ This file serves as the single point of truth for AI agents working on the Latti
 
 Single crate. The `lattice` binary serves as both the LSP server and the CLI (`lattice lint`).
 
+## Module Map
+
+Three modules are directories, split along their internal seams (issue 055).
+Each directory's `mod.rs` holds the module's entry point and the vocabulary its
+siblings share; everything else is a named seam. `crate::server::…`,
+`crate::block::…` and `crate::structural::…` still name the same items they
+always did — the splits re-export across the boundary rather than moving a path.
+
+- `src/server/` — the LSP server.
+  - `mod.rs` — the lifecycle: `run`, `serve`, the capabilities handshake, the
+    watched-files registration, `main_loop`.
+  - `dispatch.rs` / `notify.rs` — the two routing tables. Requests answer with
+    `&Workspaces`; notifications take `&mut Workspaces` and end at a publish.
+  - `workspaces.rs` — the two-tier document store, the marker-derived scope
+    registry, and the views every surface reads through (decisions 019, 024).
+  - `diagnostics.rs` / `publish.rs` — what a diagnostic row *is* (shared with
+    `lattice lint`) versus when it is sent and under whose perspective.
+  - `symbols.rs`, `navigation.rs`, `rename.rs`, `completion.rs`, `hover.rs`,
+    `folding.rs`, `semantic_tokens.rs`, `formatting.rs` — one LSP surface family
+    each.
+  - `helpers.rs` — position mapping, heading lookup, hierarchy items, link
+    labels: the cross-surface helpers.
+- `src/block/` — the block parser.
+  - `mod.rs` — tree types and the `Tree` API.
+  - `scan.rs` — the line scanner: stateless recognizers for what one line could
+    be.
+  - `parser.rs` — the tree builder: what a line *is*, against the open
+    containers.
+  - `frontmatter.rs` — frontmatter entries projected into tree nodes.
+  - `consumer.rs` — link classification, slug algorithms, bare-path detection.
+- `src/structural/` — the unconditional document diagnostics.
+  - `mod.rs` — the entry point, the `ExternalExistence` oracle, the pass order.
+  - `references.rs` / `html.rs` / `content.rs` — the scanner families.
+  - `ledger.rs` — exception routing and the suppression ledger.
+
+Every other module is a single file. Test modules live beside the code they
+cover as `<module>/tests.rs`, declared from the module root as `mod tests;` —
+never inline, so a production file stays readable at its own size.
+
 ## Coding Standards
 
 - **Edition:** Rust 2024.
