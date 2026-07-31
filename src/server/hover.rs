@@ -13,7 +13,7 @@ use crate::block::{LinkKind, content_lines};
 use crate::lsp;
 use crate::workspace::target_to_key;
 
-use super::heading_matches_fragment;
+use super::navigation::heading_matches_fragment;
 use super::workspaces::Workspaces;
 
 // ---------------------------------------------------------------------------

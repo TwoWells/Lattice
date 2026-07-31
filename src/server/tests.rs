@@ -7,19 +7,27 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
+use super::completion::*;
 use super::diagnostics::*;
+use super::folding::*;
+use super::formatting::*;
+use super::helpers::*;
+use super::hover::*;
+use super::navigation::*;
 use super::notify::*;
 use super::publish::*;
+use super::rename::*;
 use super::semantic_tokens::*;
 use super::workspaces::*;
 use super::*;
 use lsp_server::Notification;
 
-use crate::block::{HeadingId, Syntax};
+use crate::block::{Heading, HeadingId, LinkKind, Syntax};
 use crate::line_index::LineIndex;
 use crate::span::Span;
 use crate::store::Tier;
-use crate::validation::{Diagnostic, Severity};
+use crate::uri::uri_to_path;
+use crate::validation::{self, Diagnostic, Severity};
 use crate::workspace::Workspace;
 
 // -----------------------------------------------------------------------

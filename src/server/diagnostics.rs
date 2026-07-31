@@ -21,7 +21,7 @@ use crate::lsp;
 use crate::validation::{self, Diagnostic, Severity};
 use crate::workspace::{FileData, WorkspaceView};
 
-use super::{line_byte_range, span_to_lsp_range};
+use super::helpers::{line_byte_range, span_to_lsp_range};
 
 // ---------------------------------------------------------------------------
 // Diagnostic collection (shared by the push path and `lattice lint`)
