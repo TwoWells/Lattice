@@ -1425,6 +1425,22 @@ fn is_config_uri(uri: &str) -> bool {
     uri.ends_with(".lattice.toml")
 }
 
+/// A watched-file event's change kind as a log-friendly name (issue 068).
+///
+/// A trace for a dropped event has to say *what* was dropped — a create going
+/// missing is a membership phantom, a change going missing is stale content —
+/// and a bare protocol integer makes the reader look that up. Anything outside
+/// [`lsp::file_change_type`]'s three values is `unknown`: the server has no
+/// handling for it, which is itself the thing worth reporting.
+const fn file_change_kind(change_type: u8) -> &'static str {
+    match change_type {
+        lsp::file_change_type::CREATED => "created",
+        lsp::file_change_type::CHANGED => "changed",
+        lsp::file_change_type::DELETED => "deleted",
+        _ => "unknown",
+    }
+}
+
 /// Main message loop.
 fn main_loop(connection: &Connection, mut workspaces: Workspaces) -> Result<()> {
     for msg in &connection.receiver {
@@ -4813,6 +4829,16 @@ fn handle_watched_files_change(
             continue;
         }
         let Some(marker_dir) = uri_to_path(&change.uri).parent().map(Path::to_path_buf) else {
+            // A marker URI that decodes to a path with no parent names no
+            // directory to reload, so there is nothing to do — but this is a
+            // resolution failure, not a routing decision, and a config event
+            // lost here leaves the scope on stale config with no account of
+            // why (issue 068). Same level as the no-workspace miss below.
+            tracing::warn!(
+                uri = %change.uri,
+                kind = file_change_kind(change.change_type),
+                "config marker event resolves to no parent directory; reload skipped"
+            );
             continue;
         };
         if !handled_markers.insert(marker_dir.clone()) {
@@ -4883,11 +4909,26 @@ fn handle_watched_files_change(
             // client's text is never replaced by content it never sent.
             //
             // Only files under a folder are tracked (the watcher glob is
-            // folder-scoped), so an event outside every root is ignored.
+            // folder-scoped), so an event outside every root is ignored — but
+            // never in silence (issue 068).
             lsp::file_change_type::CREATED
             | lsp::file_change_type::CHANGED
             | lsp::file_change_type::DELETED => {
                 if workspaces.deepest_root_for(&abs).is_none() {
+                    // Discarding the event is the right behaviour; being
+                    // unable to tell that it happened is not. Without this,
+                    // an event the client delivered and the server threw away
+                    // has exactly the same observable as an event that was
+                    // never sent — nothing — and every staleness report in
+                    // this family (061, 062, 063, 066) turns on telling those
+                    // two apart. Same reasoning and same level as the marker
+                    // pass's no-workspace warn above.
+                    tracing::warn!(
+                        uri = %change.uri,
+                        path = %abs.display(),
+                        kind = file_change_kind(change.change_type),
+                        "watched .md event resolves under no registered root; event dropped"
+                    );
                     continue;
                 }
                 match workspaces.apply_from_disk(&abs) {
@@ -4895,12 +4936,33 @@ fn handle_watched_files_change(
                     DiskUpdate::Content => content_changed.push(abs),
                     // Nothing indexed moved (e.g. a delete echo for a file
                     // never indexed, or bytes the server already holds):
-                    // no debt, and no re-materialization to force.
-                    DiskUpdate::Untouched => continue,
+                    // no debt, and no re-materialization to force. A genuine
+                    // no-op — "nothing to do", not "I may be blind here" — so
+                    // it takes `debug` and must not be conflated with the
+                    // drop above by sharing its level.
+                    DiskUpdate::Untouched => {
+                        tracing::debug!(
+                            uri = %change.uri,
+                            kind = file_change_kind(change.change_type),
+                            "watched .md event moved nothing indexed; no work owed"
+                        );
+                        continue;
+                    }
                 }
                 changed_docs.insert(change.uri.clone());
             }
-            _ => {}
+            // A `.md` event the server has no handling for: outside the three
+            // `FileChangeType` values the protocol defines, so no conforming
+            // client sends one — which makes an arrival worth reporting rather
+            // than absorbing. With this arm and the root drop above traced,
+            // every `.md` event is accounted for: applied, or named in the log.
+            _ => {
+                tracing::warn!(
+                    uri = %change.uri,
+                    change_type = change.change_type,
+                    "watched .md event carries an unrecognized change type; event dropped"
+                );
+            }
         }
     }
     // Settle the batch's structural debt in one payment (issue 063).
@@ -12941,6 +13003,135 @@ mod tests {
                 .get(&doc_uri)
                 .is_some_and(|d| any_message_contains(d, "stale reference")),
             "the close is a genuine commitment and republishes the corrected rows: {closed:?}"
+        );
+    }
+
+    #[test]
+    fn a_watched_event_outside_every_root_is_dropped_loudly() {
+        // Issue 068. Discarding an event for a path under no registered root
+        // is the right behaviour — the watcher glob is folder-scoped and there
+        // is nothing there to index. Being unable to tell that it happened is
+        // not: without the trace, an event the client delivered and the server
+        // threw away has the same observable as an event never sent (nothing
+        // at all), and that is precisely the discriminator every staleness
+        // report in this family needs. The marker pass has treated its
+        // analogous miss as a `warn` since issue 050; the document pass now
+        // matches it, for every event type that flows through the loop.
+        let dir = workspace_with_files(&[(".lattice.toml", ""), ("doc.md", "# Clean\n")]);
+        let doc_abs = dir.path().join("doc.md");
+        let mut workspaces = scan_workspaces(&dir);
+        let (server, client) = Connection::memory();
+
+        // A `.md` file that genuinely exists, in a directory no folder ever
+        // registered — so the drop is about root membership, not about a path
+        // that fails to resolve on disk.
+        let outside = workspace_with_files(&[("stray.md", "# Stray\n")]);
+        let stray_abs = outside.path().join("stray.md");
+        let stray_uri = file_uri(&outside, "stray.md");
+
+        // Arm 1 — the drop fires, for created / changed / deleted alike.
+        let traces = CapturedTraces::default();
+        tracing::dispatcher::with_default(&tracing::Dispatch::new(traces.clone()), || {
+            drive(
+                &server,
+                &mut workspaces,
+                lsp::method::DID_CHANGE_WATCHED_FILES,
+                serde_json::json!({ "changes": [
+                    { "uri": stray_uri, "type": lsp::file_change_type::CREATED },
+                    { "uri": stray_uri, "type": lsp::file_change_type::CHANGED },
+                    { "uri": stray_uri, "type": lsp::file_change_type::DELETED },
+                ] }),
+            );
+        });
+        drop(drain_publishes(&client));
+        assert!(
+            workspaces.store.current(&stray_abs).is_none(),
+            "the out-of-root path stays unindexed — the drop itself is correct behaviour"
+        );
+        let dropped: Vec<String> = traces
+            .events()
+            .into_iter()
+            .filter(|(level, message)| {
+                *level == tracing::Level::WARN && message.contains("no registered root")
+            })
+            .map(|(_, message)| message)
+            .collect();
+        assert_eq!(
+            dropped.len(),
+            3,
+            "every dropped event is reported, not just the batch's first: {dropped:?}"
+        );
+        for kind in ["created", "changed", "deleted"] {
+            assert!(
+                dropped.iter().any(|message| message.contains(kind)
+                    && message.contains(&stray_uri)
+                    && message.contains("dropped")),
+                "the {kind} drop names the path, the kind, and the fact of the drop: {dropped:?}"
+            );
+        }
+
+        // Arm 2 — a path a root does cover: applied, and the drop trace stays
+        // quiet. A warn that also fired for covered paths would be noise, and
+        // noise is what makes a log unreadable at the moment it is needed.
+        fs::write(&doc_abs, "See `gone.md` here.\n").expect("rewrite the covered document on disk");
+        let traces = CapturedTraces::default();
+        tracing::dispatcher::with_default(&tracing::Dispatch::new(traces.clone()), || {
+            drive(
+                &server,
+                &mut workspaces,
+                lsp::method::DID_CHANGE_WATCHED_FILES,
+                watched_params(&file_uri(&dir, "doc.md"), lsp::file_change_type::CHANGED),
+            );
+        });
+        drop(drain_publishes(&client));
+        assert_eq!(
+            workspaces.store.source(&doc_abs, Tier::Saved),
+            Some("See `gone.md` here.\n"),
+            "the covered event applied — the contrast arm exercises the same code path"
+        );
+        let quiet = traces.events();
+        assert!(
+            !quiet
+                .iter()
+                .any(|(_, message)| message.contains("no registered root")),
+            "a covered path is business as usual, never reported as a drop: {quiet:?}"
+        );
+    }
+
+    #[test]
+    fn an_unrecognized_watched_change_type_is_reported_not_absorbed() {
+        // The other way a `.md` event can leave the loop unapplied (issue
+        // 068): a change type outside the three `FileChangeType` values the
+        // protocol defines. No conforming client sends one, which is exactly
+        // why an arrival is worth reporting — the file's new bytes are not in
+        // the served world and nothing else would ever say so.
+        let dir = workspace_with_files(&[(".lattice.toml", ""), ("doc.md", "# Clean\n")]);
+        let doc_abs = dir.path().join("doc.md");
+        let mut workspaces = scan_workspaces(&dir);
+        let (server, client) = Connection::memory();
+
+        fs::write(&doc_abs, "See `gone.md` here.\n").expect("rewrite the document on disk");
+        let traces = CapturedTraces::default();
+        tracing::dispatcher::with_default(&tracing::Dispatch::new(traces.clone()), || {
+            drive(
+                &server,
+                &mut workspaces,
+                lsp::method::DID_CHANGE_WATCHED_FILES,
+                watched_params(&file_uri(&dir, "doc.md"), 0),
+            );
+        });
+        drop(drain_publishes(&client));
+        assert_eq!(
+            workspaces.store.source(&doc_abs, Tier::Saved),
+            Some("# Clean\n"),
+            "the unhandled type applies nothing — the saved copy is now stale"
+        );
+        let loud = traces.events();
+        assert!(
+            loud.iter()
+                .any(|(level, message)| *level == tracing::Level::WARN
+                    && message.contains("unrecognized change type")),
+            "the stale copy above is invisible unless the drop is reported: {loud:?}"
         );
     }
 
