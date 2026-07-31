@@ -22,6 +22,14 @@
 //! so the diagnostic set a `lattice lint` produces is identical before and
 //! after a format pass. The CLI acceptance tests assert this on both a clean
 //! and a drifted fixture.
+//!
+//! "The frontmatter Lattice owns" is exactly the `backlinks` entry of a YAML
+//! carrier — the span [`crate::fm::backlinks_region`] reports (issue 079).
+//! Everything else in the carrier is somebody else's and is byte-preserved: the
+//! `exceptions` block (decisions 011/012), arbitrary user fields, the
+//! delimiters, and the surrounding blank and comment lines. A TOML or JSON
+//! carrier has no owned region at all, since Lattice canonicalizes backlinks
+//! only in YAML; such a document is left byte-identical rather than converted.
 
 use std::fmt::Write as _;
 use std::io::Write;
@@ -34,11 +42,13 @@ use crate::workspace::{Frontmatter, Workspace};
 /// Compute the formatted form of a document, or `None` when nothing applies.
 ///
 /// The two formatting inputs are the parsed `frontmatter` (whose `backlinks`
-/// are sorted and re-emitted over its `byte_range`) and the optional external
-/// `format_command` (which receives the whole post-sort document on stdin and
-/// returns the formatted document on stdout). When the document has no backlinks
-/// to sort and no formatter is configured, there is nothing to do and this
-/// returns `None`.
+/// are sorted and re-emitted over its
+/// [`backlinks_region`](Frontmatter::backlinks_region) — and *only* over that
+/// region, so every other frontmatter byte survives verbatim) and the optional
+/// external `format_command` (which receives the whole post-sort document on
+/// stdin and returns the formatted document on stdout). When the document has no
+/// backlinks to sort and no formatter is configured, there is nothing to do and
+/// this returns `None`.
 ///
 /// The returned string is the full formatted document. It may still be
 /// byte-identical to `source` (e.g. backlinks already sorted, or a formatter
@@ -54,26 +64,31 @@ pub fn format_source(
     frontmatter: Option<&Frontmatter>,
     format_command: Option<&str>,
 ) -> Option<String> {
-    let has_backlinks = frontmatter.is_some_and(|fm| !fm.backlinks.is_empty());
+    // The bytes this pass owns: the `backlinks` entry of a YAML carrier that
+    // actually declares backlinks. A carrier with no owned region (no
+    // `backlinks` key, or a TOML/JSON block) contributes no rewrite at all.
+    let owned = frontmatter.and_then(|fm| {
+        if fm.backlinks.is_empty() {
+            None
+        } else {
+            fm.backlinks_region.clone()
+        }
+    });
 
     // Nothing to do if there are no backlinks to sort and no external formatter.
-    if !has_backlinks && format_command.is_none() {
+    if owned.is_none() && format_command.is_none() {
         return None;
     }
 
-    // Step 1: sort frontmatter backlinks in place over the carrier's byte range.
+    // Step 1: sort the backlinks entry in place, over its own span only. The
+    // span stops before its last line's terminator, so the replacement carries
+    // no trailing newline and the bytes on either side — sibling keys such as
+    // `exceptions`, arbitrary user fields, the `---` delimiters — are untouched
+    // (issue 079).
     let mut document = source.to_string();
-    if let Some(fm) = frontmatter
-        && !fm.backlinks.is_empty()
-    {
-        // The carrier's `byte_range` includes the line ending that follows the
-        // closing `---` delimiter, so the rebuilt block must reproduce that same
-        // trailing terminator — otherwise an already-sorted file loses the
-        // newline after `---` and re-formatting is no longer a byte-for-byte
-        // no-op (which the graph-no-op contract requires).
-        let original = &source[fm.byte_range.clone()];
-        let replacement = sorted_backlinks_block(fm, trailing_line_ending(original));
-        document.replace_range(fm.byte_range.clone(), &replacement);
+    if let (Some(fm), Some(region)) = (frontmatter, owned) {
+        let replacement = sorted_backlinks_block(fm, line_ending_after(source, region.end));
+        document.replace_range(region, &replacement);
     }
 
     // Step 2: pipe the whole document through the external formatter, if any.
@@ -86,15 +101,18 @@ pub fn format_source(
     Some(document)
 }
 
-/// Render a `Frontmatter`'s backlinks as a normalized `---`-delimited YAML
-/// block: predicate keys alphabetical, paths within each predicate sorted,
-/// two-space indentation. This is the exact text that replaces the carrier's
-/// `byte_range`.
+/// Render a `Frontmatter`'s backlinks as the normalized `backlinks:` entry:
+/// predicate keys alphabetical, paths within each predicate sorted, two-space
+/// indentation. This is the exact text that replaces the entry's
+/// [`backlinks_region`](Frontmatter::backlinks_region).
 ///
-/// `trailing` is the line ending that followed the closing `---` in the original
-/// block (the carrier's `byte_range` includes it), re-appended so an
-/// already-sorted document round-trips to identical bytes.
-fn sorted_backlinks_block(fm: &Frontmatter, trailing: &str) -> String {
+/// No delimiters and no trailing terminator are emitted: the region covers the
+/// entry alone and stops before its last line ending, so the block it is spliced
+/// into keeps its own `---` (or fence) and its own line structure.
+///
+/// `newline` is the document's line-ending style, so a CRLF file keeps CRLF
+/// endings inside the rebuilt entry instead of acquiring mixed ones.
+fn sorted_backlinks_block(fm: &Frontmatter, newline: &str) -> String {
     let mut sorted: std::collections::BTreeMap<&str, Vec<&str>> = std::collections::BTreeMap::new();
     for (pred, paths) in &fm.backlinks {
         let mut path_refs: Vec<&str> = paths.iter().map(String::as_str).collect();
@@ -102,30 +120,30 @@ fn sorted_backlinks_block(fm: &Frontmatter, trailing: &str) -> String {
         sorted.insert(pred.as_str(), path_refs);
     }
 
-    let mut yaml = String::from("---\nbacklinks:\n");
+    let mut yaml = String::from("backlinks:");
     for (pred, paths) in &sorted {
-        let _ = writeln!(yaml, "  {pred}:");
+        let _ = write!(yaml, "{newline}  {pred}:");
         for path in paths {
-            let _ = writeln!(yaml, "    - {path}");
+            let _ = write!(yaml, "{newline}    - {path}");
         }
     }
-    yaml.push_str("---");
-    yaml.push_str(trailing);
     yaml
 }
 
-/// The trailing line ending of a frontmatter block's original text.
+/// The line-ending style to re-render the backlinks entry with: the terminator
+/// that immediately follows its region (`\r\n`, a bare `\r`, or `\n`).
 ///
-/// The carrier's `byte_range` includes the terminator after the closing `---`
-/// (`\n`, `\r\n`, or a bare `\r`), or nothing when the block ends at EOF with no
-/// newline. Returns that exact terminator so the rebuilt block preserves it.
-fn trailing_line_ending(original: &str) -> &str {
-    if original.ends_with("\r\n") {
-        &original[original.len() - 2..]
-    } else if original.ends_with(['\n', '\r']) {
-        &original[original.len() - 1..]
+/// The region ends just before its last line's terminator, so the byte at `end`
+/// is that terminator — which is the document's own style. Defaulting to `\n`
+/// covers the region ending at EOF with no terminator at all.
+fn line_ending_after(source: &str, end: usize) -> &'static str {
+    let rest = &source[end..];
+    if rest.starts_with("\r\n") {
+        "\r\n"
+    } else if rest.starts_with('\r') {
+        "\r"
     } else {
-        ""
+        "\n"
     }
 }
 
@@ -300,6 +318,16 @@ mod tests {
     fn lint_output(dir: &TempDir) -> String {
         let mut buf = Vec::new();
         lint::run(dir.path(), false, true, false, &mut buf).expect("lint run should succeed");
+        String::from_utf8(buf).expect("lint output should be utf-8")
+    }
+
+    /// Run `lattice lint` with the full suppression ledger (issue 036), so the
+    /// compared observable includes *what the exceptions hid* — the part a
+    /// carrier-destroying format pass moves even when the live diagnostics
+    /// happen to match.
+    fn lint_output_with_ledger(dir: &TempDir) -> String {
+        let mut buf = Vec::new();
+        lint::run(dir.path(), false, false, true, &mut buf).expect("lint run should succeed");
         String::from_utf8(buf).expect("lint output should be utf-8")
     }
 
@@ -528,6 +556,268 @@ mod tests {
         assert!(
             in_scope(Path::new("anything/at/all.md"), None),
             "a None scope means the whole workspace is in scope"
+        );
+    }
+
+    // -- Issue 079: format owns the `backlinks` entry and nothing else -------
+
+    #[test]
+    fn literal_exception_keys_and_reasons_survive_format() {
+        // Issue 079: a format pass rebuilt the whole carrier out of the parsed
+        // backlinks, so every key it did not own was deleted with it —
+        // `exceptions` first among them. The reason is an epitaph (decision
+        // 011): the only surviving record of a vanished reference's intent, so
+        // losing it is unrecoverable data loss, not a reformat.
+        let dir = setup(&[(
+            "a.md",
+            "---\nbacklinks:\n  referenced_by:\n    - z.md\n    - b.md\nexceptions:\n  stale_references:\n    \"gone.md\": \"deleted in the 2025 archive sweep\"\n  bare_paths:\n    \"docs/notes.md\": \"prose, deliberately not a link\"\n---\n\n# A\n",
+        )]);
+
+        let (changed, _) = run_format(&dir, false);
+        assert!(changed, "the drifted backlinks must actually be rewritten");
+
+        let formatted = read(&dir, "a.md");
+        assert_eq!(
+            formatted,
+            "---\nbacklinks:\n  referenced_by:\n    - b.md\n    - z.md\nexceptions:\n  stale_references:\n    \"gone.md\": \"deleted in the 2025 archive sweep\"\n  bare_paths:\n    \"docs/notes.md\": \"prose, deliberately not a link\"\n---\n\n# A\n",
+            "only the backlinks entry may be re-rendered; the exceptions block, its keys, and its reasons are byte-preserved"
+        );
+    }
+
+    #[test]
+    fn count_key_exceptions_survive_format() {
+        // Issue 079 for the other half of the suppression mechanism: a
+        // count-key (decision 012, issue 036) is an all-digits sentinel
+        // claiming a document's residual. Deleting it silently un-suppresses
+        // the whole residual.
+        let dir = setup(&[(
+            "a.md",
+            "---\nbacklinks:\n  referenced_by:\n    - z.md\n    - b.md\nexceptions:\n  stale_references:\n    3: \"the whole 2025 archive sweep\"\n  bare_paths:\n    \"2\": \"two prose paths, deliberate\"\n---\n\n# A\n",
+        )]);
+
+        let (changed, _) = run_format(&dir, false);
+        assert!(changed, "the drifted backlinks must actually be rewritten");
+
+        let formatted = read(&dir, "a.md");
+        assert_eq!(
+            formatted,
+            "---\nbacklinks:\n  referenced_by:\n    - b.md\n    - z.md\nexceptions:\n  stale_references:\n    3: \"the whole 2025 archive sweep\"\n  bare_paths:\n    \"2\": \"two prose paths, deliberate\"\n---\n\n# A\n",
+            "count keys and their shared reasons survive a format pass verbatim"
+        );
+
+        // And they survive as *sentinels*, not just as text.
+        let workspace =
+            crate::workspace::Workspace::scan(dir.path()).expect("rescan the formatted workspace");
+        let fm = workspace
+            .file(std::path::Path::new("a.md"))
+            .and_then(|file| file.frontmatter.as_ref())
+            .expect("the formatted file still parses frontmatter");
+        assert_eq!(
+            fm.exceptions
+                .stale_references_count
+                .as_ref()
+                .map(|count| count.expected),
+            Some(3),
+            "the stale_references count-key still reconciles after format"
+        );
+        assert_eq!(
+            fm.exceptions
+                .bare_paths_count
+                .as_ref()
+                .map(|count| count.expected),
+            Some(2),
+            "the quoted bare_paths count-key still reconciles after format"
+        );
+    }
+
+    #[test]
+    fn unknown_user_frontmatter_fields_survive_format() {
+        // The contract is "only the bytes Lattice owns": arbitrary user
+        // frontmatter — scalars, nested maps, sequences — sits either side of
+        // the backlinks entry and must come through byte-identical, with only
+        // the backlinks entry canonicalized (issue 079).
+        let dir = setup(&[(
+            "a.md",
+            "---\ntitle: A Document\nbacklinks:\n  referenced_by:\n    - z.md\n    - b.md\n  amended_by:\n    - c.md\nmeta:\n  owner: mark\n  tags:\n    - alpha\n    - beta\nexceptions:\n  stale_references:\n    \"gone.md\": \"deleted\"\n---\n\n# A\n",
+        )]);
+
+        let (changed, _) = run_format(&dir, false);
+        assert!(changed, "the drifted backlinks must actually be rewritten");
+
+        assert_eq!(
+            read(&dir, "a.md"),
+            "---\ntitle: A Document\nbacklinks:\n  amended_by:\n    - c.md\n  referenced_by:\n    - b.md\n    - z.md\nmeta:\n  owner: mark\n  tags:\n    - alpha\n    - beta\nexceptions:\n  stale_references:\n    \"gone.md\": \"deleted\"\n---\n\n# A\n",
+            "predicates and paths sort, and every other frontmatter field — before and after the entry, scalar and nested — is untouched"
+        );
+    }
+
+    #[test]
+    fn format_is_a_graph_no_op_on_a_suppressing_fixture() {
+        // The contract, stated directly: `lattice lint` produces the same
+        // diagnostics before and after a format pass — *including* what the
+        // suppression ledger reports as hidden. Issue 079 broke exactly this:
+        // deleting the exceptions block turned suppressed hints back into live
+        // diagnostics, so a format pass silently changed lint's verdict.
+        let dir = setup(&[
+            (".lattice.toml", ""),
+            (
+                "a.md",
+                "---\nbacklinks:\n  referenced_by:\n    - z.md\n    - index.md\nexceptions:\n  stale_references:\n    \"missing.md\": \"the target was deleted in 2025\"\n---\n\n# A\n\nSee `missing.md` for the history.\n",
+            ),
+            ("index.md", "# Index\n\n[a](a.md \"references\")\n"),
+            ("z.md", "# Z\n\n[a](a.md \"references\")\n"),
+        ]);
+
+        let before = lint_output_with_ledger(&dir);
+        assert!(
+            before.contains("suppressed: 1 warning"),
+            "the fixture must actually exercise a live suppression: {before}"
+        );
+
+        let (changed, _) = run_format(&dir, false);
+        assert!(
+            changed,
+            "the drifted fixture must actually be rewritten (bytes change)"
+        );
+
+        let after = lint_output_with_ledger(&dir);
+        assert_eq!(
+            before, after,
+            "diagnostics and suppression counts must be identical before and after a format pass"
+        );
+    }
+
+    #[test]
+    fn canonical_file_with_exceptions_is_stable_under_check() {
+        // `--check` is advertised as a CI gate, so it must agree with the write
+        // pass: an already-canonical file carrying exceptions is a fixed point.
+        // Issue 079 made it perpetually dirty — every run "found" the same
+        // deletion to make.
+        let original = "---\nbacklinks:\n  referenced_by:\n    - b.md\n    - z.md\nexceptions:\n  stale_references:\n    \"gone.md\": \"deleted in the 2025 archive sweep\"\n    4: \"the rest of the sweep\"\n---\n\n# A\n";
+        let dir = setup(&[("a.md", original)]);
+
+        let (changed, output) = run_format(&dir, true);
+        assert!(
+            !changed,
+            "a canonical file with exceptions must pass --check: {output}"
+        );
+        assert!(
+            output.is_empty(),
+            "--check on a clean tree prints nothing: {output}"
+        );
+
+        let (rewrote, _) = run_format(&dir, false);
+        assert!(!rewrote, "the write pass must agree with --check");
+        assert_eq!(
+            read(&dir, "a.md"),
+            original,
+            "format(x) == x for an already-canonical file with exceptions"
+        );
+
+        // And formatting is idempotent from a drifted start: format(format(x))
+        // == format(x).
+        let dir = setup(&[(
+            "a.md",
+            "---\nbacklinks:\n  referenced_by:\n    - z.md\n    - b.md\nexceptions:\n  stale_references:\n    \"gone.md\": \"deleted in the 2025 archive sweep\"\n    4: \"the rest of the sweep\"\n---\n\n# A\n",
+        )]);
+        let (changed, _) = run_format(&dir, false);
+        assert!(changed, "the drifted file must be rewritten once");
+        let once = read(&dir, "a.md");
+        let (changed_again, output) = run_format(&dir, false);
+        assert!(!changed_again, "the second pass must be a no-op: {output}");
+        assert_eq!(read(&dir, "a.md"), once, "format(format(x)) == format(x)");
+        assert_eq!(
+            once, original,
+            "the drifted file converges on the canonical form"
+        );
+    }
+
+    #[test]
+    fn fenced_carrier_backlinks_sort_without_gaining_delimiters() {
+        // A `yaml lattice` carrier's byte range is the *in-fence body*
+        // (decision 015), so rebuilding the block as a `---`-delimited document
+        // wrote YAML document markers inside the fence and deleted the rest of
+        // the body (issue 079). Sorting the entry in place cannot do either.
+        let dir = setup(&[(
+            "a.md",
+            "# A\n\nbody\n\n<details><summary>lattice</summary>\n\n```yaml lattice\nbacklinks:\n  referenced_by:\n    - z.md\n    - b.md\nexceptions:\n  bare_paths:\n    \"docs/notes.md\": \"prose\"\n```\n\n</details>\n",
+        )]);
+
+        let (changed, _) = run_format(&dir, false);
+        assert!(changed, "the drifted carrier must be rewritten");
+
+        assert_eq!(
+            read(&dir, "a.md"),
+            "# A\n\nbody\n\n<details><summary>lattice</summary>\n\n```yaml lattice\nbacklinks:\n  referenced_by:\n    - b.md\n    - z.md\nexceptions:\n  bare_paths:\n    \"docs/notes.md\": \"prose\"\n```\n\n</details>\n",
+            "the carrier body sorts in place: no `---` delimiters injected, no sibling keys lost"
+        );
+    }
+
+    #[test]
+    fn toml_and_json_carriers_are_left_byte_identical() {
+        // Lattice canonicalizes backlinks only in YAML, so a `+++` or `{`
+        // carrier has no owned region: formatting it as a `---` block would
+        // have converted the syntax and dropped every other key (issue 079).
+        // Leaving it alone is the honest no-op.
+        let toml = "+++\ntitle = \"Toml Doc\"\n[backlinks]\nreferenced_by = [\"z.md\", \"b.md\"]\n+++\n\n# Toml\n";
+        let json = "{\n  \"title\": \"Json Doc\",\n  \"backlinks\": { \"referenced_by\": [\"z.md\", \"b.md\"] }\n}\n\n# Json\n";
+        let dir = setup(&[("t.md", toml), ("j.md", json)]);
+
+        let (changed, output) = run_format(&dir, true);
+        assert!(
+            !changed,
+            "a non-YAML carrier reports no change under --check: {output}"
+        );
+
+        let (rewrote, _) = run_format(&dir, false);
+        assert!(!rewrote, "the write pass must not touch a non-YAML carrier");
+        assert_eq!(
+            read(&dir, "t.md"),
+            toml,
+            "TOML frontmatter is byte-identical"
+        );
+        assert_eq!(
+            read(&dir, "j.md"),
+            json,
+            "JSON frontmatter is byte-identical"
+        );
+    }
+
+    #[test]
+    fn crlf_backlinks_keep_their_line_endings() {
+        // The rebuilt entry inherits the document's line-ending style, so a
+        // CRLF file does not come back with a mixed-ending frontmatter block.
+        let dir = setup(&[(
+            "a.md",
+            "---\r\nbacklinks:\r\n  referenced_by:\r\n    - z.md\r\n    - b.md\r\ntitle: A\r\n---\r\n\r\n# A\r\n",
+        )]);
+
+        let (changed, _) = run_format(&dir, false);
+        assert!(changed, "the drifted backlinks must be rewritten");
+
+        assert_eq!(
+            read(&dir, "a.md"),
+            "---\r\nbacklinks:\r\n  referenced_by:\r\n    - b.md\r\n    - z.md\r\ntitle: A\r\n---\r\n\r\n# A\r\n",
+            "the re-rendered entry keeps CRLF endings and leaves the rest of the block alone"
+        );
+    }
+
+    #[test]
+    fn comments_and_blank_lines_around_the_entry_survive_format() {
+        // A comment between `backlinks` and the next top-level key belongs to
+        // neither; the owned region stops before it. A blank line does too.
+        let dir = setup(&[(
+            "a.md",
+            "---\n# top note\nbacklinks:\n  referenced_by:\n    - z.md\n    - b.md\n\n# a note about the exceptions\nexceptions:\n  stale_references:\n    \"gone.md\": \"deleted\"\n---\n\n# A\n",
+        )]);
+
+        let (changed, _) = run_format(&dir, false);
+        assert!(changed, "the drifted backlinks must be rewritten");
+
+        assert_eq!(
+            read(&dir, "a.md"),
+            "---\n# top note\nbacklinks:\n  referenced_by:\n    - b.md\n    - z.md\n\n# a note about the exceptions\nexceptions:\n  stale_references:\n    \"gone.md\": \"deleted\"\n---\n\n# A\n",
+            "comments and blank lines outside the backlinks entry are not part of it"
         );
     }
 }

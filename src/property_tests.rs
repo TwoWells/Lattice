@@ -504,6 +504,112 @@ fn yaml_backlinks_block() -> impl Strategy<Value = String> {
     })
 }
 
+/// A reason string safe to embed in a double-quoted YAML scalar.
+fn reason_text() -> impl Strategy<Value = String> {
+    prop_oneof![
+        Just("hypothetical path in the worked example"),
+        Just("deleted in the 2025 archive sweep"),
+        Just("prose, deliberately not a link"),
+    ]
+    .prop_map(String::from)
+}
+
+/// A YAML `exceptions:` block with literal reference keys and, sometimes, a
+/// count-key sentinel (issue 036) — the suppression mechanism a format pass
+/// must not touch.
+fn yaml_exceptions_block() -> impl Strategy<Value = String> {
+    (
+        proptest::collection::vec((path_text(), reason_text()), 1..3),
+        proptest::option::of((1usize..40, reason_text())),
+    )
+        .prop_map(|(entries, count)| {
+            let mut out = String::from("exceptions:\n  stale_references:\n");
+            for (reference, reason) in entries {
+                out.push_str("    \"");
+                out.push_str(&reference);
+                out.push_str("\": \"");
+                out.push_str(&reason);
+                out.push_str("\"\n");
+            }
+            if let Some((n, reason)) = count {
+                out.push_str("    ");
+                out.push_str(&n.to_string());
+                out.push_str(": \"");
+                out.push_str(&reason);
+                out.push_str("\"\n");
+            }
+            out
+        })
+}
+
+/// The six orderings of the three carrier sections, so the `backlinks` entry is
+/// generated first, last, and in the middle.
+const SECTION_ORDERS: [[usize; 3]; 6] = [
+    [0, 1, 2],
+    [0, 2, 1],
+    [1, 0, 2],
+    [1, 2, 0],
+    [2, 0, 1],
+    [2, 1, 0],
+];
+
+/// A YAML frontmatter document whose carrier mixes the `backlinks` entry
+/// Lattice owns with an `exceptions` block and arbitrary user fields (scalar and
+/// nested), in every relative order — the shape `lattice format` must round-trip
+/// (issue 079).
+fn yaml_carrier_document() -> impl Strategy<Value = String> {
+    (
+        yaml_backlinks_block(),
+        yaml_exceptions_block(),
+        0usize..SECTION_ORDERS.len(),
+        inline_text(20),
+    )
+        .prop_map(|(backlinks, exceptions, order, body)| {
+            let user = String::from("title: A Document\ntags:\n  - alpha\n  - beta\n");
+            let sections = [backlinks, exceptions, user];
+            let mut out = String::from("---\n");
+            for index in SECTION_ORDERS[order] {
+                out.push_str(&sections[index]);
+            }
+            out.push_str("---\n");
+            out.push_str(&body);
+            out.push('\n');
+            out
+        })
+}
+
+/// Rebuild the [`crate::workspace::Frontmatter`] a workspace scan produces for a
+/// leading YAML block, so the format engine can be driven straight from a
+/// generated document without a temp workspace.
+fn yaml_carrier_frontmatter(source: &str) -> Option<crate::workspace::Frontmatter> {
+    let block = yaml::parse_frontmatter_block(source)?;
+    Some(crate::workspace::Frontmatter {
+        start_line: fm::byte_offset_to_line(source, block.span.start),
+        end_line: fm::byte_offset_to_line(source, block.span.end.saturating_sub(1)),
+        backlinks: fm::extract_backlinks(&block, source),
+        exceptions: fm::extract_exceptions(&block, source),
+        backlinks_region: fm::backlinks_region(&block, source).map(Into::into),
+    })
+}
+
+/// The `(reference, reason)` pairs and count-key sentinels an `exceptions` block
+/// parses to — the suppression state a format pass must leave identical.
+fn exception_shape(exceptions: &fm::Exceptions) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for lint in [
+        fm::ExceptionLint::StaleReferences,
+        fm::ExceptionLint::BarePaths,
+    ] {
+        for entry in exceptions.entries(lint) {
+            out.push((entry.reference.clone(), entry.reason.clone()));
+        }
+        if let Some(count) = exceptions.count_key(lint) {
+            out.push((count.raw.clone(), count.reason.clone()));
+        }
+    }
+    out
+}
+
 /// A complete YAML frontmatter document (delimiters + entries + body).
 fn yaml_frontmatter() -> impl Strategy<Value = String> {
     (
@@ -888,6 +994,84 @@ proptest! {
         if let Some(block) = block {
             let _ = fm::extract_backlinks(&block, &source);
         }
+    }
+
+    /// `lattice format` owns the `backlinks` entry and nothing else (issue
+    /// 079): every byte outside that entry's region survives a format pass
+    /// verbatim, the suppression state the `exceptions` block encodes is
+    /// unchanged, the backlink data itself is preserved (only reordered), and a
+    /// second pass is a no-op.
+    #[test]
+    fn format_rewrites_only_the_backlinks_entry(source in yaml_carrier_document()) {
+        let before = yaml_carrier_frontmatter(&source)
+            .expect("the generated document has a leading YAML block");
+        let region = before
+            .backlinks_region
+            .clone()
+            .expect("the generated document declares backlinks");
+        let formatted = crate::format::format_source(&source, Some(&before), None)
+            .expect("declared backlinks make a format pass applicable");
+
+        // Everything on either side of the owned region is byte-identical.
+        prop_assert_eq!(
+            &formatted[..region.start],
+            &source[..region.start],
+            "bytes before the backlinks entry must survive a format pass"
+        );
+        let tail = source.len() - region.end;
+        prop_assert!(
+            formatted.len() >= tail,
+            "the formatted document cannot be shorter than the bytes it must preserve"
+        );
+        prop_assert_eq!(
+            &formatted[formatted.len() - tail..],
+            &source[region.end..],
+            "bytes after the backlinks entry — `exceptions` among them — must survive a format pass"
+        );
+
+        // The carrier still parses, with the same suppression state and the
+        // same backlink data (sorted, not lost).
+        let after = yaml_carrier_frontmatter(&formatted)
+            .expect("the formatted document still has a leading YAML block");
+        prop_assert_eq!(
+            exception_shape(&after.exceptions),
+            exception_shape(&before.exceptions),
+            "the exceptions block parses identically after a format pass"
+        );
+        let mut before_links: Vec<(String, Vec<String>)> = before
+            .backlinks
+            .iter()
+            .map(|(pred, paths)| {
+                let mut paths = paths.clone();
+                paths.sort();
+                (pred.clone(), paths)
+            })
+            .collect();
+        before_links.sort();
+        let mut after_links: Vec<(String, Vec<String>)> = after
+            .backlinks
+            .iter()
+            .map(|(pred, paths)| {
+                let mut paths = paths.clone();
+                paths.sort();
+                (pred.clone(), paths)
+            })
+            .collect();
+        after_links.sort();
+        prop_assert_eq!(
+            after_links,
+            before_links,
+            "sorting the entry preserves every predicate and path"
+        );
+
+        // And a format pass is a fixed point.
+        let twice = crate::format::format_source(&formatted, Some(&after), None)
+            .expect("the formatted document still declares backlinks");
+        prop_assert_eq!(
+            twice,
+            formatted,
+            "format(format(x)) == format(x)"
+        );
     }
 }
 

@@ -138,10 +138,6 @@ pub struct FileData {
 /// (delimiter-bounded block vs. in-fence body).
 #[derive(Debug)]
 pub struct Frontmatter {
-    /// Byte range of the metadata carrier — the entire frontmatter block
-    /// (including `---` delimiters) or the in-fence body of a `yaml lattice`
-    /// carrier.
-    pub byte_range: Range<usize>,
     /// 1-based line of the carrier's start (the opening `---`, or the carrier's
     /// first body line).
     pub start_line: usize,
@@ -157,6 +153,14 @@ pub struct Frontmatter {
     /// structural pass, which suppresses a matching live diagnostic and flags an
     /// exception that matches none as unused.
     pub exceptions: fm::Exceptions,
+    /// Byte range of the `backlinks` entry within the carrier — the only
+    /// frontmatter bytes `lattice format` owns and may re-render (issue 079).
+    ///
+    /// `None` when the carrier declares no top-level `backlinks` key, or when
+    /// the carrier is TOML or JSON: Lattice canonicalizes backlinks only in
+    /// YAML, so a format pass leaves a `+++` or `{` carrier byte-identical
+    /// rather than rewriting it as a `---` block.
+    pub backlinks_region: Option<Range<usize>>,
 }
 
 /// A diagnostic about a backlink predicate issue.
@@ -927,6 +931,14 @@ pub fn parse_content(content: &str, abs_path: &Path, config: &Config) -> FileDat
 
         let backlinks = fm::extract_backlinks(block, content);
         let exceptions = fm::extract_exceptions(block, content);
+        // The bytes a format pass owns. Only a YAML carrier has a canonical
+        // Lattice rendering, so a TOML or JSON block reports no owned region
+        // and is left alone rather than being rewritten as YAML (issue 079).
+        let backlinks_region = if matches!(fm_syntax, Syntax::Yaml) {
+            fm::backlinks_region(block, content).map(Range::from)
+        } else {
+            None
+        };
 
         // Validate backlink keys. A key may be any known predicate — an
         // inverse value or a forward label (decision 008) — since a forward
@@ -942,11 +954,11 @@ pub fn parse_content(content: &str, abs_path: &Path, config: &Config) -> FileDat
         }
 
         frontmatter = Some(Frontmatter {
-            byte_range,
             start_line,
             end_line,
             backlinks,
             exceptions,
+            backlinks_region,
         });
     }
 

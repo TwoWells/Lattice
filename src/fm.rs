@@ -19,7 +19,6 @@ pub struct FrontmatterBlock {
     /// Full range including delimiters (`---`, `+++`, or `{`...`}`).
     pub span: Span,
     /// Content between delimiters.
-    #[allow(dead_code, reason = "used by tree construction ticket 06a")]
     pub content_span: Span,
     /// Top-level entries.
     pub entries: Vec<FmNode>,
@@ -517,6 +516,100 @@ pub fn find_predicate_line(block: &FrontmatterBlock, predicate: &str, source: &s
 }
 
 // ---------------------------------------------------------------------------
+// Backlink region helper (the frontmatter bytes `lattice format` owns)
+// ---------------------------------------------------------------------------
+
+/// The byte span of the top-level `backlinks` entry inside a YAML carrier — the
+/// only frontmatter bytes a format pass owns and may re-render (issue 079).
+///
+/// Runs from the start of the `backlinks:` key line through the end of the last
+/// line belonging to its value (any line indented deeper than the key), stopping
+/// *before* that line's terminator. Everything else in the carrier — the
+/// delimiters, sibling keys such as `exceptions` and arbitrary user fields, and
+/// the blank or comment lines between them — is outside the span and therefore
+/// survives a format pass byte-for-byte.
+///
+/// Blank lines and comment lines at or above the key's indentation neither end
+/// the region nor extend it, mirroring the YAML parser's own
+/// `skip_blanks_and_comments`: a comment between `backlinks` and the next
+/// top-level key belongs to neither, so it is preserved.
+///
+/// Returns `None` when the block declares no top-level `backlinks` key.
+#[must_use]
+pub fn backlinks_region(block: &FrontmatterBlock, source: &str) -> Option<Span> {
+    let key_start = block.entries.iter().find_map(|entry| match entry {
+        FmNode::Mapping { key, .. } if key.text == "backlinks" => Some(key.span.start),
+        _ => None,
+    })?;
+
+    let limit = block.content_span.end.min(source.len());
+    let start = line_start(source, key_start.min(limit));
+    let key_line_end = line_content_end(source, start, limit);
+    let key_indent = indent_width(source, start, key_line_end);
+
+    // The key's own line always belongs to the region.
+    let mut end = key_line_end;
+    let mut cursor = skip_line_ending(source, key_line_end, limit);
+
+    while cursor < limit {
+        let content_end = line_content_end(source, cursor, limit);
+        let indent = indent_width(source, cursor, content_end);
+        let rest = &source[cursor + indent..content_end];
+        if !rest.is_empty() {
+            if indent > key_indent {
+                // A deeper line is part of the value — and pulls any blank or
+                // comment lines above it into the region with it.
+                end = content_end;
+            } else if !rest.starts_with('#') {
+                // A sibling (or shallower) key ends the region.
+                break;
+            }
+        }
+        let next = skip_line_ending(source, content_end, limit);
+        if next == cursor {
+            break;
+        }
+        cursor = next;
+    }
+
+    Some(Span::new(start, end))
+}
+
+/// The byte offset at which the line containing `offset` begins.
+fn line_start(source: &str, offset: usize) -> usize {
+    source[..offset].rfind(['\n', '\r']).map_or(0, |i| i + 1)
+}
+
+/// The byte offset just past the last content byte of the line starting at
+/// `from` — the position of its terminator, or `limit` when the line runs to the
+/// end of the region.
+fn line_content_end(source: &str, from: usize, limit: usize) -> usize {
+    source[from..limit]
+        .find(['\n', '\r'])
+        .map_or(limit, |i| from + i)
+}
+
+/// The number of leading space/tab bytes in `source[from..limit]`, matching the
+/// YAML parser's indentation measure (a tab counts as one).
+fn indent_width(source: &str, from: usize, limit: usize) -> usize {
+    source.as_bytes()[from..limit]
+        .iter()
+        .take_while(|b| matches!(b, b' ' | b'\t'))
+        .count()
+}
+
+/// Advance past a line terminator (`\r\n`, `\n`, or bare `\r`) at `at`, clamped
+/// to `limit`. Returns `at` unchanged when there is no terminator there.
+fn skip_line_ending(source: &str, at: usize, limit: usize) -> usize {
+    let bytes = source.as_bytes();
+    match bytes.get(at) {
+        Some(b'\r') if bytes.get(at + 1) == Some(&b'\n') => (at + 2).min(limit),
+        Some(b'\n' | b'\r') => (at + 1).min(limit),
+        _ => at,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Line counting (shared by every line-number computation in the crate)
 // ---------------------------------------------------------------------------
 
@@ -577,7 +670,7 @@ pub fn byte_offset_to_line(source: &str, offset: usize) -> usize {
 #[cfg(test)]
 #[allow(clippy::expect_used, reason = "tests use expect for clarity")]
 mod tests {
-    use super::{ExceptionLint, extract_exceptions, is_count_key};
+    use super::{ExceptionLint, backlinks_region, extract_exceptions, is_count_key};
     use crate::yaml::parse_frontmatter_block;
 
     #[test]
@@ -729,6 +822,77 @@ mod tests {
         assert!(
             ex.stale_references.is_empty() && ex.bare_paths.is_empty(),
             "no exceptions block yields empty: {ex:?}"
+        );
+    }
+
+    // -- `backlinks_region`: the bytes a format pass owns (issue 079) --------
+
+    /// The slice `backlinks_region` reports for `source`, or `None`.
+    fn region_text(source: &str) -> Option<&str> {
+        let block = parse_frontmatter_block(source).expect("should parse");
+        let span = backlinks_region(&block, source)?;
+        Some(&source[span.start..span.end])
+    }
+
+    #[test]
+    fn backlinks_region_covers_the_entry_and_stops_at_the_next_key() {
+        // The region is the `backlinks` entry alone: it starts at the key line
+        // and ends before the terminator of its last value line, so a sibling
+        // key — `exceptions` above all — is never inside it (issue 079).
+        let source = "---\ntitle: t\nbacklinks:\n  referenced_by:\n    - a.md\nexceptions:\n  stale_references:\n    \"g.md\": \"r\"\n---\n";
+        assert_eq!(
+            region_text(source),
+            Some("backlinks:\n  referenced_by:\n    - a.md"),
+            "the region is the entry, delimiter-free and terminator-free"
+        );
+    }
+
+    #[test]
+    fn backlinks_region_excludes_trailing_blank_and_comment_lines() {
+        // Blank lines and top-level comments after the entry belong to the
+        // block, not to `backlinks` — a format pass must leave them in place.
+        let source = "---\nbacklinks:\n  referenced_by:\n    - a.md\n\n# about the exceptions\nexceptions:\n  bare_paths:\n    \"g.md\": \"r\"\n---\n";
+        assert_eq!(
+            region_text(source),
+            Some("backlinks:\n  referenced_by:\n    - a.md"),
+            "the region stops at the last value line, not at the next key"
+        );
+    }
+
+    #[test]
+    fn backlinks_region_extends_through_interior_and_indented_comments() {
+        // A comment indented under the entry is part of it, and so is anything
+        // a deeper line pulls in behind it — mirroring the parser's own
+        // blank/comment skipping.
+        let source = "---\nbacklinks:\n  a:\n    - x.md\n\n  # still inside\n  b:\n    - y.md\n    # trailing note\ntitle: t\n---\n";
+        assert_eq!(
+            region_text(source),
+            Some(
+                "backlinks:\n  a:\n    - x.md\n\n  # still inside\n  b:\n    - y.md\n    # trailing note"
+            ),
+            "indented comments and the blanks before deeper lines are inside the entry"
+        );
+    }
+
+    #[test]
+    fn backlinks_region_is_none_without_the_key() {
+        let source = "---\ntitle: t\nexceptions:\n  bare_paths:\n    \"g.md\": \"r\"\n---\n";
+        assert_eq!(
+            region_text(source),
+            None,
+            "a block with no `backlinks` key has no owned region"
+        );
+    }
+
+    #[test]
+    fn backlinks_region_stops_at_the_closing_delimiter() {
+        // The region is bounded by the block's content span, so the closing
+        // `---` (and the body past it) can never be swallowed.
+        let source = "---\nbacklinks:\n  a:\n    - x.md\n---\n\n  indented body line\n";
+        assert_eq!(
+            region_text(source),
+            Some("backlinks:\n  a:\n    - x.md"),
+            "the carrier's content end bounds the region"
         );
     }
 }
