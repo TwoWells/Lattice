@@ -168,7 +168,7 @@ fn scan_inlines(
     // Precompute `[` -> matching `]` in a single pass so the scanner never
     // re-scans for a closing bracket. Without this, a degenerate run like
     // `[[[[...` drives quadratic backtracking through `find_matching_bracket`.
-    let bracket_matches = precompute_bracket_matches(bytes);
+    let bracket_matches = precompute_bracket_matches(text);
 
     // Start byte (within `bytes`) of the line currently being scanned, used
     // to bound per-line inline work.
@@ -646,37 +646,87 @@ pub fn find_closing_backticks(bytes: &[u8], start: usize, count: usize) -> Optio
 // Bracket matching
 // ---------------------------------------------------------------------------
 
-/// Precompute, for every `[` in `bytes`, the index of its matching `]`.
+/// Precompute, for every `[` in `text`, the index of its matching `]`.
 ///
-/// One left-to-right pass using a stack, with the same backslash-escape and
-/// backtick-span skipping rules as [`find_matching_bracket`], so the whole table
-/// is built in O(n) and the inline scanner never re-scans — eliminating the
-/// quadratic backtracking a run like `[[[[...` used to drive.
+/// One left-to-right pass using a stack, applying the inline scanner's own
+/// skipping rules so the table and the scanner stay in lockstep: a span the
+/// scanner walks *past* holds no brackets here either. The whole table is built
+/// in O(n) and the scanner never re-scans — eliminating the quadratic
+/// backtracking a run like `[[[[...` used to drive.
+///
+/// The spans this pass skips, each recognized at the same byte, by the same
+/// predicate, as in the scanner:
+///
+/// - a backslash and the byte after it, so `\[` is literal text. The scanner
+///   additionally requires that byte to be ASCII punctuation, which cannot part
+///   the two: `[` and `]` are punctuation, so a byte this rule swallows and the
+///   scanner's does not is never a bracket;
+/// - a backtick run and, when a run of equal length closes it, everything
+///   through that closer ([`find_closing_backticks`]);
+/// - an inline math span ([`try_parse_inline_math`]);
+/// - an autolink or a raw HTML tag — open, close, or comment
+///   ([`opaque_html_end`], which calls [`html::try_autolink`] and
+///   [`html::tokenize_tag`], the recognizers the scanner itself calls).
+///
+/// The last two rules apply only within the first
+/// [`MAX_INLINE_LINE_BYTES`](crate::limits::MAX_INLINE_LINE_BYTES) of a line:
+/// past that point the scanner recognizes nothing at all — it treats the rest of
+/// the line as plain text — so the gate holds the lookaheads to the budget the
+/// scanner already has. Brackets themselves stay live past the cap, so a link
+/// whose text runs long still matches. The walk also stops after the last bracket
+/// byte, where no skip decision can change an entry any more.
 ///
 /// Entries are `None` for every byte position that is not a `[` the pass reached
 /// and later closed. Three cases yield `None`: a non-`[` byte, a `[` the pass
-/// skipped (backslash-escaped, or inside a closed backtick span), and a reached
-/// `[` whose `]` never arrives. For a `[` the pass *does* reach, the entry equals
-/// [`find_matching_bracket`] called at that position — the depth-counting walk
-/// this table replaced. The equality is stated for reached positions only: a
-/// skipped `[` is not a bracket at all here, whereas `find_matching_bracket`
-/// starts scanning from wherever it is pointed and would happily match one.
+/// skipped (escaped, or inside a code span, math span, autolink, or tag), and a
+/// reached `[` whose `]` never arrives. The scanner only ever indexes this table
+/// at positions its own walk reaches, so a `None` at a skipped position is
+/// exactly the intended "not a bracket" answer.
 ///
-/// The scanner only ever indexes this table at positions its own walk reaches
-/// (which applies the same escape and code-span rules), so a `None` at a skipped
-/// position is exactly the intended "not a bracket" answer.
+/// Until issue 070 the pass applied the escape and code-span rules only and
+/// walked straight *through* every other opaque span, so an unbalanced `[` inside
+/// one desynchronized the two walks: `[a $x[y$ b](u)` produced no link at all —
+/// the inner `[` took the `]`, the outer `[` got `None`, and the scanner then
+/// skipped the math span on its own rules without ever revisiting the inner
+/// bracket.
+///
+/// What the pass still does not model are the scanner's *post-recognition* jumps:
+/// the destination of a link it has just matched, the body of an `<a>` element up
+/// to its `</a>`, and an `@path.md` import directive. Those are regions the
+/// scanner enters only after consuming a construct rather than skip rules it
+/// applies while walking, and the `</a>` search among them would cost this pass
+/// its linearity.
 ///
 /// [`crate::invariants::assert_bracket_table_agrees`] is the differential oracle
 /// for that contract: it recomputes the table with a naive quadratic reference
-/// walk and asserts equality position by position, so a missing, spurious, or
-/// mismapped match cannot pass silently (issue 056).
-pub fn precompute_bracket_matches(bytes: &[u8]) -> Vec<Option<usize>> {
+/// walk that re-derives every rule above from scratch, and asserts equality
+/// position by position, so a missing, spurious, or mismapped match cannot pass
+/// silently (issue 056, extended to the opacity rules by issue 070).
+pub fn precompute_bracket_matches(text: &str) -> Vec<Option<usize>> {
+    let bytes = text.as_bytes();
     let mut matches = vec![None; bytes.len()];
+    // Entries are only ever written at a `[` that a later `]` closes, so nothing
+    // after the last bracket byte can change the table: walking on would only
+    // pay for skip decisions whose outcome is unobservable. Stopping there is
+    // exact, and it keeps a host with no brackets (most prose) from paying for
+    // any opaque-span lookahead at all.
+    let Some(last_bracket) = bytes.iter().rposition(|&b| b == b'[' || b == b']') else {
+        return matches;
+    };
     let mut stack: Vec<usize> = Vec::new();
     let mut i = 0;
+    // Start of the line being walked, for the per-line recognition cap.
+    let mut line_start = 0;
 
-    while i < bytes.len() {
+    while i <= last_bracket {
+        // Past the cap the scanner skips to the line ending, recognizing no
+        // construct, so neither does this pass.
+        let recognize = i - line_start < crate::limits::MAX_INLINE_LINE_BYTES;
         match bytes[i] {
+            b'\n' => {
+                line_start = i + 1;
+                i += 1;
+            }
             b'\\' if i + 1 < bytes.len() => {
                 i += 2;
             }
@@ -687,6 +737,12 @@ pub fn precompute_bracket_matches(bytes: &[u8]) -> Vec<Option<usize>> {
                 } else {
                     i += ticks;
                 }
+            }
+            b'$' if recognize => {
+                i = try_parse_inline_math(bytes, i).unwrap_or(i + 1);
+            }
+            b'<' if recognize => {
+                i = opaque_html_end(text, i).unwrap_or(i + 1);
             }
             b'[' => {
                 stack.push(i);
@@ -707,9 +763,32 @@ pub fn precompute_bracket_matches(bytes: &[u8]) -> Vec<Option<usize>> {
     matches
 }
 
+/// End (exclusive) of the raw-HTML construct the inline scanner treats as opaque
+/// at the `<` on `pos`, or `None` when the `<` opens none and is ordinary text.
+///
+/// The order matters and is the scanner's: an autolink is tried first, so
+/// `<https://example.com/x[y>` is one opaque span rather than a tag attempt; only
+/// then is the byte run tokenized as an open, close, or comment tag. `pos` is a
+/// `<`, hence ASCII, hence a char boundary, so slicing `text` there is sound.
+fn opaque_html_end(text: &str, pos: usize) -> Option<usize> {
+    let remaining = &text[pos..];
+    if let Some((_, len)) = html::try_autolink(remaining) {
+        return Some(pos + len);
+    }
+    // The tag's attribute spans are unused here, so the base offset is 0.
+    let len = match html::tokenize_tag(remaining, 0)? {
+        HtmlTag::Open { len, .. } | HtmlTag::Close { len, .. } | HtmlTag::Comment { len } => len,
+    };
+    Some(pos + len)
+}
+
 /// Find the `]` that matches the `[` at `start`.
 ///
-/// Handles nested brackets, backslash escapes, and backtick spans.
+/// Handles nested brackets, backslash escapes, and backtick spans — but not the
+/// further spans [`precompute_bracket_matches`] treats as opaque (math,
+/// autolinks, raw HTML tags), so the two agree only on text that holds none of
+/// them. The inline pass uses the table; this walk serves the server's
+/// after-the-fact re-reading of a link node's own text.
 pub fn find_matching_bracket(bytes: &[u8], start: usize) -> Option<usize> {
     let mut i = start + 1;
     let mut depth: usize = 1;
@@ -1980,13 +2059,144 @@ mod tests {
         }
     }
 
+    // --- Opaque spans and the bracket table (issue 070) ---
+
+    /// Every `Link` node as `(url, source slice)`, in node order.
+    fn link_slices(tree: &Tree) -> Vec<(String, String)> {
+        tree.nodes()
+            .iter()
+            .filter_map(|n| match &n.kind {
+                ElementKind::Link { url, .. } => Some((
+                    url.clone(),
+                    tree.source()[n.span.start..n.span.end].to_string(),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `(url, slice)` pairs from string literals, for comparison against
+    /// [`link_slices`].
+    fn links(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|&(url, slice)| (url.to_string(), slice.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn unbalanced_bracket_in_math_span_does_not_steal_the_close() {
+        // Issue 070: the scanner recognizes `$…$` whole and walks past it, so the
+        // `[` inside is not a bracket at all. The table used to walk *through* the
+        // span, pair that inner `[` with the `]`, and leave the outer `[`
+        // unmatched — and because the scanner then skipped the math span on its
+        // own rules, nothing ever revisited the inner bracket and no link was
+        // emitted at all: silent missing structure. GitHub (math is opaque) and
+        // CommonMark (which has no math extension, so the run is balanced text)
+        // both produce a link here.
+        let tree = parse("[a $x[y$ b](u)\n");
+        assert_eq!(
+            link_slices(&tree),
+            links(&[("u", "[a $x[y$ b](u)")]),
+            "the opaque math span is link text, not a bracket"
+        );
+        crate::invariants::assert_bracket_table_fidelity(&tree);
+    }
+
+    #[test]
+    fn unbalanced_bracket_in_autolink_does_not_steal_the_close() {
+        // The same divergence through the autolink arm: `<…>` is opaque to the
+        // scanner, so a `[` in the URL is not a bracket. Before issue 070 the
+        // table paired it with the `]` and no link was emitted.
+        let tree = parse("[a <https://e.com/x[y> b](u)\n");
+        assert_eq!(
+            link_slices(&tree),
+            links(&[("u", "[a <https://e.com/x[y> b](u)")]),
+            "the opaque autolink is link text, not a bracket"
+        );
+        crate::invariants::assert_bracket_table_fidelity(&tree);
+    }
+
+    #[test]
+    fn bracket_inside_a_raw_html_tag_does_not_steal_the_close() {
+        // And through the tag arm: a bracket inside an attribute value is inside
+        // the opaque tag token, so it is not a bracket either.
+        let tree = parse("[a <span data-x=\"[\">z</span> b](u)\n");
+        assert_eq!(
+            link_slices(&tree),
+            links(&[("u", "[a <span data-x=\"[\">z</span> b](u)")]),
+            "the opaque tag is link text, not a bracket"
+        );
+        crate::invariants::assert_bracket_table_fidelity(&tree);
+    }
+
+    #[test]
+    fn bracket_between_raw_html_tags_stays_live() {
+        // The complement, and deliberately *not* changed by issue 070: only the
+        // tag tokens are opaque, so the text between `<span>` and `</span>` is
+        // ordinary text and the `[` in `x[y` is a live bracket. The nearest
+        // opener takes the `]` — the link anchors at the inner bracket and the
+        // leading `[a <span>x` is literal text, which is what CommonMark's
+        // most-recent-opener rule produces too.
+        let tree = parse("[a <span>x[y</span> b](u)\n");
+        assert_eq!(
+            link_slices(&tree),
+            links(&[("u", "[y</span> b](u)")]),
+            "text between tags is not opaque"
+        );
+        crate::invariants::assert_bracket_table_fidelity(&tree);
+    }
+
+    #[test]
+    fn balanced_opaque_spans_parse_unchanged() {
+        // Regression guard for the lockstep fix: where the opaque span holds a
+        // balanced pair, no bracket, or nothing the scanner recognizes at all,
+        // every parse must be byte-identical to what it was before issue 070.
+        // The span inside a matched link's text is not emitted as its own node —
+        // the scanner jumps past the link rather than descending into it.
+        for (source, url, slice) in [
+            // Balanced pair inside each opaque construct.
+            (
+                "[bound $a[i]$ tight](./a.md)\n",
+                "./a.md",
+                "[bound $a[i]$ tight](./a.md)",
+            ),
+            ("[a <span>x</span> b](u)\n", "u", "[a <span>x</span> b](u)"),
+            ("[a <!-- [c] --> b](u)\n", "u", "[a <!-- [c] --> b](u)"),
+            (
+                "[a <https://e.com/x> b](u)\n",
+                "u",
+                "[a <https://e.com/x> b](u)",
+            ),
+            // An opaque span before a link, holding an unbalanced opener.
+            ("$a[b$ [c](u)\n", "u", "[c](u)"),
+            // A `$` that opens no math span leaves its brackets live.
+            ("$a[b [c](u) then\n", "u", "[c](u)"),
+            // A `<` that opens neither autolink nor tag is ordinary text.
+            ("a < b [c](u) >\n", "u", "[c](u)"),
+            // A code span still shields its brackets, and a `$` inside one is
+            // not math.
+            ("[a `b[c $d` e](u)\n", "u", "[a `b[c $d` e](u)"),
+        ] {
+            let tree = parse(source);
+            assert_eq!(
+                link_slices(&tree),
+                links(&[(url, slice)]),
+                "balanced opaque span must parse unchanged: {source:?}"
+            );
+            crate::invariants::assert_bracket_table_fidelity(&tree);
+        }
+    }
+
     #[test]
     fn bracket_table_passes_differential_oracle() {
         // Issue 056: the precomputed table must equal the naive quadratic walk it
         // replaced. Checked here, next to the optimization, on the cases most
         // likely to separate a stack pass from a rescan — nesting, escape parity,
         // and brackets that straddle a code span whose backtick runs differ in
-        // length. The property suite and `fuzz_inlines` drive the same assertion
+        // length — and, since issue 070, on the opaque spans both walks now step
+        // over: math, autolinks, and raw HTML tags, each holding an unbalanced
+        // bracket. The property suite and `fuzz_inlines` drive the same assertion
         // over generated and mutated inputs.
         for case in [
             "[a [b [c] d] e](url \"references\")\n",
@@ -1995,10 +2205,33 @@ mod tests {
             "[a `b[c` d](url) and ``e ` [f] g`` and ```[h](url)\n",
             "`[a\nb` [c](url)\n",
             "日[本](url)語 [a\u{200b}b](url) \\🎉[c](url)\n",
+            "[a $x[y$ b](url) and $c]d$ and $ [e](url) $\n",
+            "[a <https://e.com/x[y> b](url) and <x@[y.com> here\n",
+            "[a <span data-x=\"[\">z</span> b](url) and <!-- [c] --> d\n",
+            "[a <span>x[y</span> b](url) and a < b [c](url) >\n",
+            "$a\\$[b$ [c](url) and `$d[e$` [f](url)\n",
         ] {
             let tree = parse(case);
             crate::invariants::assert_bracket_table_fidelity(&tree);
         }
+    }
+
+    #[test]
+    fn opaque_span_lookahead_is_not_quadratic() {
+        // The table now runs the scanner's opaque-span recognizers, each of which
+        // can scan forward, so it needs the scanner's own bounds: the per-line
+        // recognition cap, plus stopping after the last bracket byte. Without
+        // them a degenerate line of unclosed math spans drives one full-text scan
+        // per `$`. The bracket at each end defeats the last-bracket bound, so this
+        // measures the capped path.
+        let source = format!("[{}]\n", "$a ".repeat(100_000));
+        let start = cpu_time::ThreadTime::now();
+        let _table = super::precompute_bracket_matches(&source);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < INLINE_SLOW_BOUND,
+            "bracket table must bound its opaque-span lookahead, took {elapsed:?}"
+        );
     }
 
     #[test]

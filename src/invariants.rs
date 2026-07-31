@@ -457,8 +457,9 @@ pub fn assert_emphasis_span_fidelity(tree: &Tree) {
 /// The role a byte plays in the naive bracket-matching reference walk.
 ///
 /// `Inert` covers everything that is not a live bracket: ordinary text, the
-/// backslash of an escape and the character it escapes, and every byte of a
-/// closed backtick code span (including brackets inside it).
+/// backslash of an escape and the character it escapes, and every byte of a span
+/// the walk steps over whole — a closed backtick code span, an inline math span,
+/// an autolink, a raw HTML tag — brackets inside them included.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum BracketRole {
     /// A `[` the walk reached: an opener.
@@ -507,9 +508,208 @@ fn reference_code_span_end(bytes: &[u8], open: usize, ticks: usize) -> Option<us
     None
 }
 
+/// True for the four bytes the inline math rules treat as space.
+///
+/// The opening `$` may not be followed by one and the closing `$` may not be
+/// preceded by one. ASCII form feed is deliberately absent: the rule names space,
+/// tab, and the two line-ending bytes, which is narrower than "ASCII whitespace".
+const fn is_math_space(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t' | b'\n' | b'\r')
+}
+
+/// End (exclusive) of the inline math span opened by the `$` at `open`, or `None`
+/// when that `$` opens none.
+///
+/// GitHub's rules restated: the opening `$` must be followed by something that is
+/// neither space nor a second `$`; the closing `$` must not be preceded by space;
+/// and a backslash inside the span consumes the byte after it, so `\$` is content
+/// and not the closer. A span with no closer swallows nothing. Written from
+/// scratch for the same reason as [`run_length`].
+fn reference_math_span_end(bytes: &[u8], open: usize) -> Option<usize> {
+    match bytes.get(open + 1) {
+        None => return None,
+        Some(&next) if is_math_space(next) || next == b'$' => return None,
+        Some(_) => {}
+    }
+    let mut i = open + 1;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 1 < bytes.len() {
+            i += 2;
+        } else if bytes[i] == b'$' && !is_math_space(bytes[i - 1]) {
+            return Some(i + 1);
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
+/// End (exclusive) of the autolink opened by the `<` at `open`, or `None` when
+/// that `<` opens none.
+///
+/// `CommonMark`'s two forms restated over the run up to the first `>`: the run may
+/// hold no space, `<`, or line ending, and must be either `scheme:rest` — an ASCII
+/// letter followed by ASCII alphanumerics, `+`, `.`, or `-` — or `local@domain`,
+/// where the local part is ASCII alphanumeric or one of the address-literal
+/// punctuation bytes and the domain is a dotted run of ASCII alphanumeric / `-`
+/// labels, each non-empty and at most 63 bytes. Written from scratch for the same
+/// reason as [`run_length`].
+fn reference_autolink_end(bytes: &[u8], open: usize) -> Option<usize> {
+    let close = open + 1 + bytes[open + 1..].iter().position(|&b| b == b'>')?;
+    let inner = &bytes[open + 1..close];
+    if inner
+        .iter()
+        .any(|&b| matches!(b, b' ' | b'<' | b'\n' | b'\r'))
+    {
+        return None;
+    }
+    let end = close + 1;
+
+    if let Some(colon) = inner.iter().position(|&b| b == b':') {
+        let scheme = &inner[..colon];
+        if scheme.first().is_some_and(u8::is_ascii_alphabetic)
+            && scheme
+                .iter()
+                .skip(1)
+                .all(|&b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'.' | b'-'))
+        {
+            return Some(end);
+        }
+    }
+
+    if let Some(at) = inner.iter().position(|&b| b == b'@') {
+        let local = &inner[..at];
+        let domain = &inner[at + 1..];
+        let local_ok = !local.is_empty()
+            && local
+                .iter()
+                .all(|&b| b.is_ascii_alphanumeric() || b".!#$%&'*+/=?^_`{|}~-".contains(&b));
+        let domain_ok = !domain.is_empty()
+            && domain.contains(&b'.')
+            && domain.split(|&b| b == b'.').all(|label| {
+                !label.is_empty()
+                    && label.len() <= 63
+                    && label
+                        .iter()
+                        .all(|&b| b.is_ascii_alphanumeric() || b == b'-')
+            });
+        if local_ok && domain_ok {
+            return Some(end);
+        }
+    }
+
+    None
+}
+
+/// End (exclusive) of the raw HTML tag opened by the `<` at `open`, or `None`
+/// when that `<` opens none.
+///
+/// The tag grammar restated, in the three shapes the inline scanner recognizes:
+///
+/// - `<!-- … -->`: everything through the first `-->` after the opener;
+/// - `</name …>`: a name starting with an ASCII letter and continuing over ASCII
+///   alphanumerics and `-`, then optional whitespace, then `>`;
+/// - `<name …>` / `<name … />`: the same name rule, then attributes until `>` or
+///   `/>`. An attribute is a name that stops at `=`, `>`, `/`, or whitespace —
+///   empty is a parse failure — optionally followed by `=` and a value, which is
+///   either quoted (running to the matching quote, `>` and line endings included)
+///   or an unquoted run stopping at whitespace, `>`, or `/`.
+///
+/// Anything that runs off the end before its `>` is not a tag at all. Written
+/// from scratch for the same reason as [`run_length`]: production's tokenizer is
+/// the thing under test, so the reference may not call it.
+fn reference_tag_end(bytes: &[u8], open: usize) -> Option<usize> {
+    let rest = &bytes[open..];
+
+    if rest.starts_with(b"<!--") {
+        let body = &rest[4..];
+        let close = body.windows(3).position(|w| w == b"-->")?;
+        return Some(open + 4 + close + 3);
+    }
+
+    // The name of a close or open tag: an ASCII letter, then alphanumerics / `-`.
+    let mut i = if rest.get(1) == Some(&b'/') { 2 } else { 1 };
+    if !rest.get(i).is_some_and(u8::is_ascii_alphabetic) {
+        return None;
+    }
+    let close_tag = i == 2;
+    while i < rest.len() && (rest[i].is_ascii_alphanumeric() || rest[i] == b'-') {
+        i += 1;
+    }
+
+    if close_tag {
+        while i < rest.len() && rest[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        return (rest.get(i) == Some(&b'>')).then_some(open + i + 1);
+    }
+
+    loop {
+        while i < rest.len() && rest[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        match rest.get(i) {
+            None => return None,
+            Some(&b'/') if rest.get(i + 1) == Some(&b'>') => return Some(open + i + 2),
+            Some(&b'>') => return Some(open + i + 1),
+            Some(_) => {}
+        }
+
+        // Attribute name.
+        let name_start = i;
+        while i < rest.len()
+            && !matches!(rest[i], b'=' | b'>' | b'/')
+            && !rest[i].is_ascii_whitespace()
+        {
+            i += 1;
+        }
+        if i == name_start {
+            return None;
+        }
+        while i < rest.len() && rest[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if rest.get(i) != Some(&b'=') {
+            // Boolean attribute: no value follows.
+            continue;
+        }
+        i += 1;
+        while i < rest.len() && rest[i].is_ascii_whitespace() {
+            i += 1;
+        }
+
+        // Attribute value.
+        match rest.get(i) {
+            None => return None,
+            Some(&quote @ (b'"' | b'\'')) => {
+                i += 1;
+                while i < rest.len() && rest[i] != quote {
+                    i += 1;
+                }
+                if i >= rest.len() {
+                    return None;
+                }
+                i += 1;
+            }
+            Some(_) => {
+                let value_start = i;
+                while i < rest.len()
+                    && !rest[i].is_ascii_whitespace()
+                    && !matches!(rest[i], b'>' | b'/')
+                {
+                    i += 1;
+                }
+                if i == value_start {
+                    return None;
+                }
+            }
+        }
+    }
+}
+
 /// Classify every byte of `bytes` as a live opener, a live closer, or inert.
 ///
-/// A single left-to-right walk restating the two skipping rules of the inline
+/// A single left-to-right walk restating the skipping rules of the inline
 /// parser's bracket pass in the simplest form that can express them:
 ///
 /// - a backslash followed by any byte consumes both, so `\[` is literal text and
@@ -517,7 +717,17 @@ fn reference_code_span_end(bytes: &[u8], open: usize, ticks: usize) -> Option<us
 /// - a backtick run closed by a later run of the same length is a code span, and
 ///   every byte from the opener through the closer is inert — brackets included.
 ///   An unclosed run consumes only its own backticks, so brackets after it stay
-///   live.
+///   live;
+/// - the three spans the inline scanner treats as opaque are stepped over whole,
+///   so a bracket inside one is inert: an inline math span
+///   ([`reference_math_span_end`]), an autolink ([`reference_autolink_end`]), and
+///   a raw HTML tag ([`reference_tag_end`]). A `<` is an autolink first and a tag
+///   second, the order the scanner tries them in; a `<` that is neither is
+///   ordinary text (issue 070).
+///
+/// The last three rules apply only within the first
+/// [`MAX_INLINE_LINE_BYTES`](crate::limits::MAX_INLINE_LINE_BYTES) of a line,
+/// because that is where the inline scanner stops recognizing constructs.
 ///
 /// Every byte this walk inspects is ASCII, and no ASCII byte can appear inside a
 /// multi-byte UTF-8 sequence, so classifying bytes rather than characters cannot
@@ -525,12 +735,24 @@ fn reference_code_span_end(bytes: &[u8], open: usize, ticks: usize) -> Option<us
 fn bracket_roles(bytes: &[u8]) -> Vec<BracketRole> {
     let mut roles = vec![BracketRole::Inert; bytes.len()];
     let mut i = 0;
+    let mut line_start = 0;
     while i < bytes.len() {
+        let recognize = i - line_start < crate::limits::MAX_INLINE_LINE_BYTES;
         match bytes[i] {
+            b'\n' => {
+                line_start = i + 1;
+                i += 1;
+            }
             b'\\' if i + 1 < bytes.len() => i += 2,
             b'`' => {
                 let ticks = run_length(bytes, i, b'`');
                 i = reference_code_span_end(bytes, i, ticks).unwrap_or(i + ticks);
+            }
+            b'$' if recognize => i = reference_math_span_end(bytes, i).unwrap_or(i + 1),
+            b'<' if recognize => {
+                i = reference_autolink_end(bytes, i)
+                    .or_else(|| reference_tag_end(bytes, i))
+                    .unwrap_or(i + 1);
             }
             b'[' => {
                 roles[i] = BracketRole::Open;
@@ -546,19 +768,21 @@ fn bracket_roles(bytes: &[u8]) -> Vec<BracketRole> {
     roles
 }
 
-/// The naive quadratic reference bracket-match table for `bytes`.
+/// The naive quadratic reference bracket-match table for `text`.
 ///
 /// This is the loop the production precomputation replaced: for *every* live `[`,
 /// rescan forward from scratch, counting nesting depth over the live brackets,
 /// and take the `]` that brings the depth back to zero. Re-deriving each entry
 /// independently is O(n²) — which is exactly why production stopped doing it —
 /// but it is short enough to check by eye, and it shares no code with the
-/// single-pass stack table it is compared against.
+/// single-pass stack table it is compared against: which bytes are live is
+/// [`bracket_roles`]'s own answer, from its own recognizers.
 ///
 /// Exposed so the deterministic teeth test can build an honest table and corrupt
 /// it, proving the comparison rejects a missing, spurious, or mismapped match.
 #[must_use]
-pub fn naive_bracket_matches(bytes: &[u8]) -> Vec<Option<usize>> {
+pub fn naive_bracket_matches(text: &str) -> Vec<Option<usize>> {
+    let bytes = text.as_bytes();
     let roles = bracket_roles(bytes);
     let mut matches = vec![None; bytes.len()];
     for (open, role) in roles.iter().enumerate() {
@@ -583,7 +807,7 @@ pub fn naive_bracket_matches(bytes: &[u8]) -> Vec<Option<usize>> {
     matches
 }
 
-/// Assert two bracket-match tables over `bytes` are equal, entry by entry.
+/// Assert two bracket-match tables over `text` are equal, entry by entry.
 ///
 /// `table` is the implementation under test and `reference` the oracle's answer;
 /// the message names the disagreeing byte position and both verdicts, so a
@@ -593,16 +817,16 @@ pub fn naive_bracket_matches(bytes: &[u8]) -> Vec<Option<usize>> {
 /// deliberately corrupted table — otherwise a differential that never fires could
 /// be vacuous and no one would know.
 pub fn assert_bracket_tables_equal(
-    bytes: &[u8],
+    text: &str,
     table: &[Option<usize>],
     reference: &[Option<usize>],
 ) {
-    let slice = String::from_utf8_lossy(bytes);
+    let bytes = text.as_bytes();
     assert_eq!(
         table.len(),
         reference.len(),
         "bracket-match table has {} entries for {} bytes; the reference has {} — the table must \
-         carry one entry per byte\n  slice: {slice:?}",
+         carry one entry per byte\n  slice: {text:?}",
         table.len(),
         bytes.len(),
         reference.len()
@@ -613,23 +837,23 @@ pub fn assert_bracket_tables_equal(
             want,
             "bracket-match table disagrees with the naive reference walk at byte {pos} \
              (byte {:?}): table says {got:?}, reference says {want:?} — a missing, spurious, or \
-             mismapped bracket match\n  slice: {slice:?}",
+             mismapped bracket match\n  slice: {text:?}",
             bytes.get(pos).map(|&b| char::from(b))
         );
     }
 }
 
-/// The differential bracket-match oracle of issue 056, over one byte slice.
+/// The differential bracket-match oracle of issue 056, over one text slice.
 ///
 /// The inline parser precomputes `[` → matching `]` for a whole inline host in one
-/// escape- and code-span-aware pass, so link parsing never rescans (a run like
-/// `[[[[...` used to be quadratic). That table is internal, and the downstream
-/// fidelity invariants cannot see it: they check the fields of the nodes that were
-/// emitted, so a mismapped bracket that produces a *wrong* link is caught, but one
-/// that produces a *missing* or *spurious* link is invisible — nothing asserts
-/// over a node that was never created. A bracket mismapped across a code-span
-/// boundary by miscounted backtick runs (the issue 017 undercount class) is
-/// exactly that: silent wrong output.
+/// skip-aware pass, so link parsing never rescans (a run like `[[[[...` used to be
+/// quadratic). That table is internal, and the downstream fidelity invariants
+/// cannot see it: they check the fields of the nodes that were emitted, so a
+/// mismapped bracket that produces a *wrong* link is caught, but one that produces
+/// a *missing* or *spurious* link is invisible — nothing asserts over a node that
+/// was never created. A bracket mismapped across a code-span boundary by
+/// miscounted backtick runs (the issue 017 undercount class) is exactly that:
+/// silent wrong output.
 ///
 /// This closes the gap by recomputing the table with [`naive_bracket_matches`] —
 /// an independent quadratic walk that shares no code with the production pass —
@@ -638,23 +862,25 @@ pub fn assert_bracket_tables_equal(
 /// `None` where the reference says `Some` is a missing one, and two different
 /// `Some`s are a mismap.
 ///
-/// The two implementations agree on *every* byte slice, so the invariant is stated
-/// without exemptions: no skip list, no "unless", nothing to broaden. The escape
-/// rule is `\` + any byte and the code-span rule is backtick-run pairing, in both
-/// the table and the reference; a `[` either walk skips is `None` on both sides.
+/// The comparison covers the table's whole skip surface, so the invariant is
+/// stated without exemptions: no skip list, no "unless", nothing to broaden. Every
+/// rule the table applies — the `\` + any byte escape, backtick-run pairing, and
+/// since issue 070 the three opaque spans the inline scanner steps over (math,
+/// autolink, raw HTML tag) under the same per-line recognition cap — is re-derived
+/// on the reference side by [`bracket_roles`] from its own recognizers, never by
+/// calling production's. A regression in `try_parse_inline_math`,
+/// `html::try_autolink`, or `html::tokenize_tag` therefore surfaces here as a
+/// disagreement instead of cancelling out on both sides.
 ///
-/// What this does *not* pin is the wider question of whether the table's skip rules
-/// match the inline scanner's. The scanner treats more constructs as opaque than
-/// the table does — an inline math span, a raw HTML tag, an autolink — and walks
-/// past them, while the table walks straight through their contents. Both sides of
-/// this comparison mirror the table's own documented rules, deliberately: an oracle
-/// that re-derived the scanner's opacity would have to re-implement math, tag, and
-/// autolink recognition, and a reference that duplicates production logic checks
-/// nothing.
-pub fn assert_bracket_table_agrees(bytes: &[u8]) {
-    let table = inline::precompute_bracket_matches(bytes);
-    let reference = naive_bracket_matches(bytes);
-    assert_bracket_tables_equal(bytes, &table, &reference);
+/// What this still does not pin is the handful of regions the scanner enters only
+/// *after* recognizing a construct — the destination of a link it just matched,
+/// the body of an `<a>` element up to its `</a>`, an `@path.md` import directive —
+/// which the table does not model either, and so neither side of this comparison
+/// does.
+pub fn assert_bracket_table_agrees(text: &str) {
+    let table = inline::precompute_bracket_matches(text);
+    let reference = naive_bracket_matches(text);
+    assert_bracket_tables_equal(text, &table, &reference);
 }
 
 /// Assert the bracket-match table agrees with the naive reference walk over every
@@ -676,10 +902,10 @@ pub fn assert_bracket_table_fidelity(tree: &Tree) {
             node.kind,
             ElementKind::Paragraph | ElementKind::Heading { .. } | ElementKind::TableCell
         ) {
-            assert_bracket_table_agrees(&source.as_bytes()[node.span.start..node.span.end]);
+            assert_bracket_table_agrees(&source[node.span.start..node.span.end]);
         }
     }
-    assert_bracket_table_agrees(source.as_bytes());
+    assert_bracket_table_agrees(source);
 }
 
 // ---------------------------------------------------------------------------

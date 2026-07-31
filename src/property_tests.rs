@@ -1585,9 +1585,12 @@ fn bracket_table_agrees_on_known_inputs() {
     // code-span interaction (including backtick runs longer than their closers —
     // the issue 017 undercount surface), unmatched openers and stray closers,
     // image versus link brackets, the reference forms, and multi-byte / zero-width
-    // bytes adjacent to brackets. `assert_bracket_table_fidelity` compares the
-    // production table against the naive walk on every inline-host slice and on
-    // the whole document, so reaching the end proves each agreed.
+    // bytes adjacent to brackets — and, since issue 070, the spans the inline
+    // scanner treats as opaque: math, autolinks, and raw HTML tags, each holding
+    // an unbalanced bracket, plus the near misses that open no span at all.
+    // `assert_bracket_table_fidelity` compares the production table against the
+    // naive walk on every inline-host slice and on the whole document, so
+    // reaching the end proves each agreed.
     let cases = [
         "",
         "[]\n",
@@ -1625,6 +1628,28 @@ fn bracket_table_agrees_on_known_inputs() {
         "\u{feff}[a](./x.md)\n",
         "[a](./x.md)\r\n[b `c[d`](./y.md)\r\n",
         "[a](./x.md)\r[b](./y.md)\r",
+        // Opaque spans holding unbalanced brackets (issue 070).
+        "[a $x[y$ b](./x.md)\n",
+        "[a $x]y$ b](./x.md)\n",
+        "$a[b$ [c](./x.md) $d]e$\n",
+        "[a <https://e.com/x[y> b](./x.md)\n",
+        "[a <x@[y.com> b](./x.md)\n",
+        "[a <span data-x=\"[\">z</span> b](./x.md)\n",
+        "[a <span>x[y</span> b](./x.md)\n",
+        "[a <!-- [b] --> c](./x.md)\n",
+        "[a <!-- b] --> c](./x.md)\n",
+        // Near misses: constructs that open no opaque span, so their brackets
+        // stay live — `$5`, a spaced `$`, an unterminated math run, a bare `<`,
+        // a malformed tag, and an unterminated comment.
+        "a $5 [b](./x.md) and $ [c](./y.md) $\n",
+        "$a[b [c](./x.md) then more\n",
+        "a < b [c](./x.md) > d\n",
+        "a <1x [b](./x.md)> c\n",
+        "a <!-- [b](./x.md) c\n",
+        "a <span data-x=\"[ [b](./x.md)\n",
+        // Escapes inside a math span, and a math-looking run inside a code span.
+        "$a\\$[b$ [c](./x.md)\n",
+        "`$a[b$` [c](./x.md)\n",
     ];
     for case in cases {
         let tree = parse_full(case);
@@ -1664,8 +1689,8 @@ fn bracket_table_oracle_has_teeth() {
     let bytes = source.as_bytes();
 
     // The honest reference table, and the production table agreeing with it.
-    assert_bracket_table_agrees(bytes);
-    let honest = naive_bracket_matches(bytes);
+    assert_bracket_table_agrees(source);
+    let honest = naive_bracket_matches(source);
 
     let open = honest
         .iter()
@@ -1691,7 +1716,7 @@ fn bracket_table_oracle_has_teeth() {
         ("mismapped", mismapped),
     ] {
         let caught = std::panic::catch_unwind(|| {
-            assert_bracket_tables_equal(bytes, &corrupted, &honest);
+            assert_bracket_tables_equal(source, &corrupted, &honest);
         });
         assert!(
             caught.is_err(),
@@ -1702,7 +1727,7 @@ fn bracket_table_oracle_has_teeth() {
 
     // And the genuine invariant still passes on the honest source (teeth, not a
     // hair trigger).
-    assert_bracket_table_agrees(bytes);
+    assert_bracket_table_agrees(source);
 }
 
 #[test]
