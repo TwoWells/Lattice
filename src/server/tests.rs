@@ -9,11 +9,13 @@ use std::path::PathBuf;
 use super::diagnostics::*;
 use super::notify::*;
 use super::publish::*;
+use super::semantic_tokens::*;
 use super::workspaces::*;
 use super::*;
 use lsp_server::Notification;
 
 use crate::block::{HeadingId, Syntax};
+use crate::line_index::LineIndex;
 use crate::span::Span;
 use crate::store::Tier;
 use crate::validation::{Diagnostic, Severity};

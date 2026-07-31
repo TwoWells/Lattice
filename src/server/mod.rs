@@ -37,9 +37,12 @@
 
 mod completion;
 mod diagnostics;
+mod folding;
 mod helpers;
+mod hover;
 mod notify;
 mod publish;
+mod semantic_tokens;
 mod workspaces;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -48,24 +51,26 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use lsp_server::{Connection, Message, Request, RequestId, Response};
 
-use crate::block::{
-    ElementKind, Heading, HeadingId, LinkKind, NodeId, Syntax, Tree, content_lines, first_line,
-};
-use crate::line_index::LineIndex;
+use crate::block::{ElementKind, Heading, HeadingId, LinkKind, NodeId, Syntax, Tree, first_line};
 use crate::lsp;
-use crate::span::Span;
 use crate::uri::{path_to_uri, uri_to_path};
 use crate::validation::{self};
 use crate::workspace::{FileData, WorkspaceView, target_to_key};
 
 use self::completion::completion;
+use self::folding::folding_ranges;
 use self::helpers::{
     enclosing_heading, file_hierarchy_item, find_classified_link, heading_at_line,
     heading_index_at_line, heading_to_hierarchy_item, hierarchy_item_level, line_byte_range,
     link_ref_label, ref_def_label_at_offset, source_line_at, span_to_lsp_range,
 };
+use self::hover::hover_preview;
 use self::notify::handle_notification;
 use self::publish::publish_all_diagnostics;
+use self::semantic_tokens::{
+    SEMANTIC_MODIFIER_BOLD, SEMANTIC_MODIFIER_ITALIC, SEMANTIC_MODIFIER_STRIKETHROUGH,
+    SEMANTIC_TOKEN_TYPE_MARKUP, semantic_tokens_full, semantic_tokens_range,
+};
 use self::workspaces::Workspaces;
 
 // The position conversions keep their `crate::server::…` spelling: they are the
@@ -87,33 +92,6 @@ pub use self::diagnostics::collect_all_diagnostics;
 pub use self::helpers::byte_offset_to_lsp_position;
 #[cfg(any(test, feature = "fuzzing"))]
 pub use self::publish::merge_perspectives;
-
-// ---------------------------------------------------------------------------
-// Semantic tokens legend (ticket integration 15)
-// ---------------------------------------------------------------------------
-
-/// The single semantic token type Lattice emits. All emphasis runs carry this
-/// base type and distinguish themselves through modifiers, so overlapping runs
-/// (strong inside emphasis) compose into one token with combined modifiers
-/// rather than two illegal overlapping tokens.
-const SEMANTIC_TOKEN_TYPE_MARKUP: &str = "markup";
-/// Modifier name for strong (`**bold**`) runs.
-const SEMANTIC_MODIFIER_BOLD: &str = "bold";
-/// Modifier name for emphasis (`*italic*`) runs.
-const SEMANTIC_MODIFIER_ITALIC: &str = "italic";
-/// Modifier name for strikethrough (`~~struck~~`) runs.
-const SEMANTIC_MODIFIER_STRIKETHROUGH: &str = "strikethrough";
-
-/// Token-type index into the legend's `tokenTypes` array. Only `markup`
-/// (index 0) exists.
-const SEMANTIC_TOKEN_TYPE_MARKUP_INDEX: u32 = 0;
-/// Modifier bit for `bold` — index 0 in the legend's `tokenModifiers` array.
-const SEMANTIC_MODIFIER_BOLD_BIT: u32 = 1 << 0;
-/// Modifier bit for `italic` — index 1 in the legend's `tokenModifiers` array.
-const SEMANTIC_MODIFIER_ITALIC_BIT: u32 = 1 << 1;
-/// Modifier bit for `strikethrough` — index 2 in the legend's `tokenModifiers`
-/// array.
-const SEMANTIC_MODIFIER_STRIKETHROUGH_BIT: u32 = 1 << 2;
 
 /// Fixed registration id for the `.lattice.toml` watcher.
 ///
@@ -2398,378 +2376,6 @@ fn document_links(workspaces: &Workspaces, uri: &str) -> Vec<lsp::DocumentLink> 
     }
 
     links
-}
-
-// ---------------------------------------------------------------------------
-// Hover preview (ticket 10)
-// ---------------------------------------------------------------------------
-
-/// Show a preview of the link target on hover.
-#[allow(
-    clippy::cast_possible_truncation,
-    reason = "line numbers in markdown files won't exceed u32::MAX"
-)]
-fn hover_preview(
-    workspaces: &Workspaces,
-    params: &lsp::TextDocumentPositionParams,
-) -> Option<lsp::Hover> {
-    let (workspace, rel_path) = workspaces.resolve_document(&params.text_document.uri)?;
-    let file_data = workspace.file(&rel_path)?;
-    let root = workspace.root();
-    let file_links = file_data.tree.links(&root.join(&rel_path));
-
-    // Find the link on the cursor's line. Embeds are skipped rather than
-    // matched-and-rejected: an embed asserts no relation, so it has no hover to
-    // show, and letting one win the line would hide the hover of a real link
-    // sharing that line (issue 058).
-    let cursor_line = params.position.line;
-    let link = file_links.iter().find(|l| {
-        l.line.saturating_sub(1) as u32 == cursor_line && !matches!(l.kind, LinkKind::Embed { .. })
-    })?;
-
-    let (target, fragment, predicate) = match &link.kind {
-        LinkKind::IntraProject {
-            target,
-            fragment,
-            predicate,
-            ..
-        } => (target.clone(), fragment.clone(), predicate.as_str()),
-        LinkKind::NonMarkdown { target } => (target.clone(), None, "references"),
-        // No hover for external or intra-document links, nor for embeds (which
-        // the candidate filter above already excluded).
-        LinkKind::External { .. } | LinkKind::IntraDocument { .. } | LinkKind::Embed { .. } => {
-            return None;
-        }
-    };
-
-    let target_data = workspace.file(&target)?;
-
-    // For a graph edge whose predicate was explicitly authored, surface the
-    // opposite label the edge derives on its target's backlinks, so an agent
-    // sees both ends of the relationship without opening the target (decision
-    // 008). Implicit `references` links, non-markdown links, and unknown
-    // predicates have no informative paired label, so the clause is omitted.
-    let opposite = match &link.kind {
-        LinkKind::IntraProject {
-            explicit_predicate: true,
-            ..
-        } => workspace.config().opposite_of(predicate),
-        _ => None,
-    };
-
-    let preview = build_hover_preview(target_data, fragment.as_deref());
-    // Display the root-relative form, not the root-free absolute target.
-    let target_key = target_to_key(root, &target);
-    let target_display = target_key.display();
-    let header = opposite.map_or_else(
-        || format!("**{predicate}** → `{target_display}`"),
-        |opposite| {
-            format!(
-                "**{predicate}** → `{target_display}` (derives **{opposite}** on `{target_display}`)"
-            )
-        },
-    );
-
-    Some(lsp::Hover {
-        contents: lsp::MarkupContent {
-            kind: "markdown".to_string(),
-            value: format!("{header}\n\n---\n\n{preview}"),
-        },
-    })
-}
-
-/// Build a ~5 line preview from the target file content.
-fn build_hover_preview(target_data: &crate::workspace::FileData, fragment: Option<&str>) -> String {
-    let content = target_data.tree.source();
-    let lines: Vec<&str> = content_lines(content).collect();
-    let headings = target_data.tree.headings();
-
-    // Determine the start line for the preview.
-    let start = fragment.map_or_else(
-        // No fragment — skip frontmatter.
-        || target_data.frontmatter.as_ref().map_or(0, |fm| fm.end_line),
-        // Fragment — find the matching heading.
-        |frag| {
-            headings
-                .iter()
-                .find(|h| heading_matches_fragment(h, frag))
-                .map_or(0, |h| h.line.saturating_sub(1))
-        },
-    );
-
-    lines
-        .iter()
-        .skip(start)
-        .filter(|l| !l.trim().is_empty())
-        .take(5)
-        .copied()
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-// ---------------------------------------------------------------------------
-// Folding range (ticket 11)
-// ---------------------------------------------------------------------------
-
-/// Return folding ranges for headings and frontmatter.
-#[allow(
-    clippy::cast_possible_truncation,
-    reason = "line numbers in markdown files won't exceed u32::MAX"
-)]
-fn folding_ranges(workspaces: &Workspaces, uri: &str) -> Vec<lsp::FoldingRange> {
-    let Some((workspace, rel_path)) = workspaces.resolve_document(uri) else {
-        return Vec::new();
-    };
-    let Some(file_data) = workspace.file(&rel_path) else {
-        return Vec::new();
-    };
-
-    let total_lines = crate::fm::line_count(file_data.tree.source()) as u32;
-
-    let mut ranges = Vec::new();
-
-    // Frontmatter folding range.
-    if let Some(fm) = &file_data.frontmatter {
-        let start = fm.start_line.saturating_sub(1) as u32;
-        let end = fm.end_line.saturating_sub(1) as u32;
-        if end > start {
-            ranges.push(lsp::FoldingRange {
-                start_line: start,
-                end_line: end,
-                kind: Some("region".to_string()),
-            });
-        }
-    }
-
-    // Heading folding ranges.
-    let headings = file_data.tree.headings();
-    for (i, heading) in headings.iter().enumerate() {
-        let start = heading.line.saturating_sub(1) as u32;
-        // End is the line before the next heading at same or higher level, or EOF.
-        let end = headings[i + 1..]
-            .iter()
-            .find(|h| h.level <= heading.level)
-            .map_or_else(
-                || total_lines.saturating_sub(1),
-                |h| (h.line.saturating_sub(1) as u32).saturating_sub(1),
-            );
-        if end > start {
-            ranges.push(lsp::FoldingRange {
-                start_line: start,
-                end_line: end,
-                kind: Some("region".to_string()),
-            });
-        }
-    }
-
-    ranges
-}
-
-// ---------------------------------------------------------------------------
-// Semantic tokens (ticket integration 15)
-// ---------------------------------------------------------------------------
-
-/// A maximal disjoint byte region carrying the union of emphasis modifiers
-/// active over it. Reconstructed from the parser's flat, *overlapping* sibling
-/// emphasis spans so the emitted token stream can be non-overlapping (an LSP
-/// hard requirement), while still styling the `foo` in `***foo***` as both
-/// bold and italic.
-#[derive(Debug, Clone, Copy)]
-struct EmphasisRegion {
-    /// Byte start (inclusive) in the source.
-    start: usize,
-    /// Byte end (exclusive) in the source.
-    end: usize,
-    /// OR of the `SEMANTIC_MODIFIER_*_BIT` flags active over `[start, end)`.
-    modifiers: u32,
-}
-
-/// Map an emphasis [`ElementKind`] to its modifier bit, or `None` if the node
-/// is not an emphasis run.
-fn emphasis_modifier_bit(kind: &ElementKind) -> Option<u32> {
-    match kind {
-        ElementKind::Strong => Some(SEMANTIC_MODIFIER_BOLD_BIT),
-        ElementKind::Emphasis => Some(SEMANTIC_MODIFIER_ITALIC_BIT),
-        ElementKind::Strikethrough => Some(SEMANTIC_MODIFIER_STRIKETHROUGH_BIT),
-        _ => None,
-    }
-}
-
-/// Reconstruct the maximal disjoint regions from the parser's overlapping
-/// emphasis spans, each tagged with the union of modifiers active over it.
-///
-/// Parser 26 emits emphasis as flat, *overlapping* sibling spans (e.g.
-/// `***foo***` yields a `Strong` over `**foo**` and an `Emphasis` over the
-/// whole `***foo***`), but the LSP semantic-tokens protocol requires a flat,
-/// non-overlapping token list. We flatten by collecting every emphasis span's
-/// endpoints as cut points, then, for each adjacent pair of cut points, OR the
-/// modifiers of every span that fully covers that sub-segment. Segments with
-/// no active modifier (the gaps between runs) are dropped. The result is sorted
-/// by start and pairwise non-overlapping.
-///
-/// Emphasis runs never appear inside code spans or code blocks — the inline
-/// parser excludes those before delimiter matching — so this naturally emits no
-/// tokens in code.
-fn collect_emphasis_regions(tree: &Tree) -> Vec<EmphasisRegion> {
-    // (start, end, modifier_bit) for every emphasis run.
-    let mut spans: Vec<(usize, usize, u32)> = Vec::new();
-    for node in tree.nodes() {
-        if let Some(bit) = emphasis_modifier_bit(&node.kind) {
-            spans.push((node.span.start, node.span.end, bit));
-        }
-    }
-    if spans.is_empty() {
-        return Vec::new();
-    }
-
-    // Sorted, deduped boundary set: every distinct start/end is a cut point.
-    let mut cuts: Vec<usize> = Vec::with_capacity(spans.len() * 2);
-    for &(start, end, _) in &spans {
-        cuts.push(start);
-        cuts.push(end);
-    }
-    cuts.sort_unstable();
-    cuts.dedup();
-
-    // For each adjacent cut-point pair, the modifier mask is the OR of every
-    // span that fully covers the segment.
-    let mut regions: Vec<EmphasisRegion> = Vec::new();
-    for window in cuts.windows(2) {
-        let (seg_start, seg_end) = (window[0], window[1]);
-        let mut modifiers = 0;
-        for &(start, end, bit) in &spans {
-            if start <= seg_start && seg_end <= end {
-                modifiers |= bit;
-            }
-        }
-        if modifiers != 0 {
-            regions.push(EmphasisRegion {
-                start: seg_start,
-                end: seg_end,
-                modifiers,
-            });
-        }
-    }
-    regions
-}
-
-/// Encode emphasis regions as the LSP delta-quintuple stream, restricted to
-/// `byte_filter` (the whole document for `/full`, or a range's byte span for
-/// `/range`).
-///
-/// A single LSP token may not span a line break, so each region is split at
-/// line boundaries before encoding. Byte→UTF-16 conversion is delegated to the
-/// file's cached [`LineIndex`] (`span_to_lsp_range`), the same UTF-16-aware
-/// mapping diagnostics use, so multibyte and astral characters map correctly.
-/// Tokens are delta-encoded against the previous token's position, as the
-/// protocol requires.
-#[allow(
-    clippy::cast_possible_truncation,
-    reason = "line/column values in markdown files won't exceed u32::MAX"
-)]
-fn encode_semantic_tokens(
-    source: &str,
-    index: &LineIndex,
-    regions: &[EmphasisRegion],
-    byte_filter: std::ops::Range<usize>,
-) -> lsp::SemanticTokens {
-    let mut data: Vec<u32> = Vec::new();
-    // Previous token's absolute (line, char) for delta encoding.
-    let mut prev_line = 0u32;
-    let mut prev_char = 0u32;
-
-    for region in regions {
-        let start = region.start.max(byte_filter.start);
-        let end = region.end.min(byte_filter.end);
-        if start >= end {
-            continue;
-        }
-        let range = span_to_lsp_range(source, index, &Span::new(start, end));
-        // Split into one token per line the region touches: an LSP token is
-        // single-line, so a region crossing a `\n` becomes several tokens.
-        for line in range.start.line..=range.end.line {
-            let line_start_char = if line == range.start.line {
-                range.start.character
-            } else {
-                0
-            };
-            // The line's content end in UTF-16 units, or the region end on the
-            // final line.
-            let line_end_char = if line == range.end.line {
-                range.end.character
-            } else {
-                let (ls, le) = line_byte_range(source, line);
-                source[ls..le].chars().map(char::len_utf16).sum::<usize>() as u32
-            };
-            let length = line_end_char.saturating_sub(line_start_char);
-            if length == 0 {
-                continue;
-            }
-            let delta_line = line - prev_line;
-            let delta_start = if delta_line == 0 {
-                line_start_char - prev_char
-            } else {
-                line_start_char
-            };
-            data.extend_from_slice(&[
-                delta_line,
-                delta_start,
-                length,
-                SEMANTIC_TOKEN_TYPE_MARKUP_INDEX,
-                region.modifiers,
-            ]);
-            prev_line = line;
-            prev_char = line_start_char;
-        }
-    }
-
-    lsp::SemanticTokens { data }
-}
-
-/// Answer `textDocument/semanticTokens/full`: emphasis tokens over the whole
-/// document.
-///
-/// Returns an empty token set for unknown documents. Styling only — never
-/// emits a diagnostic.
-///
-/// # Perf seam
-///
-/// `full/delta` is intentionally not served: re-encoding only the emphasis runs
-/// is cheap, and a delta handler should consume the perf workstream's reusable
-/// "what changed since last parse" diff rather than recompute one — wire it
-/// here once that lands (ticket integration 15, perf seam).
-fn semantic_tokens_full(workspaces: &Workspaces, uri: &str) -> lsp::SemanticTokens {
-    let Some((workspace, rel_path)) = workspaces.resolve_document(uri) else {
-        return lsp::SemanticTokens::default();
-    };
-    let Some(file_data) = workspace.file(&rel_path) else {
-        return lsp::SemanticTokens::default();
-    };
-    let source = file_data.tree.source();
-    let regions = collect_emphasis_regions(&file_data.tree);
-    encode_semantic_tokens(source, &file_data.line_index, &regions, 0..source.len())
-}
-
-/// Answer `textDocument/semanticTokens/range`: emphasis tokens restricted to
-/// `range` (the byte span between its endpoints), for large documents.
-///
-/// Returns an empty token set for unknown documents.
-fn semantic_tokens_range(
-    workspaces: &Workspaces,
-    uri: &str,
-    range: &lsp::Range,
-) -> lsp::SemanticTokens {
-    let Some((workspace, rel_path)) = workspaces.resolve_document(uri) else {
-        return lsp::SemanticTokens::default();
-    };
-    let Some(file_data) = workspace.file(&rel_path) else {
-        return lsp::SemanticTokens::default();
-    };
-    let source = file_data.tree.source();
-    let start = file_data.line_index.offset(source, range.start);
-    let end = file_data.line_index.offset(source, range.end);
-    let regions = collect_emphasis_regions(&file_data.tree);
-    encode_semantic_tokens(source, &file_data.line_index, &regions, start..end)
 }
 
 // ---------------------------------------------------------------------------
