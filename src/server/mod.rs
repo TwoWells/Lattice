@@ -38,15 +38,17 @@
 mod completion;
 mod diagnostics;
 mod folding;
+mod formatting;
 mod helpers;
 mod hover;
 mod notify;
 mod publish;
+mod rename;
 mod semantic_tokens;
 mod workspaces;
 
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::collections::HashSet;
+use std::path::Path;
 
 use anyhow::{Context, Result};
 use lsp_server::{Connection, Message, Request, RequestId, Response};
@@ -59,6 +61,7 @@ use crate::workspace::{FileData, WorkspaceView, target_to_key};
 
 use self::completion::completion;
 use self::folding::folding_ranges;
+use self::formatting::format_document;
 use self::helpers::{
     enclosing_heading, file_hierarchy_item, find_classified_link, heading_at_line,
     heading_index_at_line, heading_to_hierarchy_item, hierarchy_item_level, line_byte_range,
@@ -67,6 +70,7 @@ use self::helpers::{
 use self::hover::hover_preview;
 use self::notify::handle_notification;
 use self::publish::publish_all_diagnostics;
+use self::rename::{do_rename, prepare_rename, will_rename_files};
 use self::semantic_tokens::{
     SEMANTIC_MODIFIER_BOLD, SEMANTIC_MODIFIER_ITALIC, SEMANTIC_MODIFIER_STRIKETHROUGH,
     SEMANTIC_TOKEN_TYPE_MARKUP, semantic_tokens_full, semantic_tokens_range,
@@ -1391,165 +1395,6 @@ fn collect_workspace_symbols(
 }
 
 // ---------------------------------------------------------------------------
-// prepareRename / rename (ticket 04)
-// ---------------------------------------------------------------------------
-
-/// Find the heading at a cursor position, returning its text range.
-///
-/// Uses the tree's `text_span` to compute the exact text range, supporting
-/// ATX, setext, and HTML headings without prefix assumptions.
-fn prepare_rename(
-    workspaces: &Workspaces,
-    params: &lsp::TextDocumentPositionParams,
-) -> Option<lsp::Range> {
-    let (workspace, rel_path) = workspaces.resolve_document(&params.text_document.uri)?;
-    let file_data = workspace.file(&rel_path)?;
-    let heading = heading_at_line(&file_data.headings, params.position.line)?;
-
-    Some(span_to_lsp_range(
-        file_data.tree.source(),
-        &file_data.line_index,
-        &heading.text_span,
-    ))
-}
-
-/// Rename a heading — its own text *and* every fragment that referred to it.
-///
-/// A heading rename is a coordinate change on the fragment axis exactly as a file
-/// move is one on the path axis (issue 057, decision 020), so it rides the same
-/// engine: [`crate::mv::compute_heading_rename_edits`] returns the complete
-/// forced edit set — the heading's `text_span` (ATX, setext, and HTML alike),
-/// every cross-file `file.md#slug` referrer, and every same-document `#slug`
-/// anchor — and the same [`merge_span_edits`] mapping turns it into one atomic
-/// [`lsp::WorkspaceEdit`]. Path spellings, embeds, prose mentions of the old
-/// title, and exception keys are untouched: the judgment surface stays in the
-/// loop (decision 020 clause 5).
-fn do_rename(workspaces: &Workspaces, params: &lsp::RenameParams) -> Option<lsp::WorkspaceEdit> {
-    let (workspace, rel_path) = workspaces.resolve_document(&params.text_document.uri)?;
-    let file_data = workspace.file(&rel_path)?;
-    let heading = heading_at_line(&file_data.headings, params.position.line)?;
-
-    let edits = crate::mv::compute_heading_rename_edits(
-        &workspace,
-        &rel_path,
-        heading.line,
-        &params.new_name,
-    )?;
-
-    let mut changes: HashMap<String, Vec<lsp::TextEdit>> = HashMap::new();
-    merge_span_edits(workspaces, &edits, &mut changes);
-
-    Some(lsp::WorkspaceEdit {
-        changes: Some(changes),
-    })
-}
-
-// ---------------------------------------------------------------------------
-// Editor move surface — workspace/willRenameFiles (ticket mv/02, decision 020)
-// ---------------------------------------------------------------------------
-
-/// Answer a `workspace/willRenameFiles` request with the move engine's forced
-/// edit set (decision 020 clause 2).
-///
-/// Each `(oldUri, newUri)` is translated into a [`crate::mv::compute_move_edits`]
-/// call over the source's covering scope at each document's **current** text
-/// (decision 024 clause 9); every file's edits are converted to LSP ranges
-/// (through that file's cached [`LineIndex`]) and merged into one
-/// [`lsp::WorkspaceEdit`]. The client applies it to the buffers it holds, then
-/// performs the rename; the aftermath needs no special path, because the edits
-/// re-enter through the channels that already exist — buffer edits as
-/// `didChange`, disk writes as watcher events — plus
-/// `workspace/didRenameFiles`'s re-keying.
-///
-/// A source outside every scope contributes no edits (there is no edit set to
-/// compute — a plain rename already does everything Lattice could; decision 020
-/// clause 6), so the rename proceeds unimpeded. Any other refusal
-/// (cross-marker, existing destination, markdown-ness flip, …) short-circuits
-/// the whole batch: `Err(message)` carries the alias-steering / fix-naming
-/// text, which the caller returns as a JSON-RPC error so the client aborts the
-/// rename and no file moves.
-///
-/// # Errors
-///
-/// Returns the refusal message (a [`crate::mv::MoveError`] `Display`) for the
-/// first rename the engine refuses.
-fn will_rename_files(
-    workspaces: &Workspaces,
-    params: &lsp::RenameFilesParams,
-) -> Result<lsp::WorkspaceEdit, String> {
-    let mut changes: HashMap<String, Vec<lsp::TextEdit>> = HashMap::new();
-
-    for rename in &params.files {
-        let old_abs = uri_to_path(&rename.old_uri);
-        let new_abs = uri_to_path(&rename.new_uri);
-
-        // Without a covering scope there is no keyspace to compute an edit set
-        // over — the source is outside every graph. Contribute nothing and let
-        // the client's rename proceed (decision 020 clause 6); refusing here
-        // would block a legitimate rename of a file Lattice does not manage.
-        let Some(root) = workspaces.deepest_root_for(&old_abs) else {
-            continue;
-        };
-
-        // Decision 024 clause 9: an edit surface computes spans against each
-        // touched document's **current** text, because the client applies the
-        // returned edits to the buffers it holds. An edit computed against
-        // saved coordinates and applied to a diverged buffer lands in the
-        // wrong place. "Current" collapses to "saved" for a closed document,
-        // so openness is not a condition on service.
-        let view = workspaces.current_view(&root);
-        let fs_exists = |p: &Path| p.is_file() || p.is_dir();
-        let edits = crate::mv::compute_move_edits(&view, &old_abs, &new_abs, &fs_exists)
-            .map_err(|e| e.to_string())?;
-
-        merge_span_edits(workspaces, &edits.edits, &mut changes);
-    }
-
-    Ok(lsp::WorkspaceEdit {
-        changes: Some(changes),
-    })
-}
-
-/// Convert an engine's per-file byte-span edits into LSP `TextEdit`s and merge
-/// them into `changes` (keyed by document URI).
-///
-/// Each edited file's source and cached [`LineIndex`] come from its **current**
-/// copy — the buffer where the client holds one, the saved copy elsewhere
-/// (decision 024 clause 9) — which is the same text the engine computed the
-/// spans over, so the byte→UTF-16 conversion lands where the client will apply
-/// it. A file the store does not hold is skipped — the engines only enumerate
-/// files in the view, so this is defensive.
-///
-/// Shared by both coordinate axes: the path-axis move engine
-/// ([`will_rename_files`]) and the fragment-axis heading rename
-/// ([`do_rename`]) hand their edit sets to the same mapping, so neither surface
-/// has a private notion of a workspace edit.
-fn merge_span_edits(
-    workspaces: &Workspaces,
-    edits: &BTreeMap<PathBuf, Vec<crate::mv::MoveTextEdit>>,
-    changes: &mut HashMap<String, Vec<lsp::TextEdit>>,
-) {
-    for (abs_path, file_edits) in edits {
-        let Some(doc) = workspaces.store.current(abs_path) else {
-            continue;
-        };
-        let source = doc.data.tree.source();
-        let index = &doc.data.line_index;
-        let uri = path_to_uri(abs_path);
-        let entry = changes.entry(uri).or_default();
-        for edit in file_edits {
-            entry.push(lsp::TextEdit {
-                range: span_to_lsp_range(source, index, &edit.span),
-                new_text: edit.new_text.clone(),
-            });
-        }
-        // A file touched by more than one rename in the batch accumulates edits
-        // out of order; sort so the client applies them deterministically.
-        entry.sort_by_key(|e| (e.range.start.line, e.range.start.character));
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Find references (ticket 05)
 // ---------------------------------------------------------------------------
 
@@ -2376,54 +2221,6 @@ fn document_links(workspaces: &Workspaces, uri: &str) -> Vec<lsp::DocumentLink> 
     }
 
     links
-}
-
-// ---------------------------------------------------------------------------
-// Formatting (ticket 12)
-// ---------------------------------------------------------------------------
-
-/// Format a document's backlink frontmatter.
-///
-/// Delegates to the shared [`crate::format::format_source`] engine (the single
-/// source of formatting semantics, shared with the `lattice format` CLI): it
-/// sorts predicate keys alphabetically, sorts paths within each predicate,
-/// normalizes whitespace, and — if the config specifies an external formatter —
-/// pipes the full document through it after frontmatter sorting. The formatted
-/// document is returned as a single whole-document [`lsp::TextEdit`].
-#[allow(
-    clippy::cast_possible_truncation,
-    reason = "line numbers in markdown files won't exceed u32::MAX"
-)]
-fn format_document(workspaces: &Workspaces, uri: &str) -> Option<Vec<lsp::TextEdit>> {
-    let (workspace, rel_path) = workspaces.resolve_document(uri)?;
-    let file_data = workspace.file(&rel_path)?;
-
-    let source = file_data.tree.source();
-    let document = crate::format::format_source(
-        source,
-        file_data.frontmatter.as_ref(),
-        workspace.config().format_command.as_deref(),
-    )?;
-
-    // Replace the entire document.
-    let total_lines = source.lines().count() as u32;
-    let last_line_len = source.lines().last().map_or(0, str::len) as u32;
-
-    let range = lsp::Range {
-        start: lsp::Position {
-            line: 0,
-            character: 0,
-        },
-        end: lsp::Position {
-            line: total_lines.saturating_sub(1),
-            character: last_line_len,
-        },
-    };
-
-    Some(vec![lsp::TextEdit {
-        range,
-        new_text: document,
-    }])
 }
 
 #[cfg(test)]

@@ -3,6 +3,7 @@
 
 //! Tests for the LSP server module.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
