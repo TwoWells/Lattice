@@ -754,6 +754,8 @@ fn emit_tree_bare_paths(
             lookup.route(ExceptionLint::BarePaths, &bare.path, diag, out);
         } else {
             route_stale_reference(
+                config,
+                external_exists,
                 config.policy.stale_references,
                 rel_path,
                 bare.line,
@@ -925,6 +927,11 @@ const fn bare_path_severity(policy: BarePathPolicy, base: Severity) -> Severity 
 /// following suggestion 001's self-documenting-message principle), so an agent
 /// learns from the diagnostic that a cross-repo reference should be written and
 /// aliased rather than left to dangle.
+///
+/// This is the message for a path with no known citation. When the path *does*
+/// exist under a configured alias directory,
+/// [`build_external_citation_steer`] replaces the generic lesson with the
+/// concrete spelling (issue 073).
 fn build_stale_reference(
     policy: StaleReferencePolicy,
     rel_path: &Path,
@@ -950,14 +957,163 @@ fn build_stale_reference(
     })
 }
 
+/// Emit the steering variant of the stale-reference diagnostic: the dangling
+/// path exists under a configured `[external]` alias directory, so the message
+/// names the exact citation to write instead of teaching the `{repo}/…` form
+/// generically (issue 073).
+///
+/// Distinct from [`build_stale_reference`] only in wording and evidence: that
+/// message says the external form *exists*, this one says *this path is one* and
+/// spells it. Everything else is deliberately identical — the `stale reference:`
+/// prefix keeps [`classify_028_lint`] routing it to the same ledger row and
+/// exception namespace, `reference` is still the key the exception lookup
+/// matches verbatim, and severity tracks [`StaleReferencePolicy`] with
+/// `Disabled` returning `None`. Steering changes the message, never the tier.
+fn build_external_citation_steer(
+    policy: StaleReferencePolicy,
+    rel_path: &Path,
+    line: usize,
+    span: Option<Span>,
+    reference: &str,
+    alias: &str,
+    citation: &str,
+) -> Option<Diagnostic> {
+    let severity = match policy {
+        StaleReferencePolicy::Disabled => return None,
+        StaleReferencePolicy::Hint => Severity::Hint,
+        StaleReferencePolicy::Warn => Severity::Warning,
+        StaleReferencePolicy::Deny => Severity::Error,
+    };
+
+    Some(Diagnostic {
+        file: rel_path.to_path_buf(),
+        line,
+        severity,
+        message: format!(
+            "stale reference: `{reference}` — path exists in external `{alias}` — cite it as `{citation}`"
+        ),
+        span,
+    })
+}
+
+/// Rewrite a dark-matter reference as the workspace-relative path to probe under
+/// an alias directory, or `None` when it has no external-citation form.
+///
+/// Collapses `.` and `..` by pure component arithmetic over the `/`-separated
+/// markdown reference grammar, and drops the leading `/` of a root-relative
+/// citation — which must go before the probe, because [`Path::join`] with an
+/// absolute argument *discards* the alias directory and would `stat` a
+/// filesystem-absolute path instead. A reference that escapes the workspace root
+/// (`../sibling.md`) has no citation form under any alias and returns `None`,
+/// mirroring [`candidate_exists`]'s rejection of the same shape.
+///
+/// The result doubles as the citation spelling's path part, so it is rebuilt
+/// with `/` rather than reusing [`block::normalize_path`]'s `PathBuf`: the
+/// message quotes a markdown reference, whose separator is `/` on every
+/// platform.
+fn external_citation_candidate(path: &str) -> Option<String> {
+    let mut parts: Vec<&str> = Vec::new();
+    for part in path.trim_start_matches('/').split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            normal => parts.push(normal),
+        }
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some(parts.join("/"))
+}
+
+/// Test whether a dangling reference names a path that exists under a configured
+/// `[external]` alias directory, and if so return that alias and the exact
+/// citation spelling to write (issue 073).
+///
+/// This reads the alias table in the direction nothing read it before.
+/// [`route_external_reference`] consults it to validate a `{Name}/…` citation
+/// someone already wrote; nothing connected a path already typed to an alias
+/// already configured, so the generic message taught the escape without evidence
+/// that *this* path was an instance of it — and a hand-written exception stayed
+/// the cheaper local move (issue 066 accumulated nine of them, every one
+/// resolvable under an alias already in `.lattice.toml`).
+///
+/// **Ordering is structural, not conditional.** The only caller is
+/// [`route_stale_reference`], which every 028 emit site reaches solely in the
+/// branch where intra-repo resolution has *already* failed. A reference that
+/// resolves in this workspace can never be steered into a cross-repo citation —
+/// that would be a regression, not a hint.
+///
+/// **Only `Present` claims a citation.** The probe reuses [`resolve_external`],
+/// so the tri-state oracle degrades exactly as decision 010's tiers do: an
+/// absent alias directory (partial checkout, or CI holding only this repo) and a
+/// failed `stat` (issue 050) both yield no steer and fall through to the generic
+/// message, rather than assert a path exists somewhere that could not be checked.
+///
+/// **Multiple matches: first match wins.** `config.external` is a [`BTreeMap`],
+/// so the scan is alphabetical and deterministic. Every match is equally
+/// correct — an external reference is existence-only and edge-free (decision
+/// 010), so a path present under two alias directories genuinely has two valid
+/// citations — and the message's job is to name *one* concrete spelling;
+/// offering both would hand back the choice this steering exists to remove.
+///
+/// **Narrower than the citation machinery it borrows.** Decision 016 makes an
+/// explicit `{Name}/…` reference existence-checked regardless of extension, but
+/// a candidate reaching here is already `.md`-shaped by [`looks_like_path`]'s
+/// intra-repo grammar, so a bare `schema.txt` sitting in an alias directory is
+/// never steered — the dark-matter scan never sees it. That asymmetry *is*
+/// decision 016's own rationale: the brace is the opt-in mark that removes the
+/// is-this-a-reference ambiguity, and an unbraced non-`.md` path still carries
+/// it.
+fn steer_to_external_citation<'cfg>(
+    config: &'cfg Config,
+    external_exists: &dyn Fn(&Path) -> ExternalExistence,
+    reference: &str,
+) -> Option<(&'cfg str, String)> {
+    if config.external.is_empty() {
+        return None;
+    }
+    let (path, fragment) = split_path_fragment(reference);
+    let candidate = external_citation_candidate(path)?;
+    for alias in config.external.keys() {
+        if resolve_external(config, external_exists, alias, &candidate) == ExternalResolution::Valid
+        {
+            // The `#fragment` is carried through verbatim: it is a heading
+            // anchor, irrelevant to existence but part of the spelling the
+            // author should write.
+            let citation = fragment.map_or_else(
+                || format!("{{{alias}}}/{candidate}"),
+                |frag| format!("{{{alias}}}/{candidate}#{frag}"),
+            );
+            return Some((alias.as_str(), citation));
+        }
+    }
+    None
+}
+
 /// Route a dangling-reference stale diagnostic through the exception lookup.
 ///
-/// Builds the stale-reference diagnostic for `reference` (a no-op under a
-/// `Disabled` policy) and hands it to [`ExceptionLookup::route`], so a literal
-/// `stale_references` exception suppresses it, an active count-key buffers it, or
-/// it passes through to `out` — the single seam every stale-reference emit site
-/// now shares (issue 031, issue 036).
+/// Builds the stale-reference diagnostic for `reference` and hands it to
+/// [`ExceptionLookup::route`], so a literal `stale_references` exception
+/// suppresses it, an active count-key buffers it, or it passes through to `out` —
+/// the single seam every stale-reference emit site now shares (issue 031, issue
+/// 036).
+///
+/// Being that single seam, it is also where the external-citation steering is
+/// decided (issue 073): reaching here *is* the proof that intra-repo resolution
+/// failed, so the check cannot fire on a live local reference. When the path
+/// exists under a configured alias directory the message names that citation;
+/// otherwise it is the generic stale message. The exception key, the ledger row,
+/// and the severity are identical either way.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "routing context parameters are distinct concerns"
+)]
 fn route_stale_reference(
+    config: &Config,
+    external_exists: &dyn Fn(&Path) -> ExternalExistence,
     policy: StaleReferencePolicy,
     rel_path: &Path,
     line: usize,
@@ -966,7 +1122,19 @@ fn route_stale_reference(
     lookup: &ExceptionLookup,
     out: &mut Vec<Diagnostic>,
 ) {
-    if let Some(diag) = build_stale_reference(policy, rel_path, line, span, reference) {
+    // Both builders return `None` under `Disabled`, so this changes nothing that
+    // is emitted — it keeps the steering probe's `stat`s off a path whose result
+    // is discarded.
+    if policy == StaleReferencePolicy::Disabled {
+        return;
+    }
+    let diag = match steer_to_external_citation(config, external_exists, reference) {
+        Some((alias, citation)) => {
+            build_external_citation_steer(policy, rel_path, line, span, reference, alias, &citation)
+        }
+        None => build_stale_reference(policy, rel_path, line, span, reference),
+    };
+    if let Some(diag) = diag {
         lookup.route(ExceptionLint::StaleReferences, reference, diag, out);
     }
 }
@@ -1167,6 +1335,8 @@ fn emit_bare_path_diagnostics(
                     }
                 } else {
                     route_stale_reference(
+                        config,
+                        external_exists,
                         stale,
                         rel_path,
                         line,
@@ -1429,6 +1599,8 @@ fn scan_line_for_quoted_paths(
                         }
                     } else {
                         route_stale_reference(
+                            config,
+                            external_exists,
                             stale,
                             rel_path,
                             line_num,
@@ -2229,6 +2401,40 @@ mod tests {
                 if unknown.contains(key) {
                     ExternalExistence::Unknown
                 } else if present.contains(key) {
+                    ExternalExistence::Present
+                } else {
+                    ExternalExistence::Absent
+                }
+            },
+            &exceptions,
+        )
+    }
+
+    /// Like [`diagnose_with_external`], but `existing` also lists the
+    /// workspace-relative paths that resolve *intra-repo*, so a test can drive
+    /// both oracles at once — the combination the external-citation steering
+    /// turns on (issue 073), where a path may exist locally, externally, or
+    /// both.
+    fn diagnose_with_files_and_external(
+        content: &str,
+        config: &Config,
+        existing: &[&str],
+        external_present: &[&str],
+    ) -> Vec<Diagnostic> {
+        let fm = yaml::parse_frontmatter_block(content);
+        let fm_span = fm.as_ref().map(|b| b.span);
+        let tree = block::parse_tree(content, fm_span);
+        let rel_path = std::path::Path::new("test.md");
+        let existing_set: HashSet<&str> = existing.iter().copied().collect();
+        let present: HashSet<&str> = external_present.iter().copied().collect();
+        let exceptions = exceptions_of(content);
+        collect(
+            &tree,
+            rel_path,
+            config,
+            &|p| existing_set.contains(p.to_str().unwrap_or("")),
+            &|p| {
+                if present.contains(p.to_str().unwrap_or("")) {
                     ExternalExistence::Present
                 } else {
                     ExternalExistence::Absent
@@ -3821,6 +4027,268 @@ mod tests {
         assert!(
             links.is_empty(),
             "an external `{{Name}}/…` citation forms no graph edge: {links:?}"
+        );
+    }
+
+    // -- External-citation steering (issue 073) --
+
+    /// The three dark-matter spellings of the same reference, in the order
+    /// bare / backtick / quoted — the 028 family's whole surface.
+    fn dark_matter_spellings(reference: &str) -> [String; 3] {
+        [
+            format!("See {reference} for details.\n"),
+            format!("See `{reference}` for details.\n"),
+            format!("See \"{reference}\" for details.\n"),
+        ]
+    }
+
+    #[test]
+    fn external_steering_names_the_citation_on_every_dark_matter_surface() {
+        // Issue 073: a dangling reference whose path *does* exist under a
+        // configured alias directory gets the concrete spelling to write, not
+        // the generic "write it as `{repo}/…`" lesson. The alias table was only
+        // ever read to validate a citation already written; this reads it to
+        // notice that a typed path is citable — the connection whose absence
+        // produced nine hand-written exceptions in issue 066.
+        let config = config_with_archive_alias();
+        for content in dark_matter_spellings("docs/configuration.md") {
+            let diags = diagnose_with_external(
+                &content,
+                &config,
+                &["/ext/Archive", "/ext/Archive/docs/configuration.md"],
+            );
+            assert_eq!(
+                count_matching(
+                    &diags,
+                    Severity::Warning,
+                    "path exists in external `Archive`"
+                ),
+                1,
+                "the steering variant fires exactly once for {content:?}: {diags:?}"
+            );
+            assert!(
+                has_any(&diags, "cite it as `{Archive}/docs/configuration.md`"),
+                "it names the exact `{{Alias}}/rest` spelling for {content:?}: {diags:?}"
+            );
+            assert!(
+                !has_any(&diags, "no such markdown file under this root"),
+                "it replaces the generic stale message for {content:?}: {diags:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn external_steering_never_overrides_a_live_intra_repo_reference() {
+        // The ordering rule (issue 073 point 1): the steering check runs only
+        // after intra-repo resolution *fails*. A same-named file in a sibling
+        // repo must never displace a live local reference — that would be a
+        // regression, not a hint. Enforced structurally: `route_stale_reference`
+        // is reached only from the dangling branch of every emit site.
+        let config = config_with_archive_alias();
+        for content in dark_matter_spellings("docs/configuration.md") {
+            let diags = diagnose_with_files_and_external(
+                &content,
+                &config,
+                // The path resolves in *this* workspace …
+                &["docs/configuration.md"],
+                // … and also exists under the alias directory.
+                &["/ext/Archive", "/ext/Archive/docs/configuration.md"],
+            );
+            assert!(
+                !has_any(&diags, "path exists in external") && !has_any(&diags, "stale reference"),
+                "a resolving local reference is never steered externally for {content:?}: {diags:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn external_steering_requires_a_present_verdict() {
+        // Issue 073 point 2: only `Present` may claim a citation. The tri-state
+        // oracle degrades exactly as decision 010's tiers do — an absent alias
+        // directory (partial checkout / CI with only this repo) and a failed
+        // `stat` (issue 050) both fall back to the generic stale message rather
+        // than assert a path exists somewhere unchecked.
+        let config = config_with_archive_alias();
+        let content = "See `docs/configuration.md` for details.\n";
+        let cases = [
+            // Alias directory absent: nothing to claim against.
+            (
+                "absent alias directory",
+                diagnose_with_external(content, &config, &[]),
+            ),
+            // Alias directory present, the path is not under it.
+            (
+                "present directory, path missing under it",
+                diagnose_with_external(content, &config, &["/ext/Archive"]),
+            ),
+            // The alias directory's own `stat` failed.
+            (
+                "unknown alias directory",
+                diagnose_with_external_unknown(content, &config, &[], &["/ext/Archive"]),
+            ),
+            // Directory present, but the path's `stat` failed.
+            (
+                "unknown path under a present directory",
+                diagnose_with_external_unknown(
+                    content,
+                    &config,
+                    &["/ext/Archive"],
+                    &["/ext/Archive/docs/configuration.md"],
+                ),
+            ),
+        ];
+        for (label, diags) in cases {
+            assert!(
+                !has_any(&diags, "path exists in external"),
+                "{label} must not claim a citation: {diags:?}"
+            );
+            assert_eq!(
+                count_matching(
+                    &diags,
+                    Severity::Warning,
+                    "no such markdown file under this root"
+                ),
+                1,
+                "{label} degrades to the plain stale-reference hint: {diags:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn external_steering_severity_tracks_the_stale_policy() {
+        // Steering changes the message, never the tier: severity still follows
+        // `stale_references` exactly, and `Disabled` still emits nothing.
+        let present = ["/ext/Archive", "/ext/Archive/docs/configuration.md"];
+        let content = "See `docs/configuration.md` for details.\n";
+        for (policy, severity) in [
+            (StaleReferencePolicy::Hint, Severity::Hint),
+            (StaleReferencePolicy::Warn, Severity::Warning),
+            (StaleReferencePolicy::Deny, Severity::Error),
+        ] {
+            let mut config = config_with_archive_alias();
+            config.policy.stale_references = policy;
+            let diags = diagnose_with_external(content, &config, &present);
+            assert_eq!(
+                count_matching(&diags, severity, "path exists in external `Archive`"),
+                1,
+                "the steering message tracks the {policy:?} policy: {diags:?}"
+            );
+        }
+
+        let mut config = config_with_archive_alias();
+        config.policy.stale_references = StaleReferencePolicy::Disabled;
+        let diags = diagnose_with_external(content, &config, &present);
+        assert!(
+            !has_any(&diags, "path exists in external"),
+            "a disabled policy emits no steering message: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn external_steering_picks_the_first_alias_deterministically() {
+        // Issue 073 point 3, decided: first match wins. `config.external` is a
+        // `BTreeMap`, so the scan is alphabetical — independent of the order the
+        // aliases were declared in. Both citations are equally correct (an
+        // external reference is existence-only and edge-free), and the message's
+        // job is to name *one* spelling.
+        let mut config = Config::default();
+        // Insert out of alphabetical order: `Zed` first, `Archive` second.
+        config
+            .external
+            .insert("Zed".to_string(), std::path::PathBuf::from("/ext/Zed"));
+        config.external.insert(
+            "Archive".to_string(),
+            std::path::PathBuf::from("/ext/Archive"),
+        );
+        let diags = diagnose_with_external(
+            "See `docs/configuration.md` for details.\n",
+            &config,
+            &[
+                "/ext/Zed",
+                "/ext/Zed/docs/configuration.md",
+                "/ext/Archive",
+                "/ext/Archive/docs/configuration.md",
+            ],
+        );
+        assert!(
+            has_any(&diags, "cite it as `{Archive}/docs/configuration.md`"),
+            "the alphabetically-first alias is named, not the first declared: {diags:?}"
+        );
+        assert!(
+            !has_any(&diags, "{Zed}/"),
+            "exactly one citation is offered, not both: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn external_steering_citation_normalizes_the_path_it_spells() {
+        // The spelling must be one that resolves when written back: a `.`
+        // segment and a root-relative leading `/` are collapsed, and a
+        // reference that escapes the workspace root has no citation form at all
+        // (a `..` would also make the alias-directory probe `stat` outside it).
+        let config = config_with_archive_alias();
+        let present = ["/ext/Archive", "/ext/Archive/docs/configuration.md"];
+        for reference in ["./docs/configuration.md", "/docs/configuration.md"] {
+            let content = format!("See `{reference}` for details.\n");
+            let diags = diagnose_with_external(&content, &config, &present);
+            assert!(
+                has_any(&diags, "cite it as `{Archive}/docs/configuration.md`"),
+                "`{reference}` cites as the normalized path: {diags:?}"
+            );
+        }
+
+        let escaping = diagnose_with_external(
+            "See `../docs/configuration.md` for details.\n",
+            &config,
+            &present,
+        );
+        assert!(
+            !has_any(&escaping, "path exists in external"),
+            "a root-escaping reference has no citation form: {escaping:?}"
+        );
+    }
+
+    #[test]
+    fn external_steering_is_suppressed_by_a_path_keyed_exception() {
+        // The steering message routes through the same exception lookup and
+        // keeps the same `stale reference:` prefix, so it lands in the same
+        // ledger row and namespace: an existing `stale_references` exception
+        // keyed on the bare path still suppresses it, and is not misreported as
+        // unused. This is the migration path for issue 066's nine suppressions —
+        // the exception keeps working while the message teaches the conversion.
+        let config = config_with_archive_alias();
+        let content = "---\n\
+             exceptions:\n  \
+               stale_references:\n    \
+                 \"docs/configuration.md\": \"lives in the Archive repo\"\n\
+             ---\n\
+             See `docs/configuration.md` for details.\n";
+        let diags = diagnose_with_external(
+            content,
+            &config,
+            &["/ext/Archive", "/ext/Archive/docs/configuration.md"],
+        );
+        assert!(
+            !has_any(&diags, "stale reference"),
+            "the exception suppresses the steering message: {diags:?}"
+        );
+        assert!(
+            !has_any(&diags, "unused exception"),
+            "and is not misreported as unused: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn external_steering_classifies_as_a_stale_reference_lint() {
+        // The ledger and the subtree-override aggregate key on the message
+        // prefix, so the steering variant must classify identically to the
+        // generic stale message it replaces.
+        assert_eq!(
+            classify_028_lint(
+                "stale reference: `docs/x.md` — path exists in external `Archive` — cite it as `{Archive}/docs/x.md`"
+            ),
+            Some(ExceptionLint::StaleReferences),
+            "the steering variant is a stale_references diagnostic"
         );
     }
 
