@@ -6,6 +6,7 @@
 use std::fs;
 use std::path::PathBuf;
 
+use super::diagnostics::*;
 use super::workspaces::*;
 use super::*;
 use crate::block::{HeadingId, Syntax};
