@@ -1147,6 +1147,56 @@ predicates = \"required\"
         );
     }
 
+    // --- URI schemes at the diagnostic surface (issue 071) ---
+
+    #[test]
+    fn uri_scheme_links_and_embeds_are_silent() {
+        // The regression the issue was filed for: a base64-inlined image is a
+        // sanctioned way to write a self-contained document, and the embed
+        // existence check (issue 058) reported its payload as a missing file.
+        // Links and embeds share the one external oracle, so both spellings of
+        // every scheme family are silent.
+        let (_dir, ws) = setup_workspace(&[(
+            "index.md",
+            "![logo](data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==)\n\n\
+             [copy](data:text/plain;base64,SGVsbG8=)\n\n\
+             [mail](mailto:a@example.com) [call](tel:+15551234567)\n\n\
+             [wire](custom-scheme:some/thing) ![clip](ftp://example.com/a.mp4)\n",
+        )]);
+
+        let diags = validate_forward_links(&ws);
+        assert!(
+            diags.is_empty(),
+            "a destination carrying any URI scheme is never resolved against \
+             the workspace, as a link or as an embed: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn windows_drive_shaped_target_is_still_existence_checked() {
+        // The boundary issue 071 decided, seen from the diagnostic surface: a
+        // one-letter scheme is a Windows drive letter, so the target stays a
+        // workspace path and a missing one is still an error.
+        let (_dir, ws) = setup_workspace(&[("index.md", "[x](C:/notes.md)\n")]);
+
+        let diags = validate_forward_links(&ws);
+        let errors: Vec<_> = diags
+            .iter()
+            .filter(|d| d.severity == Severity::Error)
+            .collect();
+
+        assert_eq!(
+            errors.len(),
+            1,
+            "the drive-shaped target is a path, not a URI: {diags:?}"
+        );
+        assert!(
+            errors[0].message.contains("does not exist"),
+            "the error is plain non-existence: {}",
+            errors[0].message
+        );
+    }
+
     #[test]
     fn embed_derives_no_backlink_obligation() {
         // An embed of a *markdown* file is still an embed: existence-checked, but

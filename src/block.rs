@@ -4496,17 +4496,63 @@ pub fn normalize_path(path: &Path) -> PathBuf {
     parts.iter().collect()
 }
 
-/// Check whether a URL is external (http/https/mailto).
+/// Check whether a URL is external — anything that is not a workspace path.
+///
+/// Recognition is by *grammar*, not by a list of known schemes (issue 071): a
+/// destination carrying any URI scheme is a URI, so it is never resolved
+/// against the source document. A prefix list answers the question backwards —
+/// every scheme nobody enumerated (`data:`, `tel:`, `sms:`, `ftp:`, `file:`,
+/// the `javascript:` an author quotes as an example) is diagnosed as a missing
+/// file, and a base64-inlined `![](data:image/png;base64,…)` embed is a common,
+/// sanctioned way to write a self-contained document.
 ///
 /// A protocol-relative URL (`//host/path`) is external too: a renderer
 /// resolves it against the current scheme and host, never against the
 /// repository root, so it must not be read as a root-relative workspace path
 /// (issue 028).
+///
+/// See [`has_uri_scheme`] for the scheme grammar and the one boundary it
+/// decides — `C:\notes.md`.
 fn is_external(url: &str) -> bool {
-    url.starts_with("http://")
-        || url.starts_with("https://")
-        || url.starts_with("mailto:")
-        || url.starts_with("//")
+    url.starts_with("//") || has_uri_scheme(url)
+}
+
+/// Whether `url` opens with an RFC 3986 scheme — `ALPHA *( ALPHA / DIGIT / "+"
+/// / "-" / "." ) ":"` — requiring at least two scheme characters.
+///
+/// The grammar is the same production [`crate::html::try_autolink`] uses to
+/// tell a URI autolink from an email one, so a destination and an autolink
+/// agree on what a scheme is. The run must start at byte 0: a `/` (or any other
+/// character outside the scheme set) before the `:` breaks it, which is what
+/// keeps `docs/a:b.md` and `12:30` out of the external bucket.
+///
+/// **The two-character minimum is the deliberate boundary.** A single ALPHA
+/// followed by `:` is read as a Windows drive letter — `C:\notes.md` is a path,
+/// not a URI — because one-letter schemes are essentially nonexistent in the
+/// wild while the drive spelling has real users. `CommonMark` draws the line in
+/// the same place: its own absolute-URI production requires a scheme of 2–32
+/// characters. Above that floor `CommonMark`'s reading governs, so a bare
+/// `foo:bar` *is* a URI (that is how a browser resolves an `href`), not a
+/// relative path that happens to contain a colon.
+///
+/// No upper bound is imposed: `CommonMark`'s 32-character cap is an autolink
+/// restriction, not an RFC 3986 one, and a longer scheme run is still not a
+/// workspace path.
+fn has_uri_scheme(url: &str) -> bool {
+    // ASCII-only comparisons: a multi-byte character's bytes are all >= 0x80,
+    // so none of them can match the scheme set or the terminating `:`, and the
+    // run simply stops there.
+    let Some((first, rest)) = url.as_bytes().split_first() else {
+        return false;
+    };
+    if !first.is_ascii_alphabetic() {
+        return false;
+    }
+    let tail = rest
+        .iter()
+        .take_while(|&&b| b.is_ascii_alphanumeric() || b == b'+' || b == b'-' || b == b'.')
+        .count();
+    tail >= 1 && rest.get(tail) == Some(&b':')
 }
 
 /// Resolve a link target path string against the source document's path.
@@ -7599,6 +7645,141 @@ mod tests {
             "protocol-relative `//host` is external, not a workspace path: {:?}",
             links[0].kind,
         );
+    }
+
+    // --- URI-scheme recognition (issue 071) ---
+
+    /// Every destination `is_external` must recognize as a URI, and the four
+    /// forms the pre-071 prefix list already knew (pinned byte-identical).
+    const EXTERNAL_DESTINATIONS: &[&str] = &[
+        // The pre-071 list: unchanged.
+        "http://example.com/a.md",
+        "https://example.com/a.md",
+        "mailto:contact@example.com",
+        "//cdn.example.com/lib.md",
+        // Recognized by grammar since 071 — each was resolved as a workspace
+        // path, and diagnosed as a missing file, before it.
+        "data:text/plain;base64,SGVsbG8=",
+        "tel:+15551234567",
+        "sms:+15551234567",
+        "ftp://example.com/pub/notes.md",
+        "file:///etc/hosts",
+        "javascript:void",
+        "custom-scheme:some/thing",
+        "x+y.z-w:thing",
+        // Schemes are case-insensitive (RFC 3986 §3.1); the prefix list was
+        // case-sensitive, so this one used to resolve as a path.
+        "HTTPS://EXAMPLE.COM/a.md",
+        // Two characters is the floor, and a digit satisfies it.
+        "s3://bucket/key.md",
+        "c9:thing",
+    ];
+
+    /// Destinations that stay workspace paths: no scheme, or a colon that the
+    /// grammar does not read as one.
+    const PATH_DESTINATIONS: &[&str] = &[
+        "notes.md",
+        "./notes.md",
+        "../notes.md",
+        "/docs/notes.md",
+        "img/logo.png",
+        "#fragment",
+        "",
+        // A `/` before the `:` breaks the scheme run.
+        "docs/a:b.md",
+        // A scheme must start with ALPHA.
+        "12:30",
+        ":x",
+        "-x:y",
+        // A single ALPHA before the `:` is a Windows drive letter, not a
+        // scheme — the boundary 071 decided.
+        "C:\\notes.md",
+        "C:/notes.md",
+        // Scheme-shaped, but never terminated by a `:`.
+        "a.b.c",
+        "http",
+    ];
+
+    #[test]
+    fn is_external_recognizes_schemes_by_grammar() {
+        for url in EXTERNAL_DESTINATIONS {
+            assert!(
+                is_external(url),
+                "a URI-scheme (or protocol-relative) destination is external: {url}"
+            );
+        }
+        for url in PATH_DESTINATIONS {
+            assert!(
+                !is_external(url),
+                "a workspace path is never external: {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn uri_scheme_links_and_embeds_classify_as_external() {
+        // Both surfaces route through the one oracle (issue 071), so a link and
+        // an embed of the same destination classify identically — neither is
+        // ever resolved against the source document.
+        for url in EXTERNAL_DESTINATIONS {
+            for source in [format!("[x]({url})\n"), format!("![x]({url})\n")] {
+                let kind = only_link_kind(&source);
+                assert!(
+                    matches!(kind, LinkKind::External { .. }),
+                    "expected External for `{source}`, got {kind:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn base64_data_uri_embed_is_not_a_workspace_target() {
+        // The shape that motivated issue 071: a self-contained document inlines
+        // its image as base64, and the embed existence check added by issue 058
+        // named the payload as a missing file.
+        let source = "![](data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAAAAAA6\
+                      fptVAAAACklEQVR4nGMAAQAABQABDQottAAAAABJRU5ErkJggg==)\n";
+        let kind = only_link_kind(source);
+        assert!(
+            matches!(kind, LinkKind::External { .. }),
+            "a base64 data URI is a URI, never a filename: {kind:?}"
+        );
+    }
+
+    #[test]
+    fn windows_drive_shaped_destination_stays_a_workspace_path() {
+        // The decided boundary (issue 071): a one-letter scheme is read as a
+        // Windows drive letter, so `C:\…` keeps resolving as a path — a
+        // one-letter URI scheme does not exist in the wild, the drive spelling
+        // does.
+        for (source, expected) in [
+            ("[x](C:\\notes.md)\n", "docs/C:\\notes.md"),
+            ("[x](C:/notes.md)\n", "docs/C:/notes.md"),
+        ] {
+            match only_link_kind(source) {
+                LinkKind::IntraProject { target, .. } => assert_eq!(
+                    target,
+                    Path::new(expected),
+                    "the drive-shaped target resolves as a path: {source}"
+                ),
+                other => panic!("expected an intra-project link for {source}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn two_character_scheme_shaped_destination_is_a_uri() {
+        // The other side of the same boundary: above the one-letter floor,
+        // `CommonMark`'s reading governs — a scheme-looking prefix makes it a
+        // URI, which is how a renderer resolves the `href`, so `foo:bar` is not
+        // a relative path that happens to carry a colon.
+        for source in ["[x](foo:bar)\n", "[x](notes:draft.md)\n"] {
+            let kind = only_link_kind(source);
+            assert!(
+                matches!(kind, LinkKind::External { .. }),
+                "a scheme-shaped destination is a URI: {source} -> {kind:?}"
+            );
+        }
     }
 
     #[test]
