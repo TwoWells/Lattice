@@ -82,7 +82,7 @@ enum Shape {
 // ---------------------------------------------------------------------------
 
 fn load_spec() -> Vec<SpecExample> {
-    let json = include_str!("../tests/fixtures/commonmark_spec.json");
+    let json = include_str!("../../tests/fixtures/commonmark_spec.json");
     serde_json::from_str(json).expect("spec.json should parse as valid JSON")
 }
 
