@@ -20,6 +20,7 @@ mod completion;
 mod config;
 mod fm;
 mod format;
+mod fragment;
 mod html;
 mod inline;
 mod json;

@@ -10,8 +10,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
-use crate::block::{self, HeadingId, LinkKind};
-use crate::config::{Config, ConnectivityPolicy, FragmentAlgorithm, PredicatePolicy};
+use crate::block::{self, LinkKind};
+use crate::config::{Config, ConnectivityPolicy, PredicatePolicy};
 use crate::span::Span;
 use crate::workspace::{BoundaryKind, WorkspaceLike, target_to_key};
 
@@ -591,12 +591,13 @@ fn check_stale_backlinks(
 
 /// Check that a fragment resolves to a heading in the target document.
 ///
-/// Explicit `{#id}` anchors are checked first (exact match). For computed
-/// slugs, the algorithm policy determines which slugs are considered.
-/// Skips the check when the target file does not exist (forward link
-/// validation handles that case). The HTML "top of document" idioms — an
-/// empty fragment (`#`) and `#top` (ASCII case-insensitive) — are always
-/// valid and never flagged.
+/// Resolution is [`crate::fragment::resolves`] — the shared authority every
+/// fragment surface reads (issue 072), so this diagnostic, the heading-rename
+/// engine, and `find_references` cannot disagree about what `#x` names.
+/// Explicit `{#id}` anchors, the configured slug algorithm, explicit raw-HTML
+/// anchors, and the HTML "top of document" idioms (an empty fragment and
+/// `#top`) are all its business. Skips the check when the target file does not
+/// exist (forward link validation handles that case).
 #[allow(
     clippy::too_many_arguments,
     reason = "validation context parameters are distinct concerns"
@@ -615,41 +616,17 @@ fn check_fragment(
         return;
     };
 
-    // `#` (empty) and `#top` (ASCII case-insensitive) are the HTML
-    // "top of document" idioms: a renderer scrolls to the top regardless of
-    // headings (a real `top` heading, if present, just takes precedence). Both
-    // are valid, so never flag them — for same-document and cross-file links
-    // alike (issue 021).
-    if fragment.is_empty() || fragment.eq_ignore_ascii_case("top") {
-        return;
-    }
-
-    let algorithm = config.policy.fragments;
-    let headings = &target_data.headings;
-
-    let found_heading = headings.iter().any(|heading| match &heading.id {
-        HeadingId::Explicit(id) => id == fragment,
-        HeadingId::Computed {
-            github,
-            gitlab,
-            vscode,
-        } => match algorithm {
-            Some(FragmentAlgorithm::Github) => github == fragment,
-            Some(FragmentAlgorithm::Gitlab) => gitlab == fragment,
-            Some(FragmentAlgorithm::Vscode) => vscode == fragment,
-            None => github == fragment || gitlab == fragment || vscode == fragment,
-        },
-    });
-
-    // A fragment also resolves against an explicit raw-HTML anchor target —
-    // `<a id="x"></a>` or `<a name="x">` — defined anywhere in the document.
-    // Such anchors are link targets, not link sources, and `#x` resolves to
-    // them exactly as it does to a heading slug (issue 025).
-    let found = found_heading
-        || target_data
-            .anchors
-            .iter()
-            .any(|anchor| anchor.id == fragment);
+    // The shared resolver covers every arm this check used to spell out: the
+    // "top of document" idioms (`#` and `#top`, valid regardless of headings —
+    // issue 021), the `[policy] fragments`-gated heading slugs and explicit
+    // `{#id}` anchors, and explicit raw-HTML anchor targets defined anywhere in
+    // the document (`<a id="x"></a>`, `<a name="x">` — issue 025).
+    let found = crate::fragment::resolves(
+        &target_data.headings,
+        &target_data.anchors,
+        config.policy.fragments,
+        fragment,
+    );
 
     if !found {
         let display = target_to_key(workspace.root(), target);

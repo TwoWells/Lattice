@@ -76,9 +76,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use thiserror::Error;
 
-use crate::block::{self, HeadingId, LinkKind};
+use crate::block::{self, LinkKind};
 use crate::config::FragmentAlgorithm;
 use crate::fm::{self, FmNode, FmValue};
+use crate::fragment::{self, SlugForm};
 use crate::span::Span;
 use crate::validation;
 use crate::workspace::{Workspace, WorkspaceLike};
@@ -1001,73 +1002,22 @@ fn collect_fragment_edits(
     }
 }
 
-/// Which anchor form a fragment matched a heading through — the pre-rename
-/// coordinate's "spelling style", the fragment-axis analogue of [`PathStyle`].
-///
-/// A retargeted fragment is re-rendered in the same form it was authored in, so
-/// a document whose fragments are spelled in one algorithm keeps that algorithm.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SlugForm {
-    /// The heading's explicit `{#id}` attribute.
-    Explicit,
-    /// The computed GitHub slug.
-    Github,
-    /// The computed GitLab slug.
-    Gitlab,
-    /// The computed VS Code slug.
-    Vscode,
-}
-
-impl SlugForm {
-    /// The forms a fragment may resolve through under `algorithm`, in
-    /// resolution order. An explicit `{#id}` is always eligible (it is not a
-    /// computed slug, so no algorithm gates it — mirroring
-    /// `validation::check_fragment`); the computed forms are gated exactly as
-    /// the fragment check gates them.
-    fn eligible(algorithm: Option<FragmentAlgorithm>) -> &'static [Self] {
-        match algorithm {
-            Some(FragmentAlgorithm::Github) => &[Self::Explicit, Self::Github],
-            Some(FragmentAlgorithm::Gitlab) => &[Self::Explicit, Self::Gitlab],
-            Some(FragmentAlgorithm::Vscode) => &[Self::Explicit, Self::Vscode],
-            None => &[Self::Explicit, Self::Github, Self::Gitlab, Self::Vscode],
-        }
-    }
-
-    /// A heading's anchor under this form, or `None` when the heading has no
-    /// such form (a computed heading has no explicit id, and an explicitly
-    /// pinned one computes no slug).
-    fn coordinate(self, heading: &block::Heading) -> Option<&str> {
-        match (&heading.id, self) {
-            (HeadingId::Explicit(id), Self::Explicit) => Some(id),
-            (
-                HeadingId::Computed {
-                    github,
-                    gitlab,
-                    vscode,
-                },
-                form,
-            ) => match form {
-                Self::Github => Some(github),
-                Self::Gitlab => Some(gitlab),
-                Self::Vscode => Some(vscode),
-                Self::Explicit => None,
-            },
-            (HeadingId::Explicit(_), _) => None,
-        }
-    }
-}
-
 /// The fragment-axis coordinate map a single heading rename induces on one
 /// document: its heading anchors before and after, and the effective fragment
 /// algorithm.
 ///
-/// Resolution mirrors `validation::check_fragment` exactly — the same eligible
-/// forms under the same `[policy] fragments` pin — with one addition the
-/// diagnostic has no need for: *which* heading a fragment resolves to
-/// (document order, first match wins, as a renderer resolves duplicate ids).
-/// That identity is what keeps a rename from silently retargeting a referrer:
-/// an edit is emitted only when the same heading's coordinate changed, never
-/// because some *other* heading answers to the old spelling.
+/// Resolution is [`crate::fragment`]'s — the shared authority the fragment
+/// diagnostic and `find_references` read too (issue 072) — used here through
+/// its heading arm, [`crate::fragment::resolve_heading`], which reports *which*
+/// heading a fragment resolves to (document order, first match wins, as a
+/// renderer resolves duplicate ids). That identity is what keeps a rename from
+/// silently retargeting a referrer: an edit is emitted only when the same
+/// heading's coordinate changed, never because some *other* heading answers to
+/// the old spelling.
+///
+/// A retargeted fragment is re-rendered in the [`SlugForm`] it was authored in,
+/// so a document whose fragments are spelled in one algorithm keeps that
+/// algorithm — the fragment-axis analogue of preserving a [`PathStyle`].
 struct FragmentMap<'a> {
     /// The document's headings before the rename.
     old: &'a [block::Heading],
@@ -1119,15 +1069,9 @@ impl FragmentMap<'_> {
     }
 
     /// The index of the first heading `fragment` resolves to, with the form it
-    /// matched through — `validation::check_fragment`'s predicate, plus the
-    /// identity of the match.
+    /// matched through — the shared resolver's heading arm.
     fn resolve(&self, headings: &[block::Heading], fragment: &str) -> Option<(usize, SlugForm)> {
-        headings.iter().enumerate().find_map(|(index, heading)| {
-            SlugForm::eligible(self.algorithm)
-                .iter()
-                .find(|form| form.coordinate(heading) == Some(fragment))
-                .map(|form| (index, *form))
-        })
+        fragment::resolve_heading(headings, self.algorithm, fragment)
     }
 
     /// The post-rename coordinate of heading `index`, in the form the authored

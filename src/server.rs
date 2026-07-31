@@ -2612,14 +2612,24 @@ fn merge_span_edits(
 }
 
 /// Find the heading whose line matches the cursor's 0-based line number.
+fn heading_at_line(headings: &[Heading], lsp_line: u32) -> Option<&Heading> {
+    heading_index_at_line(headings, lsp_line).and_then(|index| headings.get(index))
+}
+
+/// The *position* of the heading on the cursor's 0-based line number.
+///
+/// Fragment resolution answers in heading indices (a fragment names the first
+/// heading that answers to it, in document order), so a surface that must
+/// compare that answer against the cursor's heading needs its index, not a
+/// borrow of it.
 #[allow(
     clippy::cast_possible_truncation,
     reason = "line numbers in markdown files won't exceed u32::MAX"
 )]
-fn heading_at_line(headings: &[Heading], lsp_line: u32) -> Option<&Heading> {
+fn heading_index_at_line(headings: &[Heading], lsp_line: u32) -> Option<usize> {
     headings
         .iter()
-        .find(|h| h.line.saturating_sub(1) as u32 == lsp_line)
+        .position(|h| h.line.saturating_sub(1) as u32 == lsp_line)
 }
 
 // ---------------------------------------------------------------------------
@@ -2646,9 +2656,11 @@ fn find_references(workspaces: &Workspaces, params: &lsp::ReferenceParams) -> Ve
         return find_ref_def_call_sites(workspaces, &params.text_document.uri, &label);
     }
 
-    // Determine if the cursor is on a heading (to filter by fragment).
-    let file_headings = file_data.tree.headings();
-    let target_heading = heading_at_line(&file_headings, params.position.line);
+    // Determine if the cursor is on a heading (to filter by fragment). The
+    // cached extractions are the ones the rename engine resolves against, so
+    // both surfaces answer over the same heading and anchor lists.
+    let target_heading = heading_index_at_line(&file_data.headings, params.position.line);
+    let algorithm = workspace.config().policy.fragments;
 
     let mut locations = Vec::new();
 
@@ -2690,12 +2702,26 @@ fn find_references(workspaces: &Workspaces, params: &lsp::ReferenceParams) -> Ve
             if root.join(target) != cursor_abs {
                 continue;
             }
-            // If cursor is on a heading, only match links with a fragment to that heading.
-            if let Some(heading) = target_heading {
+            // If cursor is on a heading, only match links whose fragment names
+            // *that* heading. Resolution is the shared authority's (issue 072):
+            // the same eligible slug forms the fragment diagnostic validates
+            // against under the same `[policy] fragments` pin, the same
+            // first-match-in-document-order heading identity the rename engine
+            // retargets by, and the same explicit raw-HTML anchors — so a
+            // spelling the configured renderer would not resolve is not listed
+            // as a live edge, and an id an author pinned with `<a id>` is.
+            if let Some(heading_index) = target_heading {
                 let Some(frag) = fragment else {
                     continue;
                 };
-                if !heading_matches_fragment(heading, frag) {
+                if !crate::fragment::names_heading(
+                    &file_data.headings,
+                    &file_data.anchors,
+                    file_data.tree.source(),
+                    algorithm,
+                    frag,
+                    heading_index,
+                ) {
                     continue;
                 }
             }
@@ -2758,6 +2784,14 @@ fn find_ref_def_call_sites(workspaces: &Workspaces, uri: &str, label: &str) -> V
 }
 
 /// Check whether a fragment matches any of a heading's anchor IDs.
+///
+/// The **lenient navigation** matcher: it accepts any of the three computed
+/// conventions regardless of `[policy] fragments`, so jumping to a heading and
+/// previewing it still work on a fragment the configured renderer would not
+/// resolve — following a link physically, as plain navigation does. It is
+/// deliberately *not* the resolver the graph surfaces use: whether a fragment
+/// is a live edge is [`crate::fragment`]'s answer, shared by the fragment
+/// diagnostic, the heading-rename engine, and `find_references` (issue 072).
 fn heading_matches_fragment(heading: &Heading, fragment: &str) -> bool {
     match &heading.id {
         HeadingId::Explicit(id) => id == fragment,
@@ -6755,6 +6789,207 @@ mod tests {
             locations.len(),
             1,
             "only the fragment link should match, not the whole-file link"
+        );
+    }
+
+    #[test]
+    fn find_references_on_heading_honors_the_pinned_fragment_algorithm() {
+        // Issue 072, the over-report half: with `[policy] fragments` pinned, a
+        // referrer spelled in a *different* algorithm's convention is not a
+        // spelling the configured renderer resolves, so it is not a live edge
+        // and must not be listed. "Héllo" → github `héllo`, gitlab `hllo`.
+        let dir = workspace_with_files(&[
+            (".lattice.toml", "[policy]\nfragments = \"github\"\n"),
+            (
+                "a.md",
+                "# A\n\n[github spelling](b.md#héllo \"references\")\n\
+                 [gitlab spelling](b.md#hllo \"references\")\n",
+            ),
+            ("b.md", "# B\n\n## Héllo\n"),
+        ]);
+        let workspaces = scan_workspaces(&dir);
+
+        // Cursor on "## Héllo" (file line 3, LSP line 2).
+        let params = lsp::ReferenceParams {
+            text_document: lsp::TextDocumentIdentifier {
+                uri: file_uri(&dir, "b.md"),
+            },
+            position: lsp::Position {
+                line: 2,
+                character: 0,
+            },
+        };
+        let locations = find_references(&workspaces, &params);
+        assert_eq!(
+            locations.len(),
+            1,
+            "only the pinned algorithm's spelling is an edge: {locations:?}"
+        );
+        assert_eq!(
+            locations[0].range.start.line, 2,
+            "the github-spelled link on LSP line 2, not the gitlab one below it"
+        );
+    }
+
+    #[test]
+    fn find_references_on_heading_accepts_any_convention_when_unpinned() {
+        // The unpinned default validates against any of the three conventions,
+        // so the same gitlab-only spelling that a `github` pin rejects is a
+        // live edge here — the behavior that already agreed, preserved.
+        let dir = workspace_with_files(&[
+            (".lattice.toml", ""),
+            (
+                "a.md",
+                "# A\n\n[github spelling](b.md#héllo \"references\")\n\
+                 [gitlab spelling](b.md#hllo \"references\")\n",
+            ),
+            ("b.md", "# B\n\n## Héllo\n"),
+        ]);
+        let workspaces = scan_workspaces(&dir);
+
+        let params = lsp::ReferenceParams {
+            text_document: lsp::TextDocumentIdentifier {
+                uri: file_uri(&dir, "b.md"),
+            },
+            position: lsp::Position {
+                line: 2,
+                character: 0,
+            },
+        };
+        let locations = find_references(&workspaces, &params);
+        assert_eq!(
+            locations.len(),
+            2,
+            "unpinned, both conventions name the heading: {locations:?}"
+        );
+    }
+
+    #[test]
+    fn find_references_on_heading_reports_explicit_html_anchor_pins() {
+        // Issue 072, the under-report half: an `<a id>` placed above a heading
+        // pins its fragment (issue 025's construct). A referrer using that id
+        // is a reference to the heading and must be listed, while an anchor
+        // standing free in a section's body pins nothing and must not drag its
+        // referrer onto the heading below it.
+        let dir = workspace_with_files(&[
+            (".lattice.toml", ""),
+            (
+                "a.md",
+                "# A\n\n[pinned id](b.md#pinned \"references\")\n\
+                 [loose id](b.md#loose \"references\")\n",
+            ),
+            (
+                "b.md",
+                "# B\n\n<a id=\"loose\"></a>\n\nBody text.\n\n\
+                 <a id=\"pinned\"></a>\n\n## Héllo\n",
+            ),
+        ]);
+        let workspaces = scan_workspaces(&dir);
+
+        // Cursor on "## Héllo" (file line 9, LSP line 8).
+        let params = lsp::ReferenceParams {
+            text_document: lsp::TextDocumentIdentifier {
+                uri: file_uri(&dir, "b.md"),
+            },
+            position: lsp::Position {
+                line: 8,
+                character: 0,
+            },
+        };
+        let locations = find_references(&workspaces, &params);
+        assert_eq!(
+            locations.len(),
+            1,
+            "the pinning anchor's id names the heading, the loose one does not: {locations:?}"
+        );
+        assert_eq!(
+            locations[0].range.start.line, 2,
+            "the `#pinned` referrer on LSP line 2"
+        );
+    }
+
+    #[test]
+    fn find_references_diagnostics_and_rename_agree_on_one_heading() {
+        // Issue 072's deliverable: the three fragment surfaces answer alike.
+        // Under a `github` pin, of two referrers to the same heading only the
+        // github-spelled one is a coordinate — so `find_references` lists it,
+        // the rename engine edits it, and the fragment diagnostic validates it
+        // while flagging the other. All three name the same single link.
+        let dir = workspace_with_files(&[
+            (".lattice.toml", "[policy]\nfragments = \"github\"\n"),
+            (
+                "a.md",
+                "# A\n\n[github spelling](b.md#héllo \"references\")\n\
+                 [gitlab spelling](b.md#hllo \"references\")\n",
+            ),
+            (
+                "b.md",
+                "---\nbacklinks:\n  referenced_by:\n    - a.md\n---\n\n# B\n\n## Héllo\n",
+            ),
+        ]);
+        let workspaces = scan_workspaces(&dir);
+        let b_uri = file_uri(&dir, "b.md");
+        let a_uri = file_uri(&dir, "a.md");
+        // "## Héllo" is file line 9 → LSP line 8.
+        let position = lsp::Position {
+            line: 8,
+            character: 0,
+        };
+
+        // Surface 1 — the reference list.
+        let locations = find_references(
+            &workspaces,
+            &lsp::ReferenceParams {
+                text_document: lsp::TextDocumentIdentifier { uri: b_uri.clone() },
+                position,
+            },
+        );
+        let referenced: Vec<u32> = locations
+            .iter()
+            .filter(|loc| loc.uri == a_uri)
+            .map(|loc| loc.range.start.line)
+            .collect();
+        assert_eq!(
+            referenced,
+            vec![2],
+            "only the github-spelled link is a reference: {locations:?}"
+        );
+
+        // Surface 2 — the rename engine's referrer edits.
+        let edit = do_rename(
+            &workspaces,
+            &lsp::RenameParams {
+                text_document: lsp::TextDocumentIdentifier { uri: b_uri },
+                position,
+                new_name: "Wörld".to_string(),
+            },
+        )
+        .expect("the heading rename produces an edit set");
+        let changes = edit.changes.expect("the edit set names files");
+        let edited: Vec<u32> = changes
+            .get(&a_uri)
+            .expect("the referrer is edited")
+            .iter()
+            .map(|e| e.range.start.line)
+            .collect();
+        assert_eq!(
+            edited, referenced,
+            "the rename edits exactly the links find_references listed: {changes:?}"
+        );
+
+        // Surface 3 — the fragment diagnostic.
+        let (workspace, _) = workspaces
+            .resolve_document(&a_uri)
+            .expect("a.md resolves to its root");
+        let fragment_errors: Vec<usize> = validation::validate_forward_links(&workspace)
+            .into_iter()
+            .filter(|d| d.severity == Severity::Error && d.message.contains("fragment"))
+            .map(|d| d.line)
+            .collect();
+        assert_eq!(
+            fragment_errors,
+            vec![4],
+            "the gitlab spelling on file line 4 is drift; the listed one validates"
         );
     }
 
