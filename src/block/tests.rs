@@ -3,6 +3,7 @@
 
 //! Tests for the block-structure parser.
 
+use super::consumer::*;
 use super::parser::*;
 use super::scan::*;
 use super::*;
