@@ -3,12 +3,15 @@
 #   make setup           # configure hooks + check tools (first time)
 #   make check           # fmt, lint, deny, machete, test (never writes Cargo.lock)
 #   make update          # cargo update, then check against the new lockfile
+#   make install         # install this checkout's binary onto PATH
 #   make release-patch   # 0.1.0 -> 0.1.1
 #   make release-minor   # 0.1.0 -> 0.2.0
 #   make release-major   # 0.1.0 -> 1.0.0
 #   make release V=0.2.0 # explicit version
+#
+# See RELEASING.md for the release order and the irreversible boundary.
 
-.PHONY: build-release check deny fuzz print-fuzz-targets run soak machete metadata mutants setup setup-hooks setup-tools test update release release-patch release-minor release-major publish tag-current
+.PHONY: build-release check deny fuzz print-fuzz-targets install run soak machete metadata mutants setup setup-hooks setup-tools test update release release-patch release-minor release-major publish tag-current
 
 # Get current version from Cargo.toml
 CURRENT_VERSION := $(shell grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
@@ -122,6 +125,21 @@ machete:
 metadata:
 	@cargo metadata --locked --format-version 1
 
+# --- Install ---
+
+# Put THIS checkout's binary on PATH, built with the reviewed lockfile's
+# resolution (--locked), then print what landed. `lattice --version` reports the
+# build's commit hash (issue 040) — check it, and restart editor LSP sessions,
+# or a stale PATH binary keeps judging current repos and its diagnostics get
+# attributed to the wrong layer. See RELEASING.md.
+install:
+	@cargo install --path . --locked
+	@if command -v lattice >/dev/null 2>&1; then \
+	   lattice --version; \
+	 else \
+	   echo "Installed, but 'lattice' is not on PATH (add ~/.cargo/bin)."; \
+	 fi
+
 # --- Run ---
 
 # Exercise the freshly built lattice, never the one on PATH: builds the debug
@@ -230,8 +248,18 @@ pre-release-check:
 		exit 1; \
 	fi
 	@git fetch origin main --quiet
-	@if [ "$$(git rev-parse HEAD)" != "$$(git rev-parse origin/main)" ]; then \
-		echo "Error: Local main is not up to date with origin/main."; \
+	@head=$$(git rev-parse HEAD); \
+	remote=$$(git rev-parse origin/main); \
+	base=$$(git merge-base HEAD origin/main); \
+	if [ "$$head" != "$$remote" ]; then \
+		if [ "$$base" = "$$remote" ]; then \
+			ahead=$$(git rev-list --count origin/main..HEAD); \
+			echo "Error: local main is $$ahead commits ahead of origin/main — push first; the release gate requires the tagged history to be public. See RELEASING.md"; \
+		elif [ "$$base" = "$$head" ]; then \
+			echo "Error: local main is behind origin/main — pull first. See RELEASING.md"; \
+		else \
+			echo "Error: local and origin main have diverged — reconcile first. See RELEASING.md"; \
+		fi; \
 		exit 1; \
 	fi
 	@echo "Prerequisites OK."

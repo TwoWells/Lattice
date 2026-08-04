@@ -151,9 +151,6 @@ uselessness.
 
 ## Release Workflow
 
-- **Patch Release:** `make release-patch`
-- **Minor Release:** `make release-minor`
-- **Major Release:** `make release-major`
-- **Custom Version:** `make release V=x.y.z`
-
-Release runs: check → commit → tag.
+`make release-patch` / `release-minor` / `release-major` / `release V=x.y.z`,
+then `make publish`. See [RELEASING.md](RELEASING.md) for the full order and
+the irreversible boundary.

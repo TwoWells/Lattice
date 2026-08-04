@@ -23,9 +23,7 @@
 # This is the first workflow to create GitHub Releases; v0.1.0 was tagged before
 # it existed (a pre-history crates.io name-grab), so v0.2.0 is the first Release.
 #
-# One-time setup before the first successful run:
-#   - crates.io  → crate Settings → Trusted Publishing → add repo TwoWells/Lattice
-#                  and workflow file `release.yml`.
+# One-time setup (crates.io Trusted Publishing): see RELEASING.md.
 name: Release
 
 on:
