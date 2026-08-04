@@ -1175,12 +1175,11 @@ fn carrier_tree(source: &str) -> Tree {
 ///    no-panic check is blind to.
 ///
 /// The differential arm is **skipped** (the scalar-fidelity arm still runs) when
-/// the carrier body cannot be losslessly re-expressed as a leading block: when a
-/// body line is itself a `---` closing delimiter (it would close the synthetic
-/// block early) or when the body opens with a UTF-8 BOM (which the leading-block
-/// parser strips but `parse_yaml_body` does not). Skipping a genuinely
-/// non-equivalent transform keeps the invariant from firing on a *correct* parse
-/// — it is never broadened to no-panic.
+/// the carrier body cannot be losslessly re-expressed as a leading block — see
+/// [`equivalent_leading_block`], which *verifies* the wrap round-trips instead of
+/// predicting it. Skipping a genuinely non-equivalent transform keeps the
+/// invariant from firing on a *correct* parse — it is never broadened to
+/// no-panic.
 pub fn assert_carrier_fidelity(source: &str) {
     // Production consults the carrier for data only when there is no leading
     // block; mirror that, so the invariant inspects the carrier exactly when the
@@ -1205,14 +1204,9 @@ pub fn assert_carrier_fidelity(source: &str) {
     // Arm 2: differential `carrier ≡ equivalent leading block`. The carrier body
     // is exactly `content_span` (see `yaml::parse_yaml_body`).
     let body = &source[carrier_block.content_span.start..carrier_block.content_span.end];
-    let Some(leading) = equivalent_leading_block(body) else {
+    let Some((leading, leading_block)) = equivalent_leading_block(body) else {
         // The body cannot be losslessly wrapped as a leading `---` block; the
         // scalar-fidelity arm above still guarantees content fidelity.
-        return;
-    };
-    let Some(leading_block) = yaml::parse_frontmatter_block(&leading) else {
-        // The synthetic wrap failed to parse as a leading block at all — a
-        // non-equivalent transform, not a carrier bug. Skip the differential arm.
         return;
     };
     let leading_backlinks = fm::extract_backlinks(&leading_block, &leading);
@@ -1226,15 +1220,13 @@ pub fn assert_carrier_fidelity(source: &str) {
     assert_exceptions_equivalent(&carrier_exceptions, &leading_exceptions, body);
 }
 
-/// Wrap a carrier body as an equivalent leading `---` YAML block, or `None` when
-/// the wrap would not be lossless.
+/// Wrap a carrier body as an equivalent leading `---` YAML block and parse it,
+/// or `None` when the wrap would not be lossless.
 ///
 /// The synthetic document feeds the *same* body bytes between `---` delimiters,
 /// so [`yaml::parse_frontmatter_block`] sees the identical YAML the carrier's
 /// [`yaml::parse_yaml_body`] did. Returns `None` when the transform is unsound:
 ///
-/// - a body line is exactly `---` — it would close the synthetic block early, so
-///   the leading block would see a *prefix* of the body, not all of it;
 /// - the body opens with a UTF-8 BOM — [`yaml::parse_frontmatter_block`] strips a
 ///   leading BOM transparently, which `parse_yaml_body` does not, so the two
 ///   would parse a different first key; conservatively declined;
@@ -1242,22 +1234,30 @@ pub fn assert_carrier_fidelity(source: &str) {
 ///   own line, so any wrap would have to *insert* a separator after the body, and
 ///   that inserted byte is absorbed by an unterminated trailing scalar (e.g. a
 ///   lone `'` at EOF) differently than the carrier's EOF does, so the wrap would
-///   not be byte-equivalent; conservatively declined (issue 041).
+///   not be byte-equivalent; conservatively declined (issue 041);
+/// - the wrapped document does not parse as a leading block at all, or the block
+///   it *does* parse covers only part of the body — a `---` inside the body closed
+///   the synthetic block early, so the leading parser saw a prefix, not the whole
+///   carrier (issue 083).
 ///
-/// Declining a non-equivalent transform is deliberate: the differential arm must
-/// compare like with like, so a body that cannot round-trip is left to the
-/// scalar-fidelity arm rather than producing a false counterexample.
-fn equivalent_leading_block(body: &str) -> Option<String> {
-    // A `---` (or `---`-with-trailing-CR) line inside the body closes the
-    // synthetic leading block prematurely. `find_closing` in the YAML parser
-    // treats a line whose content is exactly `---` as the terminator, so any such
-    // line makes the wrap lossy.
-    if body
-        .lines()
-        .any(|line| line.trim_end_matches('\r') == "---")
-    {
-        return None;
-    }
+/// That last condition is **verified, not predicted**: the wrap is accepted only
+/// when the parsed block's `content_span` reproduces `body` byte for byte. An
+/// earlier version predicted it by scanning `body.lines()` for a line equal to
+/// `---`, which silently disagreed with the parser it was modelling —
+/// [`yaml::parse_frontmatter_block`]'s `find_closing` counts a bare `\r` as a line
+/// ending on *both* sides of the delimiter, while [`str::lines`] splits only on
+/// `\n` (stripping at most a trailing `\r`). A CR-delimited `---` (`---\r`, or one
+/// preceded by a bare `\r`) therefore slipped the guard, truncated the synthetic
+/// block, and made the differential arm compare the full carrier body against a
+/// prefix of itself. Asking the production parser what it actually consumed cannot
+/// drift from it.
+///
+/// Declining a non-equivalent transform is deliberate, and stays narrow: the
+/// differential arm must compare like with like, so only a body that genuinely
+/// cannot round-trip is left to the scalar-fidelity arm rather than producing a
+/// false counterexample. Every body whose wrap *does* round-trip is still compared
+/// in full.
+pub(crate) fn equivalent_leading_block(body: &str) -> Option<(String, FrontmatterBlock)> {
     // A leading BOM is stripped by `parse_frontmatter_block` but not by
     // `parse_yaml_body`, so the wrapped block and the carrier would disagree on
     // the first key. Decline conservatively.
@@ -1275,7 +1275,16 @@ fn equivalent_leading_block(body: &str) -> Option<String> {
     if !body.ends_with(['\n', '\r']) {
         return None;
     }
-    Some(format!("---\n{body}---\n"))
+    let leading = format!("---\n{body}---\n");
+    let block = yaml::parse_frontmatter_block(&leading)?;
+    // The wrap is lossless exactly when the leading parser consumed the whole
+    // body as its YAML content. Anything shorter means a `---` inside the body
+    // terminated the block early, so the two sides would not be comparing the
+    // same YAML.
+    if leading[block.content_span.start..block.content_span.end] != *body {
+        return None;
+    }
+    Some((leading, block))
 }
 
 /// Assert two [`Exceptions`] blocks carry the same reconciled metadata.

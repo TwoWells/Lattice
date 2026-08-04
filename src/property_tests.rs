@@ -62,7 +62,7 @@ use crate::invariants::{
     assert_edit_sequence_stable, assert_emphasis_span_fidelity, assert_frontmatter_scalar_fidelity,
     assert_html_tag_in_bounds, assert_inline_resource_fidelity, assert_line_index_agrees,
     assert_structural_invariants, assert_tree_wellformed, buffer_locality_rows, carrier_backlinks,
-    collect_scalars, detect_frontmatter, naive_bracket_matches,
+    collect_scalars, detect_frontmatter, equivalent_leading_block, naive_bracket_matches,
 };
 use crate::line_index::LineIndex;
 use crate::{inline, json, toml, yaml};
@@ -1959,6 +1959,96 @@ fn carrier_fidelity_unterminated_single_quote_at_eof() {
     // a line ending, so `equivalent_leading_block` must not inject an extra one.
     let source = "# Title\n\n```yaml lattice\nbacklinks:\n  referenced_by:\n    - ../README.md\nexceptions:\n  stale_references:\n    \"../README.md\": '\n```\n";
     assert_carrier_fidelity(source);
+}
+
+/// Compose a naked top-level `yaml lattice` carrier around `body`, so a test can
+/// hand the *same* bytes to `assert_carrier_fidelity` and to
+/// `equivalent_leading_block` without the two drifting.
+fn carrier_around(body: &str) -> String {
+    format!("# T\n\n```yaml lattice\n{body}```\n")
+}
+
+#[test]
+fn carrier_fidelity_cr_terminated_dashes_at_body_start() {
+    // Issue 083, soak reproducer c4dc4b05673c. A carrier body that *opens* with
+    // `---` followed by a bare CR. `yaml::find_closing` accepts a delimiter at
+    // offset 0 terminated by `\r`, so wrapping this body as a leading `---` block
+    // closes it immediately and the leading parser sees an empty YAML content
+    // while the carrier parses the whole body — a divergence of the transform,
+    // not of the parser. The wrap must therefore be declined.
+    let body = "---\rbacklinks:\n  referenced_by:\n    - a.md\n";
+    assert!(
+        equivalent_leading_block(body).is_none(),
+        "a body opening with a CR-terminated `---` cannot be wrapped losslessly: {body:?}"
+    );
+    assert_carrier_fidelity(&carrier_around(body));
+}
+
+#[test]
+fn carrier_fidelity_cr_terminated_dashes_after_lf_line() {
+    // Issue 083, soak reproducers 9251635ef141 and 6d5403991834. The `---` starts
+    // an LF-delimited line but is terminated by a bare CR *mid-line*, so the text
+    // after the CR is still part of the same `str::lines` line. A guard that
+    // enumerated `body.lines()` never saw a line equal to `---` and let the wrap
+    // through; `find_closing` treats the CR as the delimiter's line ending and
+    // truncates the synthetic block right there.
+    let body = "backlinks:\n  referenced_by:\n---\r lattice\n    - a.md\n";
+    assert!(
+        equivalent_leading_block(body).is_none(),
+        "a CR-terminated `---` mid-line cannot be wrapped losslessly: {body:?}"
+    );
+    assert_carrier_fidelity(&carrier_around(body));
+}
+
+#[test]
+fn carrier_fidelity_cr_line_start_dashes_hide_exceptions() {
+    // Issue 083, soak reproducer df7bead6d2e7 — the same root cause reaching the
+    // *exceptions* arm rather than the backlinks arm. Here the `---` is preceded
+    // by a bare CR (a line start `str::lines` does not recognize) and terminated
+    // by one. Truncating the synthetic block there drops the trailing
+    // `exceptions` block, so the carrier reports a stale-reference entry the
+    // leading block does not.
+    let body = "backlinks:\n  referenced_by:\n    - ./old.md\r---\r\nexceptions:\n  stale_references:\n    \"../README.md\": migrated\n";
+    assert!(
+        equivalent_leading_block(body).is_none(),
+        "a `---` between two bare CRs cannot be wrapped losslessly: {body:?}"
+    );
+    assert_carrier_fidelity(&carrier_around(body));
+}
+
+#[test]
+fn carrier_fidelity_lossy_wrap_skip_stays_narrow() {
+    // The issue-083 fix must not buy quiet by skipping the differential arm more
+    // often: only a body that genuinely cannot round-trip is declined. Bodies
+    // carrying bare CR / CRLF line endings, and `---` lookalikes that are *not*
+    // delimiters (`----`, `--- x`), still round-trip and must still be compared.
+    let comparable = [
+        "backlinks:\r  referenced_by:\r    - a.md\r",
+        "backlinks:\r\n  referenced_by:\r\n    - a.md\r\n",
+        "backlinks:\n  referenced_by:\n    - a.md\n----\n",
+        "backlinks:\n  referenced_by:\n    - a.md\n--- x\n",
+    ];
+    for body in comparable {
+        assert!(
+            equivalent_leading_block(body).is_some(),
+            "a body with no closing delimiter must stay comparable, or the differential arm goes \
+             vacuous: {body:?}"
+        );
+        assert_carrier_fidelity(&carrier_around(body));
+    }
+
+    // And the declined shapes really are the delimiter-bearing ones, in every
+    // line-ending flavour — LF, CRLF and bare CR alike.
+    for body in [
+        "backlinks:\n---\n  referenced_by:\n",
+        "backlinks:\r\n---\r\n  referenced_by:\r\n",
+        "backlinks:\r---\r  referenced_by:\r",
+    ] {
+        assert!(
+            equivalent_leading_block(body).is_none(),
+            "a body carrying a `---` delimiter line must be declined: {body:?}"
+        );
+    }
 }
 
 #[test]
