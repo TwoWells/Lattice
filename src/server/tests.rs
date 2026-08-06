@@ -6141,6 +6141,144 @@ fn watched_create_and_delete_update_cross_file_edges() {
     shutdown(&client, server_thread);
 }
 
+/// The reciprocal-backlink frontmatter `b.md` needs to satisfy an incoming
+/// `references` link from `a.md` (the configured inverse is `referenced_by`).
+const B_WITH_BACKLINK: &str = "---\nbacklinks:\n  referenced_by:\n    - a.md\n---\n# B\n";
+
+/// `a.md`'s content once it forward-links the not-yet-existing `b.md`.
+const A_LINKING_B: &str = "# A\n\n[b](b.md \"references\")\n";
+
+#[test]
+fn watched_create_refreshes_a_dependent_dirty_buffers_dead_link() {
+    // Issue 089's field shape, taken to the wire. A document whose rows were
+    // published under the OLDER membership must be refreshed when a watched
+    // `created` event admits the member that satisfies them — the graph-tier
+    // mirror of `didSave`'s unconditional full pass (issue 062).
+    //
+    // Here a.md is open and mid-edit: its buffer links b.md, which does not
+    // exist yet, so its published rows carry the broken-link error. Creating
+    // b.md on disk out-of-editor and delivering the `created` event must clear
+    // a.md's row — a.md's own path never moves, so nothing else can heal it.
+    let dir = workspace_with_files(&[(".lattice.toml", ""), ("a.md", "# A\n")]);
+    let root = fs::canonicalize(dir.path()).expect("canonicalize temp dir");
+    let root_uri = path_to_uri(&root);
+    let a_uri = path_to_uri(&root.join("a.md"));
+    let b_uri = path_to_uri(&root.join("b.md"));
+
+    let (server, client) = Connection::memory();
+    let server_thread = std::thread::spawn(move || serve(&server));
+
+    handshake(&client, &root_uri, true);
+    let reg = recv_message(&client);
+    assert!(
+        matches!(reg, Message::Request(_)),
+        "the registration request precedes the membership change, got {reg:?}"
+    );
+
+    // Open a.md as it stands on disk: clean, so the open's forced publish is
+    // an explicit empty set.
+    open_doc(&client, &a_uri, "# A\n");
+    let opened = recv_publish_for(&client, &a_uri);
+    assert!(
+        opened.is_empty(),
+        "the clean a.md opens with an explicit empty set, got {opened:?}"
+    );
+
+    // The buffer gains the forward link to a file that does not exist yet.
+    send_change(&client, &a_uri, A_LINKING_B);
+    let dirty = recv_publish_for(&client, &a_uri);
+    assert!(
+        any_message_contains(&dirty, "does not exist"),
+        "the mid-edit link to the absent b.md publishes the broken-link error, got {dirty:?}"
+    );
+
+    // b.md is created on disk, out of editor, carrying the reciprocal
+    // backlink — and announced the only way a conforming client can announce
+    // it for a document it never opened: a watched `created` event.
+    fs::write(root.join("b.md"), B_WITH_BACKLINK).expect("create b.md on disk");
+    send_watched_change(&client, &b_uri, lsp::file_change_type::CREATED);
+
+    let healed = recv_publish_for(&client, &a_uri);
+    assert!(
+        !any_message_contains(&healed, "does not exist"),
+        "the new member satisfies the dependent buffer's link, got {healed:?}"
+    );
+    assert!(
+        healed.is_empty(),
+        "a.md's rows are clear once b.md exists and backlinks it, got {healed:?}"
+    );
+
+    shutdown(&client, server_thread);
+}
+
+#[test]
+fn watched_create_refreshes_a_dependent_saved_documents_dead_link() {
+    // The same fan-out, one step closer to the field report: a.md's linking
+    // content is *committed* by a `didSave` before b.md exists, so a.md holds
+    // no overlay at all when the watched `created` event lands. Its rows were
+    // still published under the older membership, and the create must refresh
+    // them.
+    let dir = workspace_with_files(&[(".lattice.toml", ""), ("a.md", "# A\n")]);
+    let root = fs::canonicalize(dir.path()).expect("canonicalize temp dir");
+    let root_uri = path_to_uri(&root);
+    let a_uri = path_to_uri(&root.join("a.md"));
+    let b_uri = path_to_uri(&root.join("b.md"));
+
+    let (server, client) = Connection::memory();
+    let server_thread = std::thread::spawn(move || serve(&server));
+
+    handshake(&client, &root_uri, true);
+    let reg = recv_message(&client);
+    assert!(
+        matches!(reg, Message::Request(_)),
+        "the registration request precedes the membership change, got {reg:?}"
+    );
+
+    open_doc(&client, &a_uri, "# A\n");
+    let opened = recv_publish_for(&client, &a_uri);
+    assert!(
+        opened.is_empty(),
+        "the clean a.md opens with an explicit empty set, got {opened:?}"
+    );
+
+    send_change(&client, &a_uri, A_LINKING_B);
+    let dirty = recv_publish_for(&client, &a_uri);
+    assert!(
+        any_message_contains(&dirty, "does not exist"),
+        "the mid-edit link to the absent b.md publishes the broken-link error, got {dirty:?}"
+    );
+
+    // Commit the edit: disk and the notification agree, and the overlay is
+    // dropped. b.md still does not exist, so the error stands.
+    fs::write(root.join("a.md"), A_LINKING_B).expect("commit a.md to disk");
+    send_notification(
+        &client,
+        lsp::method::DID_SAVE,
+        save_params(&a_uri, A_LINKING_B),
+    );
+    let saved = recv_publish_for(&client, &a_uri);
+    assert!(
+        any_message_contains(&saved, "does not exist"),
+        "the save re-publishes the still-broken link, got {saved:?}"
+    );
+
+    // Now the member arrives on disk with the reciprocal backlink.
+    fs::write(root.join("b.md"), B_WITH_BACKLINK).expect("create b.md on disk");
+    send_watched_change(&client, &b_uri, lsp::file_change_type::CREATED);
+
+    let healed = recv_publish_for(&client, &a_uri);
+    assert!(
+        !any_message_contains(&healed, "does not exist"),
+        "the new member satisfies the saved document's link, got {healed:?}"
+    );
+    assert!(
+        healed.is_empty(),
+        "a.md's rows are clear once b.md exists and backlinks it, got {healed:?}"
+    );
+
+    shutdown(&client, server_thread);
+}
+
 #[test]
 fn an_open_documents_rows_track_its_buffer_until_the_close() {
     // What 017 §3's buffer-wins rule was actually protecting, kept — with
