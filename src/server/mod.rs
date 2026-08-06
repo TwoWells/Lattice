@@ -56,7 +56,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use lsp_server::{Connection, Message, Request, RequestId, Response};
 
-use crate::lsp;
+use crate::{cli, lsp};
 
 use self::dispatch::handle_request;
 use self::notify::handle_notification;
@@ -82,6 +82,12 @@ pub use self::diagnostics::collect_all_diagnostics;
 pub use self::helpers::{byte_offset_to_lsp_position, lsp_position_to_byte_offset};
 #[cfg(any(test, feature = "fuzzing"))]
 pub use self::publish::merge_perspectives;
+
+/// The name reported in the `initialize` result's `serverInfo` (issue 085).
+///
+/// The binary's own name, matching clap's `--version` banner, so a client
+/// naming the server in its log agrees with what the shell reports.
+const SERVER_NAME: &str = "lattice";
 
 /// Fixed registration id for the `.lattice.toml` watcher.
 ///
@@ -139,7 +145,23 @@ fn serve(connection: &Connection) -> Result<()> {
         serde_json::from_value(init_value).context("failed to parse InitializeParams")?;
 
     let capabilities = server_capabilities(&params);
-    connection.initialize_finish(init_id, serde_json::json!({ "capabilities": capabilities }))?;
+    // `serverInfo` is spec-optional, and omitting it left a running server's
+    // build unqueryable — the only version surface was `lattice --version`
+    // (issue 085). The version reported here is that *same* composed string:
+    // `cli::version` is the one composition source, so a hashless build
+    // (crates.io / tarball) degrades to the bare crate version on the wire
+    // exactly as it does in the shell. Honest about what the binary knows,
+    // and incapable of drifting from the CLI.
+    connection.initialize_finish(
+        init_id,
+        serde_json::json!({
+            "capabilities": capabilities,
+            "serverInfo": {
+                "name": SERVER_NAME,
+                "version": cli::version()
+            }
+        }),
+    )?;
 
     let mut workspaces = Workspaces::from_params(&params);
 

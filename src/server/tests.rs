@@ -9292,3 +9292,63 @@ fn no_will_rename_capability_degrades_to_nothing() {
 
     shutdown(&client, server_thread);
 }
+
+// -----------------------------------------------------------------------
+// initialize serverInfo (issue 085)
+//
+// Wire-level: the handshake answer must identify the running build, so a
+// client can report which lattice it is talking to without shelling out to
+// `lattice --version`.
+// -----------------------------------------------------------------------
+
+#[test]
+fn initialize_result_carries_server_info() {
+    // Both fields are asserted against their sources rather than against a
+    // literal version: `crate::cli::version` is the one composition source
+    // the CLI's `--version` also reads, so this test pins the two surfaces
+    // together — including the hashless-build degradation to the bare crate
+    // version, which neither surface can opt out of on its own.
+    let dir = workspace_with_files(&[(".lattice.toml", "")]);
+    let root = fs::canonicalize(dir.path()).expect("canonicalize temp dir");
+    let root_uri = path_to_uri(&root);
+
+    let (server, client) = Connection::memory();
+    let server_thread = std::thread::spawn(move || serve(&server));
+
+    let init = Request::new(
+        RequestId::from(1),
+        "initialize".to_string(),
+        serde_json::json!({
+            "capabilities": {},
+            "workspaceFolders": [ { "uri": root_uri } ]
+        }),
+    );
+    client
+        .sender
+        .send(Message::Request(init))
+        .expect("send initialize");
+    let result = recv_response_for(&client, 1);
+
+    let server_info = result
+        .get("serverInfo")
+        .expect("the initialize result carries a serverInfo block");
+    assert_eq!(
+        server_info.get("name").and_then(serde_json::Value::as_str),
+        Some("lattice"),
+        "serverInfo.name is the binary's name: {server_info}"
+    );
+    assert_eq!(
+        server_info
+            .get("version")
+            .and_then(serde_json::Value::as_str),
+        Some(crate::cli::version()),
+        "serverInfo.version is the composed --version string, byte for byte: {server_info}"
+    );
+    assert!(
+        result.get("capabilities").is_some(),
+        "serverInfo joins the capabilities block rather than replacing it: {result}"
+    );
+
+    send_notification(&client, "initialized", serde_json::json!({}));
+    shutdown(&client, server_thread);
+}

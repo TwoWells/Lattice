@@ -25,6 +25,17 @@ pub struct Cli {
 /// lives in the pure, unit-tested [`compose_version`].
 static VERSION: LazyLock<String> = LazyLock::new(version_string);
 
+/// The composed version string this build reports, borrowed for `'static`.
+///
+/// The single composition source behind both version surfaces: clap's
+/// `--version` output and the LSP `initialize` result's `serverInfo.version`
+/// (issue 085). Neither surface reads the `LATTICE_GIT_*` stamps itself, so
+/// they cannot drift — a hashless build (crates.io / tarball) degrades to the
+/// bare crate version on both at once.
+pub fn version() -> &'static str {
+    VERSION.as_str()
+}
+
 /// Compose the `--version` string from its parts.
 ///
 /// Pure and unit-tested so the format is verifiable without a build script.
