@@ -1,13 +1,17 @@
 # Release — on a vX.Y.Z tag push:
 #   verify        the tag matches Cargo.toml's version
-#   check         `make check` passes (mirrors ci.yml) — gates the publish (issue 049)
+#   check         `make check` passes (mirrors ci.yml) — gates the
+#                 publish (issue 049)
 #   build         cross-platform binaries on GitHub-hosted runners
 #   publish-crate to crates.io via Trusted Publishing (OIDC — no stored token)
-#   release       cut a GitHub Release with the binaries attached + attested
-#   notify        dispatch the distribution repos so packaging starts immediately
+#   release       cut a GitHub Release with the binaries and source tarball
+#                 attached + attested
+#   notify        dispatch the distribution repos so packaging starts
+#                 immediately
 #
-# verify and check run first, in parallel; build and publish-crate need BOTH, so a
-# red check blocks the (irreversible) crates.io publish; release gathers artifacts.
+# verify and check run first, in parallel; build and publish-crate need
+# BOTH, so a red check blocks the (irreversible) crates.io publish;
+# release gathers artifacts.
 #
 # Triggered ONLY by tag pushes, which require write access — a fork PR can never
 # trigger this, so the publish credential is never exposed to untrusted code.
@@ -20,20 +24,24 @@
 # Release archives are attested with build provenance (actions/attest-build-
 # provenance), giving each binary a verifiable link back to this workflow run.
 #
-# This is the first workflow to create GitHub Releases; v0.1.0 was tagged before
-# it existed (a pre-history crates.io name-grab), so v0.2.0 is the first Release.
+# This is the first workflow to create GitHub Releases; v0.1.0 was
+# tagged before it existed (a pre-history crates.io name-grab), so
+# v0.2.0 is the first Release.
 #
 # One-time setup (crates.io Trusted Publishing): see RELEASING.md.
+---
 name: Release
 
-on:
+"on":
   push:
     tags: ['v*']
 
 permissions:
-  contents: write # create the GitHub Release
-  id-token: write # OIDC token for crates.io Trusted Publishing + provenance signing
-  attestations: write # write build-provenance attestations for the release archives
+  contents: write  # create the GitHub Release
+  # OIDC token for crates.io Trusted Publishing + provenance signing
+  id-token: write
+  # write build-provenance attestations for the release archives
+  attestations: write
 
 jobs:
   # Guard: a pushed tag whose version disagrees with Cargo.toml is a mistake.
@@ -47,25 +55,28 @@ jobs:
         name: Tag must match Cargo.toml version
         run: |
           tag="${GITHUB_REF_NAME#v}"
-          manifest="$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')"
+          manifest="$(grep '^version = ' Cargo.toml | head -1 |
+            sed 's/version = "\(.*\)"/\1/')"
           echo "tag=$tag  manifest=$manifest"
           if [ "$tag" != "$manifest" ]; then
-            echo "::error::tag v$tag does not match Cargo.toml version $manifest"
+            msg="tag v$tag does not match Cargo.toml version $manifest"
+            echo "::error::$msg"
             exit 1
           fi
           echo "version=$tag" >> "$GITHUB_OUTPUT"
 
-  # Gate the publish on the full quality bar (issue 049). A crates.io publish is
-  # irreversible, so it must not proceed on a red check. This mirrors ci.yml's
-  # `check` job — same image, same tools, same `make check` — and runs in parallel
-  # with `verify`; `build` and `publish-crate` depend on BOTH, so a failing check
-  # blocks the publish even though the parallel ci.yml tag run is only
+  # Gate the publish on the full quality bar (issue 049). A crates.io
+  # publish is irreversible, so it must not proceed on a red check. This
+  # mirrors ci.yml's `check` job — same image, same tools, same
+  # `make check` — and runs in parallel with `verify`; `build` and
+  # `publish-crate` depend on BOTH, so a failing check blocks the
+  # publish even though the parallel ci.yml tag run is only
   # informational. Keep this in sync with ci.yml's check job.
   check:
     runs-on: ubuntu-latest
     container: ghcr.io/twowells/rust-ci:latest
-    # Container default shell is sh (dash); force bash so run steps don't break on
-    # a bashism (matches ci.yml).
+    # Container default shell is sh (dash); force bash so run steps
+    # don't break on a bashism (matches ci.yml).
     defaults:
       run:
         shell: bash
@@ -106,9 +117,10 @@ jobs:
             runner: macos-14
             archive: tar
     runs-on: ${{ matrix.runner }}
-    # Linux builds inside the rust-ci image on the hosted runner. Windows/macOS
-    # define no matrix container, so this evaluates empty and they build natively
-    # on windows-latest / macos-14, which carry their own MSVC / Xcode toolchains.
+    # Linux builds inside the rust-ci image on the hosted runner.
+    # Windows/macOS define no matrix container, so this evaluates empty
+    # and they build natively on windows-latest / macos-14, which carry
+    # their own MSVC / Xcode toolchains.
     container: ${{ matrix.container }}
     steps:
       - uses: actions/checkout@v6
@@ -131,9 +143,10 @@ jobs:
 
       - name: Package (zip)
         if: matrix.archive == 'zip'
-        # windows-latest ships both Windows PowerShell 5.1 (powershell) and
-        # PowerShell 7 (pwsh); we pin `powershell` (5.1) deliberately for a stable,
-        # always-present shell. Compress-Archive is built in there, so this works.
+        # windows-latest ships both Windows PowerShell 5.1 (powershell)
+        # and PowerShell 7 (pwsh); we pin `powershell` (5.1)
+        # deliberately for a stable, always-present shell.
+        # Compress-Archive is built in there, so this works.
         shell: powershell
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
@@ -146,18 +159,22 @@ jobs:
           name: lattice-${{ matrix.target }}
           path: dist/*
 
-  # Publish to crates.io. Idempotent: skips if this version is already live, so
-  # a re-run (or a re-pushed tag) is a harmless no-op rather than a hard failure.
+  # Publish to crates.io. Idempotent: skips if this version is already
+  # live, so a re-run (or a re-pushed tag) is a harmless no-op rather
+  # than a hard failure.
   publish-crate:
     needs: [verify, check]
     runs-on: ubuntu-latest
-    # Hosted runner → run in the toolchain image (cargo publish + the curl guard).
+    # Hosted runner → run in the toolchain image (cargo publish + the
+    # curl guard).
     container: ghcr.io/twowells/rust-ci:latest
-    # Container default shell is sh (dash); force bash for the guard/publish steps.
+    # Container default shell is sh (dash); force bash for the
+    # guard/publish steps.
     defaults:
       run:
         shell: bash
-    # Must match the Environment name registered in crates.io Trusted Publishing.
+    # Must match the Environment name registered in crates.io Trusted
+    # Publishing.
     # Scopes the OIDC token subject to this environment (tighter trust binding)
     # and gives you a hook for required-reviewer / tag protection rules later.
     # Create it under Settings -> Environments to attach those rules; otherwise
@@ -173,8 +190,9 @@ jobs:
         id: guard
         run: |
           v="${{ needs.verify.outputs.version }}"
-          # Query the sparse index, NOT /api/v1 — the API 403s requests without a
-          # descriptive User-Agent, but the index enforces no such policy.
+          # Query the sparse index, NOT /api/v1 — the API 403s requests
+          # without a descriptive User-Agent, but the index enforces no
+          # such policy.
           # Path layout for a name >= 4 chars: <chars 1-2>/<chars 3-4>/<name>.
           # `|| true` tolerates the 404 a never-yet-published crate returns.
           idx="$(curl -fsS https://index.crates.io/la/tt/lattice || true)"
@@ -200,14 +218,37 @@ jobs:
     needs: [verify, build, publish-crate]
     runs-on: ubuntu-latest
     steps:
+      # Checkout is here for the source-tarball step below (it archives the
+      # tag's tree). It must run before download-artifact: checkout cleans the
+      # workspace and would delete an already-populated dist/.
+      - uses: actions/checkout@v6
+
       - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
 
+      # Ship the source as a release asset, not just a codeload URL. GitHub's
+      # on-the-fly /archive/ tarballs carry no byte-stability guarantee, so a
+      # package that builds from source (the AUR's lattice-markdown) cannot pin
+      # their checksum without risking false alarms; a release asset's bytes
+      # freeze at upload and get a sidecar + attestation below. The
+      # lattice-src-*.tar.gz name deliberately matches the existing
+      # lattice-*.tar.gz globs so the sidecar loop and the provenance
+      # attestation cover it with no changes; the Lattice-<version>/ prefix
+      # mirrors codeload's layout so the PKGBUILD keeps its _srcdir when it
+      # repoints.
+      - name: Package source tarball
+        run: |
+          v="${{ needs.verify.outputs.version }}"
+          git archive --format=tar.gz --prefix="Lattice-${v}/" \
+            -o "dist/lattice-src-${v}.tar.gz" "v${v}"
+
       # Publish a sha256 sidecar next to each archive ("<hash>  <filename>",
       # sha256sum format). The Homebrew tap's and Scoop bucket's bump automation
-      # read these to pin per-platform hashes without downloading the archives.
+      # read these to pin per-platform hashes without downloading the archives;
+      # the source tarball's sidecar is the checksum anchor for the AUR source
+      # package (TwoWells/pkgbuilds).
       - name: Generate sha256 sidecars
         working-directory: dist
         run: |
@@ -216,9 +257,10 @@ jobs:
           done
 
       # Sign a build-provenance attestation for every release archive, linking
-      # each binary back to this workflow run. The globs cover the Linux/macOS
-      # tar.gz and the Windows zip and nothing else — the .sha256 sidecars
-      # don't match the anchored extensions, so only the archives are attested.
+      # each one back to this workflow run. The globs cover the Linux/macOS
+      # tar.gz, the Windows zip, and the source tarball, and nothing else — the
+      # .sha256 sidecars don't match the anchored extensions, so only the
+      # archives are attested.
       - uses: actions/attest-build-provenance@v4
         with:
           subject-path: |
