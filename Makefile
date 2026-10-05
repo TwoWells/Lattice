@@ -147,7 +147,7 @@ install:
 # the working directory (default: this repo), for subcommands that resolve the
 # workspace from cwd.
 #   make run ARGS="lint --verbose"
-#   make run ARGS="lint tickets/misc/x.md" DIR=../CatenaryInternal
+#   make run ARGS="lint tickets/misc/x.md" DIR=../ThemisInternal
 DIR ?= .
 run:
 	@cargo build --quiet

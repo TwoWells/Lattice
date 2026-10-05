@@ -230,7 +230,7 @@ stale_references = "warn"  # or "hint", "deny", "disabled" — dangling `.md` re
 # directory is absent, is exempt; a present directory with a missing file is a
 # stale reference. Relative (sibling-checkout) values are preferred.
 # [external]
-# Catenary = "../Catenary"
+# Themis = "../Themis"
 ```
 
 ### Nested scopes
@@ -273,7 +273,7 @@ keyed by the literal reference with a required reason as the value:
 exceptions:
   stale_references:
     "tickets/acquire/DESIGN.md": "hypothetical path in the worked example"
-    "{Catenary}/old/layout.md": "pre-refactor path, kept for the changelog note"
+    "{Themis}/old/layout.md": "pre-refactor path, kept for the changelog note"
   bare_paths:
     "README.md": "naming the file, deliberately not a link"
 ---
