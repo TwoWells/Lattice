@@ -52,7 +52,7 @@ jobs:
     outputs:
       matrix: ${{ steps.list.outputs.matrix }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - id: list
         run: |
           json="$(make -s print-fuzz-targets | jq -R . | jq -cs .)"
@@ -71,7 +71,7 @@ jobs:
       matrix:
         target: ${{ fromJson(needs.targets.outputs.matrix) }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Choose fuzz duration
         run: |
@@ -99,7 +99,7 @@ jobs:
       # restore-keys prefix is what actually pulls the last one back. Per-target
       # keys keep independent caches rather than one contended blob.
       - name: Restore discovered corpus
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: fuzz/corpus/${{ matrix.target }}
           key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
@@ -112,7 +112,7 @@ jobs:
 
       - name: Upload crash input
         if: steps.fuzz.outcome == 'failure'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: crash-${{ matrix.target }}
           path: fuzz/artifacts/${{ matrix.target }}/
