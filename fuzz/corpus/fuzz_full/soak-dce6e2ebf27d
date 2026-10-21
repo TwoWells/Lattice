@@ -1,0 +1,12 @@
+ #Title
+
+```yaml lattice
+backlinks:
+  ed_by:
+   d---# render.
+
+<:::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::details><summary>lattice</summa - ../README.md
+exceptions:
+  stale_references:
+    "../README.'m": d
+```
