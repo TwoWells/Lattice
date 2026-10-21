@@ -1,0 +1,10 @@
+# Title
+2
+```yaml lattice
+backlinks:
+  ebacklinks:  referenced_by:    - ../README+md  superseded_by:    - ./old.md---# yBdoA paragraph linking [forreferenced_by:
+    - ../README.md
+exceptions:
+  stale_references:
+    "../README.md": '
+```amends
