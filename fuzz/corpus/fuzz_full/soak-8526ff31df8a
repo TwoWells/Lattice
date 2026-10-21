@@ -1,0 +1,16 @@
+# Title
+
+A `<details>`-wrapped car<+summary>
+
+```yaml lattice
+backrier, collapsed at the foot for a clean render.
+
+<details><l la---# summary>lattice<+summary>
+
+```yaml lattice
+backlinks:
+  referenced_by:
+    - a.md
+```
+
+</detailsw
