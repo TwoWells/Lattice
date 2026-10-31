@@ -11,7 +11,7 @@
 #
 # See RELEASING.md for the release order and the irreversible boundary.
 
-.PHONY: build-release check deny fuzz print-fuzz-targets install run soak machete metadata mutants setup setup-hooks setup-tools test update release release-patch release-minor release-major publish tag-current
+.PHONY: build-release check cmin deny fuzz print-fuzz-targets install run soak machete metadata mutants setup setup-hooks setup-tools test update release release-patch release-minor release-major publish tag-current
 
 # Get current version from Cargo.toml
 CURRENT_VERSION := $(shell grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
@@ -227,6 +227,47 @@ soak:
 	 done; \
 	 if [ $$fail -eq 0 ]; then echo "Soak clean: all targets survived $(FUZZ_TIME)s."; fi; \
 	 exit $$fail
+
+# Minimise each corpus to a coverage-equivalent subset (libFuzzer's -merge), so
+# a soak starts faster and the corpus stays small enough to archive. Every
+# target by default; pass T= for one.
+#
+#   make cmin                  # all targets
+#   make cmin T=fuzz_yaml      # a single target
+#
+# Two traps this encodes, both of which cost an afternoon to rediscover:
+#
+#  - the same --target pin `fuzz` needs, for the same reason (see FUZZ_TRIPLE).
+#  - the merge rewrites fuzz/corpus/<target>/ as a minimal set under
+#    content-hash names, which *deletes the named seeds checked in there*. Their
+#    coverage survives inside the merged set, but the filenames saying what each
+#    one is for do not, so the tracked files are restored afterwards.
+#
+# Most of the corpus is untracked and lives only on this disk. Archive it first
+# if you want a way back:  tar -I zstd -cf /tmp/corpus.tar.zst fuzz/corpus
+cmin:
+	@command -v cargo-fuzz >/dev/null 2>&1 || { \
+	  echo "cargo-fuzz not found. Install with: cargo binstall cargo-fuzz"; exit 1; }
+	@export RUSTUP_TOOLCHAIN=nightly; \
+	 min_one() { \
+	   before=$$(find "fuzz/corpus/$$1" -type f 2>/dev/null | wc -l); \
+	   echo "=== minimising $$1 ($$before inputs) ==="; \
+	   cargo fuzz cmin "$$1" --target $(FUZZ_TRIPLE) || return $$?; \
+	   after=$$(find "fuzz/corpus/$$1" -type f 2>/dev/null | wc -l); \
+	   echo "  $$1: $$before -> $$after inputs"; \
+	 }; \
+	 if [ -n "$(T)" ]; then \
+	   min_one "$(T)" || exit $$?; \
+	 else \
+	   for t in $(FUZZ_TARGETS); do min_one "$$t" || exit $$?; done; \
+	 fi; \
+	 if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then \
+	   n=$$(git ls-files --deleted --modified -- fuzz/corpus | sort -u | wc -l); \
+	   if [ "$$n" -gt 0 ]; then \
+	     git checkout -- fuzz/corpus; \
+	     echo "Restored $$n checked-in seed(s) the merge dropped."; \
+	   fi; \
+	 fi
 
 # Run tests. Pass T= to filter, N= to repeat, PROFILE= to select a nextest
 # profile (e.g. PROFILE=hardening for extended PROPTEST_CASES / fork runs).
